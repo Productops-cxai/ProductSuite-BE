@@ -1,0 +1,12 @@
+# Keep secrets and local env out of git
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
