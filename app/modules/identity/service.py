@@ -23,7 +23,7 @@ from app.infrastructure.database.models import (
     TokenDenylistModel,
     UserModel,
 )
-from app.infrastructure.email.service import email_service
+from app.infrastructure.email.service import send_email
 from app.modules.platform.services.entitlement_service import get_effective_products
 from app.shared.enums import AuthTokenType, LoginNextStep, PlatformRole, UserStatus
 
@@ -255,11 +255,17 @@ class IdentityService:
             user.id, AuthTokenType.PASSWORD_RESET, settings.PASSWORD_RESET_EXPIRE_HOURS
         )
         link = f"{settings.FRONTEND_URL}/reset-password?token={raw}"
-        email_service.send(
-            user.email,
-            "Reset your Platform Suite password",
-            f"Use this link to reset your password (expires in "
-            f"{settings.PASSWORD_RESET_EXPIRE_HOURS} hours):\n{link}",
+        send_email(
+            self.db,
+            to_email=user.email,
+            subject="Reset your Platform Suite password",
+            body=(
+                f"Use this link to reset your password (expires in "
+                f"{settings.PASSWORD_RESET_EXPIRE_HOURS} hours):\n{link}"
+            ),
+            email_type="password_reset",
+            action_link=link,
+            related_user_id=user.id,
         )
 
     def reset_password(self, token: str, new_password: str, confirm_password: str) -> None:
@@ -288,14 +294,21 @@ class IdentityService:
             rt.revoked_at = now
         self.db.commit()
 
-    def send_activation_invite(self, user: UserModel) -> None:
+    def send_activation_invite(self, user: UserModel) -> str:
         raw = self.create_auth_token(
             user.id, AuthTokenType.ACTIVATION, settings.ACTIVATION_TOKEN_EXPIRE_HOURS
         )
         link = f"{settings.FRONTEND_URL}/activate?token={raw}"
-        email_service.send(
-            user.email,
-            "Activate your Platform Suite account",
-            f"Hello {user.full_name},\n\nSet your password using this link "
-            f"(expires in {settings.ACTIVATION_TOKEN_EXPIRE_HOURS} hours):\n{link}",
+        send_email(
+            self.db,
+            to_email=user.email,
+            subject="Activate your Platform Suite account",
+            body=(
+                f"Hello {user.full_name},\n\nSet your password using this link "
+                f"(expires in {settings.ACTIVATION_TOKEN_EXPIRE_HOURS} hours):\n{link}"
+            ),
+            email_type="activation",
+            action_link=link,
+            related_user_id=user.id,
         )
+        return link

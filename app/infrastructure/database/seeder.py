@@ -121,6 +121,7 @@ class DatabaseSeeder:
             ("products", "Products", "/platform/products", "box", 2, False),
             ("product_access", "Product Access", "/platform/product-access", "key", 3, False),
             ("people", "People", "/platform/people", "users", 4, False),
+            ("email_logs", "Email Logs", "/platform/email-logs", "mail", 5, False),
         ]
         for key, label, route, icon, sort_order, soon in platform_items:
             exists = (

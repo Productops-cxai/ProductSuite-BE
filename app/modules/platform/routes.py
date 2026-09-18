@@ -6,8 +6,10 @@ from app.core.deps import CurrentPerson, DbSession, SuperAdmin
 from app.core.exceptions import AppError
 from app.modules.platform.schemas import (
     AssignProductRequest,
+    EmailLogResponse,
     EnterProductResponse,
     GrantAccessRequest,
+    InviteResendResponse,
     MenusResponse,
     OrganizationResponse,
     OrganizationSave,
@@ -50,7 +52,7 @@ def get_menus(
 ):
     if context == MenuContext.PLATFORM_ADMIN and person.role_code != "platform_super_admin":
         raise HTTPException(status_code=403, detail="Platform Super Admin required")
-    return PlatformService(db).menus(context.value, person.role_code)
+    return PlatformService(db).menus(context.value, person.role_code, person.email)
 
 
 @router.get("/products", response_model=List[ProductResponse])
@@ -151,11 +153,25 @@ def remove_product(payload: AssignProductRequest, _: SuperAdmin, db: DbSession):
         raise _map_error(exc) from exc
 
 
-@router.post("/people/resend-invite")
+@router.post("/people/resend-invite", response_model=InviteResendResponse)
 def resend_invite(payload: PersonIdRequest, _: SuperAdmin, db: DbSession):
     try:
-        PlatformService(db).resend_invite(payload.user_id)
-        return {"message": "Invitation sent"}
+        return PlatformService(db).resend_invite(payload.user_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/email-logs", response_model=List[EmailLogResponse])
+def list_email_logs(
+    admin: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    email_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Private ops view — only the seeded suite admin (SEED_SUPER_ADMIN_EMAIL)."""
+    try:
+        return PlatformService(db).list_email_logs(admin.email, search, email_type, limit)
     except AppError as exc:
         raise _map_error(exc) from exc
 

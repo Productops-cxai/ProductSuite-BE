@@ -145,6 +145,7 @@ class PersonResponse(BaseModel):
     status: str
     assigned_products: List[AssignedProduct]
     created_at: datetime
+    activation_link: Optional[str] = None
 
 
 class AssignProductRequest(BaseModel):
@@ -159,3 +160,22 @@ class PersonIdRequest(BaseModel):
 class EnterProductResponse(BaseModel):
     product: ProductResponse
     message: str = "Product access granted"
+
+
+class EmailLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    to_email: EmailStr
+    subject: str
+    body: str
+    email_type: str
+    action_link: Optional[str] = None
+    related_user_id: Optional[UUID] = None
+    status: str
+    created_at: datetime
+
+
+class InviteResendResponse(BaseModel):
+    message: str = "Invitation sent"
+    activation_link: Optional[str] = None

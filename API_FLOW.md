@@ -56,10 +56,11 @@ Pehle yeh sequence Swagger pe chalao.
 | 11 | `POST` | `/product-access/grant` | Org ko product entitlement do. |
 | 12 | `POST` | `/product-access/revoke` | Entitlement hatao (soft revoke). |
 | 13 | `GET` | `/people` | Platform users list. |
-| 14 | `POST` | `/people` | Naya user create (invite email console pe print). Optional `product_ids`. |
+| 14 | `POST` | `/people` | Naya user create → invite `email_logs` + `activation_link` response mein. Optional `product_ids`. |
 | 15 | `POST` | `/people/assign-product` | User ko product assign. |
 | 16 | `POST` | `/people/remove-product` | Assignment hatao. |
-| 17 | `POST` | `/people/resend-invite` | Activation email dubara. |
+| 17 | `POST` | `/people/resend-invite` | Activation email dubara (`email_logs` + link). |
+| 18 | `GET` | `/email-logs` | Logged emails (SMTP nahi — link yahan se copy). |
 
 **Zaroori rule:** Product enter tabhi hoga jab **dono** hon:
 1. Org pe product **granted**
@@ -69,13 +70,14 @@ Pehle yeh sequence Swagger pe chalao.
 
 ## Flow B — Naya user activate (invitation)
 
-Admin ne `POST /people` kiya → console/email pe setup link aata hai (`?token=...`).
+Admin ne `POST /people` kiya → row `email_logs` mein save hoti hai (`action_link` ke sath). SMTP nahi — link FE `/activate?token=...` pe kholo.
 
 | Step | Method | API | Kaam |
 |------|--------|-----|------|
-| 1 | `GET` | `/auth/activation/{token}` | Email read-only + link valid? |
-| 2 | `POST` | `/auth/activate` | Password set → account **active**. |
-| 3 | `POST` | `/auth/login` | Ab naye password se login. |
+| 1 | `GET` | `/email-logs` | Latest invite link copy (ya People create response se). |
+| 2 | `GET` | `/auth/activation/{token}` | Email read-only + link valid? |
+| 3 | `POST` | `/auth/activate` | Password set → account **active**. |
+| 4 | `POST` | `/auth/login` | Ab naye password se login. |
 
 ---
 
@@ -136,6 +138,7 @@ Admin ne `POST /people` kiya → console/email pe setup link aata hai (`?token=.
 | `POST /people/assign-product` | Assign product to user |
 | `POST /people/remove-product` | Remove assignment |
 | `POST /people/resend-invite` | Resend activation |
+| `GET /email-logs` | Logged outbound emails + action links |
 | `GET /platform/billing` | Coming soon (501) |
 
 ### Product entry

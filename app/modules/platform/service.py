@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.config import settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     OrganizationModel,
@@ -65,7 +66,7 @@ class PlatformService:
         }
 
     # ---- Menus ----
-    def menus(self, context: str, role: str) -> dict:
+    def menus(self, context: str, role: str, email: str | None = None) -> dict:
         from app.infrastructure.database.models import MenuSectionModel
 
         sections = (
@@ -74,6 +75,8 @@ class PlatformService:
             .order_by(MenuSectionModel.sort_order)
             .all()
         )
+        email_logs_admin = settings.SEED_SUPER_ADMIN_EMAIL.lower()
+        caller_email = (email or "").lower()
         result = []
         for section in sections:
             items = []
@@ -81,6 +84,9 @@ class PlatformService:
                 if not item.is_active:
                     continue
                 if item.required_role and item.required_role != role:
+                    continue
+                # Email Logs is a private ops view for the seeded suite admin only
+                if item.key == "email_logs" and caller_email != email_logs_admin:
                     continue
                 items.append(
                     {
@@ -287,7 +293,7 @@ class PlatformService:
         }
 
     # ---- Users (People API) ----
-    def _user_response(self, user: UserModel) -> dict:
+    def _user_response(self, user: UserModel, activation_link: str | None = None) -> dict:
         effective_ids = {p.id for p in get_effective_products(self.db, user)}
         assigned = []
         for link in user.product_links:
@@ -314,6 +320,7 @@ class PlatformService:
             "status": user.status,
             "assigned_products": assigned,
             "created_at": user.created_at,
+            "activation_link": activation_link,
         }
 
     def _load_user(self, user_id: UUID) -> UserModel | None:
@@ -373,8 +380,8 @@ class PlatformService:
 
             self.db.commit()
             user = self._load_user(user.id)
-            IdentityService(self.db).send_activation_invite(user)
-            return self._user_response(user)
+            link = IdentityService(self.db).send_activation_invite(user)
+            return self._user_response(user, activation_link=link)
 
         user = self._load_user(data.id)
         if not user:
@@ -437,13 +444,53 @@ class PlatformService:
             self.db.commit()
         return self._user_response(self._load_user(user_id))
 
-    def resend_invite(self, user_id: UUID) -> None:
+    def resend_invite(self, user_id: UUID) -> dict:
         user = self.db.query(UserModel).filter(UserModel.id == user_id).first()
         if not user:
             raise NotFoundError("User not found")
         if user.status == UserStatus.ACTIVE.value:
             raise ValidationAppError("User is already active")
-        IdentityService(self.db).send_activation_invite(user)
+        link = IdentityService(self.db).send_activation_invite(user)
+        return {"message": "Invitation sent", "activation_link": link}
+
+    def list_email_logs(
+        self,
+        actor_email: str,
+        search: Optional[str] = None,
+        email_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        if (actor_email or "").lower() != settings.SEED_SUPER_ADMIN_EMAIL.lower():
+            raise ForbiddenError("Email Logs are only available to the suite admin")
+
+        from app.infrastructure.database.models import EmailLogModel
+
+        query = self.db.query(EmailLogModel)
+        if email_type:
+            query = query.filter(EmailLogModel.email_type == email_type)
+        if search:
+            like = f"%{search.lower()}%"
+            query = query.filter(
+                or_(
+                    EmailLogModel.to_email.ilike(like),
+                    EmailLogModel.subject.ilike(like),
+                )
+            )
+        rows = query.order_by(EmailLogModel.id.desc()).limit(min(limit, 500)).all()
+        return [
+            {
+                "id": r.id,
+                "to_email": r.to_email,
+                "subject": r.subject,
+                "body": r.body,
+                "email_type": r.email_type,
+                "action_link": r.action_link,
+                "related_user_id": r.related_user_id,
+                "status": r.status,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
 
     def enter_product(self, user: UserModel, code: str) -> dict:
         product = self.get_product_by_code(code)
