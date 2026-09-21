@@ -9,13 +9,24 @@ from app.infrastructure.database.models import (
     UserModel,
     UserProductModel,
 )
-from app.shared.enums import EntitlementStatus, ProductStatus, UserStatus
+from app.shared.enums import EntitlementStatus, PlatformRole, ProductStatus, UserStatus
 
 
 def get_effective_products(db: Session, user: UserModel) -> List[ProductModel]:
-    """Active product + org granted + user assigned."""
+    """Active product + org granted + user assigned.
+
+    Platform Super Admin always receives every active product.
+    """
     if user.status != UserStatus.ACTIVE.value:
         return []
+
+    if user.role_code == PlatformRole.PLATFORM_SUPER_ADMIN.value:
+        return (
+            db.query(ProductModel)
+            .filter(ProductModel.status == ProductStatus.ACTIVE.value)
+            .order_by(ProductModel.name)
+            .all()
+        )
 
     assigned_ids = {
         link.product_id
