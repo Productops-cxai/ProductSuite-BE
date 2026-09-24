@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,10 +10,16 @@ from app.modules.identity.routes import router as identity_router
 from app.modules.payflow.routes import router as payflow_router
 from app.modules.platform.routes import router as platform_router
 
+logger = logging.getLogger("uvicorn.error")
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Additive only: create missing tables/columns + insert missing seed rows.
+    # Existing org grants, people assignments, and product rows are never overwritten.
+    logger.info("Startup: schema sync + seed (additive)…")
     run_seeder()
+    logger.info("Startup: ready")
     yield
 
 

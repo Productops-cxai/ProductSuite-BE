@@ -123,7 +123,26 @@ def test_person_assignment_without_org_grant_not_enough(db_session):
     assert has_product_access(db_session, user, "INSIGHTIQ") is False
 
 
-def test_create_product(client, admin_token):
+def test_remove_assignment_hides_product_from_me(client, admin_token, db_session):
+    admin = db_session.query(UserModel).filter_by(email="admin@payflow.ai").first()
+    payflow = db_session.query(ProductModel).filter_by(code="PAYFLOW").first()
+
+    before = client.get("/me/products", headers={"Authorization": f"Bearer {admin_token}"})
+    assert before.status_code == 200
+    assert "PAYFLOW" in {p["code"] for p in before.json()}
+
+    removed = client.post(
+        "/people/remove-product",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"user_id": str(admin.id), "product_id": payflow.id},
+    )
+    assert removed.status_code == 200
+    assert "PAYFLOW" not in {p["code"] for p in removed.json()["assigned_products"]}
+
+    after = client.get("/me/products", headers={"Authorization": f"Bearer {admin_token}"})
+    assert after.status_code == 200
+    assert "PAYFLOW" not in {p["code"] for p in after.json()}
+
     response = client.post(
         "/products",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -145,3 +164,69 @@ def test_forgot_password_privacy(client):
     )
     assert response.status_code == 200
     assert "If an account exists" in response.json()["message"]
+
+
+def test_get_product_details(client, admin_token, db_session):
+    payflow = db_session.query(ProductModel).filter_by(code="PAYFLOW").first()
+    response = client.get(
+        f"/products/{payflow.id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["code"] == "PAYFLOW"
+    assert data["name"] == "PayFlow"
+    assert data["status"] == "active"
+    assert data["description"]
+    assert "Collections" in data["description"]
+
+
+def test_update_product_description_and_status(client, admin_token, db_session):
+    payflow = db_session.query(ProductModel).filter_by(code="PAYFLOW").first()
+    response = client.post(
+        "/products",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "id": payflow.id,
+            "name": "PayFlow",
+            "description": "Updated collections platform",
+            "status": "active",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["description"] == "Updated collections platform"
+    assert body["status"] == "active"
+    assert body["code"] == "PAYFLOW"
+
+
+def test_product_code_immutable_on_update(client, admin_token, db_session):
+    payflow = db_session.query(ProductModel).filter_by(code="PAYFLOW").first()
+    response = client.post(
+        "/products",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "id": payflow.id,
+            "name": "PayFlow",
+            "code": "NEWCODE",
+            "status": "active",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Product code cannot be changed"
+
+
+def test_products_require_admin(client, user_token, db_session):
+    payflow = db_session.query(ProductModel).filter_by(code="PAYFLOW").first()
+    post_denied = client.post(
+        "/products",
+        headers={"Authorization": f"Bearer {user_token}"},
+        json={"name": "Blocked Product", "code": "BLOCKED"},
+    )
+    assert post_denied.status_code == 403
+
+    get_denied = client.get(
+        f"/products/{payflow.id}",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert get_denied.status_code == 403

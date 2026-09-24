@@ -141,6 +141,9 @@ class PlatformService:
             self.db.add(product)
         else:
             product = self.get_product(data.id)
+            # AC6 — product identity (code) is immutable once registered
+            if data.code is not None and data.code.strip().upper() != product.code.upper():
+                raise ValidationAppError("Product code cannot be changed")
             product.name = data.name.strip()
             if data.description is not None:
                 product.description = data.description

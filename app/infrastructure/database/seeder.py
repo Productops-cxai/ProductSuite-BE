@@ -33,6 +33,15 @@ from app.shared.enums import (
 
 
 class DatabaseSeeder:
+    """Idempotent + additive only.
+
+    On every app start:
+    - creates missing tables / nullable columns
+    - inserts missing default rows (roles, orgs, products, menus, demo grants)
+    Never updates or deletes existing people, product assignments, org grants,
+    or product fields — so restart after code changes does not undo manual work.
+    """
+
     def run(self) -> None:
         sync_schema(engine)
         db = SessionLocal()
@@ -184,6 +193,7 @@ class DatabaseSeeder:
             .filter(UserModel.email == settings.SEED_SUPER_ADMIN_EMAIL.lower())
             .first()
         )
+        created = False
         if not admin:
             admin = UserModel(
                 full_name=settings.SEED_SUPER_ADMIN_NAME,
@@ -195,20 +205,17 @@ class DatabaseSeeder:
             )
             db.add(admin)
             db.flush()
+            created = True
 
-        products = (
-            db.query(ProductModel).filter(ProductModel.status == ProductStatus.ACTIVE.value).all()
-        )
-        for product in products:
-            link = (
-                db.query(UserProductModel)
-                .filter(
-                    UserProductModel.user_id == admin.id,
-                    UserProductModel.product_id == product.id,
-                )
-                .first()
+        # Only seed product assignments for a brand-new admin so manual
+        # assign/remove on People page is not overwritten on every restart.
+        if created:
+            products = (
+                db.query(ProductModel)
+                .filter(ProductModel.status == ProductStatus.ACTIVE.value)
+                .all()
             )
-            if not link:
+            for product in products:
                 db.add(UserProductModel(user_id=admin.id, product_id=product.id))
         db.flush()
 
