@@ -6,6 +6,7 @@ from app.core.exceptions import AppError
 from app.modules.identity.schemas import (
     ActivateAccountRequest,
     ActivationPreviewResponse,
+    ChangePasswordRequest,
     ForgotPasswordRequest,
     LoginRequest,
     LoginResponse,
@@ -14,6 +15,7 @@ from app.modules.identity.schemas import (
     RefreshRequest,
     ResetPasswordRequest,
     TokenResponse,
+    UpdateProfileRequest,
 )
 from app.modules.identity.service import IdentityService
 
@@ -44,6 +46,28 @@ def login(payload: LoginRequest, db: DbSession):
 @router.get("/me", response_model=MeResponse)
 def me(user: CurrentPerson, db: DbSession):
     return IdentityService(db).me(user)
+
+
+@router.patch("/me", response_model=MeResponse)
+def update_profile(payload: UpdateProfileRequest, user: CurrentPerson, db: DbSession):
+    try:
+        return IdentityService(db).update_profile(user, payload.full_name)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/change-password", response_model=MessageResponse)
+def change_password(payload: ChangePasswordRequest, user: CurrentPerson, db: DbSession):
+    try:
+        IdentityService(db).change_password(
+            user,
+            payload.current_password,
+            payload.new_password,
+            payload.confirm_password,
+        )
+        return {"message": "Password updated successfully."}
+    except AppError as exc:
+        raise _map_error(exc) from exc
 
 
 @router.post("/refresh", response_model=TokenResponse)

@@ -117,6 +117,45 @@ class IdentityService:
             "next_step": resolve_next_step(user, products),
         }
 
+    def update_profile(self, user: UserModel, full_name: str) -> dict:
+        name = (full_name or "").strip()
+        if not name:
+            raise ValidationAppError("Full name is required")
+        if len(name) > 255:
+            raise ValidationAppError("Full name must be 255 characters or fewer")
+
+        user.full_name = name
+        self.db.commit()
+        self.db.refresh(user)
+        if user.organization is None:
+            user = (
+                self.db.query(UserModel)
+                .options(joinedload(UserModel.organization))
+                .filter(UserModel.id == user.id)
+                .first()
+            ) or user
+        return self.me(user)
+
+    def change_password(
+        self,
+        user: UserModel,
+        current_password: str,
+        new_password: str,
+        confirm_password: str,
+    ) -> None:
+        if not user.password_hash or not verify_password(current_password, user.password_hash):
+            raise UnauthorizedError("Current password is incorrect")
+        if new_password != confirm_password:
+            raise ValidationAppError("New password and confirm password do not match")
+        policy_error = validate_password_policy(new_password)
+        if policy_error:
+            raise ValidationAppError(policy_error)
+        if verify_password(new_password, user.password_hash):
+            raise ValidationAppError("New password must be different from the current password")
+
+        user.password_hash = hash_password(new_password)
+        self.db.commit()
+
     def refresh(self, refresh_token: str) -> dict:
         payload = safe_decode_token(refresh_token)
         if not payload or payload.get("type") != "refresh":
