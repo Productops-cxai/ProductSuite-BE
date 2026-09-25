@@ -228,18 +228,37 @@ class IdentityService:
 
         self.db.commit()
 
-    def create_auth_token(self, user_id, token_type: AuthTokenType, hours: int) -> str:
+    def create_auth_token(self, user_id, token_type: AuthTokenType, *, minutes: int) -> str:
+        now = datetime.now(timezone.utc)
+        # Invalidate prior unused tokens of the same type so only the latest link works.
+        for prior in (
+            self.db.query(AuthTokenModel)
+            .filter(
+                AuthTokenModel.user_id == user_id,
+                AuthTokenModel.token_type == token_type.value,
+                AuthTokenModel.used_at.is_(None),
+            )
+            .all()
+        ):
+            prior.used_at = now
+
         raw = secrets.token_urlsafe(32)
         self.db.add(
             AuthTokenModel(
                 user_id=user_id,
                 token_hash=_hash_token(raw),
                 token_type=token_type.value,
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=hours),
+                expires_at=now + timedelta(minutes=minutes),
             )
         )
         self.db.commit()
         return raw
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def _get_valid_auth_token(self, raw: str, token_type: AuthTokenType) -> AuthTokenModel:
         row = (
@@ -250,15 +269,54 @@ class IdentityService:
             )
             .first()
         )
-        if not row or row.used_at is not None or row.expires_at < datetime.now(timezone.utc):
-            raise ValidationAppError("Setup link is invalid, expired, or already used")
+        now = datetime.now(timezone.utc)
+        if (
+            not row
+            or row.used_at is not None
+            or self._as_utc(row.expires_at) < now
+        ):
+            raise ValidationAppError(
+                "This setup link is invalid, expired, or has already been used"
+            )
         return row
+
+    def _consume_auth_token(self, row: AuthTokenModel) -> None:
+        """One-time use: mark this token and any other unused same-type tokens as used."""
+        now = datetime.now(timezone.utc)
+        row.used_at = now
+        for other in (
+            self.db.query(AuthTokenModel)
+            .filter(
+                AuthTokenModel.user_id == row.user_id,
+                AuthTokenModel.token_type == row.token_type,
+                AuthTokenModel.id != row.id,
+                AuthTokenModel.used_at.is_(None),
+            )
+            .all()
+        ):
+            other.used_at = now
 
     def preview_activation(self, token: str) -> dict:
         row = self._get_valid_auth_token(token, AuthTokenType.ACTIVATION)
         user = self.db.query(UserModel).filter(UserModel.id == row.user_id).first()
         if not user:
             raise NotFoundError("User not found")
+        if user.status == UserStatus.ACTIVE.value:
+            # Account already activated — never show the setup form again.
+            self._consume_auth_token(row)
+            self.db.commit()
+            raise ValidationAppError(
+                "This setup link is invalid, expired, or has already been used"
+            )
+        return {"email": user.email, "full_name": user.full_name}
+
+    def preview_password_reset(self, token: str) -> dict:
+        row = self._get_valid_auth_token(token, AuthTokenType.PASSWORD_RESET)
+        user = self.db.query(UserModel).filter(UserModel.id == row.user_id).first()
+        if not user or user.status != UserStatus.ACTIVE.value:
+            raise ValidationAppError(
+                "This setup link is invalid, expired, or has already been used"
+            )
         return {"email": user.email, "full_name": user.full_name}
 
     def activate_account(self, token: str, new_password: str, confirm_password: str) -> None:
@@ -272,10 +330,16 @@ class IdentityService:
         user = self.db.query(UserModel).filter(UserModel.id == row.user_id).first()
         if not user:
             raise NotFoundError("User not found")
+        if user.status == UserStatus.ACTIVE.value:
+            self._consume_auth_token(row)
+            self.db.commit()
+            raise ValidationAppError(
+                "This setup link is invalid, expired, or has already been used"
+            )
 
         user.password_hash = hash_password(new_password)
         user.status = UserStatus.ACTIVE.value
-        row.used_at = datetime.now(timezone.utc)
+        self._consume_auth_token(row)
         self.db.commit()
 
     def forgot_password(self, email: str) -> None:
@@ -290,17 +354,25 @@ class IdentityService:
         if not user or not user.password_hash:
             return
 
+        minutes = settings.PASSWORD_RESET_EXPIRE_MINUTES
         raw = self.create_auth_token(
-            user.id, AuthTokenType.PASSWORD_RESET, settings.PASSWORD_RESET_EXPIRE_HOURS
+            user.id,
+            AuthTokenType.PASSWORD_RESET,
+            minutes=minutes,
         )
         link = f"{settings.FRONTEND_URL}/reset-password?token={raw}"
+        expiry_label = (
+            f"{minutes} minute{'s' if minutes != 1 else ''}"
+            if minutes < 60
+            else f"{minutes // 60} hour{'s' if minutes // 60 != 1 else ''}"
+        )
         send_email(
             self.db,
             to_email=user.email,
             subject="Reset your Platform Suite password",
             body=(
                 f"Use this link to reset your password (expires in "
-                f"{settings.PASSWORD_RESET_EXPIRE_HOURS} hours):\n{link}"
+                f"{expiry_label}):\n{link}"
             ),
             email_type="password_reset",
             action_link=link,
@@ -320,7 +392,7 @@ class IdentityService:
             raise NotFoundError("User not found")
 
         user.password_hash = hash_password(new_password)
-        row.used_at = datetime.now(timezone.utc)
+        self._consume_auth_token(row)
         now = datetime.now(timezone.utc)
         for rt in (
             self.db.query(RefreshTokenModel)
@@ -334,17 +406,23 @@ class IdentityService:
         self.db.commit()
 
     def send_activation_invite(self, user: UserModel) -> str:
+        minutes = settings.ACTIVATION_TOKEN_EXPIRE_MINUTES
         raw = self.create_auth_token(
-            user.id, AuthTokenType.ACTIVATION, settings.ACTIVATION_TOKEN_EXPIRE_HOURS
+            user.id, AuthTokenType.ACTIVATION, minutes=minutes
         )
         link = f"{settings.FRONTEND_URL}/activate?token={raw}"
+        expiry_label = (
+            f"{minutes} minute{'s' if minutes != 1 else ''}"
+            if minutes < 60
+            else f"{minutes // 60} hour{'s' if minutes // 60 != 1 else ''}"
+        )
         send_email(
             self.db,
             to_email=user.email,
             subject="Activate your Platform Suite account",
             body=(
                 f"Hello {user.full_name},\n\nSet your password using this link "
-                f"(expires in {settings.ACTIVATION_TOKEN_EXPIRE_HOURS} hours):\n{link}"
+                f"(expires in {expiry_label}):\n{link}"
             ),
             email_type="activation",
             action_link=link,

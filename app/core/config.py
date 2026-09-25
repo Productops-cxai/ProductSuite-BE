@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     JWT_ACCESS_EXPIRE_MINUTES: int = 60
     JWT_REFRESH_EXPIRE_DAYS: int = 7
 
-    PASSWORD_RESET_EXPIRE_HOURS: int = 24
-    ACTIVATION_TOKEN_EXPIRE_HOURS: int = 72
+    # Password-reset and activation link TTLs (minutes). Overridden by .env — restart API after change.
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 5
+    ACTIVATION_TOKEN_EXPIRE_MINUTES: int = 5
     FRONTEND_URL: str = "http://localhost:5173"
 
     SEED_SUPER_ADMIN_EMAIL: str = "admin@payflow.ai"

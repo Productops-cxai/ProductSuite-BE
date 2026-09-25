@@ -104,6 +104,14 @@ def activation_preview(token: str, db: DbSession):
         raise _map_error(exc) from exc
 
 
+@router.get("/password-reset/{token}", response_model=ActivationPreviewResponse)
+def password_reset_preview(token: str, db: DbSession):
+    try:
+        return IdentityService(db).preview_password_reset(token)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.post("/activate", response_model=MessageResponse)
 def activate(payload: ActivateAccountRequest, db: DbSession):
     try:
