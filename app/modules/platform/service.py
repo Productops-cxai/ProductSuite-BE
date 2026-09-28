@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
@@ -129,25 +130,44 @@ class PlatformService:
     def save_product(self, data) -> ProductModel:
         status_value = data.status.value if hasattr(data.status, "value") else data.status
         if data.id is None:
-            code = data.code.strip().upper()
-            if self.db.query(ProductModel).filter(ProductModel.code == code).first():
-                raise ConflictError(f"Product code '{code}' already exists")
+            raw = (data.code or "").strip().upper()
+            if not raw:
+                raise ValidationAppError("Product code is required")
+            # Product code is the unique identity key (case-insensitive).
+            existing = (
+                self.db.query(ProductModel)
+                .filter(func.upper(ProductModel.code) == raw)
+                .first()
+            )
+            if existing:
+                raise ConflictError(
+                    f"Product code '{raw}' already exists. Choose a unique code."
+                )
             product = ProductModel(
                 name=data.name.strip(),
-                code=code,
+                code=raw,
                 description=data.description,
                 status=status_value,
             )
             self.db.add(product)
-        else:
-            product = self.get_product(data.id)
-            # AC6 — product identity (code) is immutable once registered
-            if data.code is not None and data.code.strip().upper() != product.code.upper():
-                raise ValidationAppError("Product code cannot be changed")
-            product.name = data.name.strip()
-            if data.description is not None:
-                product.description = data.description
-            product.status = status_value
+            try:
+                self.db.commit()
+            except IntegrityError as exc:
+                self.db.rollback()
+                raise ConflictError(
+                    f"Product code '{raw}' already exists. Choose a unique code."
+                ) from exc
+            self.db.refresh(product)
+            return product
+
+        product = self.get_product(data.id)
+        # AC6 — product identity (code) is immutable once registered
+        if data.code is not None and data.code.strip().upper() != product.code.upper():
+            raise ValidationAppError("Product code cannot be changed")
+        product.name = data.name.strip()
+        if data.description is not None:
+            product.description = data.description
+        product.status = status_value
         self.db.commit()
         self.db.refresh(product)
         return product

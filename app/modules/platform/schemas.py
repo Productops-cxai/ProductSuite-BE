@@ -1,8 +1,9 @@
 from datetime import datetime
+import re
 from typing import List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.shared.enums import EntitlementStatus, PersonStatus, ProductStatus
 
@@ -15,6 +16,21 @@ class ProductSave(BaseModel):
     code: Optional[str] = Field(None, min_length=2, max_length=64)
     description: Optional[str] = None
     status: ProductStatus = ProductStatus.DRAFT
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip().upper()
+        if not cleaned:
+            return None
+        # Letters, digits, underscore, hyphen only — stable unique key.
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9_-]*", cleaned):
+            raise ValueError(
+                "Product code must start with a letter or digit and use only A–Z, 0–9, _ or -"
+            )
+        return cleaned
 
     @model_validator(mode="after")
     def code_required_on_create(self):
