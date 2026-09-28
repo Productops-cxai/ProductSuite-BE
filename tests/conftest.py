@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -14,6 +13,8 @@ from app.infrastructure.database.models import (
     MenuSectionModel,
     OrganizationModel,
     OrganizationProductModel,
+    PayflowRoleModel,
+    PayflowUserMembershipModel,
     ProductModel,
     RoleModel,
     UserModel,
@@ -24,6 +25,8 @@ from app.main import app
 from app.shared.enums import (
     EntitlementStatus,
     MenuContext,
+    PayflowRoleCode,
+    PayflowRoleScope,
     PersonStatus,
     PlatformRole,
     ProductStatus,
@@ -110,10 +113,34 @@ def db_session():
         ]
     )
 
+    ops_admin = PayflowRoleModel(
+        code=PayflowRoleCode.OPERATIONS_ADMIN.value,
+        name="Operations Admin",
+        scope=PayflowRoleScope.PLATFORM_WIDE.value,
+        description="Full access",
+        is_built_in=True,
+    )
+    supervisor = PayflowRoleModel(
+        code=PayflowRoleCode.SUPERVISOR.value,
+        name="Supervisor",
+        scope=PayflowRoleScope.CLIENT_SCOPED.value,
+        description="Client scoped",
+        is_built_in=True,
+    )
+    session.add_all([ops_admin, supervisor])
+    session.flush()
+    session.add_all(
+        [
+            PayflowUserMembershipModel(user_id=admin.id, payflow_role_id=ops_admin.id),
+            PayflowUserMembershipModel(user_id=user.id, payflow_role_id=ops_admin.id),
+        ]
+    )
+
     section = MenuSectionModel(
         key="platform",
         label="PLATFORM",
         context=MenuContext.PLATFORM_ADMIN.value,
+        product_code="",
         sort_order=1,
     )
     session.add(section)
@@ -126,7 +153,7 @@ def db_session():
             route="/platform/overview",
             icon="layout",
             sort_order=1,
-            required_role=PlatformRole.PLATFORM_SUPER_ADMIN.value,
+            required_role_code=PlatformRole.PLATFORM_SUPER_ADMIN.value,
             is_coming_soon=False,
             is_active=True,
         )
@@ -135,6 +162,7 @@ def db_session():
         key="future",
         label="FUTURE",
         context=MenuContext.PLATFORM_ADMIN.value,
+        product_code="",
         sort_order=2,
     )
     session.add(future)
@@ -147,7 +175,7 @@ def db_session():
             route="/platform/billing",
             icon="receipt",
             sort_order=1,
-            required_role=PlatformRole.PLATFORM_SUPER_ADMIN.value,
+            required_role_code=PlatformRole.PLATFORM_SUPER_ADMIN.value,
             is_coming_soon=True,
             is_active=True,
         )

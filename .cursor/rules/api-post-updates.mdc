@@ -1,0 +1,12 @@
+---
+description: Prefer POST for create and update APIs (avoid PATCH)
+alwaysApply: true
+---
+
+# API update method preference
+
+For ProductSuite / PayFlow APIs:
+
+- Use **POST** for create and for update operations (e.g. `POST /payflow/users/{id}/update`, `POST /payflow/roles/{id}/update`).
+- Do **not** use PATCH (or PUT) for updates unless the user explicitly asks for REST-style PATCH.
+- Deletes that are soft or gated can also use `POST /.../delete` when matching existing PayFlow patterns.

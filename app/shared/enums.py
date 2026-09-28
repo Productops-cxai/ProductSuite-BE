@@ -27,6 +27,16 @@ class PlatformRole(str, Enum):
     PLATFORM_USER = "platform_user"
 
 
+class PayflowRoleCode(str, Enum):
+    OPERATIONS_ADMIN = "operations_admin"
+    SUPERVISOR = "supervisor"
+
+
+class PayflowRoleScope(str, Enum):
+    PLATFORM_WIDE = "platform_wide"
+    CLIENT_SCOPED = "client_scoped"
+
+
 class AuthTokenType(str, Enum):
     ACTIVATION = "activation"
     PASSWORD_RESET = "password_reset"

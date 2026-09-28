@@ -4,10 +4,10 @@ from uuid import UUID
 from sqlalchemy.orm import Session, joinedload
 
 from app.infrastructure.database.models import (
-    OrganizationProductModel,
+    OrganizationProductEntitlementModel,
     ProductModel,
     UserModel,
-    UserProductModel,
+    UserProductAssignmentModel,
 )
 from app.shared.enums import EntitlementStatus, ProductStatus, UserStatus
 
@@ -24,17 +24,19 @@ def get_effective_products(db: Session, user: UserModel) -> List[ProductModel]:
 
     assigned_ids = {
         link.product_id
-        for link in db.query(UserProductModel).filter(UserProductModel.user_id == user.id).all()
+        for link in db.query(UserProductAssignmentModel)
+        .filter(UserProductAssignmentModel.user_id == user.id)
+        .all()
     }
     if not assigned_ids:
         return []
 
     granted_ids = {
         link.product_id
-        for link in db.query(OrganizationProductModel)
+        for link in db.query(OrganizationProductEntitlementModel)
         .filter(
-            OrganizationProductModel.organization_id == user.organization_id,
-            OrganizationProductModel.status == EntitlementStatus.GRANTED.value,
+            OrganizationProductEntitlementModel.organization_id == user.organization_id,
+            OrganizationProductEntitlementModel.status == EntitlementStatus.GRANTED.value,
         )
         .all()
     }

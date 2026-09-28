@@ -9,12 +9,13 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.config import settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
+    NavigationSectionModel,
     OrganizationModel,
-    OrganizationProductModel,
+    OrganizationProductEntitlementModel,
+    PlatformRoleModel,
     ProductModel,
-    RoleModel,
     UserModel,
-    UserProductModel,
+    UserProductAssignmentModel,
 )
 from app.modules.identity.service import IdentityService
 from app.modules.platform.services.entitlement_service import get_effective_products, has_product_access
@@ -30,8 +31,8 @@ class PlatformService:
     def __init__(self, db: Session):
         self.db = db
 
-    def _role_by_code(self, code: str) -> RoleModel:
-        role = self.db.query(RoleModel).filter(RoleModel.code == code).first()
+    def _role_by_code(self, code: str) -> PlatformRoleModel:
+        role = self.db.query(PlatformRoleModel).filter(PlatformRoleModel.code == code).first()
         if not role:
             raise NotFoundError(f"Role '{code}' not found — run seeder")
         return role
@@ -44,8 +45,10 @@ class PlatformService:
 
         granted_org_ids = {
             e.organization_id
-            for e in self.db.query(OrganizationProductModel)
-            .filter(OrganizationProductModel.status == EntitlementStatus.GRANTED.value)
+            for e in self.db.query(OrganizationProductEntitlementModel)
+            .filter(
+                OrganizationProductEntitlementModel.status == EntitlementStatus.GRANTED.value
+            )
             .all()
         }
 
@@ -68,23 +71,26 @@ class PlatformService:
 
     # ---- Menus ----
     def menus(self, context: str, role: str, email: str | None = None) -> dict:
-        from app.infrastructure.database.models import MenuSectionModel
-
         sections = (
-            self.db.query(MenuSectionModel)
-            .filter(MenuSectionModel.context == context)
-            .order_by(MenuSectionModel.sort_order)
+            self.db.query(NavigationSectionModel)
+            .filter(
+                NavigationSectionModel.context == context,
+            )
+            .order_by(NavigationSectionModel.sort_order)
             .all()
         )
         email_logs_admin = settings.SEED_SUPER_ADMIN_EMAIL.lower()
         caller_email = (email or "").lower()
         result = []
         for section in sections:
+            # Platform menus only (empty / null product_code)
+            if (section.product_code or "") != "":
+                continue
             items = []
             for item in sorted(section.items, key=lambda i: i.sort_order):
                 if not item.is_active:
                     continue
-                if item.required_role and item.required_role != role:
+                if item.required_role_code and item.required_role_code != role:
                     continue
                 # Email Logs is a private ops view for the seeded suite admin only
                 if item.key == "email_logs" and caller_email != email_logs_admin:
@@ -214,7 +220,7 @@ class PlatformService:
 
         links = {
             (e.organization_id, e.product_id): e
-            for e in self.db.query(OrganizationProductModel).all()
+            for e in self.db.query(OrganizationProductEntitlementModel).all()
         }
 
         rows: List[dict] = []
@@ -247,10 +253,10 @@ class PlatformService:
 
         now = datetime.now(timezone.utc)
         row = (
-            self.db.query(OrganizationProductModel)
+            self.db.query(OrganizationProductEntitlementModel)
             .filter(
-                OrganizationProductModel.organization_id == organization_id,
-                OrganizationProductModel.product_id == product_id,
+                OrganizationProductEntitlementModel.organization_id == organization_id,
+                OrganizationProductEntitlementModel.product_id == product_id,
             )
             .first()
         )
@@ -259,7 +265,7 @@ class PlatformService:
             row.granted_at = now
             row.revoked_at = None
         else:
-            row = OrganizationProductModel(
+            row = OrganizationProductEntitlementModel(
                 organization_id=organization_id,
                 product_id=product_id,
                 status=EntitlementStatus.GRANTED.value,
@@ -286,15 +292,15 @@ class PlatformService:
 
         now = datetime.now(timezone.utc)
         row = (
-            self.db.query(OrganizationProductModel)
+            self.db.query(OrganizationProductEntitlementModel)
             .filter(
-                OrganizationProductModel.organization_id == organization_id,
-                OrganizationProductModel.product_id == product_id,
+                OrganizationProductEntitlementModel.organization_id == organization_id,
+                OrganizationProductEntitlementModel.product_id == product_id,
             )
             .first()
         )
         if not row:
-            row = OrganizationProductModel(
+            row = OrganizationProductEntitlementModel(
                 organization_id=organization_id,
                 product_id=product_id,
                 status=EntitlementStatus.REVOKED.value,
@@ -352,7 +358,7 @@ class PlatformService:
             .options(
                 joinedload(UserModel.organization),
                 joinedload(UserModel.role),
-                joinedload(UserModel.product_links).joinedload(UserProductModel.product),
+                joinedload(UserModel.product_links).joinedload(UserProductAssignmentModel.product),
             )
             .filter(UserModel.id == user_id)
             .first()
@@ -362,7 +368,7 @@ class PlatformService:
         query = self.db.query(UserModel).options(
             joinedload(UserModel.organization),
             joinedload(UserModel.role),
-            joinedload(UserModel.product_links).joinedload(UserProductModel.product),
+            joinedload(UserModel.product_links).joinedload(UserProductAssignmentModel.product),
         )
         if organization_id:
             query = query.filter(UserModel.organization_id == organization_id)
@@ -399,7 +405,10 @@ class PlatformService:
                 product = self.db.query(ProductModel).filter(ProductModel.id == product_id).first()
                 if not product:
                     raise NotFoundError(f"Product {product_id} not found")
-                self.db.add(UserProductModel(user_id=user.id, product_id=product.id))
+                self.db.add(UserProductAssignmentModel(user_id=user.id, product_id=product.id))
+                from app.modules.payflow.membership import on_payflow_product_assigned
+
+                on_payflow_product_assigned(self.db, user.id, product.code)
 
             self.db.commit()
             user = self._load_user(user.id)
@@ -420,14 +429,17 @@ class PlatformService:
         if data.product_ids is not None:
             existing = {
                 a.product_id: a
-                for a in self.db.query(UserProductModel).filter(UserProductModel.user_id == user.id).all()
+                for a in self.db.query(UserProductAssignmentModel).filter(UserProductAssignmentModel.user_id == user.id).all()
             }
             desired = set(data.product_ids)
             for product_id in desired - set(existing):
                 product = self.db.query(ProductModel).filter(ProductModel.id == product_id).first()
                 if not product:
                     raise NotFoundError(f"Product {product_id} not found")
-                self.db.add(UserProductModel(user_id=user.id, product_id=product.id))
+                self.db.add(UserProductAssignmentModel(user_id=user.id, product_id=product.id))
+                from app.modules.payflow.membership import on_payflow_product_assigned
+
+                on_payflow_product_assigned(self.db, user.id, product.code)
             for product_id, row in existing.items():
                 if product_id not in desired:
                     self.db.delete(row)
@@ -444,12 +456,15 @@ class PlatformService:
             raise NotFoundError("Product not found")
 
         exists = (
-            self.db.query(UserProductModel)
-            .filter(UserProductModel.user_id == user_id, UserProductModel.product_id == product_id)
+            self.db.query(UserProductAssignmentModel)
+            .filter(UserProductAssignmentModel.user_id == user_id, UserProductAssignmentModel.product_id == product_id)
             .first()
         )
         if not exists:
-            self.db.add(UserProductModel(user_id=user_id, product_id=product_id))
+            self.db.add(UserProductAssignmentModel(user_id=user_id, product_id=product_id))
+            from app.modules.payflow.membership import on_payflow_product_assigned
+
+            on_payflow_product_assigned(self.db, user_id, product.code)
             self.db.commit()
         return self._user_response(self._load_user(user_id))
 
@@ -458,8 +473,8 @@ class PlatformService:
         if not user:
             raise NotFoundError("User not found")
         row = (
-            self.db.query(UserProductModel)
-            .filter(UserProductModel.user_id == user_id, UserProductModel.product_id == product_id)
+            self.db.query(UserProductAssignmentModel)
+            .filter(UserProductAssignmentModel.user_id == user_id, UserProductAssignmentModel.product_id == product_id)
             .first()
         )
         if row:
