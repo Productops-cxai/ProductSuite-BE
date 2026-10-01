@@ -15,7 +15,6 @@ from app.infrastructure.database.models import (
     PayflowRoleModel,
     PayflowRolePermissionModel,
     PayflowUserClientAssignmentModel,
-    PayflowUserClientPermissionModel,
     PayflowUserMembershipModel,
     PlatformRoleModel,
     ProductModel,
@@ -97,15 +96,15 @@ class PayflowUserService:
         role = membership.role
         if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
             return "Full Access"
-        if not membership.client_assignments:
-            return "None assigned"
-        # Compare assignment perms to role defaults
+        # Role permissions are the source of truth; client pages only assign where.
         role_perm_ids = {
             link.permission_id
             for link in self.db.query(PayflowRolePermissionModel)
             .filter(PayflowRolePermissionModel.payflow_role_id == role.id)
             .all()
         }
+        if not membership.client_assignments:
+            return f"{role.name} (standard)"
         profiles = []
         for assignment in membership.client_assignments:
             assigned_ids = {link.permission_id for link in assignment.permissions}
@@ -116,6 +115,23 @@ class PayflowUserService:
         if profiles and all(p == profiles[0] for p in profiles):
             return profiles[0]
         return "Custom"
+
+    def _role_permission_names(self, role: PayflowRoleModel) -> list[str]:
+        if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
+            return ["Full Access"]
+        links = (
+            self.db.query(PayflowRolePermissionModel)
+            .options(joinedload(PayflowRolePermissionModel.permission))
+            .filter(PayflowRolePermissionModel.payflow_role_id == role.id)
+            .all()
+        )
+        return sorted(
+            {
+                link.permission.name
+                for link in links
+                if link.permission and link.permission.name
+            }
+        )
 
     def _serialize(self, membership: PayflowUserMembershipModel) -> dict:
         user = membership.user
@@ -143,6 +159,7 @@ class PayflowUserService:
             "status_label": self._status_label(user.status),
             "assigned_clients": clients if clients else (["None assigned"] if not is_platform else ["All Clients"]),
             "permission_profile": self._permission_profile(membership),
+            "role_permission_names": self._role_permission_names(role),
             "last_active": None,
             "created_at": user.created_at,
             "organization_id": user.organization_id,
@@ -250,62 +267,12 @@ class PayflowUserService:
         self.db.flush()
 
         ensure_user_product_assignment(self.db, user.id, "PAYFLOW")
-        membership = ensure_payflow_membership_for_role(self.db, user.id, pf_role.code)
+        ensure_payflow_membership_for_role(self.db, user.id, pf_role.code)
 
-        is_platform = pf_role.scope == PayflowRoleScope.PLATFORM_WIDE.value
-        client_ids = client_ids or []
-        permission_codes = permission_codes or []
-
-        if is_platform:
-            # Platform-wide: no client assignments
-            pass
-        else:
-            if not client_ids:
-                raise ValidationAppError(
-                    "Select at least one client for a client-scoped role"
-                )
-            all_perms = {
-                p.code: p for p in self.db.query(PayflowPermissionModel).all()
-            }
-            if not permission_codes:
-                # Default to role permission set
-                permission_codes = [
-                    link.permission.code
-                    for link in self.db.query(PayflowRolePermissionModel)
-                    .options(joinedload(PayflowRolePermissionModel.permission))
-                    .filter(PayflowRolePermissionModel.payflow_role_id == pf_role.id)
-                    .all()
-                    if link.permission
-                ]
-            selected_perms = []
-            for code in permission_codes:
-                perm = all_perms.get(code)
-                if not perm:
-                    raise ValidationAppError(f"Unknown permission code: {code}")
-                selected_perms.append(perm)
-
-            clients = (
-                self.db.query(PayflowClientModel)
-                .filter(PayflowClientModel.id.in_(client_ids))
-                .all()
-            )
-            if len(clients) != len(set(client_ids)):
-                raise ValidationAppError("One or more selected clients were not found")
-
-            for client in clients:
-                assignment = PayflowUserClientAssignmentModel(
-                    membership_id=membership.id,
-                    client_id=client.id,
-                )
-                self.db.add(assignment)
-                self.db.flush()
-                for perm in selected_perms:
-                    self.db.add(
-                        PayflowUserClientPermissionModel(
-                            assignment_id=assignment.id,
-                            permission_id=perm.id,
-                        )
-                    )
+        # Client assignment happens on client create/edit only.
+        # Role permissions apply when a supervisor is assigned to a client.
+        _ = client_ids
+        _ = permission_codes
 
         self.db.commit()
 
@@ -402,6 +369,50 @@ class PayflowUserService:
             )
         link = IdentityService(self.db).send_activation_invite(user)
         return {"message": "Invitation resent", "activation_link": link}
+
+    def deactivate_user(self, user_id: UUID, *, actor: UserModel) -> dict:
+        membership = (
+            self._membership_query()
+            .filter(PayflowUserMembershipModel.user_id == user_id)
+            .first()
+        )
+        if not membership:
+            raise NotFoundError("PayFlow user not found")
+        user = membership.user
+        if user.id == actor.id:
+            raise ValidationAppError("You cannot deactivate your own account")
+        if user.status != UserStatus.ACTIVE.value:
+            raise ValidationAppError("Only an Active user can be deactivated")
+        # Soft-disable: keep membership, client assignments, and permissions.
+        user.status = UserStatus.DISABLED.value
+        self.db.commit()
+        return self.get_user(user_id)
+
+    def reactivate_user(self, user_id: UUID, *, actor: UserModel) -> dict:
+        membership = (
+            self._membership_query()
+            .filter(PayflowUserMembershipModel.user_id == user_id)
+            .first()
+        )
+        if not membership:
+            raise NotFoundError("PayFlow user not found")
+        user = membership.user
+        if user.id == actor.id:
+            raise ValidationAppError("You cannot change status on your own account this way")
+        if user.status != UserStatus.DISABLED.value:
+            raise ValidationAppError("Only an Inactive user can be reactivated")
+        # Restore access; keep role, client assignments, and permissions intact.
+        if user.password_hash:
+            user.status = UserStatus.ACTIVE.value
+            self.db.commit()
+            return self.get_user(user_id)
+        # Never activated (created Inactive) — invite so they can set a password.
+        user.status = UserStatus.INVITED.value
+        self.db.commit()
+        link = IdentityService(self.db).send_activation_invite(user)
+        detail = self.get_user(user_id)
+        detail["activation_link"] = link
+        return detail
 
     def list_roles(self) -> dict:
         roles = self.db.query(PayflowRoleModel).order_by(PayflowRoleModel.id).all()

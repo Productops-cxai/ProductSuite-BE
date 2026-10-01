@@ -21,6 +21,7 @@ from app.infrastructure.database.models import (
     NavigationSectionModel,
     OrganizationModel,
     OrganizationProductEntitlementModel,
+    PayflowAccountModel,
     PayflowClientModel,
     PayflowPermissionModel,
     PayflowRoleModel,
@@ -36,6 +37,12 @@ from app.infrastructure.database.session import SessionLocal, engine
 from app.shared.enums import (
     EntitlementStatus,
     MenuContext,
+    PayflowAiMode,
+    PayflowBusinessDomain,
+    PayflowClientStatus,
+    PayflowClientType,
+    PayflowConnectionStatus,
+    PayflowDataSourceType,
     PayflowRoleCode,
     PayflowRoleScope,
     PlatformRole,
@@ -86,8 +93,8 @@ _PAYFLOW_NAV: list[tuple[str, str, int, list[tuple[str, str, str, str, int, bool
         "OPERATIONS",
         2,
         [
-            ("clients", "Clients", "/payflow/clients", "people", 1, True, None),
-            ("cases", "Accounts / Cases", "/payflow/cases", "products", 2, True, None),
+            ("clients", "Clients", "/payflow/clients", "people", 1, False, None),
+            ("cases", "Accounts / Cases", "/payflow/cases", "products", 2, False, None),
             ("review", "Human Review", "/payflow/review", "access", 3, True, None),
         ],
     ),
@@ -134,7 +141,7 @@ _PAYFLOW_NAV: list[tuple[str, str, int, list[tuple[str, str, str, str, int, bool
                 "/payflow/integrations",
                 "products",
                 2,
-                True,
+                False,
                 PayflowRoleCode.OPERATIONS_ADMIN.value,
             ),
         ],
@@ -158,6 +165,7 @@ class DatabaseSeeder:
             self._seed_payflow_permissions(db)
             self._seed_payflow_roles(db)
             self._seed_payflow_clients(db)
+            self._seed_payflow_demo_accounts(db)
             self._seed_payflow_menus(db)
             self._backfill_payflow_ops_admin_memberships(db)
             db.commit()
@@ -463,24 +471,276 @@ class DatabaseSeeder:
         db.flush()
 
     def _seed_payflow_clients(self, db: Session) -> None:
-        clients = [
-            ("paypal", "PayPal", "Payments"),
-            ("canadian-tire", "Canadian Tire", "Retail"),
-            ("northstar-utilities", "Northstar Utilities", "Utilities"),
+        """Seed Lovable-shaped demo clients so Accounts / Integrations have data."""
+        demo_clients = [
+            {
+                "code": "paypal",
+                "name": "PayPal",
+                "category": "Payments",
+                "crm_system_name": "CRM",
+                "channel_email": True,
+                "channel_sms": True,
+            },
+            {
+                "code": "canadian-tire",
+                "name": "Canadian Tire",
+                "category": "Retail",
+                "crm_system_name": "CRM",
+                "channel_email": True,
+                "channel_sms": True,
+            },
+            {
+                "code": "northstar-utilities",
+                "name": "Northstar Utilities",
+                "category": "Utilities",
+                "crm_system_name": "CRM",
+                "channel_email": True,
+                "channel_sms": True,
+            },
         ]
-        for code, name, category in clients:
-            if not db.query(PayflowClientModel).filter(PayflowClientModel.code == code).first():
-                db.add(
-                    PayflowClientModel(
-                        code=code,
-                        name=name,
-                        category=category,
-                        status="active",
-                    )
+        for item in demo_clients:
+            exists = (
+                db.query(PayflowClientModel)
+                .filter(PayflowClientModel.code == item["code"])
+                .first()
+            )
+            if exists:
+                # Ensure channel / connection flags for integrations demo.
+                if exists.connection_status is None:
+                    exists.connection_status = PayflowConnectionStatus.CONNECTED.value
+                if exists.data_source_type is None:
+                    exists.data_source_type = PayflowDataSourceType.CRM.value
+                if exists.channel_email is None:
+                    exists.channel_email = item["channel_email"]
+                if exists.channel_sms is None:
+                    exists.channel_sms = item["channel_sms"]
+                continue
+            client = PayflowClientModel(
+                code=item["code"],
+                name=item["name"],
+                category=item["category"],
+                status=PayflowClientStatus.ACTIVE.value,
+                client_type=PayflowClientType.THIRD_PARTY.value,
+                business_domain=PayflowBusinessDomain.COLLECTIONS.value,
+                ai_mode=PayflowAiMode.SUPERVISED_AI.value,
+                data_source_type=PayflowDataSourceType.CRM.value,
+                connection_status=PayflowConnectionStatus.CONNECTED.value,
+                crm_system_name=item["crm_system_name"],
+                environment="Production",
+                sync_frequency="Every 15 minutes",
+                channel_email=item["channel_email"],
+                channel_sms=item["channel_sms"],
+                channel_whatsapp=False,
+            )
+            db.add(client)
+            db.flush()
+            from app.modules.payflow.services.client_service import PayflowClientService
+
+            PayflowClientService(db)._seed_default_mappings(client)
+        db.flush()
+
+    def _seed_payflow_demo_accounts(self, db: Session) -> None:
+        """Idempotent seed of Lovable sample customer accounts / cases."""
+        clients = {c.code: c for c in db.query(PayflowClientModel).all()}
+        demo_accounts = [
+            {
+                "client_code": "paypal",
+                "customer_name": "John Smith",
+                "account_reference": "PP-10482",
+                "case_reference": "CASE-PP-10482-01",
+                "original_balance": 5400,
+                "outstanding_balance": 4250,
+                "recovered_balance": 1150,
+                "collection_status": "Active",
+                "current_workflow": "Early Stage Collection",
+                "last_action": "Email reminder sent",
+                "next_action": "Reassess in 48 hours",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Account became overdue", "detail": "31 days past due", "at": "Aug 12"},
+                    {"label": "Customer assessed", "detail": "Low risk, email preferred", "at": "Aug 13"},
+                    {"label": "Email reminder sent", "detail": "Early stage template", "at": "Aug 14"},
+                    {"label": "Partial payment received", "detail": "$1,150", "at": "Aug 15"},
+                    {"label": "Next reassessment scheduled", "detail": "In 48 hours", "at": "Aug 16"},
+                ],
+            },
+            {
+                "client_code": "paypal",
+                "customer_name": "Sarah Khan",
+                "account_reference": "PP-11021",
+                "case_reference": "CASE-PP-11021-01",
+                "original_balance": 9600,
+                "outstanding_balance": 8900,
+                "recovered_balance": 700,
+                "collection_status": "Promise to Pay",
+                "current_workflow": "Promise-to-Pay Follow-Up",
+                "last_action": "SMS sent",
+                "next_action": "Review after promise date",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Account became overdue", "detail": "48 days past due", "at": "Jul 30"},
+                    {"label": "Promise to pay captured", "detail": "$8,900 by Aug 28", "at": "Aug 05"},
+                    {"label": "SMS sent", "detail": "Promise reminder", "at": "Aug 20"},
+                ],
+            },
+            {
+                "client_code": "paypal",
+                "customer_name": "Michael Brown",
+                "account_reference": "PP-12098",
+                "case_reference": "CASE-PP-12098-01",
+                "original_balance": 3600,
+                "outstanding_balance": 2100,
+                "recovered_balance": 1500,
+                "collection_status": "Payment Plan",
+                "current_workflow": "Payment Plan Monitoring",
+                "last_action": "Installment received",
+                "next_action": "Next installment in 7 days",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Payment plan agreed", "detail": "6 monthly installments", "at": "Jul 25"},
+                    {"label": "Installment received", "detail": "$500", "at": "Aug 18"},
+                ],
+            },
+            {
+                "client_code": "paypal",
+                "customer_name": "David Lee",
+                "account_reference": "PP-88831",
+                "case_reference": "CASE-PP-88831-01",
+                "original_balance": 12500,
+                "outstanding_balance": 12500,
+                "recovered_balance": 0,
+                "collection_status": "Human Review",
+                "current_workflow": "Escalated Collection",
+                "last_action": "AI recommendation created",
+                "next_action": "Awaiting supervisor",
+                "human_review": True,
+                "timeline": [
+                    {"label": "Escalation triggered", "detail": "No response after 4 attempts", "at": "Aug 10"},
+                    {"label": "AI recommendation created", "detail": "Settlement offer proposed", "at": "Aug 19"},
+                ],
+            },
+            {
+                "client_code": "canadian-tire",
+                "customer_name": "Emily Jones",
+                "account_reference": "CT-20394",
+                "case_reference": "CASE-CT-20394-01",
+                "original_balance": 7800,
+                "outstanding_balance": 7300,
+                "recovered_balance": 500,
+                "collection_status": "Active",
+                "current_workflow": "Progressive Reminder",
+                "last_action": "SMS sent",
+                "next_action": "Reassess tomorrow",
+                "human_review": False,
+                "timeline": [
+                    {"label": "SMS sent", "detail": "Reminder 2 of 4", "at": "Aug 19"},
+                ],
+            },
+            {
+                "client_code": "canadian-tire",
+                "customer_name": "Robert Chen",
+                "account_reference": "CT-21877",
+                "case_reference": "CASE-CT-21877-01",
+                "original_balance": 4100,
+                "outstanding_balance": 1900,
+                "recovered_balance": 2200,
+                "collection_status": "Payment Plan",
+                "current_workflow": "Payment Plan Monitoring",
+                "last_action": "Installment received",
+                "next_action": "Next installment in 12 days",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Installment received", "detail": "$1,100", "at": "Aug 14"},
+                ],
+            },
+            {
+                "client_code": "canadian-tire",
+                "customer_name": "Priya Nair",
+                "account_reference": "CT-22540",
+                "case_reference": "CASE-CT-22540-01",
+                "original_balance": 3200,
+                "outstanding_balance": 3200,
+                "recovered_balance": 0,
+                "collection_status": "Human Review",
+                "current_workflow": "Escalated Collection",
+                "last_action": "Dispute flagged by customer",
+                "next_action": "Awaiting supervisor",
+                "human_review": True,
+                "timeline": [
+                    {"label": "Dispute flagged by customer", "detail": "Charge disputed via reply", "at": "Aug 18"},
+                ],
+            },
+            {
+                "client_code": "northstar-utilities",
+                "customer_name": "Laura Fitzgerald",
+                "account_reference": "NS-30112",
+                "case_reference": "CASE-NS-30112-01",
+                "original_balance": 2600,
+                "outstanding_balance": 2450,
+                "recovered_balance": 150,
+                "collection_status": "Active",
+                "current_workflow": "Early Stage Collection",
+                "last_action": "Email reminder sent",
+                "next_action": "Reassess in 72 hours",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Email reminder sent", "detail": "Soft reminder", "at": "Aug 16"},
+                ],
+            },
+            {
+                "client_code": "northstar-utilities",
+                "customer_name": "Marcus Webb",
+                "account_reference": "NS-31450",
+                "case_reference": "CASE-NS-31450-01",
+                "original_balance": 5900,
+                "outstanding_balance": 5400,
+                "recovered_balance": 500,
+                "collection_status": "Promise to Pay",
+                "current_workflow": "Promise-to-Pay Follow-Up",
+                "last_action": "Promise captured on call",
+                "next_action": "Review after promise date",
+                "human_review": False,
+                "timeline": [
+                    {"label": "Promise to pay captured", "detail": "$5,400 by Sep 01", "at": "Aug 12"},
+                ],
+            },
+        ]
+
+        for item in demo_accounts:
+            client = clients.get(item["client_code"])
+            if not client:
+                continue
+            exists = (
+                db.query(PayflowAccountModel)
+                .filter(
+                    PayflowAccountModel.client_id == client.id,
+                    PayflowAccountModel.account_reference == item["account_reference"],
                 )
+                .first()
+            )
+            if exists:
+                continue
+            db.add(
+                PayflowAccountModel(
+                    client_id=client.id,
+                    customer_name=item["customer_name"],
+                    account_reference=item["account_reference"],
+                    case_reference=item["case_reference"],
+                    original_balance=item["original_balance"],
+                    outstanding_balance=item["outstanding_balance"],
+                    recovered_balance=item["recovered_balance"],
+                    collection_status=item["collection_status"],
+                    current_workflow=item["current_workflow"],
+                    last_action=item["last_action"],
+                    next_action=item["next_action"],
+                    human_review=item["human_review"],
+                    timeline=item["timeline"],
+                )
+            )
         db.flush()
 
     def _seed_payflow_menus(self, db: Session) -> None:
+        unlock_keys = {"clients", "cases", "integrations"}
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)
@@ -524,6 +784,8 @@ class DatabaseSeeder:
                             is_active=True,
                         )
                     )
+                elif key in unlock_keys and exists.is_coming_soon:
+                    exists.is_coming_soon = False
         db.flush()
 
     def _backfill_payflow_ops_admin_memberships(self, db: Session) -> None:

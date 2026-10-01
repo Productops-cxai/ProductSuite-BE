@@ -37,6 +37,82 @@ class PayflowRoleScope(str, Enum):
     CLIENT_SCOPED = "client_scoped"
 
 
+class PayflowClientStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+
+
+class PayflowClientType(str, Enum):
+    FIRST_PARTY = "first_party"
+    THIRD_PARTY = "third_party"
+
+
+class PayflowBusinessDomain(str, Enum):
+    COLLECTIONS = "collections"
+
+
+class PayflowAiMode(str, Enum):
+    AUTOPILOT = "autopilot"
+    SUPERVISED_AI = "supervised_ai"
+
+
+class PayflowDataSourceType(str, Enum):
+    CRM = "crm"
+
+
+class PayflowConnectionStatus(str, Enum):
+    NOT_CONNECTED = "not_connected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    CONNECTION_FAILED = "connection_failed"
+
+
+class PayflowMappingStatus(str, Enum):
+    MAPPED = "mapped"
+    NEEDS_ATTENTION = "needs_attention"
+    UNMAPPED = "unmapped"
+    VALIDATED = "validated"
+
+
+class PayflowPortfolioStatus(str, Enum):
+    ONBOARDING = "onboarding"
+    ACTIVE = "active"
+    PAUSED = "paused"
+
+
+class PayflowCollectionStatus(str, Enum):
+    """Display labels match Lovable Accounts / Cases UI."""
+
+    ACTIVE = "Active"
+    PROMISE_TO_PAY = "Promise to Pay"
+    PAYMENT_PLAN = "Payment Plan"
+    HUMAN_REVIEW = "Human Review"
+    RESOLVED = "Resolved"
+
+
+class PayflowIntegrationCategory(str, Enum):
+    DATA_SOURCE = "Data Source"
+    COMMUNICATION = "Communication"
+    PAYMENTS = "Payments"
+    FUTURE = "Future"
+
+
+class PayflowIntegrationStatus(str, Enum):
+    CONNECTED = "Connected"
+    ATTENTION_REQUIRED = "Attention Required"
+    DISCONNECTED = "Disconnected"
+    CONFIGURATION_PENDING = "Configuration Pending"
+    TESTING = "Testing"
+    COMING_LATER = "Coming Later"
+
+
+class PayflowOnboardingStepStatus(str, Enum):
+    COMPLETE = "complete"
+    PENDING = "pending"
+    INCOMPLETE = "incomplete"
+    BLOCKED = "blocked"
+
+
 class AuthTokenType(str, Enum):
     ACTIVATION = "activation"
     PASSWORD_RESET = "password_reset"

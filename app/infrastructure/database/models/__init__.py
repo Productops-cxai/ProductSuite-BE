@@ -12,8 +12,10 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -262,20 +264,152 @@ class PayflowPermissionModel(Base):
 
 
 class PayflowClientModel(Base):
-    """Minimal client stub for scope FKs (full client management comes later)."""
+    """PayFlow collection client (organization) with onboarding configuration."""
 
     __tablename__ = "payflow_clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    category: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    category: Mapped[str | None] = mapped_column(String(128), nullable=True)  # industry display
+    status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
+    client_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    business_domain: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ai_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    data_source_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    connection_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    crm_system_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    integration_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    environment: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sync_frequency: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    brand_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sender_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_from: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sms_sender_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel_email: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    channel_sms: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    channel_whatsapp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    governance_rules: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=True
+    )
 
     assignments = relationship("PayflowUserClientAssignmentModel", back_populates="client")
+    portfolios = relationship(
+        "PayflowPortfolioModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+    field_mappings = relationship(
+        "PayflowClientFieldMappingModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+    accounts = relationship(
+        "PayflowAccountModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowPortfolioModel(Base):
+    """Sub-client / portfolio under a PayFlow client."""
+
+    __tablename__ = "payflow_portfolios"
+    __table_args__ = (
+        UniqueConstraint("client_id", "code", name="uq_payflow_portfolio_client_code"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="onboarding", nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="portfolios")
+    accounts = relationship("PayflowAccountModel", back_populates="portfolio")
+
+
+class PayflowAccountModel(Base):
+    """Customer account under collection, with linked collection-case fields."""
+
+    __tablename__ = "payflow_accounts"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "account_reference", name="uq_payflow_account_client_reference"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    portfolio_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_portfolios.id"), nullable=True, index=True
+    )
+    customer_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    account_reference: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    case_reference: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    outstanding_balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    recovered_balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    collection_status: Mapped[str] = mapped_column(String(64), default="Active", nullable=False)
+    current_workflow: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_action: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    next_action: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    human_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    timeline: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="accounts")
+    portfolio = relationship("PayflowPortfolioModel", back_populates="accounts")
+
+
+class PayflowClientFieldMappingModel(Base):
+    """CRM source field → PayFlow field mapping for a client."""
+
+    __tablename__ = "payflow_client_field_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id", "source_field", name="uq_payflow_client_source_field"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    source_field: Mapped[str] = mapped_column(String(128), nullable=False)
+    payflow_field: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sample_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="unmapped", nullable=False)
+    is_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="field_mappings")
 
 
 class PayflowUserMembershipModel(Base):
