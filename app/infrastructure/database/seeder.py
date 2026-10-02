@@ -23,9 +23,13 @@ from app.infrastructure.database.models import (
     OrganizationProductEntitlementModel,
     PayflowAccountModel,
     PayflowClientModel,
+    PayflowCommunicationModel,
+    PayflowHumanReviewModel,
     PayflowPermissionModel,
     PayflowRoleModel,
     PayflowRolePermissionModel,
+    PayflowRuleModel,
+    PayflowStrategyModel,
     PayflowUserMembershipModel,
     PlatformRoleModel,
     ProductModel,
@@ -95,7 +99,7 @@ _PAYFLOW_NAV: list[tuple[str, str, int, list[tuple[str, str, str, str, int, bool
         [
             ("clients", "Clients", "/payflow/clients", "people", 1, False, None),
             ("cases", "Accounts / Cases", "/payflow/cases", "products", 2, False, None),
-            ("review", "Human Review", "/payflow/review", "access", 3, True, None),
+            ("review", "Human Review", "/payflow/review", "access", 3, False, None),
         ],
     ),
     (
@@ -109,17 +113,17 @@ _PAYFLOW_NAV: list[tuple[str, str, int, list[tuple[str, str, str, str, int, bool
                 "/payflow/workflows",
                 "overview",
                 1,
-                True,
+                False,
                 None,
             ),
-            ("comms", "Communications", "/payflow/comms", "mail", 2, True, None),
+            ("comms", "Communications", "/payflow/comms", "mail", 2, False, None),
         ],
     ),
     (
         "governance",
         "GOVERNANCE",
         4,
-        [("rules", "Rules", "/payflow/rules", "billing", 1, True, None)],
+        [("rules", "Rules", "/payflow/rules", "billing", 1, False, None)],
     ),
     (
         "administration",
@@ -166,8 +170,13 @@ class DatabaseSeeder:
             self._seed_payflow_roles(db)
             self._seed_payflow_clients(db)
             self._seed_payflow_demo_accounts(db)
+            self._seed_payflow_demo_rules(db)
+            self._seed_payflow_demo_reviews(db)
+            self._seed_payflow_demo_strategies(db)
+            self._seed_payflow_demo_communications(db)
             self._seed_payflow_menus(db)
             self._backfill_payflow_ops_admin_memberships(db)
+            self._seed_payflow_demo_notifications(db)
             db.commit()
         except Exception:
             db.rollback()
@@ -739,8 +748,958 @@ class DatabaseSeeder:
             )
         db.flush()
 
+    def _seed_payflow_demo_rules(self, db: Session) -> None:
+        clients = {c.code: c for c in db.query(PayflowClientModel).all()}
+        demo_rules = [
+            {
+                "code": "high-balance-review",
+                "name": "High Balance Review",
+                "description": "Routes high-value accounts to a supervisor before any autonomous collection action is executed.",
+                "rule_type": "Client Rule",
+                "client_code": "paypal",
+                "category": "Amount",
+                "logic": "ALL",
+                "conditions": [
+                    {
+                        "id": "hb-1",
+                        "field": "Outstanding Balance",
+                        "operator": "Greater Than",
+                        "value": "10000",
+                    }
+                ],
+                "action": "Require Human Review",
+                "status": "Active",
+                "created_by": "Daniya Shaikh",
+                "triggers_7d": 14,
+                "applied_to": ["paypal"],
+                "history": [
+                    {"at": "12 Sep 2026", "change": "Threshold updated", "by": "Daniya Shaikh"},
+                    {"at": "10 Sep 2026", "change": "Rule activated", "by": "Daniya Shaikh"},
+                ],
+            },
+            {
+                "code": "repeated-attempts-escalation",
+                "name": "Repeated Attempts Escalation",
+                "description": "Escalates accounts where repeated outreach has not produced a response or payment commitment.",
+                "rule_type": "System Rule",
+                "client_code": None,
+                "category": "Collection Attempts",
+                "logic": "ALL",
+                "conditions": [
+                    {
+                        "id": "ra-1",
+                        "field": "Unsuccessful Attempts",
+                        "operator": "Greater Than or Equal To",
+                        "value": "3",
+                    }
+                ],
+                "action": "Require Human Review",
+                "status": "Active",
+                "created_by": "Daniya Shaikh",
+                "triggers_7d": 42,
+                "applied_to": ["canadian-tire", "northstar-utilities"],
+                "history": [
+                    {"at": "09 Sep 2026", "change": "Applied to Canadian Tire", "by": "Daniya Shaikh"},
+                    {"at": "02 Sep 2026", "change": "Rule activated", "by": "Daniya Shaikh"},
+                ],
+            },
+            {
+                "code": "low-confidence-review",
+                "name": "Low Confidence Review",
+                "description": "Requires supervisor judgement when the AI recommendation confidence falls below the configured threshold.",
+                "rule_type": "Client Rule",
+                "client_code": "canadian-tire",
+                "category": "AI Confidence",
+                "logic": "ALL",
+                "conditions": [
+                    {"id": "lc-1", "field": "AI Confidence", "operator": "Less Than", "value": "70"}
+                ],
+                "action": "Require Human Review",
+                "status": "Active",
+                "created_by": "Zeeshan",
+                "triggers_7d": 9,
+                "applied_to": ["canadian-tire"],
+                "history": [
+                    {"at": "11 Sep 2026", "change": "Threshold updated", "by": "Zeeshan"},
+                    {"at": "04 Sep 2026", "change": "Rule created", "by": "Zeeshan"},
+                ],
+            },
+            {
+                "code": "dispute-detected-review",
+                "name": "Dispute Detected Review",
+                "description": "Holds collection activity when a customer disputes the balance.",
+                "rule_type": "System Rule",
+                "client_code": None,
+                "category": "Customer Risk",
+                "logic": "ANY",
+                "conditions": [
+                    {"id": "dd-1", "field": "Dispute Flag", "operator": "Is", "value": "Yes"},
+                    {
+                        "id": "dd-2",
+                        "field": "Customer Reply Content",
+                        "operator": "Contains",
+                        "value": "dispute",
+                    },
+                ],
+                "action": "Hold Action",
+                "status": "Active",
+                "created_by": "Daniya Shaikh",
+                "triggers_7d": 6,
+                "applied_to": ["paypal", "canadian-tire"],
+                "history": [{"at": "07 Sep 2026", "change": "Rule activated", "by": "Daniya Shaikh"}],
+            },
+            {
+                "code": "broken-promise-escalation",
+                "name": "Broken Promise Escalation",
+                "description": "Escalates cases where a promise-to-pay was not honoured.",
+                "rule_type": "Client Rule",
+                "client_code": "canadian-tire",
+                "category": "Promise-to-Pay",
+                "logic": "ALL",
+                "conditions": [
+                    {"id": "bp-1", "field": "Promise-to-Pay Status", "operator": "Is", "value": "Broken"},
+                    {
+                        "id": "bp-2",
+                        "field": "Outstanding Balance",
+                        "operator": "Greater Than",
+                        "value": "2500",
+                    },
+                ],
+                "action": "Escalate Case",
+                "status": "Draft",
+                "created_by": "Zeeshan",
+                "triggers_7d": 0,
+                "applied_to": ["canadian-tire"],
+                "history": [{"at": "12 Sep 2026", "change": "Draft created", "by": "Zeeshan"}],
+            },
+            {
+                "code": "quiet-period-guard",
+                "name": "Quiet Period Guard",
+                "description": "Prevents further outreach when the account has already received the configured weekly message volume.",
+                "rule_type": "System Rule",
+                "client_code": None,
+                "category": "Communication",
+                "logic": "ALL",
+                "conditions": [
+                    {
+                        "id": "qp-1",
+                        "field": "Messages Sent (7 days)",
+                        "operator": "Greater Than or Equal To",
+                        "value": "4",
+                    }
+                ],
+                "action": "Prevent Communication",
+                "status": "Active",
+                "created_by": "Daniya Shaikh",
+                "triggers_7d": 28,
+                "applied_to": ["paypal", "canadian-tire", "northstar-utilities"],
+                "history": [{"at": "05 Sep 2026", "change": "Rule activated", "by": "Daniya Shaikh"}],
+            },
+            {
+                "code": "northstar-hardship-review",
+                "name": "Hardship Signal Review",
+                "description": "Client-specific review for utility customers signalling financial hardship.",
+                "rule_type": "Client Rule",
+                "client_code": "northstar-utilities",
+                "category": "Customer Risk",
+                "logic": "ALL",
+                "conditions": [
+                    {"id": "nh-1", "field": "Customer Risk Level", "operator": "Is", "value": "High"}
+                ],
+                "action": "Require Human Review",
+                "status": "Active",
+                "created_by": "Sarah",
+                "triggers_7d": 5,
+                "applied_to": ["northstar-utilities"],
+                "history": [{"at": "10 Sep 2026", "change": "Rule activated", "by": "Sarah"}],
+            },
+        ]
+        for item in demo_rules:
+            if db.query(PayflowRuleModel).filter(PayflowRuleModel.code == item["code"]).first():
+                continue
+            client_id = None
+            if item["client_code"]:
+                client = clients.get(item["client_code"])
+                if not client:
+                    continue
+                client_id = client.id
+            db.add(
+                PayflowRuleModel(
+                    code=item["code"],
+                    name=item["name"],
+                    description=item["description"],
+                    rule_type=item["rule_type"],
+                    client_id=client_id,
+                    category=item["category"],
+                    logic=item["logic"],
+                    conditions=item["conditions"],
+                    action=item["action"],
+                    status=item["status"],
+                    created_by=item["created_by"],
+                    triggers_7d=item["triggers_7d"],
+                    applied_to=item["applied_to"],
+                    history=item["history"],
+                )
+            )
+        db.flush()
+
+    def _seed_payflow_demo_reviews(self, db: Session) -> None:
+        clients = {c.code: c for c in db.query(PayflowClientModel).all()}
+        accounts = {
+            a.account_reference: a for a in db.query(PayflowAccountModel).all()
+        }
+        rules = {r.code: r for r in db.query(PayflowRuleModel).all()}
+        demo_reviews = [
+            {
+                "code": "rev-1041",
+                "client_code": "paypal",
+                "account_reference": "PP-10482",
+                "rule_code": "repeated-attempts-escalation",
+                "priority": "High",
+                "reason": "Repeated unsuccessful attempts",
+                "condition_text": "Unsuccessful Attempts greater than or equal to 3",
+                "observed_value": "4 unsuccessful attempts",
+                "proposed_action": "Move to stronger collection treatment",
+                "confidence": 92,
+                "explanation": [
+                    "The customer has received multiple reminders without payment.",
+                    "The latest communication was opened but no payment link interaction occurred.",
+                    "The configured governance rule requires supervisor review before stronger treatment is applied.",
+                ],
+                "context": [
+                    {"label": "Previous Attempts", "value": "4"},
+                    {"label": "Last Communication", "value": "SMS Reminder"},
+                    {"label": "Payment Status", "value": "Partial Payment Previously Received"},
+                ],
+                "timeline": [
+                    {"at": "12 Sep · 09:42", "label": "SMS Reminder Delivered"},
+                    {"at": "12 Sep · 12:01", "label": "Human Review Created"},
+                ],
+                "waiting_minutes": 18,
+                "status": "Awaiting Review",
+                "assigned_supervisor": "Zeeshan",
+                "days_past_due": 42,
+                "history": [
+                    {
+                        "at": "12 Sep · 12:01",
+                        "event": "Human review created",
+                        "detail": "Repeated Attempts Escalation required supervisor judgement",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1042",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-20394",
+                "rule_code": "low-confidence-review",
+                "priority": "Medium",
+                "reason": "Low decision confidence",
+                "condition_text": "AI Confidence less than 70",
+                "observed_value": "64% confidence",
+                "proposed_action": "Change communication strategy",
+                "confidence": 64,
+                "explanation": [
+                    "Engagement signals are mixed: messages are delivered but rarely opened.",
+                    "Confidence fell below the client threshold, so a supervisor confirms the strategy change.",
+                ],
+                "context": [
+                    {"label": "Previous Attempts", "value": "2"},
+                    {"label": "Last Communication", "value": "SMS Reminder"},
+                ],
+                "timeline": [
+                    {"at": "12 Sep · 11:16", "label": "Human Review Created"},
+                ],
+                "waiting_minutes": 42,
+                "status": "Awaiting Review",
+                "assigned_supervisor": "Zeeshan",
+                "days_past_due": 27,
+                "history": [
+                    {
+                        "at": "12 Sep · 11:16",
+                        "event": "Human review created",
+                        "detail": "Low Confidence Review",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1043",
+                "client_code": "paypal",
+                "account_reference": "PP-11021",
+                "rule_code": "high-balance-review",
+                "priority": "Normal",
+                "reason": "Payment arrangement exception",
+                "condition_text": "Outstanding Balance greater than $10,000",
+                "observed_value": "$8,900 outstanding with an extended arrangement request",
+                "proposed_action": "Modify payment treatment",
+                "confidence": 78,
+                "explanation": [
+                    "The customer requested a longer arrangement than the configured standard.",
+                    "Arrangement exceptions require supervisor confirmation before they are offered.",
+                ],
+                "context": [
+                    {"label": "Promise-to-Pay", "value": "Active · due 28 Sep"},
+                ],
+                "timeline": [
+                    {"at": "12 Sep · 10:05", "label": "Human Review Created"},
+                ],
+                "waiting_minutes": 72,
+                "status": "Awaiting Review",
+                "assigned_supervisor": None,
+                "days_past_due": 48,
+                "history": [
+                    {
+                        "at": "12 Sep · 10:05",
+                        "event": "Human review created",
+                        "detail": "High Balance Review",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1044",
+                "client_code": "paypal",
+                "account_reference": "PP-88831",
+                "rule_code": "high-balance-review",
+                "priority": "High",
+                "reason": "High balance treatment",
+                "condition_text": "Outstanding Balance greater than $10,000",
+                "observed_value": "$12,500 outstanding",
+                "proposed_action": "Send settlement offer",
+                "confidence": 88,
+                "explanation": [
+                    "No payment or engagement has been recorded after four outreach attempts.",
+                    "A settlement offer materially changes the outcome, so supervisor approval is required.",
+                ],
+                "context": [
+                    {"label": "Previous Attempts", "value": "4"},
+                    {"label": "Payment Status", "value": "Unpaid"},
+                ],
+                "timeline": [
+                    {"at": "12 Sep · 06:31", "label": "Human Review Created"},
+                ],
+                "waiting_minutes": 330,
+                "status": "Awaiting Review",
+                "assigned_supervisor": "Zeeshan",
+                "days_past_due": 96,
+                "history": [
+                    {
+                        "at": "12 Sep · 06:31",
+                        "event": "Human review created",
+                        "detail": "High Balance Review",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1045",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-22540",
+                "rule_code": "dispute-detected-review",
+                "priority": "High",
+                "reason": "Customer dispute raised",
+                "condition_text": 'Customer Reply Content contains "dispute"',
+                "observed_value": "Reply flagged as a balance dispute",
+                "proposed_action": "Hold collection activity pending dispute review",
+                "confidence": None,
+                "explanation": [
+                    "The customer disputed the balance in a direct reply.",
+                    "Collection activity is paused while the dispute is assessed.",
+                ],
+                "context": [
+                    {"label": "Last Customer Engagement", "value": "Replied · dispute raised"},
+                ],
+                "timeline": [
+                    {"at": "11 Sep · 15:04", "label": "Human Review Created"},
+                    {"at": "11 Sep · 16:40", "label": "Placed On Hold by Zeeshan"},
+                ],
+                "waiting_minutes": 1290,
+                "status": "On Hold",
+                "assigned_supervisor": "Zeeshan",
+                "final_action": "Collection activity paused",
+                "hold_until": "14 Sep 2026",
+                "days_past_due": 62,
+                "history": [
+                    {
+                        "at": "11 Sep · 16:40",
+                        "event": "Held until 14 Sep 2026",
+                        "detail": "Customer contacted support and requested 48 hours",
+                        "by": "Zeeshan",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1046",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-21877",
+                "rule_code": "broken-promise-escalation",
+                "priority": "Normal",
+                "reason": "Payment arrangement exception",
+                "condition_text": "Missed Installments greater than or equal to 1",
+                "observed_value": "1 missed installment, then paid",
+                "proposed_action": "Move to stronger collection treatment",
+                "confidence": 71,
+                "explanation": [
+                    "One installment was missed before the customer paid late.",
+                    "Supervisor guidance kept the customer on the existing plan.",
+                ],
+                "context": [
+                    {"label": "Payment Status", "value": "Partially Paid"},
+                ],
+                "timeline": [
+                    {"at": "10 Sep · 09:12", "label": "Supervisor Modified Recommendation"},
+                ],
+                "waiting_minutes": 71,
+                "status": "Modified",
+                "assigned_supervisor": "Zeeshan",
+                "final_action": "Continue current treatment with adjusted communication",
+                "guidance": "Customer made a recent partial payment. Maintain softer tone for the next communication.",
+                "days_past_due": 40,
+                "history": [
+                    {
+                        "at": "10 Sep · 09:12",
+                        "event": "Supervisor modified recommendation",
+                        "detail": "Final action: Continue current treatment with adjusted communication",
+                        "by": "Zeeshan",
+                    }
+                ],
+            },
+            {
+                "code": "rev-1047",
+                "client_code": "northstar-utilities",
+                "account_reference": "NS-31450",
+                "rule_code": "northstar-hardship-review",
+                "priority": "Medium",
+                "reason": "Hardship signal detected",
+                "condition_text": "Customer Risk Level is High",
+                "observed_value": "Hardship language detected in reply",
+                "proposed_action": "Pause outreach and request updated contact details",
+                "confidence": 69,
+                "explanation": [
+                    "The customer indicated financial hardship in a recent reply.",
+                    "Utility hardship handling requires a supervisor decision before further outreach.",
+                ],
+                "context": [
+                    {"label": "Last Customer Engagement", "value": "Replied · hardship mentioned"},
+                ],
+                "timeline": [
+                    {"at": "12 Sep · 09:02", "label": "Human Review Created"},
+                ],
+                "waiting_minutes": 195,
+                "status": "Awaiting Review",
+                "assigned_supervisor": "Sarah",
+                "days_past_due": 55,
+                "history": [
+                    {
+                        "at": "12 Sep · 09:02",
+                        "event": "Human review created",
+                        "detail": "Hardship Signal Review",
+                    }
+                ],
+            },
+        ]
+        for item in demo_reviews:
+            if (
+                db.query(PayflowHumanReviewModel)
+                .filter(PayflowHumanReviewModel.code == item["code"])
+                .first()
+            ):
+                continue
+            client = clients.get(item["client_code"])
+            account = accounts.get(item["account_reference"])
+            rule = rules.get(item["rule_code"])
+            if not client or not account:
+                continue
+            db.add(
+                PayflowHumanReviewModel(
+                    code=item["code"],
+                    client_id=client.id,
+                    account_id=account.id,
+                    rule_id=rule.id if rule else None,
+                    priority=item["priority"],
+                    reason=item["reason"],
+                    condition_text=item["condition_text"],
+                    observed_value=item["observed_value"],
+                    proposed_action=item["proposed_action"],
+                    confidence=item.get("confidence"),
+                    explanation=item.get("explanation"),
+                    context=item.get("context"),
+                    timeline=item.get("timeline"),
+                    waiting_minutes=item["waiting_minutes"],
+                    status=item["status"],
+                    assigned_supervisor=item.get("assigned_supervisor"),
+                    final_action=item.get("final_action"),
+                    guidance=item.get("guidance"),
+                    rejection_reason=item.get("rejection_reason"),
+                    hold_until=item.get("hold_until"),
+                    history=item.get("history"),
+                    days_past_due=item.get("days_past_due", 0),
+                )
+            )
+        db.flush()
+
+    def _seed_payflow_demo_strategies(self, db: Session) -> None:
+        clients = {c.code: c for c in db.query(PayflowClientModel).all()}
+        demo = [
+            {
+                "code": "pp-early-recovery",
+                "name": "Early Stage Collection",
+                "client_code": "paypal",
+                "status": "Active",
+                "origin": "AI Proposed",
+                "version": 3,
+                "summary": "Soft email then SMS reminder for early-stage balances under progressive reassessment.",
+                "coverage": "Early-stage · low–mid balance",
+                "segment": {
+                    "age_band": "25-44",
+                    "balance_band": "$1K–$5K",
+                    "delinquency": "1–30 days",
+                },
+                "steps": [
+                    {"id": "t1", "kind": "Trigger", "title": "Account overdue"},
+                    {
+                        "id": "c1",
+                        "kind": "Communication",
+                        "title": "Email reminder",
+                        "channel": "Email",
+                        "purpose": "Payment Reminder",
+                        "timing": "Day 0",
+                    },
+                    {"id": "w1", "kind": "Wait", "title": "Wait 48 hours", "timing": "48 Hours After"},
+                    {
+                        "id": "c2",
+                        "kind": "Communication",
+                        "title": "SMS reminder",
+                        "channel": "SMS",
+                        "purpose": "Payment Reminder",
+                    },
+                    {"id": "r1", "kind": "AI Reassessment", "title": "Reassess engagement"},
+                    {"id": "o1", "kind": "Outcome", "title": "Continue or escalate"},
+                ],
+                "ai_context": [
+                    {"label": "Preferred channel", "value": "Email then SMS"},
+                    {"label": "Risk band", "value": "Low–Medium"},
+                ],
+                "versions": [
+                    {"version": 3, "date": "10 Sep 2026", "note": "Approved for production"},
+                    {"version": 2, "date": "08 Sep 2026", "note": "SMS step timing tightened"},
+                ],
+                "approved_by": "Daniya Shaikh",
+                "approval_date": "10 Sep 2026",
+            },
+            {
+                "code": "pp-ptp-follow-up",
+                "name": "Promise-to-Pay Follow-Up",
+                "client_code": "paypal",
+                "status": "Under Review",
+                "origin": "Human Modified",
+                "version": 2,
+                "summary": "Follow up on active promises with SMS before promise date, then reassess.",
+                "coverage": "Active PTP accounts",
+                "segment": {"delinquency": "31–60 days", "balance_band": "$5K–$10K"},
+                "steps": [
+                    {"id": "t1", "kind": "Trigger", "title": "Promise captured"},
+                    {
+                        "id": "c1",
+                        "kind": "Communication",
+                        "title": "Promise reminder SMS",
+                        "channel": "SMS",
+                        "purpose": "Promise-to-Pay Follow-Up",
+                        "timing": "3 Days Before",
+                    },
+                    {"id": "w1", "kind": "Wait", "title": "Wait for promise date"},
+                    {
+                        "id": "cond1",
+                        "kind": "Condition",
+                        "title": "Promise kept?",
+                        "detail": "Payment received by promise date",
+                    },
+                    {"id": "h1", "kind": "Human Review", "title": "Broken promise review"},
+                ],
+                "ai_context": [{"label": "Exception", "value": "Broken promise escalates to review"}],
+                "versions": [{"version": 2, "date": "12 Sep 2026", "note": "Human modified timing"}],
+            },
+            {
+                "code": "ct-progressive-reminder",
+                "name": "Progressive Reminder",
+                "client_code": "canadian-tire",
+                "status": "AI Proposed",
+                "origin": "AI Proposed",
+                "version": 1,
+                "summary": "Four-step progressive SMS/email ladder for mid-stage retail balances.",
+                "coverage": "Progressive reminder cohort",
+                "segment": {"delinquency": "15–45 days"},
+                "steps": [
+                    {"id": "t1", "kind": "Trigger", "title": "File assigned"},
+                    {
+                        "id": "c1",
+                        "kind": "Communication",
+                        "title": "SMS reminder 1",
+                        "channel": "SMS",
+                        "purpose": "Payment Reminder",
+                    },
+                    {"id": "w1", "kind": "Wait", "title": "Wait 3 days"},
+                    {
+                        "id": "c2",
+                        "kind": "Communication",
+                        "title": "Email reminder 2",
+                        "channel": "Email",
+                        "purpose": "Payment Reminder",
+                    },
+                    {"id": "r1", "kind": "AI Reassessment", "title": "Channel preference check"},
+                ],
+                "ai_context": [{"label": "Proposal", "value": "Awaiting supervisor approval"}],
+                "versions": [{"version": 1, "date": "11 Sep 2026", "note": "AI proposed"}],
+            },
+            {
+                "code": "ns-early-stage",
+                "name": "Early Stage Collection",
+                "client_code": "northstar-utilities",
+                "status": "Approved",
+                "origin": "Human Modified",
+                "version": 2,
+                "summary": "Soft utility reminder path with hardship-aware reassessment.",
+                "coverage": "Residential early stage",
+                "segment": {"delinquency": "1–30 days", "language": "English"},
+                "steps": [
+                    {"id": "t1", "kind": "Trigger", "title": "Utility account overdue"},
+                    {
+                        "id": "c1",
+                        "kind": "Communication",
+                        "title": "Soft email",
+                        "channel": "Email",
+                        "purpose": "Payment Reminder",
+                    },
+                    {"id": "w1", "kind": "Wait", "title": "Wait 72 hours"},
+                    {"id": "r1", "kind": "AI Reassessment", "title": "Hardship screen"},
+                    {"id": "o1", "kind": "Outcome", "title": "Continue monitoring"},
+                ],
+                "ai_context": [{"label": "Domain", "value": "Utilities hardship-aware"}],
+                "versions": [
+                    {"version": 2, "date": "10 Sep 2026", "note": "Approved"},
+                    {"version": 1, "date": "07 Sep 2026", "note": "Created"},
+                ],
+                "approved_by": "Sarah",
+                "approval_date": "10 Sep 2026",
+            },
+            {
+                "code": "pp-escalated",
+                "name": "Escalated Collection",
+                "client_code": "paypal",
+                "status": "Active",
+                "origin": "Human Modified",
+                "version": 4,
+                "summary": "High-balance escalation with settlement offer gated by human review.",
+                "coverage": "High balance · escalated",
+                "segment": {"balance_band": "$10K+", "delinquency": "90+ days"},
+                "steps": [
+                    {"id": "t1", "kind": "Trigger", "title": "Escalation threshold met"},
+                    {
+                        "id": "c1",
+                        "kind": "Communication",
+                        "title": "Final notice email",
+                        "channel": "Email",
+                        "purpose": "Final Notice",
+                    },
+                    {"id": "h1", "kind": "Human Review", "title": "Settlement approval"},
+                    {
+                        "id": "c2",
+                        "kind": "Communication",
+                        "title": "Settlement offer",
+                        "channel": "Email",
+                        "purpose": "Settlement Offer",
+                    },
+                    {"id": "o1", "kind": "Outcome", "title": "Case resolved or continue"},
+                ],
+                "ai_context": [{"label": "Gate", "value": "Settlement requires human review"}],
+                "versions": [{"version": 4, "date": "09 Sep 2026", "note": "Active"}],
+                "approved_by": "Daniya Shaikh",
+                "approval_date": "09 Sep 2026",
+            },
+        ]
+        for item in demo:
+            if db.query(PayflowStrategyModel).filter(PayflowStrategyModel.code == item["code"]).first():
+                continue
+            client = clients.get(item["client_code"])
+            if not client:
+                continue
+            db.add(
+                PayflowStrategyModel(
+                    code=item["code"],
+                    name=item["name"],
+                    client_id=client.id,
+                    status=item["status"],
+                    origin=item["origin"],
+                    version=item["version"],
+                    summary=item["summary"],
+                    coverage=item.get("coverage"),
+                    segment=item.get("segment"),
+                    steps=item["steps"],
+                    ai_context=item.get("ai_context"),
+                    versions=item.get("versions"),
+                    approved_by=item.get("approved_by"),
+                    approval_date=item.get("approval_date"),
+                    created_by="PayFlow Seeder",
+                )
+            )
+        db.flush()
+
+    def _seed_payflow_demo_communications(self, db: Session) -> None:
+        clients = {c.code: c for c in db.query(PayflowClientModel).all()}
+        accounts = {a.account_reference: a for a in db.query(PayflowAccountModel).all()}
+        reviews = {r.code: r for r in db.query(PayflowHumanReviewModel).all()}
+        demo = [
+            {
+                "code": "cm-90412",
+                "client_code": "paypal",
+                "account_reference": "PP-10482",
+                "channel": "Email",
+                "purpose": "Payment Reminder",
+                "status": "Payment Link Clicked",
+                "workflow_name": "Early Stage Collection",
+                "engagement": "Clicked payment link",
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "09:42",
+                "subject": "A quick reminder about your PayPal balance",
+                "body_lines": [
+                    "Hi John,",
+                    "Your account PP-10482 has an outstanding balance of $4,250.",
+                    "You can review and pay securely using the link below.",
+                ],
+                "payment_link": True,
+                "why_message": "Early-stage reminder selected after partial payment and email preference.",
+                "why_channel": "Email is the customer's preferred channel for this segment.",
+                "why_timing": "Sent after the configured 48-hour reassessment window.",
+                "events": [
+                    {"at": "12 Sep · 09:42", "label": "Email sent"},
+                    {"at": "12 Sep · 09:55", "label": "Delivered"},
+                    {"at": "12 Sep · 10:12", "label": "Opened"},
+                    {"at": "12 Sep · 10:18", "label": "Payment link clicked"},
+                ],
+                "balance": 4250,
+            },
+            {
+                "code": "cm-90413",
+                "client_code": "paypal",
+                "account_reference": "PP-11021",
+                "channel": "SMS",
+                "purpose": "Promise-to-Pay Follow-Up",
+                "status": "Opened / Read",
+                "workflow_name": "Promise-to-Pay Follow-Up",
+                "engagement": "Message read",
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "08:15",
+                "subject": None,
+                "body_lines": [
+                    "Hi Sarah, reminder: your promise of $8,900 is due 28 Aug. Pay: {{payment_link}}",
+                ],
+                "payment_link": True,
+                "why_message": "Promise reminder before the due date.",
+                "why_channel": "SMS for time-sensitive PTP follow-up.",
+                "why_timing": "3 days before promise date.",
+                "events": [
+                    {"at": "12 Sep · 08:15", "label": "SMS sent"},
+                    {"at": "12 Sep · 08:16", "label": "Delivered"},
+                    {"at": "12 Sep · 08:40", "label": "Read"},
+                ],
+                "balance": 8900,
+            },
+            {
+                "code": "cm-90414",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-20394",
+                "channel": "SMS",
+                "purpose": "Payment Reminder",
+                "status": "Delivered",
+                "workflow_name": "Progressive Reminder",
+                "engagement": "Delivered, not opened",
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "07:50",
+                "body_lines": ["Emily, reminder about CT-20394. Outstanding $7,300. {{payment_link}}"],
+                "payment_link": True,
+                "why_message": "Progressive reminder step 2 of 4.",
+                "why_channel": "SMS preferred for this portfolio.",
+                "why_timing": "Scheduled after previous soft reminder.",
+                "events": [
+                    {"at": "12 Sep · 07:50", "label": "SMS sent"},
+                    {"at": "12 Sep · 07:51", "label": "Delivered"},
+                ],
+                "balance": 7300,
+            },
+            {
+                "code": "cm-90415",
+                "client_code": "paypal",
+                "account_reference": "PP-88831",
+                "channel": "Email",
+                "purpose": "Settlement Offer",
+                "status": "Awaiting Governance",
+                "workflow_name": "Escalated Collection",
+                "engagement": None,
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "06:40",
+                "subject": "Settlement option for your PayPal account",
+                "body_lines": [
+                    "Hi David,",
+                    "A settlement option may be available for account PP-88831.",
+                    "This message is awaiting supervisor approval before send.",
+                ],
+                "payment_link": True,
+                "why_message": "High-balance rule requires settlement review.",
+                "why_channel": "Email for formal settlement language.",
+                "why_timing": "Held until human review completes.",
+                "events": [{"at": "12 Sep · 06:40", "label": "Prepared · awaiting governance"}],
+                "balance": 12500,
+                "review_code": "rev-1044",
+            },
+            {
+                "code": "cm-90416",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-22540",
+                "channel": "Email",
+                "purpose": "Payment Reminder",
+                "status": "Failed",
+                "workflow_name": "Escalated Collection",
+                "engagement": "Delivery failed",
+                "date_bucket": "Yesterday",
+                "date_label": "11 Sep 2026",
+                "time_label": "14:22",
+                "subject": "Important update on your Canadian Tire account",
+                "body_lines": ["Hi Priya, please review your account CT-22540."],
+                "payment_link": False,
+                "why_message": "Progressive reminder before dispute detection.",
+                "why_channel": "Email was last successful channel.",
+                "why_timing": "Scheduled reminder window.",
+                "events": [
+                    {"at": "11 Sep · 14:22", "label": "Email send attempted"},
+                    {"at": "11 Sep · 14:23", "label": "Failed", "detail": "Mailbox unavailable"},
+                ],
+                "balance": 3200,
+                "review_code": "rev-1045",
+            },
+            {
+                "code": "cm-90417",
+                "client_code": "canadian-tire",
+                "account_reference": "CT-21877",
+                "channel": "SMS",
+                "purpose": "Payment Plan Reminder",
+                "status": "Opened / Read",
+                "workflow_name": "Payment Plan Monitoring",
+                "engagement": "Read",
+                "date_bucket": "Yesterday",
+                "date_label": "11 Sep 2026",
+                "time_label": "09:05",
+                "body_lines": ["Robert, installment reminder for CT-21877. Next due soon."],
+                "payment_link": True,
+                "why_message": "Installment reminder on active plan.",
+                "why_channel": "SMS for short payment-plan nudges.",
+                "why_timing": "7 days before next installment.",
+                "events": [
+                    {"at": "11 Sep · 09:05", "label": "SMS sent"},
+                    {"at": "11 Sep · 09:06", "label": "Delivered"},
+                    {"at": "11 Sep · 09:20", "label": "Read"},
+                ],
+                "balance": 1900,
+            },
+            {
+                "code": "cm-90418",
+                "client_code": "northstar-utilities",
+                "account_reference": "NS-30112",
+                "channel": "Email",
+                "purpose": "Payment Reminder",
+                "status": "Delivered",
+                "workflow_name": "Early Stage Collection",
+                "engagement": "Delivered",
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "10:05",
+                "subject": "Friendly reminder from Northstar Utilities",
+                "body_lines": [
+                    "Hi Laura,",
+                    "This is a soft reminder about account NS-30112.",
+                    "Outstanding balance: $2,450.",
+                ],
+                "payment_link": True,
+                "why_message": "First-time delinquency soft reminder.",
+                "why_channel": "Email preferred for utility branding.",
+                "why_timing": "Within early-stage window.",
+                "events": [
+                    {"at": "12 Sep · 10:05", "label": "Email sent"},
+                    {"at": "12 Sep · 10:07", "label": "Delivered"},
+                ],
+                "balance": 2450,
+            },
+            {
+                "code": "cm-90419",
+                "client_code": "northstar-utilities",
+                "account_reference": "NS-31450",
+                "channel": "Email",
+                "purpose": "Promise-to-Pay Follow-Up",
+                "status": "Suppressed",
+                "workflow_name": "Promise-to-Pay Follow-Up",
+                "engagement": None,
+                "date_bucket": "Today",
+                "date_label": "12 Sep 2026",
+                "time_label": "09:10",
+                "subject": "About your payment promise",
+                "body_lines": ["Hi Marcus, we paused outreach while hardship is reviewed."],
+                "payment_link": False,
+                "why_message": "Hardship signal suppressed further outreach.",
+                "why_channel": "Email prepared but held.",
+                "why_timing": "Suppressed by hardship review.",
+                "events": [{"at": "12 Sep · 09:10", "label": "Suppressed", "detail": "Hardship review open"}],
+                "balance": 5400,
+                "review_code": "rev-1047",
+            },
+        ]
+        for item in demo:
+            if (
+                db.query(PayflowCommunicationModel)
+                .filter(PayflowCommunicationModel.code == item["code"])
+                .first()
+            ):
+                continue
+            client = clients.get(item["client_code"])
+            account = accounts.get(item["account_reference"])
+            if not client or not account:
+                continue
+            review = reviews.get(item["review_code"]) if item.get("review_code") else None
+            db.add(
+                PayflowCommunicationModel(
+                    code=item["code"],
+                    client_id=client.id,
+                    account_id=account.id,
+                    channel=item["channel"],
+                    purpose=item["purpose"],
+                    status=item["status"],
+                    workflow_name=item.get("workflow_name"),
+                    engagement=item.get("engagement"),
+                    date_bucket=item.get("date_bucket"),
+                    date_label=item.get("date_label"),
+                    time_label=item.get("time_label"),
+                    subject=item.get("subject"),
+                    body_lines=item.get("body_lines"),
+                    payment_link=bool(item.get("payment_link")),
+                    why_message=item.get("why_message"),
+                    why_channel=item.get("why_channel"),
+                    why_timing=item.get("why_timing"),
+                    events=item.get("events"),
+                    balance=item.get("balance", 0),
+                    review_id=review.id if review else None,
+                )
+            )
+        db.flush()
+
     def _seed_payflow_menus(self, db: Session) -> None:
-        unlock_keys = {"clients", "cases", "integrations"}
+        unlock_keys = {
+            "clients",
+            "cases",
+            "integrations",
+            "review",
+            "rules",
+            "workflows",
+            "comms",
+        }
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)
@@ -816,6 +1775,15 @@ class DatabaseSeeder:
                 )
             )
         db.flush()
+
+    def _seed_payflow_demo_notifications(self, db: Session) -> None:
+        """Backfill in-app notifications for awaiting reviews / workflows / comms."""
+        from app.modules.payflow.services.notification_service import PayflowNotificationService
+
+        svc = PayflowNotificationService(db)
+        svc.sync_awaiting_review_notifications()
+        svc.sync_awaiting_workflow_notifications()
+        svc.sync_awaiting_comm_notifications()
 
 
 def run_seeder() -> None:

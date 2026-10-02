@@ -51,6 +51,7 @@ def user_brief_dict(user: UserModel) -> dict:
         "status": user.status,
         "organization_id": user.organization_id,
         "organization_name": user.organization.name if user.organization else None,
+        "avatar_url": user.avatar_url,
     }
 
 
@@ -131,6 +132,83 @@ class IdentityService:
             user = (
                 self.db.query(UserModel)
                 .options(joinedload(UserModel.organization))
+                .filter(UserModel.id == user.id)
+                .first()
+            ) or user
+        return self.me(user)
+
+    def update_avatar(self, user: UserModel, *, file_bytes: bytes, content_type: str | None, filename: str | None) -> dict:
+        from pathlib import Path
+
+        allowed = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }
+        ext = None
+        if content_type and content_type.lower() in allowed:
+            ext = allowed[content_type.lower()]
+        elif filename:
+            lower = filename.lower()
+            if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                ext = ".jpg"
+            elif lower.endswith(".png"):
+                ext = ".png"
+            elif lower.endswith(".webp"):
+                ext = ".webp"
+            elif lower.endswith(".gif"):
+                ext = ".gif"
+        if not ext:
+            raise ValidationAppError("Upload a JPG, PNG, WEBP or GIF image.")
+        if len(file_bytes) > 2 * 1024 * 1024:
+            raise ValidationAppError("Photo must be 2 MB or smaller.")
+
+        project_root = Path(__file__).resolve().parents[3]
+        upload_root = project_root / "uploads" / "avatars"
+        upload_root.mkdir(parents=True, exist_ok=True)
+
+        # Clear prior avatars for this user (any extension / cache-busting name).
+        for old in upload_root.glob(f"{user.id}*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        import time
+
+        dest_name = f"{user.id}-{int(time.time())}{ext}"
+        dest = upload_root / dest_name
+        dest.write_bytes(file_bytes)
+        user.avatar_url = f"/uploads/avatars/{dest_name}"
+        self.db.commit()
+        self.db.refresh(user)
+        if user.organization is None:
+            user = (
+                self.db.query(UserModel)
+                .options(joinedload(UserModel.organization), joinedload(UserModel.role))
+                .filter(UserModel.id == user.id)
+                .first()
+            ) or user
+        return self.me(user)
+
+    def remove_avatar(self, user: UserModel) -> dict:
+        from pathlib import Path
+
+        project_root = Path(__file__).resolve().parents[3]
+        upload_root = project_root / "uploads" / "avatars"
+        for old in upload_root.glob(f"{user.id}*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        user.avatar_url = None
+        self.db.commit()
+        self.db.refresh(user)
+        if user.organization is None:
+            user = (
+                self.db.query(UserModel)
+                .options(joinedload(UserModel.organization), joinedload(UserModel.role))
                 .filter(UserModel.id == user.id)
                 .first()
             ) or user

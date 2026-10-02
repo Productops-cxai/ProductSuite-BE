@@ -133,6 +133,24 @@ class PayflowUserService:
             }
         )
 
+    def _role_permission_codes(self, role: PayflowRoleModel) -> list[str]:
+        if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
+            rows = self.db.query(PayflowPermissionModel).all()
+            return sorted({p.code for p in rows if p.code})
+        links = (
+            self.db.query(PayflowRolePermissionModel)
+            .options(joinedload(PayflowRolePermissionModel.permission))
+            .filter(PayflowRolePermissionModel.payflow_role_id == role.id)
+            .all()
+        )
+        return sorted(
+            {
+                link.permission.code
+                for link in links
+                if link.permission and link.permission.code
+            }
+        )
+
     def _serialize(self, membership: PayflowUserMembershipModel) -> dict:
         user = membership.user
         role = membership.role
@@ -160,6 +178,7 @@ class PayflowUserService:
             "assigned_clients": clients if clients else (["None assigned"] if not is_platform else ["All Clients"]),
             "permission_profile": self._permission_profile(membership),
             "role_permission_names": self._role_permission_names(role),
+            "role_permission_codes": self._role_permission_codes(role),
             "last_active": None,
             "created_at": user.created_at,
             "organization_id": user.organization_id,

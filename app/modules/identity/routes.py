@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, File, Header, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.core.deps import CurrentPerson, DbSession, bearer_scheme
@@ -52,6 +52,32 @@ def me(user: CurrentPerson, db: DbSession):
 def update_profile(payload: UpdateProfileRequest, user: CurrentPerson, db: DbSession):
     try:
         return IdentityService(db).update_profile(user, payload.full_name)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/me/avatar", response_model=MeResponse)
+async def upload_avatar(
+    user: CurrentPerson,
+    db: DbSession,
+    file: UploadFile = File(...),
+):
+    try:
+        data = await file.read()
+        return IdentityService(db).update_avatar(
+            user,
+            file_bytes=data,
+            content_type=file.content_type,
+            filename=file.filename,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/me/avatar/delete", response_model=MeResponse)
+def delete_avatar(user: CurrentPerson, db: DbSession):
+    try:
+        return IdentityService(db).remove_avatar(user)
     except AppError as exc:
         raise _map_error(exc) from exc
 

@@ -25,5 +25,13 @@ class Settings(BaseSettings):
 
     PASSWORD_MIN_LENGTH: int = 8
 
+    # Optional SMTP — when SMTP_HOST is empty, emails are logged only (email_logs).
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
+    SMTP_USE_TLS: bool = True
+
 
 settings = Settings()

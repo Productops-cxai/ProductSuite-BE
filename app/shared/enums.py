@@ -106,6 +106,88 @@ class PayflowIntegrationStatus(str, Enum):
     COMING_LATER = "Coming Later"
 
 
+class PayflowReviewPriority(str, Enum):
+    HIGH = "High"
+    MEDIUM = "Medium"
+    NORMAL = "Normal"
+
+
+class PayflowReviewStatus(str, Enum):
+    AWAITING_REVIEW = "Awaiting Review"
+    APPROVED = "Approved"
+    MODIFIED = "Modified"
+    REJECTED = "Rejected"
+    ON_HOLD = "On Hold"
+    COMPLETED = "Completed"
+
+
+class PayflowRuleType(str, Enum):
+    SYSTEM = "System Rule"
+    CLIENT = "Client Rule"
+
+
+class PayflowRuleStatus(str, Enum):
+    DRAFT = "Draft"
+    ACTIVE = "Active"
+    INACTIVE = "Inactive"
+
+
+class PayflowRuleLogic(str, Enum):
+    ALL = "ALL"
+    ANY = "ANY"
+
+
+class PayflowStrategyStatus(str, Enum):
+    AI_PROPOSED = "AI Proposed"
+    UNDER_REVIEW = "Under Review"
+    APPROVED = "Approved"
+    ACTIVE = "Active"
+    INACTIVE = "Inactive"
+
+
+class PayflowStrategyOrigin(str, Enum):
+    AI_PROPOSED = "AI Proposed"
+    HUMAN_MODIFIED = "Human Modified"
+
+
+class PayflowCommChannel(str, Enum):
+    EMAIL = "Email"
+    SMS = "SMS"
+    WHATSAPP = "WhatsApp"
+
+
+class PayflowCommStatus(str, Enum):
+    PREPARED = "Prepared"
+    AWAITING_GOVERNANCE = "Awaiting Governance"
+    APPROVED = "Approved"
+    SCHEDULED = "Scheduled"
+    SENT = "Sent"
+    DELIVERED = "Delivered"
+    OPENED_READ = "Opened / Read"
+    PAYMENT_LINK_CLICKED = "Payment Link Clicked"
+    FAILED = "Failed"
+    SUPPRESSED = "Suppressed"
+
+
+class PayflowCommPurpose(str, Enum):
+    PAYMENT_REMINDER = "Payment Reminder"
+    PROMISE_FOLLOW_UP = "Promise-to-Pay Follow-Up"
+    PAYMENT_PLAN_REMINDER = "Payment Plan Reminder"
+    SETTLEMENT_OFFER = "Settlement Offer"
+    FINAL_NOTICE = "Final Notice"
+
+
+class PayflowNotificationType(str, Enum):
+    HUMAN_REVIEW_AWAITING = "human_review_awaiting"
+    WORKFLOW_AWAITING_APPROVAL = "workflow_awaiting_approval"
+    COMM_AWAITING_GOVERNANCE = "comm_awaiting_governance"
+    INTEGRATION_CONNECTION_FAILED = "integration_connection_failed"
+    SUPERVISOR_ASSIGNMENT = "supervisor_assignment"
+    CLIENT_ACTIVATED = "client_activated"
+    REVIEW_DECIDED = "review_decided"
+    WORKFLOW_DECIDED = "workflow_decided"
+
+
 class PayflowOnboardingStepStatus(str, Enum):
     COMPLETE = "complete"
     PENDING = "pending"

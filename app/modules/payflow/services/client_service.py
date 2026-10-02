@@ -340,9 +340,100 @@ class PayflowClientService:
         if "mappings" in payload and payload["mappings"] is not None:
             self._replace_mappings(client, payload["mappings"])
 
+        newly_assigned = []
         if "supervisor_user_ids" in payload and payload["supervisor_user_ids"] is not None:
-            self._sync_supervisors(client, payload["supervisor_user_ids"])
+            newly_assigned = self._sync_supervisors(client, payload["supervisor_user_ids"])
 
+        client.updated_at = _utcnow()
+        self.db.commit()
+        self.db.refresh(client)
+        if newly_assigned:
+            try:
+                from app.modules.payflow.services.notification_service import (
+                    PayflowNotificationService,
+                )
+
+                svc = PayflowNotificationService(self.db)
+                for user in newly_assigned:
+                    if user:
+                        svc.notify_supervisor_assignment(
+                            user=user,
+                            client_id=client.id,
+                            client_name=client.name,
+                            send_mail=True,
+                        )
+            except Exception:
+                pass
+        return self._detail(client)
+
+    def update_logo(
+        self,
+        client_id: int,
+        *,
+        file_bytes: bytes,
+        content_type: str | None,
+        filename: str | None,
+    ) -> dict:
+        from pathlib import Path
+        import time
+
+        client = self._get_or_404(client_id)
+        allowed = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }
+        ext = None
+        if content_type and content_type.lower() in allowed:
+            ext = allowed[content_type.lower()]
+        elif filename:
+            lower = filename.lower()
+            if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+                ext = ".jpg"
+            elif lower.endswith(".png"):
+                ext = ".png"
+            elif lower.endswith(".webp"):
+                ext = ".webp"
+            elif lower.endswith(".gif"):
+                ext = ".gif"
+        if not ext:
+            raise ValidationAppError("Upload a JPG, PNG, WEBP or GIF image.")
+        if len(file_bytes) > 2 * 1024 * 1024:
+            raise ValidationAppError("Logo must be 2 MB or smaller.")
+
+        project_root = Path(__file__).resolve().parents[4]
+        upload_root = project_root / "uploads" / "client-logos"
+        upload_root.mkdir(parents=True, exist_ok=True)
+
+        for old in upload_root.glob(f"{client.id}*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        dest_name = f"{client.id}-{int(time.time())}{ext}"
+        dest = upload_root / dest_name
+        dest.write_bytes(file_bytes)
+        client.logo_url = f"/uploads/client-logos/{dest_name}"
+        client.updated_at = _utcnow()
+        self.db.commit()
+        self.db.refresh(client)
+        return self._detail(client)
+
+    def remove_logo(self, client_id: int) -> dict:
+        from pathlib import Path
+
+        client = self._get_or_404(client_id)
+        project_root = Path(__file__).resolve().parents[4]
+        upload_root = project_root / "uploads" / "client-logos"
+        for old in upload_root.glob(f"{client.id}*"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        client.logo_url = None
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(client)
@@ -367,6 +458,10 @@ class PayflowClientService:
         self._get_or_404(client_id)
         rows = (
             self.db.query(PayflowPortfolioModel)
+            .options(
+                joinedload(PayflowPortfolioModel.accounts),
+                joinedload(PayflowPortfolioModel.strategies),
+            )
             .filter(PayflowPortfolioModel.client_id == client_id)
             .order_by(PayflowPortfolioModel.name)
             .all()
@@ -564,7 +659,8 @@ class PayflowClientService:
             self.db.query(PayflowClientModel)
             .options(
                 joinedload(PayflowClientModel.field_mappings),
-                joinedload(PayflowClientModel.portfolios),
+                joinedload(PayflowClientModel.portfolios).joinedload(PayflowPortfolioModel.accounts),
+                joinedload(PayflowClientModel.portfolios).joinedload(PayflowPortfolioModel.strategies),
                 joinedload(PayflowClientModel.assignments)
                 .joinedload(PayflowUserClientAssignmentModel.membership)
                 .joinedload(PayflowUserMembershipModel.user),
@@ -715,11 +811,13 @@ class PayflowClientService:
                 else:
                     row.status = PayflowMappingStatus.MAPPED.value
 
-    def _sync_supervisors(self, client: PayflowClientModel, user_ids: list) -> None:
+    def _sync_supervisors(self, client: PayflowClientModel, user_ids: list) -> list:
         try:
             wanted = {UUID(str(u)) for u in user_ids}
         except Exception as exc:
             raise ValidationAppError("Invalid supervisor_user_ids") from exc
+
+        newly_assigned: list = []
 
         supervisor_role = (
             self.db.query(PayflowRoleModel)
@@ -785,7 +883,9 @@ class PayflowClientService:
                         permission_id=link.permission_id,
                     )
                 )
+            newly_assigned.append(user)
         self.db.flush()
+        return newly_assigned
 
     def _supervisors(self, client: PayflowClientModel) -> list[dict]:
         result = []
@@ -1050,6 +1150,7 @@ class PayflowClientService:
             "environment": client.environment,
             "sync_frequency": client.sync_frequency,
             "brand_name": client.brand_name or "",
+            "logo_url": client.logo_url,
             "sender_name": client.sender_name or "",
             "email_from": client.email_from or "",
             "sms_sender_id": client.sms_sender_id or "",
@@ -1082,13 +1183,81 @@ class PayflowClientService:
         }
 
     def _portfolio_item(self, p: PayflowPortfolioModel) -> dict:
+        accounts = list(p.accounts or [])
+        account_count = len(accounts)
+        case_count = account_count  # one collection case per account in Phase 1
+        outstanding = float(sum(float(a.outstanding_balance or 0) for a in accounts))
+        active_strategy = None
+        for s in p.strategies or []:
+            if (s.status or "").lower() in ("active", "approved"):
+                active_strategy = s
+                break
+        if active_strategy is None and (p.strategies or []):
+            # Prefer most recently updated strategy for display if none active
+            active_strategy = max(
+                p.strategies,
+                key=lambda s: s.updated_at or s.created_at,
+            )
+            if (active_strategy.status or "").lower() not in ("active", "approved"):
+                active_strategy = None
+
         return {
             "id": p.id,
             "client_id": p.client_id,
             "name": p.name,
             "code": p.code,
             "status": p.status,
+            "status_label": {
+                PayflowPortfolioStatus.ONBOARDING.value: "Onboarding",
+                PayflowPortfolioStatus.ACTIVE.value: "Active",
+                PayflowPortfolioStatus.PAUSED.value: "Paused",
+            }.get(p.status, p.status),
             "description": p.description,
+            "account_count": account_count,
+            "case_count": case_count,
+            "outstanding": outstanding,
+            "active_strategy_id": active_strategy.id if active_strategy else None,
+            "active_strategy_name": active_strategy.name if active_strategy else None,
+            "last_file_received": "No file received yet",
             "created_at": p.created_at,
             "updated_at": p.updated_at,
+        }
+
+    def get_portfolio(self, client_id: int, portfolio_id: int) -> dict:
+        client = self._get_or_404(client_id)
+        portfolio = (
+            self.db.query(PayflowPortfolioModel)
+            .options(
+                joinedload(PayflowPortfolioModel.accounts),
+                joinedload(PayflowPortfolioModel.strategies),
+            )
+            .filter(
+                PayflowPortfolioModel.id == portfolio_id,
+                PayflowPortfolioModel.client_id == client_id,
+            )
+            .first()
+        )
+        if not portfolio:
+            raise NotFoundError("Portfolio not found")
+        strategies = sorted(
+            portfolio.strategies or [],
+            key=lambda s: s.updated_at or s.created_at,
+            reverse=True,
+        )
+        return {
+            **self._portfolio_item(portfolio),
+            "client_name": client.name,
+            "client_code": client.code,
+            "strategies": [
+                {
+                    "id": s.id,
+                    "name": s.name,
+                    "code": s.code,
+                    "status": s.status,
+                    "origin": s.origin,
+                    "version": s.version,
+                    "updated_at": s.updated_at or s.created_at,
+                }
+                for s in strategies
+            ],
         }

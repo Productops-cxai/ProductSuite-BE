@@ -196,6 +196,7 @@ class PayflowUserListItem(BaseModel):
     assigned_clients: List[str]
     permission_profile: str
     role_permission_names: List[str] = Field(default_factory=list)
+    role_permission_codes: List[str] = Field(default_factory=list)
     last_active: Optional[str] = None
     created_at: Optional[datetime] = None
 
@@ -360,3 +361,446 @@ class IntegrationTestResponse(BaseModel):
     message: str
     integration_id: str
     status: str
+
+
+class ReviewContextItem(BaseModel):
+    label: str
+    value: str
+
+
+class ReviewTimelineItem(BaseModel):
+    at: str
+    label: str
+
+
+class ReviewHistoryItem(BaseModel):
+    at: str
+    event: str
+    detail: Optional[str] = None
+    by: Optional[str] = None
+
+
+class PayflowReviewItem(BaseModel):
+    id: int
+    code: str
+    client_id: int
+    client_code: Optional[str] = None
+    client_name: Optional[str] = None
+    account_id: int
+    customer_name: Optional[str] = None
+    account_reference: Optional[str] = None
+    case_reference: Optional[str] = None
+    original_balance: float = 0
+    outstanding_balance: float = 0
+    recovered_balance: float = 0
+    days_past_due: int = 0
+    current_workflow: Optional[str] = None
+    priority: str
+    reason: str
+    rule_id: Optional[int] = None
+    rule_code: Optional[str] = None
+    rule_name: Optional[str] = None
+    condition_text: Optional[str] = None
+    observed_value: Optional[str] = None
+    proposed_action: str
+    confidence: Optional[float] = None
+    explanation: List[str] = Field(default_factory=list)
+    context: List[ReviewContextItem] = Field(default_factory=list)
+    timeline: List[ReviewTimelineItem] = Field(default_factory=list)
+    waiting_minutes: int = 0
+    waiting_label: Optional[str] = None
+    status: str
+    assigned_supervisor: Optional[str] = None
+    final_action: Optional[str] = None
+    guidance: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    hold_until: Optional[str] = None
+    history: List[ReviewHistoryItem] = Field(default_factory=list)
+    can_decide: Optional[bool] = None
+    can_modify: Optional[bool] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ReviewsSummary(BaseModel):
+    awaiting: int = 0
+    high_priority: int = 0
+    due_today: int = 0
+    on_hold: int = 0
+
+
+class PayflowReviewsListResponse(BaseModel):
+    reviews: List[PayflowReviewItem]
+    summary: ReviewsSummary
+    statuses: List[str] = Field(default_factory=list)
+    priorities: List[str] = Field(default_factory=list)
+    reasons: List[str] = Field(default_factory=list)
+    proposed_actions: List[str] = Field(default_factory=list)
+    rejection_reasons: List[str] = Field(default_factory=list)
+    waiting_buckets: List[str] = Field(default_factory=list)
+
+
+class ApproveReviewRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class ModifyReviewRequest(BaseModel):
+    action: str
+    guidance: Optional[str] = None
+
+
+class RejectReviewRequest(BaseModel):
+    reason: str
+    comment: Optional[str] = None
+
+
+class HoldReviewRequest(BaseModel):
+    until: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class RuleConditionItem(BaseModel):
+    id: Optional[str] = None
+    field: str
+    operator: str
+    value: str
+
+
+class RuleHistoryItem(BaseModel):
+    at: str
+    change: str
+    by: str
+
+
+class RuleRecentTrigger(BaseModel):
+    review_id: int
+    review_code: str
+    customer_name: Optional[str] = None
+    account_reference: Optional[str] = None
+    client_name: Optional[str] = None
+    status: str
+    waiting_minutes: int = 0
+
+
+class PayflowRuleItem(BaseModel):
+    id: int
+    code: str
+    name: str
+    description: Optional[str] = None
+    rule_type: str
+    client_id: Optional[int] = None
+    client_code: Optional[str] = None
+    client_name: Optional[str] = None
+    category: str
+    logic: str
+    conditions: List[RuleConditionItem] = Field(default_factory=list)
+    condition_summary: Optional[str] = None
+    action: str
+    status: str
+    created_by: Optional[str] = None
+    triggers_7d: int = 0
+    applied_to: List[str] = Field(default_factory=list)
+    history: List[RuleHistoryItem] = Field(default_factory=list)
+    can_edit: Optional[bool] = None
+    recent_triggers: List[RuleRecentTrigger] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    last_updated_label: Optional[str] = None
+
+
+class RulesSummary(BaseModel):
+    active: int = 0
+    system: int = 0
+    client: int = 0
+    triggers_7d: int = 0
+
+
+class RuleFieldCatalogItem(BaseModel):
+    label: str
+    category: str
+    type: str
+    options: Optional[List[str]] = None
+
+
+class PayflowRulesListResponse(BaseModel):
+    rules: List[PayflowRuleItem]
+    summary: RulesSummary
+    can_create: bool = False
+    categories: List[str] = Field(default_factory=list)
+    actions: List[str] = Field(default_factory=list)
+    fields: List[RuleFieldCatalogItem] = Field(default_factory=list)
+    statuses: List[str] = Field(default_factory=list)
+    types: List[str] = Field(default_factory=list)
+    logics: List[str] = Field(default_factory=list)
+
+
+class CreatePayflowRuleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = None
+    rule_type: str = "Client Rule"
+    client_id: Optional[int] = None
+    category: str
+    logic: str = "ALL"
+    conditions: List[RuleConditionItem] = Field(default_factory=list)
+    action: str
+    status: str = "Draft"
+
+
+class StrategyStepItem(BaseModel):
+    id: Optional[str] = None
+    kind: str
+    title: str
+    channel: Optional[str] = None
+    purpose: Optional[str] = None
+    timing: Optional[str] = None
+    detail: Optional[str] = None
+    disabled: bool = False
+
+
+class StrategySegment(BaseModel):
+    age_band: Optional[str] = None
+    postal_region: Optional[str] = None
+    balance_band: Optional[str] = None
+    delinquency: Optional[str] = None
+    language: Optional[str] = None
+    tenure: Optional[str] = None
+
+
+class StrategyVersionItem(BaseModel):
+    version: int
+    date: str
+    note: str
+
+
+class StrategyStats(BaseModel):
+    steps: int = 0
+    branches: int = 0
+    emails: int = 0
+    sms: int = 0
+
+
+class StrategyContextItem(BaseModel):
+    label: str
+    value: str
+
+
+class PayflowStrategyItem(BaseModel):
+    id: int
+    code: str
+    name: str
+    client_id: int
+    client_code: Optional[str] = None
+    client_name: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
+    status: str
+    origin: str
+    version: int = 1
+    summary: Optional[str] = None
+    coverage: Optional[str] = None
+    segment: dict = Field(default_factory=dict)
+    steps: List[StrategyStepItem] = Field(default_factory=list)
+    stats: StrategyStats = Field(default_factory=StrategyStats)
+    ai_context: List[StrategyContextItem] = Field(default_factory=list)
+    versions: List[StrategyVersionItem] = Field(default_factory=list)
+    approved_by: Optional[str] = None
+    approval_date: Optional[str] = None
+    created_by: Optional[str] = None
+    last_updated_label: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class StrategiesSummary(BaseModel):
+    total: int = 0
+    ai_proposed: int = 0
+    active: int = 0
+    under_review: int = 0
+
+
+class PayflowStrategiesListResponse(BaseModel):
+    strategies: List[PayflowStrategyItem]
+    summary: StrategiesSummary
+    statuses: List[str] = Field(default_factory=list)
+    step_kinds: List[str] = Field(default_factory=list)
+
+
+class CreatePayflowStrategyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    client_id: int
+    portfolio_id: Optional[int] = None
+    summary: Optional[str] = None
+    coverage: Optional[str] = None
+    segment: Optional[dict] = None
+    steps: List[StrategyStepItem] = Field(default_factory=list)
+    status: str = "Under Review"
+    ai_context: Optional[List[StrategyContextItem]] = None
+
+
+class UpdatePayflowStrategyRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    summary: Optional[str] = None
+    coverage: Optional[str] = None
+    segment: Optional[dict] = None
+    steps: Optional[List[StrategyStepItem]] = None
+
+
+class RejectStrategyRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class CommEventItem(BaseModel):
+    at: str
+    label: str
+    detail: Optional[str] = None
+
+
+class PayflowCommunicationItem(BaseModel):
+    id: int
+    code: str
+    client_id: int
+    client_code: Optional[str] = None
+    client_name: Optional[str] = None
+    account_id: int
+    customer_name: Optional[str] = None
+    account_reference: Optional[str] = None
+    case_reference: Optional[str] = None
+    channel: str
+    purpose: str
+    status: str
+    workflow_name: Optional[str] = None
+    engagement: Optional[str] = None
+    date_bucket: Optional[str] = None
+    date_label: Optional[str] = None
+    time_label: Optional[str] = None
+    subject: Optional[str] = None
+    body_lines: List[str] = Field(default_factory=list)
+    payment_link: bool = False
+    why_message: Optional[str] = None
+    why_channel: Optional[str] = None
+    why_timing: Optional[str] = None
+    events: List[CommEventItem] = Field(default_factory=list)
+    balance: float = 0
+    review_id: Optional[int] = None
+    drop_off_segment: Optional[str] = None
+    brand_name: Optional[str] = None
+    sender_name: Optional[str] = None
+    email_from: Optional[str] = None
+    sms_sender_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class CommunicationsSummary(BaseModel):
+    sent_today: int = 0
+    delivered: int = 0
+    engaged: int = 0
+    clicks: int = 0
+    failed: int = 0
+
+
+class PayflowCommunicationsListResponse(BaseModel):
+    communications: List[PayflowCommunicationItem]
+    summary: CommunicationsSummary
+    drop_off: dict[str, int] = Field(default_factory=dict)
+    statuses: List[str] = Field(default_factory=list)
+    channels: List[str] = Field(default_factory=list)
+    purposes: List[str] = Field(default_factory=list)
+    workflows: List[str] = Field(default_factory=list)
+    drop_off_segments: List[str] = Field(default_factory=list)
+
+
+class PayflowNotificationItem(BaseModel):
+    id: int
+    notification_type: str
+    title: str
+    body: Optional[str] = None
+    link: Optional[str] = None
+    client_id: Optional[int] = None
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    read: bool = False
+    read_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+
+class PayflowNotificationsListResponse(BaseModel):
+    notifications: List[PayflowNotificationItem]
+    unread_count: int = 0
+
+
+class DashboardKpiItem(BaseModel):
+    id: str
+    label: str
+    value: float | int = 0
+    display: str
+    hint: Optional[str] = None
+    tone: str = "neutral"
+    href: Optional[str] = None
+
+
+class DashboardAttentionItem(BaseModel):
+    id: str
+    label: str
+    count: int = 0
+    tone: str = "peach"
+    href: Optional[str] = None
+
+
+class DashboardFunnelStep(BaseModel):
+    step: str
+    label: str
+    value: int = 0
+    display: str
+    rate: Optional[str] = None
+    drop: Optional[str] = None
+    bar: float = 0
+    paid: bool = False
+
+
+class DashboardOutcomeItem(BaseModel):
+    id: str
+    label: str
+    value: float | int = 0
+    display: str
+    href: Optional[str] = None
+
+
+class DashboardClientAttentionItem(BaseModel):
+    client_id: int
+    name: str
+    reviews: int = 0
+    flagged_accounts: int = 0
+    detail: str = ""
+    badge: str = ""
+    tone: str = "tan"
+    href: Optional[str] = None
+
+
+class DashboardActivityItem(BaseModel):
+    id: int
+    text: str
+    when: str = ""
+    href: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class DashboardClientOption(BaseModel):
+    id: int
+    name: str
+    code: str
+    status: str
+
+
+class PayflowDashboardResponse(BaseModel):
+    description: str
+    filters: dict = Field(default_factory=dict)
+    clients: List[DashboardClientOption] = Field(default_factory=list)
+    channels: List[str] = Field(default_factory=list)
+    workflows: List[str] = Field(default_factory=list)
+    kpis: List[DashboardKpiItem] = Field(default_factory=list)
+    attention: List[DashboardAttentionItem] = Field(default_factory=list)
+    funnel: List[DashboardFunnelStep] = Field(default_factory=list)
+    outcomes: List[DashboardOutcomeItem] = Field(default_factory=list)
+    clients_attention: List[DashboardClientAttentionItem] = Field(default_factory=list)
+    activity: List[DashboardActivityItem] = Field(default_factory=list)

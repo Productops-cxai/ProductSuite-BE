@@ -8,31 +8,56 @@ from app.core.exceptions import AppError
 from app.modules.payflow.deps import PayflowAccessContext, PayflowOpsAdmin, RequirePayflowProduct
 from app.modules.payflow.schemas import (
     AccessContextResponse,
+    ApproveReviewRequest,
     CreatePayflowClientRequest,
     CreatePayflowRoleRequest,
+    CreatePayflowRuleRequest,
+    CreatePayflowStrategyRequest,
     CreatePayflowUserRequest,
     CreatePortfolioRequest,
+    HoldReviewRequest,
     IntegrationTestResponse,
     MessageResponse,
     MenusResponse,
+    ModifyReviewRequest,
     PayflowAccountsListResponse,
     PayflowClientsListResponse,
+    PayflowCommunicationItem,
+    PayflowCommunicationsListResponse,
     PayflowIntegrationItem,
     PayflowIntegrationsListResponse,
+    PayflowNotificationItem,
+    PayflowNotificationsListResponse,
     PayflowPermissionsCatalogResponse,
+    PayflowReviewItem,
+    PayflowReviewsListResponse,
     PayflowRolesListResponse,
+    PayflowRuleItem,
+    PayflowRulesListResponse,
+    PayflowStrategiesListResponse,
+    PayflowStrategyItem,
     PayflowUserDetailResponse,
     PayflowUsersListResponse,
+    RejectReviewRequest,
+    RejectStrategyRequest,
     UpdatePayflowClientRequest,
     UpdatePayflowRoleRequest,
+    UpdatePayflowStrategyRequest,
     UpdatePayflowUserRequest,
     UpdatePortfolioRequest,
+    PayflowDashboardResponse,
 )
 from app.modules.payflow.service import PayflowUserService
 from app.modules.payflow.services.access_context_service import AccessContextService
 from app.modules.payflow.services.account_service import PayflowAccountService
 from app.modules.payflow.services.client_service import PayflowClientService
+from app.modules.payflow.services.communication_service import PayflowCommunicationService
+from app.modules.payflow.services.dashboard_service import PayflowDashboardService
 from app.modules.payflow.services.integration_service import PayflowIntegrationService
+from app.modules.payflow.services.notification_service import PayflowNotificationService
+from app.modules.payflow.services.review_service import PayflowReviewService
+from app.modules.payflow.services.rule_service import PayflowRuleService
+from app.modules.payflow.services.strategy_service import PayflowStrategyService
 
 router = APIRouter(prefix="/payflow", tags=["PayFlow"])
 
@@ -225,6 +250,33 @@ def update_client(
         raise _map_error(exc) from exc
 
 
+@router.post("/clients/{client_id}/logo")
+async def upload_client_logo(
+    client_id: int,
+    _: PayflowOpsAdmin,
+    db: DbSession,
+    file: UploadFile = File(...),
+):
+    try:
+        data = await file.read()
+        return PayflowClientService(db).update_logo(
+            client_id,
+            file_bytes=data,
+            content_type=file.content_type,
+            filename=file.filename,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/clients/{client_id}/logo/delete")
+def delete_client_logo(client_id: int, _: PayflowOpsAdmin, db: DbSession):
+    try:
+        return PayflowClientService(db).remove_logo(client_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.post("/clients/{client_id}/activate")
 def activate_client(client_id: int, _: PayflowOpsAdmin, db: DbSession):
     try:
@@ -240,6 +292,17 @@ def list_portfolios(client_id: int, user: RequirePayflowProduct, db: DbSession):
         if not access.can_see_client(user, client_id):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied")
         return PayflowClientService(db).list_portfolios(client_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/clients/{client_id}/portfolios/{portfolio_id}")
+def get_portfolio(client_id: int, portfolio_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        access = AccessContextService(db)
+        if not access.can_see_client(user, client_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied")
+        return PayflowClientService(db).get_portfolio(client_id, portfolio_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -268,6 +331,32 @@ def update_portfolio(
     try:
         return PayflowClientService(db).update_portfolio(
             client_id, portfolio_id, payload.model_dump(exclude_unset=True)
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
+
+@router.get("/dashboard", response_model=PayflowDashboardResponse)
+def get_dashboard(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    date_range: str = Query(default="today"),
+    client_id: int | None = Query(default=None),
+    channel: str | None = Query(default=None),
+    workflow: str | None = Query(default=None),
+):
+    try:
+        return PayflowDashboardService(db).get_dashboard(
+            user,
+            date_range=date_range,
+            client_id=client_id,
+            channel=channel,
+            workflow=workflow,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -347,6 +436,350 @@ def get_integration(integration_id: str, user: RequirePayflowProduct, db: DbSess
 def test_integration(integration_id: str, user: PayflowOpsAdmin, db: DbSession):
     try:
         return PayflowIntegrationService(db).test_connection(user, integration_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Human Review
+# ---------------------------------------------------------------------------
+
+
+@router.get("/reviews", response_model=PayflowReviewsListResponse)
+def list_reviews(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    priority: str | None = Query(default=None),
+    reason: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    waiting_bucket: str | None = Query(default=None),
+):
+    try:
+        return PayflowReviewService(db).list_reviews(
+            user,
+            client_id=client_id,
+            status=status_filter,
+            priority=priority,
+            reason=reason,
+            search=search,
+            waiting_bucket=waiting_bucket,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/reviews/{review_id}", response_model=PayflowReviewItem)
+def get_review(review_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowReviewService(db).get_review(user, review_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews/{review_id}/approve", response_model=PayflowReviewItem)
+def approve_review(
+    review_id: int,
+    payload: ApproveReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).approve(user, review_id, note=payload.note)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews/{review_id}/modify", response_model=PayflowReviewItem)
+def modify_review(
+    review_id: int,
+    payload: ModifyReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).modify(
+            user, review_id, action=payload.action, guidance=payload.guidance
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews/{review_id}/reject", response_model=PayflowReviewItem)
+def reject_review(
+    review_id: int,
+    payload: RejectReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).reject(
+            user, review_id, reason=payload.reason, comment=payload.comment
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews/{review_id}/hold", response_model=PayflowReviewItem)
+def hold_review(
+    review_id: int,
+    payload: HoldReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).hold(
+            user, review_id, until=payload.until, reason=payload.reason
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+
+@router.get("/rules/catalog")
+def get_rules_catalog(user: RequirePayflowProduct, db: DbSession):
+    _ = user
+    return PayflowRuleService(db).catalog()
+
+
+@router.get("/rules", response_model=PayflowRulesListResponse)
+def list_rules(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    category: str | None = Query(default=None),
+    action: str | None = Query(default=None),
+    rule_type: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+):
+    try:
+        return PayflowRuleService(db).list_rules(
+            user,
+            client_id=client_id,
+            status=status_filter,
+            category=category,
+            action=action,
+            rule_type=rule_type,
+            search=search,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/rules", response_model=PayflowRuleItem)
+def create_rule(
+    payload: CreatePayflowRuleRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowRuleService(db).create_rule(
+            user,
+            {
+                **payload.model_dump(),
+                "conditions": [c.model_dump() for c in payload.conditions],
+            },
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/rules/{rule_id}", response_model=PayflowRuleItem)
+def get_rule(rule_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowRuleService(db).get_rule(user, rule_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/rules/{rule_id}/activate", response_model=PayflowRuleItem)
+def activate_rule(rule_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowRuleService(db).activate(user, rule_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/rules/{rule_id}/deactivate", response_model=PayflowRuleItem)
+def deactivate_rule(rule_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowRuleService(db).deactivate(user, rule_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Strategies / Workflows
+# ---------------------------------------------------------------------------
+
+
+@router.get("/workflows", response_model=PayflowStrategiesListResponse)
+def list_workflows(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None),
+):
+    try:
+        return PayflowStrategyService(db).list_strategies(
+            user,
+            client_id=client_id,
+            portfolio_id=portfolio_id,
+            status=status_filter,
+            search=search,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows", response_model=PayflowStrategyItem)
+def create_workflow(
+    payload: CreatePayflowStrategyRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        data = payload.model_dump()
+        data["steps"] = [s.model_dump() for s in payload.steps]
+        if payload.ai_context is not None:
+            data["ai_context"] = [c.model_dump() for c in payload.ai_context]
+        return PayflowStrategyService(db).create_strategy(user, data)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/workflows/{strategy_id}", response_model=PayflowStrategyItem)
+def get_workflow(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowStrategyService(db).get_strategy(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/update", response_model=PayflowStrategyItem)
+def update_workflow(
+    strategy_id: int,
+    payload: UpdatePayflowStrategyRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        data = payload.model_dump(exclude_unset=True)
+        if "steps" in data and data["steps"] is not None:
+            data["steps"] = [s if isinstance(s, dict) else s for s in data["steps"]]
+            # ensure plain dicts
+            data["steps"] = [
+                s.model_dump() if hasattr(s, "model_dump") else s for s in payload.steps or []
+            ]
+        return PayflowStrategyService(db).update_strategy(user, strategy_id, data)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/save-draft", response_model=PayflowStrategyItem)
+def save_workflow_draft(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowStrategyService(db).save_draft(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/approve", response_model=PayflowStrategyItem)
+def approve_workflow(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowStrategyService(db).approve(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/reject", response_model=PayflowStrategyItem)
+def reject_workflow(
+    strategy_id: int,
+    payload: RejectStrategyRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowStrategyService(db).reject(user, strategy_id, note=payload.note)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Communications
+# ---------------------------------------------------------------------------
+
+
+@router.get("/comms", response_model=PayflowCommunicationsListResponse)
+def list_comms(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    channel: str | None = Query(default=None),
+    purpose: str | None = Query(default=None),
+    workflow: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+):
+    try:
+        return PayflowCommunicationService(db).list_communications(
+            user,
+            client_id=client_id,
+            account_id=account_id,
+            status=status_filter,
+            channel=channel,
+            purpose=purpose,
+            workflow=workflow,
+            search=search,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/comms/{communication_id}", response_model=PayflowCommunicationItem)
+def get_comm(communication_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowCommunicationService(db).get_communication(user, communication_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+
+@router.get("/notifications", response_model=PayflowNotificationsListResponse)
+def list_notifications(user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowNotificationService(db).list_for_user(user)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/notifications/{notification_id}/read", response_model=PayflowNotificationItem)
+def mark_notification_read(
+    notification_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowNotificationService(db).mark_read(user, notification_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/notifications/read-all", response_model=PayflowNotificationsListResponse)
+def mark_all_notifications_read(user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowNotificationService(db).mark_all_read(user)
     except AppError as exc:
         raise _map_error(exc) from exc
 

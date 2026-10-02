@@ -158,10 +158,35 @@ class PayflowIntegrationService:
         if not self.access.is_operations_admin(user):
             raise ForbiddenError("Operations Admin access required")
         integration = self.get_integration(user, integration_id)
+        status = integration.get("status") or ""
+        issues = integration.get("issues") or []
+        needs_attention = (
+            status == PayflowIntegrationStatus.ATTENTION_REQUIRED.value or bool(issues)
+        )
+        if needs_attention:
+            try:
+                from app.modules.payflow.services.notification_service import (
+                    PayflowNotificationService,
+                )
+
+                detail = "; ".join(issues) if issues else f"Status: {status}"
+                PayflowNotificationService(self.db).notify_integration_failed(
+                    integration_id=integration["id"],
+                    client_name=integration.get("client_name") or "Client",
+                    detail=detail,
+                    send_mail=True,
+                )
+            except Exception:
+                pass
+            return {
+                "message": "Test completed. Connection needs attention.",
+                "integration_id": integration["id"],
+                "status": status,
+            }
         return {
             "message": "Test completed. Connection responded normally.",
             "integration_id": integration["id"],
-            "status": integration["status"],
+            "status": status,
         }
 
     def _build_from_clients(self, clients: list[PayflowClientModel]) -> list[dict[str, Any]]:

@@ -94,6 +94,7 @@ class UserModel(Base):
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     organization_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("organizations.id"), nullable=False
     )
@@ -283,6 +284,7 @@ class PayflowClientModel(Base):
     environment: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sync_frequency: Mapped[str | None] = mapped_column(String(64), nullable=True)
     brand_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     sender_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_from: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sms_sender_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -313,6 +315,26 @@ class PayflowClientModel(Base):
         back_populates="client",
         cascade="all, delete-orphan",
     )
+    rules = relationship(
+        "PayflowRuleModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+    reviews = relationship(
+        "PayflowHumanReviewModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+    strategies = relationship(
+        "PayflowStrategyModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+    communications = relationship(
+        "PayflowCommunicationModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
 
 
 class PayflowPortfolioModel(Base):
@@ -340,6 +362,7 @@ class PayflowPortfolioModel(Base):
 
     client = relationship("PayflowClientModel", back_populates="portfolios")
     accounts = relationship("PayflowAccountModel", back_populates="portfolio")
+    strategies = relationship("PayflowStrategyModel", back_populates="portfolio")
 
 
 class PayflowAccountModel(Base):
@@ -380,6 +403,180 @@ class PayflowAccountModel(Base):
 
     client = relationship("PayflowClientModel", back_populates="accounts")
     portfolio = relationship("PayflowPortfolioModel", back_populates="accounts")
+    reviews = relationship(
+        "PayflowHumanReviewModel",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+    communications = relationship(
+        "PayflowCommunicationModel",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowStrategyModel(Base):
+    """Collection strategy / visual workflow for a client (optionally portfolio-scoped)."""
+
+    __tablename__ = "payflow_strategies"
+    __table_args__ = (UniqueConstraint("code", name="uq_payflow_strategy_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    portfolio_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_portfolios.id"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Under Review")
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="Human Modified")
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    coverage: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    segment: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    ai_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    versions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approval_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="strategies")
+    portfolio = relationship("PayflowPortfolioModel", back_populates="strategies")
+
+
+class PayflowCommunicationModel(Base):
+    """Customer collection communication log entry."""
+
+    __tablename__ = "payflow_communications"
+    __table_args__ = (UniqueConstraint("code", name="uq_payflow_communication_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, default="Sent")
+    workflow_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    engagement: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    date_bucket: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    date_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    time_label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    body_lines: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    payment_link: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    why_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    why_channel: Mapped[str | None] = mapped_column(Text, nullable=True)
+    why_timing: Mapped[str | None] = mapped_column(Text, nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    review_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_human_reviews.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="communications")
+    account = relationship("PayflowAccountModel", back_populates="communications")
+    review = relationship("PayflowHumanReviewModel")
+
+
+class PayflowRuleModel(Base):
+    """Governance rule — system-wide or client-scoped."""
+
+    __tablename__ = "payflow_rules"
+    __table_args__ = (UniqueConstraint("code", name="uq_payflow_rule_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rule_type: Mapped[str] = mapped_column(String(32), nullable=False, default="Client Rule")
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    logic: Mapped[str] = mapped_column(String(8), nullable=False, default="ALL")
+    conditions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Draft")
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    triggers_7d: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    applied_to: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="rules")
+    reviews = relationship("PayflowHumanReviewModel", back_populates="rule")
+
+
+class PayflowHumanReviewModel(Base):
+    """Exception queue item requiring supervisor judgement before a proposed action."""
+
+    __tablename__ = "payflow_human_reviews"
+    __table_args__ = (UniqueConstraint("code", name="uq_payflow_human_review_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    rule_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_rules.id"), nullable=True, index=True
+    )
+    priority: Mapped[str] = mapped_column(String(32), nullable=False, default="Normal")
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    condition_text: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    observed_value: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    proposed_action: Mapped[str] = mapped_column(String(255), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    explanation: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    context: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    timeline: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    waiting_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Awaiting Review")
+    assigned_supervisor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    final_action: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    guidance: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    hold_until: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    history: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    days_past_due: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="reviews")
+    account = relationship("PayflowAccountModel", back_populates="reviews")
+    rule = relationship("PayflowRuleModel", back_populates="reviews")
 
 
 class PayflowClientFieldMappingModel(Base):
@@ -583,6 +780,33 @@ class EmailLogModel(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class PayflowNotificationModel(Base):
+    """In-app notification inbox for PayFlow users (supervisors + ops admins)."""
+
+    __tablename__ = "payflow_notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    notification_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    link: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    entity_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    entity_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user = relationship("UserModel")
+    client = relationship("PayflowClientModel")
 
 
 # ---------------------------------------------------------------------------

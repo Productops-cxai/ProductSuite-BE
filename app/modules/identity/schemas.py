@@ -32,6 +32,7 @@ class PersonBrief(BaseModel):
     status: PersonStatus | str
     organization_id: int
     organization_name: Optional[str] = None
+    avatar_url: Optional[str] = None
 
 
 class LoginResponse(BaseModel):
