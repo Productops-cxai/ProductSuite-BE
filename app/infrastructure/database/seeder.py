@@ -146,7 +146,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/review",
                 "access",
                 3,
-                False,
+                True,  # disabled / coming soon — FE parked in _design_backup/payflow-ai-ops
                 None,
                 "view_human_reviews",
             ),
@@ -163,7 +163,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/workflows",
                 "overview",
                 1,
-                False,
+                True,  # disabled — FE redesign backup
                 None,
                 "view_workflows",
             ),
@@ -173,7 +173,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/comms",
                 "mail",
                 2,
-                False,
+                True,  # disabled — FE redesign backup
                 None,
                 "view_communications",
             ),
@@ -603,13 +603,12 @@ class DatabaseSeeder:
             "clients",
             "cases",
             "integrations",
-            "review",
             "rules",
-            "workflows",
-            "comms",
             "users",
             "dashboard",
         }
+        # Visible but disabled until FE redesign is restored from _design_backup/payflow-ai-ops.
+        parked_disabled_keys = {"review", "workflows", "comms"}
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)
@@ -629,6 +628,9 @@ class DatabaseSeeder:
                 )
                 db.add(section)
                 db.flush()
+            else:
+                section.label = label
+                section.sort_order = sort_order
 
             for key, item_label, route, icon, item_sort, soon, role_code, perm_code in items:
                 exists = (
@@ -657,12 +659,16 @@ class DatabaseSeeder:
                 else:
                     if key in unlock_keys and exists.is_coming_soon:
                         exists.is_coming_soon = False
+                    if key in parked_disabled_keys:
+                        exists.is_coming_soon = True
+                        exists.is_active = True
                     # Keep menu permission gates aligned with catalog (additive sync).
                     exists.required_permission_code = perm_code
                     # Prefer permission gates over hard-coded ops-admin role gates.
                     exists.required_role_code = role_code
                     exists.label = item_label
                     exists.route = route
+                    exists.sort_order = item_sort
         stale = (
             db.query(NavigationItemModel)
             .join(NavigationSectionModel)
