@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -13,18 +15,28 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
+    PayflowAccountModel,
     PayflowClientFieldMappingModel,
     PayflowClientModel,
+    PayflowCommunicationModel,
+    PayflowHumanReviewModel,
+    PayflowImportErrorModel,
+    PayflowImportRunModel,
+    PayflowNotificationModel,
     PayflowPortfolioModel,
     PayflowRoleModel,
     PayflowRolePermissionModel,
+    PayflowRuleModel,
+    PayflowStrategyModel,
     PayflowUserClientAssignmentModel,
     PayflowUserClientPermissionModel,
     PayflowUserMembershipModel,
     UserModel,
 )
+from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
     BULK_UPLOAD_HEADERS,
+    CLIENT_IMPORT_MASTER_REQUIRED,
     CRM_INBOUND_FIELDS,
     CRM_OUTBOUND_FIELDS,
     GOVERNANCE_RULE_LIBRARY,
@@ -109,6 +121,44 @@ def _parse_client_type(value: str | None, default: str = PayflowClientType.THIRD
     if key in ("third_party", "thirdparty"):
         return PayflowClientType.THIRD_PARTY.value
     raise ValidationAppError("Client type must be First Party or Third Party")
+
+
+def _parse_client_type_soft(value: str | None) -> str:
+    """Map CRM labels (Lender, Non-Commercial, …) without failing import."""
+    try:
+        return _parse_client_type(value)
+    except ValidationAppError:
+        raw = (value or "").strip().lower()
+        if "first" in raw:
+            return PayflowClientType.FIRST_PARTY.value
+        return PayflowClientType.THIRD_PARTY.value
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+_PRIMARY_CONTACT_FIELDS = (
+    "crm_client_number",
+    "contact_name",
+    "contact_title",
+    "contact_email",
+    "contact_phone",
+    "address_line1",
+    "address_line2",
+    "city",
+    "province_state",
+    "country",
+    "postal_code",
+    "correspondence_language",
+    "currency_code",
+    "crm_status",
+)
+
+_BE_ROOT = Path(__file__).resolve().parents[4]
+_CLIENT_UPLOADS = _BE_ROOT / "uploads" / "client-imports"
 
 
 def _parse_ai_mode(value: str | None, default: str = PayflowAiMode.SUPERVISED_AI.value) -> str:
@@ -214,42 +264,108 @@ class PayflowClientService:
     # ------------------------------------------------------------------
 
     def create_client(self, payload: dict[str, Any]) -> dict:
+        client, _action = self.upsert_client(payload, commit=True)
+        return self._detail(client)
+
+    def upsert_client(
+        self,
+        payload: dict[str, Any],
+        *,
+        commit: bool = True,
+        soft_client_type: bool = False,
+    ) -> tuple[PayflowClientModel, str]:
+        """Create or update a client. Match by crm_client_number, then code."""
         name = (payload.get("name") or "").strip()
         code = _normalize_code(payload.get("code") or "")
+        crm_number = (payload.get("crm_client_number") or "").strip() or None
         if not name:
             raise ValidationAppError("Client name is required")
         if not code:
             raise ValidationAppError("Client code / reference is required")
-        self._assert_unique_code(code)
 
-        client = PayflowClientModel(
-            name=name,
-            code=code,
-            category=(payload.get("industry") or payload.get("category") or "").strip() or None,
-            status=PayflowClientStatus.DRAFT.value,
-            client_type=_parse_client_type(payload.get("client_type")),
-            business_domain=_parse_domain(payload.get("business_domain")),
-            ai_mode=_parse_ai_mode(payload.get("ai_mode")),
-            data_source_type=None,
-            connection_status=PayflowConnectionStatus.NOT_CONNECTED.value,
-            environment="Sandbox",
-            sync_frequency="Every 15 minutes",
-            brand_name="",
-            sender_name="",
-            email_from="collections@payflow.io",
-            sms_sender_id="PAYFLOW",
-            channel_email=True,
-            channel_sms=True,
-            channel_whatsapp=False,
-            governance_rules=[],
-            updated_at=_utcnow(),
-        )
-        self.db.add(client)
-        self.db.flush()
-        self._seed_default_mappings(client)
-        self.db.commit()
-        self.db.refresh(client)
-        return self._detail(client)
+        client = self._find_client(crm_number=crm_number, code=code)
+        type_parser = _parse_client_type_soft if soft_client_type else _parse_client_type
+        ds = self._normalize_data_source(payload.get("data_source_type"), allow_none=True)
+
+        if client is None:
+            self._assert_unique_code(code)
+            if crm_number:
+                self._assert_unique_crm_number(crm_number)
+            client = PayflowClientModel(
+                name=name,
+                code=code,
+                category=(payload.get("industry") or payload.get("category") or "").strip()
+                or None,
+                status=PayflowClientStatus.DRAFT.value,
+                client_type=type_parser(payload.get("client_type")),
+                business_domain=_parse_domain(payload.get("business_domain")),
+                ai_mode=_parse_ai_mode(payload.get("ai_mode")),
+                data_source_type=ds or PayflowDataSourceType.FILE.value,
+                connection_status=(
+                    PayflowConnectionStatus.CONNECTED.value
+                    if (ds or PayflowDataSourceType.FILE.value)
+                    == PayflowDataSourceType.FILE.value
+                    else PayflowConnectionStatus.NOT_CONNECTED.value
+                ),
+                environment="Sandbox",
+                sync_frequency="Every 15 minutes",
+                brand_name=(payload.get("brand_name") or "").strip()
+                or (payload.get("short_name") or "").strip()
+                or "",
+                sender_name="",
+                email_from="collections@payflow.io",
+                sms_sender_id="PAYFLOW",
+                channel_email=True,
+                channel_sms=True,
+                channel_whatsapp=False,
+                governance_rules=[],
+                updated_at=_utcnow(),
+            )
+            self._apply_primary_fields(client, payload, create=True)
+            self.db.add(client)
+            self.db.flush()
+            if ds == PayflowDataSourceType.CRM.value or ds is None:
+                self._seed_default_mappings(client)
+            action = "created"
+        else:
+            if code.lower() != (client.code or "").lower():
+                self._assert_unique_code(code, exclude_id=client.id)
+                client.code = code
+            if crm_number and crm_number != (client.crm_client_number or ""):
+                self._assert_unique_crm_number(crm_number, exclude_id=client.id)
+            client.name = name
+            if "industry" in payload or "category" in payload:
+                industry = payload.get("industry", payload.get("category"))
+                client.category = (str(industry).strip() if industry is not None else None) or None
+            if payload.get("client_type") is not None:
+                client.client_type = type_parser(payload.get("client_type"))
+            if payload.get("business_domain") is not None:
+                client.business_domain = _parse_domain(payload.get("business_domain"))
+            if payload.get("ai_mode") is not None:
+                client.ai_mode = _parse_ai_mode(payload.get("ai_mode"))
+            if "data_source_type" in payload:
+                self._set_data_source(client, ds)
+            if payload.get("brand_name") is not None or payload.get("short_name"):
+                client.brand_name = (
+                    (payload.get("brand_name") or "").strip()
+                    or (payload.get("short_name") or "").strip()
+                    or client.brand_name
+                )
+            self._apply_primary_fields(client, payload, create=False)
+            if (
+                client.data_source_type == PayflowDataSourceType.CRM.value
+                and not (client.field_mappings or [])
+            ):
+                self._seed_default_mappings(client)
+            client.updated_at = _utcnow()
+            action = "updated"
+
+        if commit:
+            self.db.commit()
+            self.db.refresh(client)
+        else:
+            self.db.flush()
+        return client, action
 
     def update_client(self, client_id: int, payload: dict[str, Any]) -> dict:
         client = self._get_or_404(client_id)
@@ -284,27 +400,20 @@ class PayflowClientService:
         if "ai_mode" in payload and payload["ai_mode"] is not None:
             client.ai_mode = _parse_ai_mode(payload["ai_mode"])
 
-        # Data source (CRM only)
         if "data_source_type" in payload:
-            ds = payload["data_source_type"]
-            if ds is None or ds == "":
-                client.data_source_type = None
-                client.connection_status = PayflowConnectionStatus.NOT_CONNECTED.value
-            else:
-                ds_norm = str(ds).strip().lower()
-                if ds_norm not in ("crm", PayflowDataSourceType.CRM.value):
-                    raise ValidationAppError("Only CRM data source is supported")
-                if client.data_source_type != PayflowDataSourceType.CRM.value:
-                    client.connection_status = PayflowConnectionStatus.NOT_CONNECTED.value
-                client.data_source_type = PayflowDataSourceType.CRM.value
+            ds = self._normalize_data_source(payload["data_source_type"], allow_none=True)
+            self._set_data_source(client, ds)
 
         if "connection_status" in payload and payload["connection_status"] is not None:
-            cs = str(payload["connection_status"]).strip().lower().replace(" ", "_")
-            label_map = {v.lower().replace(" ", "_"): k for k, v in _CONNECTION_LABELS.items()}
-            label_map.update({k: k for k in _CONNECTION_LABELS})
-            if cs not in label_map:
-                raise ValidationAppError("Invalid connection status")
-            client.connection_status = label_map[cs]
+            if client.data_source_type == PayflowDataSourceType.FILE.value:
+                client.connection_status = PayflowConnectionStatus.CONNECTED.value
+            else:
+                cs = str(payload["connection_status"]).strip().lower().replace(" ", "_")
+                label_map = {v.lower().replace(" ", "_"): k for k, v in _CONNECTION_LABELS.items()}
+                label_map.update({k: k for k in _CONNECTION_LABELS})
+                if cs not in label_map:
+                    raise ValidationAppError("Invalid connection status")
+                client.connection_status = label_map[cs]
 
         for field in (
             "crm_system_name",
@@ -315,9 +424,10 @@ class PayflowClientService:
             "sender_name",
             "email_from",
             "sms_sender_id",
+            *_PRIMARY_CONTACT_FIELDS,
         ):
             if field in payload and payload[field] is not None:
-                setattr(client, field, str(payload[field]).strip())
+                setattr(client, field, str(payload[field]).strip() or None)
 
         if "channels" in payload and isinstance(payload["channels"], dict):
             ch = payload["channels"]
@@ -469,40 +579,83 @@ class PayflowClientService:
         return {"portfolios": [self._portfolio_item(p) for p in rows]}
 
     def create_portfolio(self, client_id: int, payload: dict[str, Any]) -> dict:
+        row, _action = self.upsert_portfolio(client_id, payload, commit=True)
+        return self._portfolio_item(row)
+
+    def upsert_portfolio(
+        self,
+        client_id: int,
+        payload: dict[str, Any],
+        *,
+        commit: bool = True,
+    ) -> tuple[PayflowPortfolioModel, str]:
         client = self._get_or_404(client_id)
         name = (payload.get("name") or "").strip()
         code = _normalize_code(payload.get("code") or "")
+        crm_number = (payload.get("crm_client_number") or "").strip() or None
         if not name:
             raise ValidationAppError("Portfolio name is required")
         if not code:
             raise ValidationAppError("Portfolio code / reference is required")
-        exists = (
-            self.db.query(PayflowPortfolioModel)
-            .filter(
-                PayflowPortfolioModel.client_id == client.id,
-                PayflowPortfolioModel.code == code,
-            )
-            .first()
-        )
-        if exists:
-            raise ConflictError("Portfolio code already exists for this client")
 
+        row = self._find_portfolio(client.id, crm_number=crm_number, code=code)
         status = (payload.get("status") or PayflowPortfolioStatus.ONBOARDING.value).strip().lower()
         if status not in {s.value for s in PayflowPortfolioStatus}:
             raise ValidationAppError("Invalid portfolio status")
 
-        row = PayflowPortfolioModel(
-            client_id=client.id,
-            name=name,
-            code=code,
-            status=status,
-            description=(payload.get("description") or "").strip() or None,
-        )
-        self.db.add(row)
+        if row is None:
+            clash = (
+                self.db.query(PayflowPortfolioModel)
+                .filter(
+                    PayflowPortfolioModel.client_id == client.id,
+                    PayflowPortfolioModel.code == code,
+                )
+                .first()
+            )
+            if clash:
+                raise ConflictError("Portfolio code already exists for this client")
+            row = PayflowPortfolioModel(
+                client_id=client.id,
+                name=name,
+                code=code,
+                status=status,
+                description=(payload.get("description") or "").strip() or None,
+                crm_client_number=crm_number,
+            )
+            self.db.add(row)
+            action = "created"
+        else:
+            if code.lower() != (row.code or "").lower():
+                clash = (
+                    self.db.query(PayflowPortfolioModel)
+                    .filter(
+                        PayflowPortfolioModel.client_id == client.id,
+                        PayflowPortfolioModel.code == code,
+                        PayflowPortfolioModel.id != row.id,
+                    )
+                    .first()
+                )
+                if clash:
+                    raise ConflictError("Portfolio code already exists for this client")
+                row.code = code
+            row.name = name
+            if "status" in payload and payload["status"] is not None:
+                row.status = status
+            if "description" in payload:
+                row.description = (
+                    str(payload["description"]).strip() if payload.get("description") else None
+                )
+            if crm_number is not None:
+                row.crm_client_number = crm_number
+            action = "updated"
+
         client.updated_at = _utcnow()
-        self.db.commit()
-        self.db.refresh(row)
-        return self._portfolio_item(row)
+        if commit:
+            self.db.commit()
+            self.db.refresh(row)
+        else:
+            self.db.flush()
+        return row, action
 
     def update_portfolio(self, client_id: int, portfolio_id: int, payload: dict[str, Any]) -> dict:
         client = self._get_or_404(client_id)
@@ -547,14 +700,235 @@ class PayflowClientService:
             row.description = (
                 str(payload["description"]).strip() if payload["description"] else None
             )
+        if "crm_client_number" in payload:
+            row.crm_client_number = (
+                str(payload["crm_client_number"]).strip() if payload.get("crm_client_number") else None
+            )
 
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(row)
         return self._portfolio_item(row)
 
+    def _purge_account(self, account: PayflowAccountModel) -> list[dict[str, str]]:
+        related: list[dict[str, str]] = []
+        comms = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(PayflowCommunicationModel.account_id == account.id)
+            .all()
+        )
+        for comm in comms:
+            related.append(
+                {"entity_type": "communication", "id": str(comm.id), "label": comm.code}
+            )
+            self.db.delete(comm)
+        reviews = (
+            self.db.query(PayflowHumanReviewModel)
+            .filter(PayflowHumanReviewModel.account_id == account.id)
+            .all()
+        )
+        for review in reviews:
+            related.append({"entity_type": "review", "id": str(review.id), "label": review.code})
+            self.db.delete(review)
+        related.append(
+            {
+                "entity_type": "account",
+                "id": str(account.id),
+                "label": f"{account.customer_name} ({account.account_reference})",
+            }
+        )
+        self.db.delete(account)
+        return related
+
+    def delete_portfolio(
+        self,
+        client_id: int,
+        portfolio_id: int,
+        *,
+        actor: UserModel,
+        source: str | None = None,
+    ) -> dict:
+        self._get_or_404(client_id)
+        row = (
+            self.db.query(PayflowPortfolioModel)
+            .filter(
+                PayflowPortfolioModel.id == portfolio_id,
+                PayflowPortfolioModel.client_id == client_id,
+            )
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Portfolio not found")
+        snapshot = snapshot_model(row)
+        related: list[dict[str, str]] = []
+        accounts = (
+            self.db.query(PayflowAccountModel)
+            .filter(PayflowAccountModel.portfolio_id == portfolio_id)
+            .all()
+        )
+        for account in accounts:
+            related.extend(self._purge_account(account))
+        strategies = (
+            self.db.query(PayflowStrategyModel)
+            .filter(PayflowStrategyModel.portfolio_id == portfolio_id)
+            .all()
+        )
+        for strategy in strategies:
+            related.append(
+                {"entity_type": "workflow", "id": str(strategy.id), "label": strategy.name}
+            )
+            self.db.delete(strategy)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="portfolio",
+            entity_id=row.id,
+            entity_label=f"{row.name} ({row.code})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.delete(row)
+        self.db.commit()
+        return {"message": "Portfolio deleted"}
+
+    def delete_client(
+        self, client_id: int, *, actor: UserModel, source: str | None = None
+    ) -> dict:
+        client = self._get_or_404(client_id)
+        snapshot = snapshot_model(client)
+        related: list[dict[str, str]] = []
+
+        notifications = (
+            self.db.query(PayflowNotificationModel)
+            .filter(PayflowNotificationModel.client_id == client_id)
+            .all()
+        )
+        for note in notifications:
+            related.append({"entity_type": "notification", "id": str(note.id), "label": note.title})
+            self.db.delete(note)
+
+        assignments = (
+            self.db.query(PayflowUserClientAssignmentModel)
+            .filter(PayflowUserClientAssignmentModel.client_id == client_id)
+            .all()
+        )
+        for assignment in assignments:
+            perms = (
+                self.db.query(PayflowUserClientPermissionModel)
+                .filter(PayflowUserClientPermissionModel.assignment_id == assignment.id)
+                .all()
+            )
+            for perm in perms:
+                self.db.delete(perm)
+            related.append(
+                {
+                    "entity_type": "supervisor_assignment",
+                    "id": str(assignment.id),
+                    "label": str(assignment.membership_id),
+                }
+            )
+            self.db.delete(assignment)
+
+        comms = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(PayflowCommunicationModel.client_id == client_id)
+            .all()
+        )
+        for comm in comms:
+            related.append(
+                {"entity_type": "communication", "id": str(comm.id), "label": comm.code}
+            )
+            self.db.delete(comm)
+
+        reviews = (
+            self.db.query(PayflowHumanReviewModel)
+            .filter(PayflowHumanReviewModel.client_id == client_id)
+            .all()
+        )
+        for review in reviews:
+            related.append({"entity_type": "review", "id": str(review.id), "label": review.code})
+            self.db.delete(review)
+
+        accounts = (
+            self.db.query(PayflowAccountModel)
+            .filter(PayflowAccountModel.client_id == client_id)
+            .all()
+        )
+        for account in accounts:
+            related.append(
+                {
+                    "entity_type": "account",
+                    "id": str(account.id),
+                    "label": f"{account.customer_name} ({account.account_reference})",
+                }
+            )
+            self.db.delete(account)
+
+        strategies = (
+            self.db.query(PayflowStrategyModel)
+            .filter(PayflowStrategyModel.client_id == client_id)
+            .all()
+        )
+        for strategy in strategies:
+            related.append(
+                {"entity_type": "workflow", "id": str(strategy.id), "label": strategy.name}
+            )
+            self.db.delete(strategy)
+
+        portfolios = (
+            self.db.query(PayflowPortfolioModel)
+            .filter(PayflowPortfolioModel.client_id == client_id)
+            .all()
+        )
+        for portfolio in portfolios:
+            related.append(
+                {"entity_type": "portfolio", "id": str(portfolio.id), "label": portfolio.name}
+            )
+            self.db.delete(portfolio)
+
+        mappings = (
+            self.db.query(PayflowClientFieldMappingModel)
+            .filter(PayflowClientFieldMappingModel.client_id == client_id)
+            .all()
+        )
+        for mapping in mappings:
+            related.append(
+                {
+                    "entity_type": "field_mapping",
+                    "id": str(mapping.id),
+                    "label": mapping.source_field,
+                }
+            )
+            self.db.delete(mapping)
+
+        rules = (
+            self.db.query(PayflowRuleModel)
+            .filter(PayflowRuleModel.client_id == client_id)
+            .all()
+        )
+        for rule in rules:
+            related.append({"entity_type": "rule", "id": str(rule.id), "label": rule.name})
+            self.db.delete(rule)
+
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="client",
+            entity_id=client.id,
+            entity_label=f"{client.name} ({client.code})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.delete(client)
+        self.db.commit()
+        return {"message": "Client deleted"}
+
     # ------------------------------------------------------------------
-    # Bulk upload
+    # Bulk upload (CRM clients hierarchy + simple template)
     # ------------------------------------------------------------------
 
     def bulk_template_bytes(self) -> bytes:
@@ -564,53 +938,464 @@ class PayflowClientService:
         ws.append(BULK_UPLOAD_HEADERS)
         ws.append(
             [
-                "Example Client",
-                "EX-CLT-001",
+                "2026-0001-001",
+                "EX-MASTER",
+                "Example Master Client",
+                "EXMASTER",
+                "True",
+                "",
+                "Consumer",
+                "ops@example.com",
+                "15155550100",
+                "Jane Contact",
+                "jane@example.com",
+                "15155550100",
+                "100 Main St",
+                "Montreal",
+                "Quebec",
+                "Canada",
+                "H3B1A1",
+                "Financial Institutions",
                 "Third Party",
-                "Collections",
-                "Payments",
-                "Supervised AI",
+                "English",
+                "Canadian Dollars",
+                "Enable",
+            ]
+        )
+        ws.append(
+            [
+                "2026-0001-002",
+                "EX-SUB-01",
+                "Example Master Client",
+                "EX Sub Book",
+                "False",
+                "2026-0001-001",
+                "Loans",
+                "ops@example.com",
+                "15155550100",
+                "",
+                "",
+                "",
+                "100 Main St",
+                "Montreal",
+                "Quebec",
+                "Canada",
+                "H3B1A1",
+                "Financial Institutions",
+                "Third Party",
+                "English",
+                "Canadian Dollars",
+                "Enable",
             ]
         )
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
 
-    def bulk_upload(self, file_bytes: bytes) -> dict:
+    def bulk_validate(self, file_bytes: bytes, filename: str) -> dict:
+        safe_name = (filename or "upload.xlsx").split("/")[-1]
+        try:
+            headers, data_rows = self._load_client_rows(file_bytes, filename)
+        except ValidationAppError as exc:
+            return self._bulk_preview_fail(safe_name, "File structure", exc.message)
+
+        return self._process_client_hierarchy(
+            headers, data_rows, filename=safe_name, dry_run=True, user=None
+        )
+
+    def bulk_upload(self, file_bytes: bytes, *, user: UserModel | None = None, filename: str = "upload.xlsx") -> dict:
+        safe_name = (filename or "upload.xlsx").split("/")[-1]
+        headers, data_rows = self._load_client_rows(file_bytes, filename)
+        result = self._process_client_hierarchy(
+            headers, data_rows, filename=safe_name, dry_run=False, user=user, file_bytes=file_bytes
+        )
+        # Back-compat shape for older FE callers
+        result["created_count"] = result.get("summary", {}).get("created", 0)
+        result["error_count"] = result.get("summary", {}).get("failed", 0)
+        result["created"] = [
+            {
+                "row": p.get("record_id"),
+                "id": p.get("entity_id"),
+                "code": p.get("sub_client") if p.get("is_sub") else p.get("client_code"),
+                "name": p.get("sub_client_name") if p.get("is_sub") else p.get("client_name"),
+            }
+            for p in result.get("preview", [])
+            if p.get("action") in ("Create", "Update") and p.get("entity_id")
+        ]
+        result["errors"] = [
+            {
+                "row": e.get("record_id"),
+                "code": e.get("sub_client") if e.get("sub_client") not in (None, "—") else e.get("client"),
+                "message": e.get("error"),
+            }
+            for e in result.get("errors", [])
+        ]
+        return result
+
+    def _load_client_rows(
+        self, file_bytes: bytes, filename: str
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        lower = (filename or "").lower()
+        if lower.endswith(".csv"):
+            try:
+                text = file_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = file_bytes.decode("latin-1")
+            reader = csv.DictReader(io.StringIO(text))
+            if not reader.fieldnames:
+                raise ValidationAppError("CSV file is empty or missing headers")
+            headers = [str(h or "").strip().lower() for h in reader.fieldnames]
+            rows: list[dict[str, str]] = []
+            for raw in reader:
+                row = {
+                    str(k or "").strip().lower(): ("" if v is None else str(v).strip())
+                    for k, v in raw.items()
+                }
+                if any(row.values()):
+                    rows.append(row)
+            return headers, rows
+
         try:
             wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
         except Exception as exc:
-            raise ValidationAppError("Invalid Excel file") from exc
-
+            raise ValidationAppError("Invalid Excel or CSV file") from exc
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        raw_rows = list(ws.iter_rows(values_only=True))
+        if not raw_rows:
             raise ValidationAppError("Excel file is empty")
+        headers = [str(h or "").strip().lower() for h in raw_rows[0]]
+        rows = []
+        for raw in raw_rows[1:]:
+            if not raw or all(c is None or str(c).strip() == "" for c in raw):
+                continue
+            row = {}
+            for i, h in enumerate(headers):
+                if not h:
+                    continue
+                val = raw[i] if i < len(raw) else None
+                row[h] = "" if val is None else str(val).strip()
+            if any(row.values()):
+                rows.append(row)
+        return headers, rows
 
-        headers = [str(h or "").strip().lower() for h in rows[0]]
-        missing = [h for h in ("client_name", "client_code") if h not in headers]
-        if missing:
-            raise ValidationAppError(
-                f"Missing required column(s): {', '.join(missing)}"
+    def _is_hierarchy_format(self, headers: list[str]) -> bool:
+        return "is_master_client" in headers or (
+            "client_number" in headers and "client_code" in headers
+        )
+
+    def _process_client_hierarchy(
+        self,
+        headers: list[str],
+        data_rows: list[dict[str, str]],
+        *,
+        filename: str,
+        dry_run: bool,
+        user: UserModel | None,
+        file_bytes: bytes | None = None,
+    ) -> dict:
+        if self._is_hierarchy_format(headers):
+            missing = [h for h in CLIENT_IMPORT_MASTER_REQUIRED if h not in headers]
+            if missing:
+                return self._bulk_preview_fail(
+                    filename,
+                    "File structure",
+                    f"Missing required column(s): {', '.join(missing)}",
+                )
+            return self._process_crm_hierarchy(
+                data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
             )
 
-        idx = {h: i for i, h in enumerate(headers)}
-        created: list[dict] = []
+        # Legacy simple template: client_name + client_code
+        if "client_name" not in headers or "client_code" not in headers:
+            return self._bulk_preview_fail(
+                filename,
+                "File structure",
+                "Expected CRM hierarchy columns (is_master_client, client_number, "
+                "client_code) or legacy client_name/client_code columns.",
+            )
+        return self._process_simple_clients(
+            data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
+        )
+
+    def _process_crm_hierarchy(
+        self,
+        data_rows: list[dict[str, str]],
+        *,
+        filename: str,
+        dry_run: bool,
+        user: UserModel | None,
+        file_bytes: bytes | None,
+    ) -> dict:
+        preview: list[dict] = []
         errors: list[dict] = []
+        created = updated = failed = 0
+        preview_limit = 80
+        masters_in_file: dict[str, dict[str, str]] = {}
         seen_codes: set[str] = set()
+        seen_numbers: set[str] = set()
 
-        for row_num, row in enumerate(rows[1:], start=2):
-            if not row or all(c is None or str(c).strip() == "" for c in row):
+        # Pass 1 — masters
+        for row_num, row in enumerate(data_rows, start=2):
+            if not _truthy(row.get("is_master_client")):
                 continue
+            record_id = row.get("client_number") or f"Row {row_num}"
+            code = _normalize_code(row.get("client_code") or "")
+            number = (row.get("client_number") or "").strip()
+            name = (row.get("company_name") or row.get("short_name") or "").strip()
+            try:
+                if not number:
+                    raise ValidationAppError("client_number is required for master clients")
+                if not code:
+                    raise ValidationAppError("client_code is required")
+                if not name:
+                    raise ValidationAppError("company_name or short_name is required")
+                if number.lower() in seen_numbers:
+                    raise ConflictError(f"Duplicate client_number in file: {number}")
+                if code.lower() in seen_codes:
+                    raise ConflictError(f"Duplicate client_code in file: {code}")
+                seen_numbers.add(number.lower())
+                seen_codes.add(code.lower())
+                masters_in_file[number.lower()] = row
 
-            def cell(key: str) -> str:
-                i = idx.get(key)
-                if i is None or i >= len(row) or row[i] is None:
-                    return ""
-                return str(row[i]).strip()
+                payload = self._crm_row_to_client_payload(row, data_source="crm")
+                existing = self._find_client(crm_number=number, code=code)
+                action = "Update" if existing else "Create"
+                entity_id = existing.id if existing else None
+                if not dry_run:
+                    client, act = self.upsert_client(
+                        payload, commit=False, soft_client_type=True
+                    )
+                    # CRM export ingest counts as an established file-based CRM link
+                    client.connection_status = PayflowConnectionStatus.CONNECTED.value
+                    entity_id = client.id
+                    action = "Create" if act == "created" else "Update"
+                if action == "Create":
+                    created += 1
+                else:
+                    updated += 1
+                if len(preview) < preview_limit:
+                    preview.append(
+                        {
+                            "id": f"master-{row_num}",
+                            "record_id": record_id,
+                            "client": name,
+                            "client_name": name,
+                            "client_code": code,
+                            "sub_client": "—",
+                            "sub_client_name": "—",
+                            "action": action,
+                            "note": number,
+                            "is_sub": False,
+                            "entity_id": entity_id,
+                        }
+                    )
+            except (ValidationAppError, ConflictError) as exc:
+                failed += 1
+                errors.append(
+                    {
+                        "record_id": record_id,
+                        "client": name or "—",
+                        "sub_client": "—",
+                        "field": "client_number",
+                        "error": exc.message,
+                        "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
+                    }
+                )
 
-            name = cell("client_name")
-            code = _normalize_code(cell("client_code"))
+        # Resolve masters already in DB for children whose parent is not in this file
+        db_masters_by_number = {
+            (c.crm_client_number or "").strip().lower(): c
+            for c in self.db.query(PayflowClientModel).all()
+            if (c.crm_client_number or "").strip()
+        }
+
+        # Pass 2 — sub-clients
+        for row_num, row in enumerate(data_rows, start=2):
+            if _truthy(row.get("is_master_client")):
+                continue
+            record_id = row.get("client_number") or f"Row {row_num}"
+            code = _normalize_code(row.get("client_code") or "")
+            number = (row.get("client_number") or "").strip()
+            master_number = (row.get("master_client__client_number") or "").strip()
+            name = (
+                row.get("short_name")
+                or row.get("product")
+                or row.get("company_name")
+                or ""
+            ).strip()
+            try:
+                if not master_number:
+                    raise ValidationAppError(
+                        "master_client__client_number is required for sub-clients"
+                    )
+                if not code:
+                    raise ValidationAppError("client_code is required")
+                if not name:
+                    raise ValidationAppError("short_name, product, or company_name is required")
+                if number and number.lower() in seen_numbers:
+                    raise ConflictError(f"Duplicate client_number in file: {number}")
+                if code.lower() in seen_codes:
+                    raise ConflictError(f"Duplicate client_code in file: {code}")
+                if number:
+                    seen_numbers.add(number.lower())
+                seen_codes.add(code.lower())
+
+                parent = self._find_client(crm_number=master_number, code=None)
+                if parent is None:
+                    parent = db_masters_by_number.get(master_number.lower())
+                master_row = masters_in_file.get(master_number.lower())
+                if parent is None and master_row is None:
+                    raise ValidationAppError(
+                        f"Unknown master client_number: {master_number}"
+                    )
+
+                parent_name = (
+                    parent.name
+                    if parent
+                    else (
+                        master_row.get("company_name")
+                        or master_row.get("short_name")
+                        or master_number
+                    )
+                )
+                parent_code = (
+                    parent.code
+                    if parent
+                    else _normalize_code(master_row.get("client_code") or "")
+                )
+
+                existing = (
+                    self._find_portfolio(parent.id, crm_number=number or None, code=code)
+                    if parent
+                    else None
+                )
+                action = "Update" if existing else "Create"
+                entity_id = existing.id if existing else None
+                if not dry_run:
+                    if parent is None:
+                        # Master should have been upserted in pass 1
+                        parent = self._find_client(crm_number=master_number, code=None)
+                    if parent is None:
+                        raise ValidationAppError(
+                            f"Unknown master client_number: {master_number}"
+                        )
+                    port, act = self.upsert_portfolio(
+                        parent.id,
+                        {
+                            "name": name,
+                            "code": code,
+                            "crm_client_number": number or None,
+                            "description": (row.get("product") or "").strip() or None,
+                            "status": PayflowPortfolioStatus.ONBOARDING.value,
+                        },
+                        commit=False,
+                    )
+                    entity_id = port.id
+                    action = "Create" if act == "created" else "Update"
+                    db_masters_by_number[master_number.lower()] = parent
+                    parent_name = parent.name
+                    parent_code = parent.code
+
+                if action == "Create":
+                    created += 1
+                else:
+                    updated += 1
+                if len(preview) < preview_limit:
+                    preview.append(
+                        {
+                            "id": f"sub-{row_num}",
+                            "record_id": record_id,
+                            "client": parent_name,
+                            "client_name": parent_name,
+                            "client_code": parent_code or "—",
+                            "sub_client": code,
+                            "sub_client_name": name,
+                            "action": action,
+                            "note": number or code,
+                            "is_sub": True,
+                            "entity_id": entity_id,
+                        }
+                    )
+            except (ValidationAppError, ConflictError) as exc:
+                failed += 1
+                errors.append(
+                    {
+                        "record_id": record_id,
+                        "client": master_number or "—",
+                        "sub_client": code or name or "—",
+                        "field": "master_client__client_number"
+                        if not master_number
+                        else "client_code",
+                        "error": exc.message,
+                        "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
+                    }
+                )
+
+        if not dry_run:
+            run = self._persist_client_import_run(
+                user=user,
+                filename=filename,
+                file_bytes=file_bytes,
+                created=created,
+                updated=updated,
+                failed=failed,
+                errors=errors,
+            )
+            self.db.commit()
+            return {
+                "ok": True,
+                "file_name": filename,
+                "status": run.status if run else ("Completed with Errors" if failed else "Completed"),
+                "import_id": run.id if run else None,
+                "message": None,
+                "summary": {
+                    "total": created + updated + failed,
+                    "created": created,
+                    "updated": updated,
+                    "unchanged": 0,
+                    "failed": failed,
+                    "new_clients": created,
+                    "existing_clients": updated,
+                },
+                "preview": preview,
+                "errors": errors,
+            }
+
+        return {
+            "ok": True,
+            "file_name": filename,
+            "status": "Ready",
+            "message": None,
+            "summary": {
+                "total": created + updated + failed,
+                "created": created,
+                "updated": updated,
+                "unchanged": 0,
+                "failed": failed,
+                "new_clients": created,
+                "existing_clients": updated,
+            },
+            "preview": preview,
+            "errors": errors,
+        }
+
+    def _process_simple_clients(
+        self,
+        data_rows: list[dict[str, str]],
+        *,
+        filename: str,
+        dry_run: bool,
+        user: UserModel | None,
+        file_bytes: bytes | None,
+    ) -> dict:
+        preview: list[dict] = []
+        errors: list[dict] = []
+        created = updated = failed = 0
+        seen_codes: set[str] = set()
+        for row_num, row in enumerate(data_rows, start=2):
+            name = (row.get("client_name") or row.get("company_name") or "").strip()
+            code = _normalize_code(row.get("client_code") or "")
+            record_id = f"Row {row_num}"
             try:
                 if not name:
                     raise ValidationAppError("Client name is required")
@@ -619,35 +1404,240 @@ class PayflowClientService:
                 if code.lower() in seen_codes:
                     raise ConflictError(f"Duplicate client code in file: {code}")
                 seen_codes.add(code.lower())
-                self._assert_unique_code(code)
-
-                payload = {
-                    "name": name,
-                    "code": code,
-                    "client_type": cell("client_type") or "Third Party",
-                    "business_domain": cell("business_domain") or "Collections",
-                    "industry": cell("industry") or None,
-                    "ai_mode": cell("ai_mode") or "Supervised AI",
-                }
-                detail = self.create_client(payload)
-                created.append(
+                existing = self._find_client(crm_number=None, code=code)
+                action = "Update" if existing else "Create"
+                entity_id = existing.id if existing else None
+                if not dry_run:
+                    client, act = self.upsert_client(
+                        {
+                            "name": name,
+                            "code": code,
+                            "client_type": row.get("client_type") or "Third Party",
+                            "business_domain": row.get("business_domain") or "Collections",
+                            "industry": row.get("industry") or None,
+                            "ai_mode": row.get("ai_mode") or "Supervised AI",
+                            "data_source_type": "file",
+                        },
+                        commit=False,
+                        soft_client_type=True,
+                    )
+                    entity_id = client.id
+                    action = "Create" if act == "created" else "Update"
+                if action == "Create":
+                    created += 1
+                else:
+                    updated += 1
+                if len(preview) < 50:
+                    preview.append(
+                        {
+                            "id": f"row-{row_num}",
+                            "record_id": record_id,
+                            "client": name,
+                            "client_name": name,
+                            "client_code": code,
+                            "sub_client": "—",
+                            "sub_client_name": "—",
+                            "action": action,
+                            "note": code,
+                            "is_sub": False,
+                            "entity_id": entity_id,
+                        }
+                    )
+            except (ValidationAppError, ConflictError) as exc:
+                failed += 1
+                errors.append(
                     {
-                        "row": row_num,
-                        "id": detail["id"],
-                        "code": detail["code"],
-                        "name": detail["name"],
+                        "record_id": record_id,
+                        "client": name or "—",
+                        "sub_client": "—",
+                        "field": "client_code",
+                        "error": exc.message,
+                        "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
                     }
                 )
-            except (ValidationAppError, ConflictError) as exc:
-                errors.append({"row": row_num, "code": code or None, "message": exc.message})
-            except Exception as exc:  # noqa: BLE001
-                errors.append({"row": row_num, "code": code or None, "message": str(exc)})
+
+        if not dry_run:
+            run = self._persist_client_import_run(
+                user=user,
+                filename=filename,
+                file_bytes=file_bytes,
+                created=created,
+                updated=updated,
+                failed=failed,
+                errors=errors,
+            )
+            self.db.commit()
+            return {
+                "ok": True,
+                "file_name": filename,
+                "status": run.status if run else ("Completed with Errors" if failed else "Completed"),
+                "import_id": run.id if run else None,
+                "message": None,
+                "summary": {
+                    "total": created + updated + failed,
+                    "created": created,
+                    "updated": updated,
+                    "unchanged": 0,
+                    "failed": failed,
+                    "new_clients": created,
+                    "existing_clients": updated,
+                },
+                "preview": preview,
+                "errors": errors,
+            }
 
         return {
-            "created_count": len(created),
-            "error_count": len(errors),
-            "created": created,
+            "ok": True,
+            "file_name": filename,
+            "status": "Ready",
+            "message": None,
+            "summary": {
+                "total": created + updated + failed,
+                "created": created,
+                "updated": updated,
+                "unchanged": 0,
+                "failed": failed,
+                "new_clients": created,
+                "existing_clients": updated,
+            },
+            "preview": preview,
             "errors": errors,
+        }
+
+    def _crm_row_to_client_payload(self, row: dict[str, str], *, data_source: str) -> dict[str, Any]:
+        email = (
+            row.get("email_address")
+            or row.get("clientdemographiccontactinformation__email_address")
+            or ""
+        ).strip()
+        phone = (
+            row.get("phone_number")
+            or row.get("cell_number")
+            or row.get("clientdemographiccontactinformation__phone_number")
+            or ""
+        ).strip()
+        contact_name = (
+            row.get("clientdemographiccontactinformation__full_name") or ""
+        ).strip()
+        contact_title = (
+            row.get("clientdemographiccontactinformation__contact_title") or ""
+        ).strip()
+        number = (row.get("client_number") or "").strip()
+        return {
+            "name": (row.get("company_name") or row.get("short_name") or "").strip(),
+            "code": _normalize_code(row.get("client_code") or ""),
+            "short_name": (row.get("short_name") or "").strip() or None,
+            "brand_name": (row.get("short_name") or "").strip() or None,
+            "industry": (row.get("client_industry__name") or "").strip() or None,
+            "client_type": row.get("client_type__name") or "Third Party",
+            "business_domain": "Collections",
+            "ai_mode": "Supervised AI",
+            "data_source_type": data_source,
+            "crm_client_number": number or None,
+            "integration_ref": number or None,
+            "crm_system_name": "CRM",
+            "contact_name": contact_name or None,
+            "contact_title": contact_title or None,
+            "contact_email": email or None,
+            "contact_phone": phone or None,
+            "address_line1": (row.get("address_line_1") or "").strip() or None,
+            "address_line2": (row.get("address_line_2") or "").strip() or None,
+            "city": (row.get("city__name") or "").strip() or None,
+            "province_state": (row.get("province__name") or "").strip() or None,
+            "country": (row.get("country__name") or "").strip() or None,
+            "postal_code": (row.get("zip_code") or "").strip() or None,
+            "correspondence_language": (
+                row.get("correspondence_language__name") or ""
+            ).strip()
+            or None,
+            "currency_code": (row.get("currency__name") or "").strip() or None,
+            "crm_status": (row.get("client_status__name") or "").strip() or None,
+        }
+
+    def _persist_client_import_run(
+        self,
+        *,
+        user: UserModel | None,
+        filename: str,
+        file_bytes: bytes | None,
+        created: int,
+        updated: int,
+        failed: int,
+        errors: list[dict],
+    ) -> PayflowImportRunModel | None:
+        stored_path = None
+        if file_bytes:
+            _CLIENT_UPLOADS.mkdir(parents=True, exist_ok=True)
+            safe = Path(filename).name
+            dest = _CLIENT_UPLOADS / f"{int(_utcnow().timestamp())}-{safe}"
+            dest.write_bytes(file_bytes)
+            try:
+                stored_path = str(dest.relative_to(_BE_ROOT)).replace("\\", "/")
+            except ValueError:
+                stored_path = str(dest)
+
+        if created or updated:
+            status = "Completed with Errors" if failed else "Completed"
+        else:
+            status = "Failed"
+
+        run = PayflowImportRunModel(
+            kind="client",
+            file_name=filename,
+            stored_path=stored_path,
+            uploaded_by_user_id=user.id if user else None,
+            uploaded_by_name=(user.full_name if user else None) or (user.email if user else "System"),
+            status=status,
+            total_count=created + updated + failed,
+            created_count=created,
+            updated_count=updated,
+            unchanged_count=0,
+            failed_count=failed,
+            completed_at=_utcnow(),
+        )
+        self.db.add(run)
+        self.db.flush()
+        for err in errors:
+            self.db.add(
+                PayflowImportErrorModel(
+                    run_id=run.id,
+                    record_id=str(err.get("record_id") or "—"),
+                    client=str(err.get("client") or "—"),
+                    sub_client=str(err.get("sub_client") or "—"),
+                    field=str(err.get("field") or "—"),
+                    message=str(err.get("error") or "Error"),
+                    status=str(err.get("status") or "Rejected"),
+                )
+            )
+        return run
+
+    @staticmethod
+    def _bulk_preview_fail(file_name: str, field: str, message: str) -> dict:
+        return {
+            "ok": False,
+            "file_name": file_name,
+            "status": "Failed",
+            "message": message,
+            "summary": {
+                "total": 0,
+                "created": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "new_clients": 0,
+                "existing_clients": 0,
+            },
+            "preview": [],
+            "errors": [
+                {
+                    "record_id": "File",
+                    "client": "—",
+                    "sub_client": "—",
+                    "field": field,
+                    "error": message,
+                    "status": "Rejected",
+                }
+            ],
         }
 
     # ------------------------------------------------------------------
@@ -684,6 +1674,103 @@ class PayflowClientService:
             q = q.filter(PayflowClientModel.id != exclude_id)
         if q.first():
             raise ConflictError("Client code / reference already exists")
+
+    def _assert_unique_crm_number(self, crm_number: str, exclude_id: int | None = None) -> None:
+        q = self.db.query(PayflowClientModel).filter(
+            PayflowClientModel.crm_client_number == crm_number
+        )
+        if exclude_id is not None:
+            q = q.filter(PayflowClientModel.id != exclude_id)
+        if q.first():
+            raise ConflictError("CRM client number already linked to another client")
+
+    def _find_client(
+        self, *, crm_number: str | None, code: str | None
+    ) -> PayflowClientModel | None:
+        if crm_number:
+            row = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.crm_client_number == crm_number)
+                .first()
+            )
+            if row:
+                return row
+        if code:
+            return (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.code == code)
+                .first()
+            )
+        return None
+
+    def _find_portfolio(
+        self,
+        client_id: int,
+        *,
+        crm_number: str | None,
+        code: str | None,
+    ) -> PayflowPortfolioModel | None:
+        if crm_number:
+            row = (
+                self.db.query(PayflowPortfolioModel)
+                .filter(
+                    PayflowPortfolioModel.client_id == client_id,
+                    PayflowPortfolioModel.crm_client_number == crm_number,
+                )
+                .first()
+            )
+            if row:
+                return row
+        if code:
+            return (
+                self.db.query(PayflowPortfolioModel)
+                .filter(
+                    PayflowPortfolioModel.client_id == client_id,
+                    PayflowPortfolioModel.code == code,
+                )
+                .first()
+            )
+        return None
+
+    @staticmethod
+    def _normalize_data_source(value: Any, *, allow_none: bool = False) -> str | None:
+        if value is None or value == "":
+            if allow_none:
+                return None
+            raise ValidationAppError("Data source is required")
+        ds = str(value).strip().lower()
+        if ds in ("crm", PayflowDataSourceType.CRM.value):
+            return PayflowDataSourceType.CRM.value
+        if ds in ("file", "daily_file", "file_only", PayflowDataSourceType.FILE.value):
+            return PayflowDataSourceType.FILE.value
+        raise ValidationAppError("Data source must be CRM or File")
+
+    def _set_data_source(self, client: PayflowClientModel, ds: str | None) -> None:
+        prev = client.data_source_type
+        client.data_source_type = ds
+        if ds is None:
+            client.connection_status = PayflowConnectionStatus.NOT_CONNECTED.value
+        elif ds == PayflowDataSourceType.FILE.value:
+            client.connection_status = PayflowConnectionStatus.CONNECTED.value
+        elif ds == PayflowDataSourceType.CRM.value and prev != PayflowDataSourceType.CRM.value:
+            client.connection_status = PayflowConnectionStatus.NOT_CONNECTED.value
+
+    def _apply_primary_fields(
+        self, client: PayflowClientModel, payload: dict[str, Any], *, create: bool
+    ) -> None:
+        for field in _PRIMARY_CONTACT_FIELDS:
+            if field not in payload:
+                continue
+            val = payload.get(field)
+            if val is None and not create:
+                continue
+            setattr(client, field, (str(val).strip() if val is not None else None) or None)
+        if payload.get("integration_ref") is not None:
+            client.integration_ref = str(payload["integration_ref"]).strip() or None
+        elif create and payload.get("crm_client_number"):
+            client.integration_ref = str(payload["crm_client_number"]).strip()
+        if payload.get("crm_system_name") is not None:
+            client.crm_system_name = str(payload["crm_system_name"]).strip() or None
 
     def _seed_default_mappings(self, client: PayflowClientModel) -> None:
         for i, field in enumerate(CRM_INBOUND_FIELDS):
@@ -957,16 +2044,16 @@ class PayflowClientService:
         }
 
     def _onboarding_progress(self, client: PayflowClientModel) -> dict:
-        summary = self._mapping_summary(client)
         supervisors = self._supervisors(client)
         portfolio_count = len(client.portfolios or [])
 
         profile_ok = bool(client.name and client.code and client.client_type and client.business_domain)
-        source_ok = (
-            client.data_source_type == PayflowDataSourceType.CRM.value
-            and client.connection_status == PayflowConnectionStatus.CONNECTED.value
+        # Clients use daily file intake; CRM field mapping is global (System Mapping).
+        is_file = client.data_source_type == PayflowDataSourceType.FILE.value
+        is_crm = client.data_source_type == PayflowDataSourceType.CRM.value
+        source_ok = is_file or (
+            is_crm and client.connection_status == PayflowConnectionStatus.CONNECTED.value
         )
-        mapping_ok = len(summary["required_missing"]) == 0 and summary["attention"] == 0
         branding_ok = bool(
             (client.channel_email or client.channel_sms)
             and (client.brand_name or client.client_type == PayflowClientType.THIRD_PARTY.value)
@@ -1005,11 +2092,6 @@ class PayflowClientService:
                 "key": "data_source",
                 "label": "Data Source",
                 "status": step(source_ok, client.data_source_type is not None),
-            },
-            {
-                "key": "data_mapping",
-                "label": "Data Mapping",
-                "status": step(mapping_ok, summary["total"] > 0),
             },
             {
                 "key": "branding",
@@ -1061,17 +2143,12 @@ class PayflowClientService:
             blockers.append("Client name is required")
         if not (client.code or "").strip():
             blockers.append("Client code is required")
-        if client.data_source_type != PayflowDataSourceType.CRM.value:
+        # Phase-1 client intake is daily file; CRM→PayFlow mapping is system-wide.
+        if client.data_source_type not in (
+            PayflowDataSourceType.FILE.value,
+            PayflowDataSourceType.CRM.value,
+        ):
             blockers.append("A primary data source has not been selected")
-        elif client.connection_status != PayflowConnectionStatus.CONNECTED.value:
-            blockers.append("CRM connection is not established")
-        summary = self._mapping_summary(client)
-        if summary["required_missing"]:
-            blockers.append(
-                f"{len(summary['required_missing'])} required field mapping(s) are incomplete"
-            )
-        if summary["attention"] > 0:
-            blockers.append(f"{summary['attention']} field mapping(s) need attention")
         if not client.channel_email and not client.channel_sms:
             blockers.append("At least one communication channel must be enabled")
         if not self._supervisors(client):
@@ -1147,6 +2224,20 @@ class PayflowClientService:
             **self._list_item(client),
             "crm_system_name": client.crm_system_name,
             "integration_ref": client.integration_ref,
+            "crm_client_number": client.crm_client_number,
+            "contact_name": client.contact_name,
+            "contact_title": client.contact_title,
+            "contact_email": client.contact_email,
+            "contact_phone": client.contact_phone,
+            "address_line1": client.address_line1,
+            "address_line2": client.address_line2,
+            "city": client.city,
+            "province_state": client.province_state,
+            "country": client.country,
+            "postal_code": client.postal_code,
+            "correspondence_language": client.correspondence_language,
+            "currency_code": client.currency_code,
+            "crm_status": client.crm_status,
             "environment": client.environment,
             "sync_frequency": client.sync_frequency,
             "brand_name": client.brand_name or "",
@@ -1213,6 +2304,7 @@ class PayflowClientService:
                 PayflowPortfolioStatus.PAUSED.value: "Paused",
             }.get(p.status, p.status),
             "description": p.description,
+            "crm_client_number": p.crm_client_number,
             "account_count": account_count,
             "case_count": case_count,
             "outstanding": outstanding,

@@ -25,6 +25,12 @@ from app.modules.payflow.membership import (
     ensure_payflow_membership_for_role,
     ensure_user_product_assignment,
 )
+from app.shared.deletion import (
+    list_deletion_logs,
+    purge_user_identity,
+    record_deletion,
+    snapshot_model,
+)
 from app.shared.enums import (
     EntitlementStatus,
     PayflowRoleCode,
@@ -433,6 +439,33 @@ class PayflowUserService:
         detail["activation_link"] = link
         return detail
 
+    def delete_user(self, user_id: UUID, *, actor: UserModel, source: str | None = None) -> dict:
+        membership = (
+            self._membership_query()
+            .filter(PayflowUserMembershipModel.user_id == user_id)
+            .first()
+        )
+        if not membership:
+            raise NotFoundError("PayFlow user not found")
+        user = membership.user
+        snapshot = snapshot_model(user)
+        snapshot["payflow_role"] = membership.role.code if membership.role else None
+        snapshot["payflow_role_name"] = membership.role.name if membership.role else None
+        related = purge_user_identity(self.db, user, actor=actor)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="payflow_user",
+            entity_id=user_id,
+            entity_label=f"{snapshot.get('full_name')} ({snapshot.get('email')})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.commit()
+        return {"message": "User deleted"}
+
     def list_roles(self) -> dict:
         roles = self.db.query(PayflowRoleModel).order_by(PayflowRoleModel.id).all()
         membership_counts = dict(
@@ -475,6 +508,7 @@ class PayflowUserService:
             "governance": "GOVERNANCE",
             "analytics": "ANALYTICS",
             "client_configuration": "CLIENT CONFIGURATION",
+            "administration": "ADMINISTRATION",
         }
         rows = (
             self.db.query(PayflowPermissionModel)
@@ -635,7 +669,7 @@ class PayflowUserService:
         self.db.commit()
         return self.list_roles()
 
-    def delete_role(self, role_id: int) -> dict:
+    def delete_role(self, role_id: int, *, actor: UserModel, source: str | None = None) -> dict:
         role = self.db.query(PayflowRoleModel).filter(PayflowRoleModel.id == role_id).first()
         if not role:
             raise NotFoundError("Role not found")
@@ -648,13 +682,43 @@ class PayflowUserService:
         )
         if users > 0:
             raise ValidationAppError("Cannot delete a role that is assigned to users")
+        snapshot = snapshot_model(role)
         links = (
             self.db.query(PayflowRolePermissionModel)
             .filter(PayflowRolePermissionModel.payflow_role_id == role_id)
             .all()
         )
+        related = [
+            {"entity_type": "role_permission", "id": str(link.id), "label": str(link.permission_id)}
+            for link in links
+        ]
         for link in links:
             self.db.delete(link)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="role",
+            entity_id=role.id,
+            entity_label=role.name,
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
         self.db.delete(role)
         self.db.commit()
         return {"message": "Role deleted"}
+
+    def list_deletion_logs(
+        self,
+        search: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: int = 200,
+    ) -> list:
+        return list_deletion_logs(
+            self.db,
+            module="payflow",
+            search=search,
+            entity_type=entity_type,
+            limit=limit,
+        )

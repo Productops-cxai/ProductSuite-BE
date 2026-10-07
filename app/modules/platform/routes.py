@@ -1,4 +1,5 @@
 from typing import List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
@@ -20,6 +21,8 @@ from app.modules.platform.schemas import (
     ProductAccessItem,
     ProductResponse,
     ProductSave,
+    DeletionLogResponse,
+    MessageResponse,
 )
 from app.modules.platform.service import PlatformService
 from app.modules.platform.services.entitlement_service import get_effective_products
@@ -73,6 +76,19 @@ def save_product(payload: ProductSave, _: SuperAdmin, db: DbSession):
 def get_product(product_id: int, _: SuperAdmin, db: DbSession):
     try:
         return PlatformService(db).get_product(product_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/products/{product_id}/delete", response_model=MessageResponse)
+def delete_product(
+    product_id: int,
+    admin: SuperAdmin,
+    db: DbSession,
+    source: Optional[str] = Query(default=None),
+):
+    try:
+        return PlatformService(db).delete_product(product_id, actor=admin, source=source)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -161,6 +177,19 @@ def resend_invite(payload: PersonIdRequest, _: SuperAdmin, db: DbSession):
         raise _map_error(exc) from exc
 
 
+@router.post("/people/{user_id}/delete", response_model=MessageResponse)
+def delete_person(
+    user_id: UUID,
+    admin: SuperAdmin,
+    db: DbSession,
+    source: Optional[str] = Query(default=None),
+):
+    try:
+        return PlatformService(db).delete_person(user_id, actor=admin, source=source)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.get("/email-logs", response_model=List[EmailLogResponse])
 def list_email_logs(
     admin: SuperAdmin,
@@ -174,6 +203,17 @@ def list_email_logs(
         return PlatformService(db).list_email_logs(admin.email, search, email_type, limit)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+@router.get("/deletion-logs", response_model=List[DeletionLogResponse])
+def list_deletion_logs(
+    _: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    entity_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    return PlatformService(db).list_deletion_logs(search, entity_type, limit)
 
 
 @router.get("/me/products", response_model=List[ProductResponse])

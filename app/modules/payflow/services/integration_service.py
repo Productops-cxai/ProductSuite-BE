@@ -67,6 +67,8 @@ def _status_from_connection(connection: str | None) -> str:
 def _data_source_label(client: PayflowClientModel) -> str | None:
     if client.data_source_type == PayflowDataSourceType.CRM.value:
         return (client.crm_system_name or "CRM").strip() or "CRM"
+    if client.data_source_type == PayflowDataSourceType.FILE.value:
+        return "Daily File"
     if client.data_source_type:
         return client.data_source_type.upper()
     return None
@@ -80,6 +82,8 @@ class PayflowIntegrationService:
         self.access = AccessContextService(db)
 
     def _visible_clients(self, user: UserModel) -> list[PayflowClientModel]:
+        if not self.access.can(user, "manage_integrations"):
+            raise ForbiddenError("Manage Integrations permission required")
         q = self.db.query(PayflowClientModel).options(
             joinedload(PayflowClientModel.field_mappings)
         )

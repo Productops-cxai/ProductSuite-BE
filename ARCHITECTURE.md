@@ -38,7 +38,8 @@ Shared pieces:
 | DTOs | **Pydantic v2** |
 | Auth | **python-jose** (JWT HS256) + **passlib/bcrypt** |
 | Uploads | **python-multipart** + static `/uploads` |
-| Excel | **openpyxl** (client bulk upload) |
+| Excel / CSV | **openpyxl** (+ CSV for client import) |
+| HTTP client | **httpx** (geo provider proxy) |
 | Email | Optional SMTP; always logged in `email_logs` |
 | Tests | **pytest** |
 
@@ -55,11 +56,12 @@ ProductSuite-BE/
 ├── ARCHITECTURE.md          ← this file
 ├── API_FLOW.md
 ├── .cursor/rules/api-post-updates.mdc
-├── uploads/                 # avatars, client logos (runtime)
+├── docs/samples/            # daily account sample + start/changelog notes
+├── uploads/                 # avatars, client logos, client-imports (runtime)
 ├── app/
 │   ├── main.py              # FastAPI app entry
 │   ├── core/                # config, deps, security, exceptions
-│   ├── shared/              # shared enums
+│   ├── shared/              # shared enums + soft-delete helpers
 │   ├── infrastructure/
 │   │   ├── database/        # session, models, schema sync, seeder
 │   │   └── email/           # send_email + email_logs
@@ -233,18 +235,20 @@ user_product_assignments
 | `schemas.py` | Large Pydantic surface for every PayFlow domain |
 | `deps.py` | `RequirePayflowProduct`, `PayflowOpsAdmin`, `PayflowAccessContext` |
 | `membership.py` | Ensure ops-admin membership when PAYFLOW assigned; role helpers |
-| `crm_catalog.py` | Static CRM inbound field catalog for client mapping |
-| `service.py` | `PayflowUserService`: PayFlow users + custom roles/permissions |
+| `crm_catalog.py` | Global CRM inbound/outbound catalog (**System Mapping**); includes payload ids such as `loan_identifier` |
+| `service.py` | `PayflowUserService`: PayFlow users + custom roles/permissions + deletion logs |
 
 ### Services (`services/`)
 
 | File | What it does |
 |------|----------------|
 | `access_context_service.py` | Membership, permission codes, client visibility, PayFlow menus |
-| `client_service.py` | Clients, portfolios, logos, field mappings, bulk Excel, activation blockers, supervisors |
+| `client_service.py` | Clients (master/sub hierarchy), portfolios, logos, mapping catalog sync, client CSV/XLSX import, activation blockers, supervisors; file-first `data_source_type` |
 | `account_service.py` | Collection accounts list/detail (scoped by access) |
+| `import_service.py` | Daily account Excel validate/upload, import runs, sample template generation |
+| `geo_service.py` | Country list (bundled) + states/cities via countriesnow.space proxy |
 | `dashboard_service.py` | KPI / funnel / attention / activity dashboard |
-| `integration_service.py` | Integrations **derived** from client CRM/channel config; list/get/test |
+| `integration_service.py` | Legacy client-derived integration cards; global catalog is preferred for System Mapping |
 | `review_service.py` | Human review queue + approve/modify/reject/hold |
 | `rule_service.py` | Governance rules catalog + CRUD activate/deactivate |
 | `strategy_service.py` | Workflows/strategies create/update/draft/approve/reject |
@@ -370,9 +374,13 @@ User: GET /me/products
   → /payflow/* (RequirePayflowProduct + membership/permissions)
 ```
 
-### Integrations note
+### System Mapping & imports note
 
-`PayflowIntegrationService` does **not** use a separate integrations table. It builds integration cards from each visible client’s CRM data-source + channel flags. `crm_catalog.py` defines inbound CRM→PayFlow field definitions for mapping/onboarding. There is no live third-party CRM connector package in-repo yet.
+- **System Mapping** (FE `/payflow/system-mapping`) reads `GET /payflow/clients/mapping-catalog` → `CRM_INBOUND_FIELDS` / `CRM_OUTBOUND_FIELDS` in `crm_catalog.py`. This is the **global** CRM→PayFlow catalog; per-client Data Mapping UI was removed for file-first onboarding.
+- **Client hierarchy:** master vs sub-client via `is_master_client` + `master_client__client_number`; shared upsert for UI create and client import.
+- **Account imports:** `import_service.py` + `/payflow/imports/*` (template, validate, upload, run history). Sample workbook under `docs/samples/`.
+- **Geo:** `/payflow/geo/countries|states|cities` — countries bundled; provinces/cities proxied to countriesnow (avoids browser CORS). No Google geo dependency.
+- `PayflowIntegrationService` still builds optional client-derived connector cards; there is no live third-party CRM connector package in-repo yet.
 
 ---
 
@@ -412,3 +420,7 @@ User: GET /me/products
 5. **POST-for-updates** is intentional under `/payflow`.
 6. **Demo-heavy seeder** — seeds clients, accounts, rules, reviews, strategies, communications, notifications for UI development.
 7. **Entitlement gate** — org granted + user assigned + product active, then PayFlow membership for in-product RBAC.
+8. **File-first clients** — daily file / import is the primary onboarding path; System Mapping is global, not per-client.
+9. **Geo via BE proxy** — public geo APIs are never called from the browser.
+
+Operational start + recent changelog: `docs/samples/README.md`.

@@ -7,10 +7,11 @@ UUID only where needed: users + auth tokens.
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -281,6 +282,20 @@ class PayflowClientModel(Base):
     connection_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     crm_system_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     integration_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    crm_client_number: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    contact_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    address_line1: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    address_line2: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    province_state: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    correspondence_language: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    crm_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     environment: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sync_frequency: Mapped[str | None] = mapped_column(String(64), nullable=True)
     brand_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -353,6 +368,7 @@ class PayflowPortfolioModel(Base):
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="onboarding", nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    crm_client_number: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -394,6 +410,54 @@ class PayflowAccountModel(Base):
     next_action: Mapped[str | None] = mapped_column(String(255), nullable=True)
     human_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     timeline: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    customer_first_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    customer_last_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
+    age_group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    employment_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    income_band: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    education_level: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    customer_segment: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    address_line1: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    province_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone_mobile: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    phone_work: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    fee_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    days_past_due: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_payment_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_payment_is_ptp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ptp_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ptp_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ptp_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    account_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    account_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    negative_balance_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    crm_case_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    debtor_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    client_reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    product_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    date_listed: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_email_sent_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_sms_sent_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_contact_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    provincial_hold: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    hold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    email_consent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    source_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_crm_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -413,6 +477,55 @@ class PayflowAccountModel(Base):
         back_populates="account",
         cascade="all, delete-orphan",
     )
+
+
+class PayflowImportRunModel(Base):
+    """Traceable CRM file ingest (daily account file in v1)."""
+
+    __tablename__ = "payflow_import_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    uploaded_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unchanged_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    uploader = relationship("UserModel")
+    errors = relationship(
+        "PayflowImportErrorModel",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowImportErrorModel(Base):
+    __tablename__ = "payflow_import_errors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_import_runs.id"), nullable=False, index=True
+    )
+    record_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    client: Mapped[str] = mapped_column(String(128), nullable=False, default="—")
+    sub_client: Mapped[str] = mapped_column(String(128), nullable=False, default="—")
+    field: Mapped[str] = mapped_column(String(64), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Rejected")
+
+    run = relationship("PayflowImportRunModel", back_populates="errors")
 
 
 class PayflowStrategyModel(Base):
@@ -807,6 +920,31 @@ class PayflowNotificationModel(Base):
 
     user = relationship("UserModel")
     client = relationship("PayflowClientModel")
+
+
+class DeletionLogModel(Base):
+    """Permanent audit of admin deletes — snapshot + related cascade + actor."""
+
+    __tablename__ = "deletion_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    module: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_label: Mapped[str] = mapped_column(String(512), nullable=False)
+    activity: Mapped[str] = mapped_column(String(64), default="delete", nullable=False)
+    source: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
+    actor_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    actor_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    actor_role: Mapped[str] = mapped_column(String(128), nullable=False)
+    record_snapshot: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    related_deleted: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
 
 
 # ---------------------------------------------------------------------------

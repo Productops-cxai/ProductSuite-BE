@@ -94,6 +94,20 @@ class CreatePayflowClientRequest(BaseModel):
     business_domain: Optional[str] = "Collections"
     industry: Optional[str] = None
     ai_mode: Optional[str] = "Supervised AI"
+    data_source_type: Optional[str] = None
+    crm_client_number: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address_line1: Optional[str] = None
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    correspondence_language: Optional[str] = None
+    currency_code: Optional[str] = None
 
 
 class MappingUpdateItem(BaseModel):
@@ -115,6 +129,20 @@ class UpdatePayflowClientRequest(BaseModel):
     connection_status: Optional[str] = None
     crm_system_name: Optional[str] = None
     integration_ref: Optional[str] = None
+    crm_client_number: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address_line1: Optional[str] = None
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    correspondence_language: Optional[str] = None
+    currency_code: Optional[str] = None
+    crm_status: Optional[str] = None
     environment: Optional[str] = None
     sync_frequency: Optional[str] = None
     brand_name: Optional[str] = None
@@ -132,6 +160,7 @@ class CreatePortfolioRequest(BaseModel):
     code: str = Field(max_length=64, description="Portfolio code / reference")
     status: Optional[str] = "onboarding"
     description: Optional[str] = None
+    crm_client_number: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -155,6 +184,7 @@ class UpdatePortfolioRequest(BaseModel):
     code: Optional[str] = Field(default=None, max_length=64)
     status: Optional[str] = None
     description: Optional[str] = None
+    crm_client_number: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -289,6 +319,51 @@ class PayflowAccountItem(BaseModel):
     next_action: Optional[str] = None
     human_review: bool = False
     timeline: List[AccountTimelineEvent] = Field(default_factory=list)
+    portfolio_code: Optional[str] = None
+    customer_first_name: Optional[str] = None
+    customer_last_name: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    age_group: Optional[str] = None
+    employment_status: Optional[str] = None
+    income_band: Optional[str] = None
+    education_level: Optional[str] = None
+    customer_segment: Optional[str] = None
+    address_line1: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    postal_code: Optional[str] = None
+    country_code: Optional[str] = None
+    region: Optional[str] = None
+    email: Optional[str] = None
+    phone_mobile: Optional[str] = None
+    phone_work: Optional[str] = None
+    language: Optional[str] = None
+    currency_code: Optional[str] = None
+    fee_amount: Optional[float] = None
+    due_date: Optional[str] = None
+    days_past_due: Optional[int] = None
+    last_payment_amount: Optional[float] = None
+    last_payment_date: Optional[str] = None
+    last_payment_is_ptp: Optional[bool] = None
+    ptp_code: Optional[str] = None
+    ptp_amount: Optional[float] = None
+    ptp_due_date: Optional[str] = None
+    account_status: Optional[str] = None
+    account_category: Optional[str] = None
+    negative_balance_reason: Optional[str] = None
+    crm_case_id: Optional[str] = None
+    debtor_id: Optional[str] = None
+    client_reference_number: Optional[str] = None
+    product_code: Optional[str] = None
+    date_listed: Optional[str] = None
+    last_email_sent_date: Optional[str] = None
+    last_sms_sent_date: Optional[str] = None
+    last_contact_date: Optional[str] = None
+    provincial_hold: Optional[bool] = None
+    hold_days: Optional[int] = None
+    email_consent: Optional[bool] = None
+    source_updated_at: Optional[str] = None
+    last_crm_refresh_at: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -804,3 +879,68 @@ class PayflowDashboardResponse(BaseModel):
     outcomes: List[DashboardOutcomeItem] = Field(default_factory=list)
     clients_attention: List[DashboardClientAttentionItem] = Field(default_factory=list)
     activity: List[DashboardActivityItem] = Field(default_factory=list)
+
+
+class PayflowImportErrorItem(BaseModel):
+    record_id: str
+    client: str
+    sub_client: str
+    field: str
+    error: str
+    status: str
+
+
+class PayflowImportCounts(BaseModel):
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    failed: int = 0
+
+
+class PayflowImportRunItem(BaseModel):
+    id: int
+    kind: str
+    file_name: str
+    date_time: str
+    uploaded_by: str
+    status: str
+    counts: PayflowImportCounts
+    errors: List[PayflowImportErrorItem] = Field(default_factory=list)
+
+
+class PayflowImportListResponse(BaseModel):
+    imports: List[PayflowImportRunItem]
+
+
+class PayflowImportPreviewRecord(BaseModel):
+    id: str
+    record_id: str
+    client: str
+    sub_client: str
+    client_name: str
+    sub_client_name: str
+    action: str
+    current_balance: Optional[float] = None
+    incoming_balance: Optional[float] = None
+    note: Optional[str] = None
+
+
+class PayflowImportPreviewSummary(BaseModel):
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    new_clients: int = 0
+    existing_clients: int = 0
+
+
+class PayflowImportPreviewResponse(BaseModel):
+    ok: bool
+    file_name: str
+    status: str
+    message: Optional[str] = None
+    summary: PayflowImportPreviewSummary
+    preview: List[PayflowImportPreviewRecord] = Field(default_factory=list)
+    errors: List[PayflowImportErrorItem] = Field(default_factory=list)

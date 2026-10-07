@@ -14,6 +14,7 @@ from app.infrastructure.database.models import (
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
+from app.shared.deletion import record_deletion, snapshot_model
 from app.shared.enums import PayflowStrategyOrigin, PayflowStrategyStatus
 
 STRATEGY_STEP_KINDS = [
@@ -333,6 +334,28 @@ class PayflowStrategyService:
         except Exception:
             pass
         return self._serialize(self._get_row(row.id))
+
+    def delete_strategy(
+        self, user: UserModel, strategy_id: int, *, source: str | None = None
+    ) -> dict[str, Any]:
+        if not self.access.is_operations_admin(user):
+            raise ForbiddenError("Operations Admin access required")
+        row = self._get_row(strategy_id)
+        snapshot = snapshot_model(row)
+        record_deletion(
+            self.db,
+            actor=user,
+            module="payflow",
+            entity_type="workflow",
+            entity_id=row.id,
+            entity_label=row.name,
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=[],
+        )
+        self.db.delete(row)
+        self.db.commit()
+        return {"message": "Workflow deleted"}
 
     def _get_row(self, strategy_id: int) -> PayflowStrategyModel:
         row = (

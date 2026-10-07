@@ -58,6 +58,7 @@ class PayflowAiMode(str, Enum):
 
 class PayflowDataSourceType(str, Enum):
     CRM = "crm"
+    FILE = "file"
 
 
 class PayflowConnectionStatus(str, Enum):

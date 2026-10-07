@@ -18,6 +18,17 @@ from app.modules.platform.services.entitlement_service import has_product_access
 from app.shared.enums import PayflowRoleCode, PayflowRoleScope
 
 
+def _perm_matches(held: set[str] | list[str], required: str | None) -> bool:
+    """True when required is empty, or any of the OR-separated codes is held."""
+    if not required:
+        return True
+    held_set = set(held)
+    parts = [p.strip() for p in required.split("|") if p.strip()]
+    if not parts:
+        return True
+    return any(p in held_set for p in parts)
+
+
 class AccessContextService:
     """Resolves Product entitlement → PayFlow role → scope → permissions."""
 
@@ -51,16 +62,17 @@ class AccessContextService:
     def build_context(self, user: UserModel) -> dict[str, Any]:
         membership = self.require_membership(user)
         role = membership.role
+        # Platform-wide roles (built-in Ops Admin + custom) see every client.
+        is_platform_wide = role.scope == PayflowRoleScope.PLATFORM_WIDE.value
         is_ops_admin = (
-            role.scope == PayflowRoleScope.PLATFORM_WIDE.value
-            or role.code == PayflowRoleCode.OPERATIONS_ADMIN.value
+            is_platform_wide or role.code == PayflowRoleCode.OPERATIONS_ADMIN.value
         )
 
         role_perm_codes = self._role_permission_codes(role.id)
         client_ids: list[int] = []
         permissions_by_client: dict[str, list[str]] = {}
 
-        if not is_ops_admin:
+        if not is_platform_wide:
             for assignment in membership.client_assignments:
                 client_ids.append(assignment.client_id)
                 perm_codes = [
@@ -68,6 +80,7 @@ class AccessContextService:
                     for link in assignment.permissions
                     if link.permission
                 ]
+                # Default: role permission set applies on every assigned client.
                 if not perm_codes:
                     perm_codes = list(role_perm_codes)
                 permissions_by_client[str(assignment.client_id)] = perm_codes
@@ -88,9 +101,10 @@ class AccessContextService:
             "is_operations_admin": is_ops_admin,
             "client_ids": client_ids,
             "permissions_by_client": permissions_by_client,
-            "all_permissions": role_perm_codes
-            if is_ops_admin
-            else sorted({p for perms in permissions_by_client.values() for p in perms}),
+            # Menus + page gates use the role's permission set (not "only when
+            # assigned to a client"). Client assignment only scopes which
+            # clients' data the user can see / act on.
+            "all_permissions": role_perm_codes,
         }
 
     def _role_permission_codes(self, role_id: int) -> list[str]:
@@ -117,16 +131,35 @@ class AccessContextService:
         return client_id in ctx["client_ids"]
 
     def can(self, user: UserModel, permission: str, client_id: int | None = None) -> bool:
+        """Permission check.
+
+        - No client_id: role holds the permission (menus / page gates).
+        - With client_id: user must be assigned to that client (or platform-wide)
+          and hold the permission for that client.
+        """
+        ctx = self.build_context(user)
+        role_held = set(ctx["all_permissions"])
+
+        # Ops / platform-wide admin always has every permission.
         if self.is_operations_admin(user):
             return True
+
         if client_id is None:
+            return permission in role_held
+
+        client_perms = ctx["permissions_by_client"].get(str(client_id))
+        if client_perms is None:
             return False
-        ctx = self.build_context(user)
-        return permission in ctx["permissions_by_client"].get(str(client_id), [])
+        return permission in client_perms
+
+    def can_any(
+        self, user: UserModel, permissions: list[str], client_id: int | None = None
+    ) -> bool:
+        return any(self.can(user, p, client_id) for p in permissions)
 
     def menus_for_user(self, user: UserModel) -> dict:
         ctx = self.build_context(user)
-        role_code = ctx["role"]["code"]
+        held = set(ctx["all_permissions"])
         is_admin = ctx["is_operations_admin"]
 
         sections = (
@@ -141,16 +174,11 @@ class AccessContextService:
             for item in sorted(section.items, key=lambda i: i.sort_order):
                 if not item.is_active:
                     continue
-                if item.required_role_code:
-                    if is_admin:
-                        # Ops Admin sees everything including admin-gated items
-                        pass
-                    elif item.required_role_code != role_code:
+                if item.required_role_code and not is_admin:
+                    if item.required_role_code != ctx["role"]["code"]:
                         continue
-                if (
-                    item.required_permission_code
-                    and not is_admin
-                    and item.required_permission_code not in ctx["all_permissions"]
+                if item.required_permission_code and not _perm_matches(
+                    held, item.required_permission_code
                 ):
                     continue
                 items.append(

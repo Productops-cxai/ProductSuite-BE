@@ -195,3 +195,24 @@ class EmailLogResponse(BaseModel):
 class InviteResendResponse(BaseModel):
     message: str = "Invitation sent"
     activation_link: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+class DeletionLogResponse(BaseModel):
+    id: int
+    module: str
+    entity_type: str
+    entity_id: str
+    entity_label: str
+    activity: str
+    source: Optional[str] = None
+    actor_user_id: Optional[str] = None
+    actor_name: str
+    actor_email: str
+    actor_role: str
+    record_snapshot: Optional[dict | list] = None
+    related_deleted: List[dict] = Field(default_factory=list)
+    created_at: datetime

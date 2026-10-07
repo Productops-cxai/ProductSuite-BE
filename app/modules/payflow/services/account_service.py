@@ -65,6 +65,63 @@ class PayflowAccountService:
             "next_action": row.next_action,
             "human_review": bool(row.human_review),
             "timeline": list(row.timeline or []),
+            "portfolio_code": portfolio.code if portfolio else None,
+            "customer_first_name": row.customer_first_name,
+            "customer_last_name": row.customer_last_name,
+            "date_of_birth": row.date_of_birth.isoformat() if row.date_of_birth else None,
+            "age_group": row.age_group,
+            "employment_status": row.employment_status,
+            "income_band": row.income_band,
+            "education_level": row.education_level,
+            "customer_segment": row.customer_segment,
+            "address_line1": row.address_line1,
+            "city": row.city,
+            "province_state": row.province_state,
+            "postal_code": row.postal_code,
+            "country_code": row.country_code,
+            "region": row.region,
+            "email": row.email,
+            "phone_mobile": row.phone_mobile,
+            "phone_work": row.phone_work,
+            "language": row.language,
+            "currency_code": row.currency_code,
+            "fee_amount": float(row.fee_amount) if row.fee_amount is not None else None,
+            "due_date": row.due_date.isoformat() if row.due_date else None,
+            "days_past_due": row.days_past_due,
+            "last_payment_amount": float(row.last_payment_amount)
+            if row.last_payment_amount is not None
+            else None,
+            "last_payment_date": row.last_payment_date.isoformat() if row.last_payment_date else None,
+            "last_payment_is_ptp": row.last_payment_is_ptp,
+            "ptp_code": row.ptp_code,
+            "ptp_amount": float(row.ptp_amount) if row.ptp_amount is not None else None,
+            "ptp_due_date": row.ptp_due_date.isoformat() if row.ptp_due_date else None,
+            "account_status": row.account_status,
+            "account_category": row.account_category,
+            "negative_balance_reason": row.negative_balance_reason,
+            "crm_case_id": row.crm_case_id,
+            "debtor_id": row.debtor_id,
+            "client_reference_number": row.client_reference_number,
+            "product_code": row.product_code,
+            "date_listed": row.date_listed.isoformat() if row.date_listed else None,
+            "last_email_sent_date": row.last_email_sent_date.isoformat()
+            if row.last_email_sent_date
+            else None,
+            "last_sms_sent_date": row.last_sms_sent_date.isoformat()
+            if row.last_sms_sent_date
+            else None,
+            "last_contact_date": row.last_contact_date.isoformat()
+            if row.last_contact_date
+            else None,
+            "provincial_hold": row.provincial_hold,
+            "hold_days": row.hold_days,
+            "email_consent": row.email_consent,
+            "source_updated_at": row.source_updated_at.isoformat()
+            if row.source_updated_at
+            else None,
+            "last_crm_refresh_at": row.last_crm_refresh_at.isoformat()
+            if row.last_crm_refresh_at
+            else None,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -113,6 +170,7 @@ class PayflowAccountService:
                 (PayflowAccountModel.customer_name.ilike(term))
                 | (PayflowAccountModel.account_reference.ilike(term))
                 | (PayflowAccountModel.case_reference.ilike(term))
+                | (PayflowAccountModel.email.ilike(term))
             )
 
         rows = q.order_by(PayflowAccountModel.customer_name.asc()).all()
@@ -125,13 +183,16 @@ class PayflowAccountService:
                 or self.access.can(user, "view_collection_cases", r.client_id)
             ]
 
-        client_ids_for_intake = sorted({r.client_id for r in rows})
+        from app.modules.payflow.services.import_service import PayflowImportService
+
+        intake = PayflowImportService(self.db).latest_account_intake()
         if client_id is not None:
-            client_ids_for_intake = [client_id]
+            scoped = [r for r in rows if r.client_id == client_id]
+            intake = {**intake, "accounts_in_files": len(scoped), "files": 1 if scoped else 0}
 
         return {
             "accounts": [self._serialize(r) for r in rows],
-            "intake": self._intake_summary(client_ids_for_intake, len(rows)),
+            "intake": intake,
             "workflows": COLLECTION_WORKFLOWS,
             "statuses": [s.value for s in PayflowCollectionStatus],
         }

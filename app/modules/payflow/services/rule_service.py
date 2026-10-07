@@ -14,6 +14,7 @@ from app.infrastructure.database.models import (
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
+from app.shared.deletion import record_deletion, snapshot_model
 from app.shared.enums import PayflowRuleLogic, PayflowRuleStatus, PayflowRuleType
 
 RULE_CATEGORIES = [
@@ -413,6 +414,35 @@ class PayflowRuleService:
         self.db.commit()
         self.db.refresh(row)
         return self._serialize(row, user)
+
+    def delete_rule(self, user: UserModel, rule_id: int, *, source: str | None = None) -> dict[str, Any]:
+        if not self.access.is_operations_admin(user):
+            raise ForbiddenError("Operations Admin access required")
+        row = self._get_row(rule_id)
+        snapshot = snapshot_model(row)
+        related: list[dict[str, str]] = []
+        reviews = (
+            self.db.query(PayflowHumanReviewModel)
+            .filter(PayflowHumanReviewModel.rule_id == row.id)
+            .all()
+        )
+        for review in reviews:
+            related.append({"entity_type": "review_unlink", "id": str(review.id), "label": review.code})
+            review.rule_id = None
+        record_deletion(
+            self.db,
+            actor=user,
+            module="payflow",
+            entity_type="rule",
+            entity_id=row.id,
+            entity_label=row.name,
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.delete(row)
+        self.db.commit()
+        return {"message": "Rule deleted"}
 
     def _get_row(self, rule_id: int) -> PayflowRuleModel:
         row = (
