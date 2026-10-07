@@ -19,7 +19,7 @@ from app.modules.identity.schemas import (
 )
 from app.modules.identity.service import IdentityService
 
-router = APIRouter(prefix="/auth", tags=["Login"])
+router = APIRouter(prefix="/auth", tags=["Auth"])
 
 
 def _map_error(exc: AppError):
@@ -27,12 +27,20 @@ def _map_error(exc: AppError):
 
     code_map = {
         "unauthorized": status.HTTP_401_UNAUTHORIZED,
+        "session_replaced": status.HTTP_401_UNAUTHORIZED,
+        "session_ended": status.HTTP_401_UNAUTHORIZED,
         "forbidden": status.HTTP_403_FORBIDDEN,
         "not_found": status.HTTP_404_NOT_FOUND,
         "conflict": status.HTTP_409_CONFLICT,
         "validation_error": status.HTTP_400_BAD_REQUEST,
     }
-    return HTTPException(status_code=code_map.get(exc.code, 400), detail=exc.message)
+    status_code = code_map.get(exc.code, 400)
+    if exc.code in {"session_replaced", "session_ended"}:
+        return HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    return HTTPException(status_code=status_code, detail=exc.message)
 
 
 @router.post("/login", response_model=LoginResponse)

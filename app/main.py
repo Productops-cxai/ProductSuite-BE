@@ -4,9 +4,11 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
+from app.core.openapi_tags import OPENAPI_TAGS, apply_openapi_tags
 from app.infrastructure.database.seeder import run_seeder
 from app.modules.identity.routes import router as identity_router
 from app.modules.payflow.routes import router as payflow_router
@@ -28,7 +30,9 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     description=(
-        "Platform Suite API — identity, product entitlement, and product entry gates.\n\n"
+        "Platform Suite API — identity, product entitlement, and product modules.\n\n"
+        "Swagger sections: **Auth**, **Platform · …**, **PayFlow · …** "
+        "(grouped by area; URL paths are unchanged).\n\n"
         "## Auth (Swagger)\n"
         "1. Call `POST /auth/login`\n"
         "2. Copy **access_token** only (not refresh_token, not the whole JSON)\n"
@@ -38,6 +42,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
+    openapi_tags=OPENAPI_TAGS,
 )
 
 app.add_middleware(
@@ -63,3 +68,21 @@ app.include_router(payflow_router)
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "ok", "app": settings.APP_NAME}
+
+
+def custom_openapi():
+    """Regroup operations into Auth / Platform / PayFlow sections without changing paths."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=OPENAPI_TAGS,
+    )
+    app.openapi_schema = apply_openapi_tags(schema)
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi

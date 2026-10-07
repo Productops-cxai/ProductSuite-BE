@@ -70,9 +70,9 @@ CRM_INBOUND_FIELDS: list[CrmFieldDef] = [
         "available": "Yes",
     },
     {
-        "source_field": "LOAN_IDENTIFIER",
+        "source_field": "id",
         "payflow_field": "loan_identifier",
-        "meaning": "Loan / credit account id from the inbound payload. Account data is keyed on this id.",
+        "meaning": "CRM case UUID (`id` on Debtor Summary / FetchDebtorCaseSummary). PayFlow stores it as loan_identifier.",
         "required": True,
         "sample_value": "bd52a426-8c1e-4f2a-9b3d-1a2b3c4d5e6f",
         "group": "Account and Loan",

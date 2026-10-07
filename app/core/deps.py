@@ -7,12 +7,20 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from app.core.security import safe_decode_token
-from app.infrastructure.database.models import TokenDenylistModel, UserModel
+from app.infrastructure.database.models import TokenDenylistModel, UserModel, UserSessionModel
 from app.infrastructure.database.session import get_db
+from app.modules.identity.session_messages import (
+    SESSION_ENDED_MESSAGE,
+    SESSION_REPLACED_MESSAGE,
+)
 from app.modules.platform.services.entitlement_service import has_product_access, load_user
 from app.shared.enums import PlatformRole, UserStatus
 
 bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _auth_detail(message: str, code: str = "unauthorized") -> dict:
+    return {"code": code, "message": message}
 
 
 def get_current_user(
@@ -47,10 +55,47 @@ def get_current_user(
         if denied:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
 
+    sid = payload.get("sid")
+    if not sid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(SESSION_ENDED_MESSAGE, "session_ended"),
+        )
+    try:
+        session_id = UUID(str(sid))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(SESSION_ENDED_MESSAGE, "session_ended"),
+        ) from exc
+
+    session = db.query(UserSessionModel).filter(UserSessionModel.id == session_id).first()
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(SESSION_ENDED_MESSAGE, "session_ended"),
+        )
+    if session.revoked_at is not None:
+        if session.revoke_reason == "replaced":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=_auth_detail(SESSION_REPLACED_MESSAGE, "session_replaced"),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(SESSION_ENDED_MESSAGE, "session_ended"),
+        )
+
     try:
         user_id = UUID(str(payload.get("sub")))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject") from exc
+
+    if session.user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(SESSION_ENDED_MESSAGE, "session_ended"),
+        )
 
     user = load_user(db, user_id)
     if not user or user.status != UserStatus.ACTIVE.value:

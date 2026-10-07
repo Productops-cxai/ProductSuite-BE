@@ -118,6 +118,9 @@ class UserModel(Base):
     refresh_tokens = relationship(
         "RefreshTokenModel", back_populates="user", cascade="all, delete-orphan"
     )
+    sessions = relationship(
+        "UserSessionModel", back_populates="user", cascade="all, delete-orphan"
+    )
     payflow_membership = relationship(
         "PayflowUserMembershipModel",
         back_populates="user",
@@ -847,12 +850,35 @@ class AuthTokenModel(Base):
     )
 
 
+class UserSessionModel(Base):
+    """Single active login session per user — new login revokes prior rows."""
+
+    __tablename__ = "user_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
+    refresh_jti: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoke_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    user = relationship("UserModel", back_populates="sessions")
+    refresh_tokens = relationship("RefreshTokenModel", back_populates="session")
+
+
 class RefreshTokenModel(Base):
     __tablename__ = "refresh_tokens"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("user_sessions.id"), nullable=True, index=True
     )
     jti: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -862,6 +888,7 @@ class RefreshTokenModel(Base):
     )
 
     user = relationship("UserModel", back_populates="refresh_tokens")
+    session = relationship("UserSessionModel", back_populates="refresh_tokens")
 
 
 class TokenDenylistModel(Base):

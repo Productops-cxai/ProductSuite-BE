@@ -28,7 +28,8 @@ from app.modules.platform.service import PlatformService
 from app.modules.platform.services.entitlement_service import get_effective_products
 from app.shared.enums import MenuContext
 
-router = APIRouter(tags=["Platform"])
+# Default tag is overridden in app.core.openapi_tags for Swagger sections.
+router = APIRouter(tags=["Platform · Overview"])
 
 
 def _map_error(exc: AppError) -> HTTPException:

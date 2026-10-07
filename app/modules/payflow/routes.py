@@ -80,7 +80,8 @@ from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
 
-router = APIRouter(prefix="/payflow", tags=["PayFlow"])
+# Default tag is overridden in app.core.openapi_tags for Swagger sections.
+router = APIRouter(prefix="/payflow", tags=["PayFlow · Access"])
 
 
 def _map_error(exc: AppError) -> HTTPException:

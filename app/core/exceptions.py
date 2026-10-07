@@ -16,8 +16,8 @@ class ConflictError(AppError):
 
 
 class UnauthorizedError(AppError):
-    def __init__(self, message: str = "Unauthorized"):
-        super().__init__(message, code="unauthorized")
+    def __init__(self, message: str = "Unauthorized", code: str = "unauthorized"):
+        super().__init__(message, code=code)
 
 
 class ForbiddenError(AppError):

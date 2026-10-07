@@ -32,9 +32,16 @@ def create_access_token(
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_refresh_token(subject: str, jti: str) -> str:
+def create_refresh_token(
+    subject: str,
+    jti: str,
+    *,
+    session_id: str | None = None,
+) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=settings.JWT_REFRESH_EXPIRE_DAYS)
-    payload = {"sub": subject, "exp": expire, "type": "refresh", "jti": jti}
+    payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "refresh", "jti": jti}
+    if session_id:
+        payload["sid"] = session_id
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 

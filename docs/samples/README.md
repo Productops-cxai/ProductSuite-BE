@@ -81,7 +81,7 @@ Documented here so FE + BE stay aligned. Deeper design notes: root `ARCHITECTURE
 
 - Menu label **System Mapping** (route still under integrations / `system-mapping`).
 - One global **CRM → PayFlow** inbound catalog from `app/modules/payflow/crm_catalog.py` (`CRM_INBOUND_FIELDS`).
-- `loan_identifier` is an **inbound payload id** (`LOAN_IDENTIFIER` → `loan_identifier`, required, available Yes) — not a “missing from placement” blocker. Same id is used on outbound REMIT.
+- `loan_identifier` maps inbound from CRM **`id`** (Debtor Summary case UUID) → `loan_identifier` (required, available Yes). Outbound REMIT still sends it as `LOAN_IDENTIFIER`.
 
 ### Imports
 

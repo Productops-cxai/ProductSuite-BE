@@ -19,6 +19,7 @@ from app.infrastructure.database.models import (
     RefreshTokenModel,
     UserModel,
     UserProductAssignmentModel,
+    UserSessionModel,
 )
 from app.shared.enums import PayflowRoleCode, PlatformRole
 
@@ -177,6 +178,10 @@ def purge_user_identity(
     for token in db.query(RefreshTokenModel).filter(RefreshTokenModel.user_id == user.id).all():
         related.append(related_item("refresh_token", token.id, "refresh"))
         db.delete(token)
+
+    for session in db.query(UserSessionModel).filter(UserSessionModel.user_id == user.id).all():
+        related.append(related_item("user_session", session.id, session.revoke_reason or "session"))
+        db.delete(session)
 
     for note in db.query(PayflowNotificationModel).filter(PayflowNotificationModel.user_id == user.id).all():
         related.append(related_item("notification", note.id, note.title))
