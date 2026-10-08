@@ -75,15 +75,9 @@ class AccessContextService:
         if not is_platform_wide:
             for assignment in membership.client_assignments:
                 client_ids.append(assignment.client_id)
-                perm_codes = [
-                    link.permission.code
-                    for link in assignment.permissions
-                    if link.permission
-                ]
-                # Default: role permission set applies on every assigned client.
-                if not perm_codes:
-                    perm_codes = list(role_perm_codes)
-                permissions_by_client[str(assignment.client_id)] = perm_codes
+                # Role is the source of truth (Users & Permissions → Edit access).
+                # Assignment only decides WHERE; do not freeze a per-client snapshot.
+                permissions_by_client[str(assignment.client_id)] = list(role_perm_codes)
 
         return {
             "product_code": "PAYFLOW",

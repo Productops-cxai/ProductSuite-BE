@@ -53,6 +53,7 @@ from app.shared.enums import (
     PayflowOnboardingStepStatus,
     PayflowPortfolioStatus,
     PayflowRoleCode,
+    PayflowRoleScope,
 )
 
 
@@ -415,6 +416,10 @@ class PayflowClientService:
                     raise ValidationAppError("Invalid connection status")
                 client.connection_status = label_map[cs]
 
+        branding_keys = ("brand_name", "sender_name", "email_from", "sms_sender_id", "channels")
+        if any(k in payload for k in branding_keys):
+            self._require_draft_for_branding(client)
+
         for field in (
             "crm_system_name",
             "integration_ref",
@@ -488,6 +493,11 @@ class PayflowClientService:
         import time
 
         client = self._get_or_404(client_id)
+        self._require_draft_for_branding(client)
+        if client.client_type == PayflowClientType.THIRD_PARTY.value:
+            raise ValidationAppError(
+                "Third Party clients use PayFlow operator branding; client logo upload is not used"
+            )
         allowed = {
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
@@ -536,6 +546,7 @@ class PayflowClientService:
         from pathlib import Path
 
         client = self._get_or_404(client_id)
+        self._require_draft_for_branding(client)
         project_root = Path(__file__).resolve().parents[4]
         upload_root = project_root / "uploads" / "client-logos"
         for old in upload_root.glob(f"{client.id}*"):
@@ -1906,18 +1917,13 @@ class PayflowClientService:
 
         newly_assigned: list = []
 
-        supervisor_role = (
-            self.db.query(PayflowRoleModel)
-            .filter(PayflowRoleModel.code == PayflowRoleCode.SUPERVISOR.value)
-            .first()
-        )
-        if not supervisor_role and wanted:
-            raise ValidationAppError("Supervisor role is not configured")
-
         # Current assignments for this client
         current = (
             self.db.query(PayflowUserClientAssignmentModel)
             .join(PayflowUserMembershipModel)
+            .options(joinedload(PayflowUserClientAssignmentModel.membership).joinedload(
+                PayflowUserMembershipModel.role
+            ))
             .filter(PayflowUserClientAssignmentModel.client_id == client.id)
             .all()
         )
@@ -1926,13 +1932,14 @@ class PayflowClientService:
             if a.membership and a.membership.user_id:
                 current_by_user[a.membership.user_id] = a
 
-        # Remove supervisors no longer wanted (only remove supervisor-role assignments)
+        # Remove client-scoped users no longer wanted (never touch platform-wide admins).
         for uid, assignment in list(current_by_user.items()):
-            role_code = assignment.membership.role.code if assignment.membership.role else None
-            if uid not in wanted and role_code == PayflowRoleCode.SUPERVISOR.value:
+            role = assignment.membership.role if assignment.membership else None
+            scope = role.scope if role else None
+            if uid not in wanted and scope == PayflowRoleScope.CLIENT_SCOPED.value:
                 self.db.delete(assignment)
 
-        # Add missing
+        # Add missing — any client-scoped role (Supervisor or custom).
         for uid in wanted:
             if uid in current_by_user:
                 continue
@@ -1944,32 +1951,20 @@ class PayflowClientService:
             )
             if not membership:
                 raise ValidationAppError(f"User {uid} has no PayFlow membership")
-            if membership.role.code != PayflowRoleCode.SUPERVISOR.value:
+            if not membership.role or membership.role.scope != PayflowRoleScope.CLIENT_SCOPED.value:
                 raise ValidationAppError(
-                    "Only users with the Supervisor role can be assigned as client supervisors"
+                    "Only client-scoped users can be assigned to a client"
                 )
             user = self.db.query(UserModel).filter(UserModel.id == uid).first()
             if not user or user.status == "disabled":
-                raise ValidationAppError("Supervisor user is not available")
+                raise ValidationAppError("User is not available for client assignment")
             assignment = PayflowUserClientAssignmentModel(
                 membership_id=membership.id,
                 client_id=client.id,
             )
             self.db.add(assignment)
             self.db.flush()
-            # Apply role default permissions (not editable from client UI).
-            role_perm_links = (
-                self.db.query(PayflowRolePermissionModel)
-                .filter(PayflowRolePermissionModel.payflow_role_id == membership.payflow_role_id)
-                .all()
-            )
-            for link in role_perm_links:
-                self.db.add(
-                    PayflowUserClientPermissionModel(
-                        assignment_id=assignment.id,
-                        permission_id=link.permission_id,
-                    )
-                )
+            # Permissions come live from the role — no per-assignment snapshot.
             newly_assigned.append(user)
         self.db.flush()
         return newly_assigned
@@ -1980,18 +1975,11 @@ class PayflowClientService:
             m = a.membership
             if not m or not m.user:
                 continue
-            role_code = m.role.code if m.role else None
-            if role_code and role_code != PayflowRoleCode.SUPERVISOR.value:
-                # Still show if assigned; prefer supervisors
-                if role_code == PayflowRoleCode.OPERATIONS_ADMIN.value:
-                    continue
-            # Read-only permission view: role standard labels from assignment or role.
+            if m.role and m.role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
+                continue
+            # Always show current role permissions (Edit access updates apply immediately).
             perm_names: list[str] = []
-            if a.permissions:
-                for link in a.permissions:
-                    if link.permission and link.permission.name:
-                        perm_names.append(link.permission.name)
-            elif m.role:
+            if m.role:
                 role_links = (
                     self.db.query(PayflowRolePermissionModel)
                     .options(joinedload(PayflowRolePermissionModel.permission))
@@ -2054,16 +2042,19 @@ class PayflowClientService:
         source_ok = is_file or (
             is_crm and client.connection_status == PayflowConnectionStatus.CONNECTED.value
         )
-        branding_ok = bool(
-            (client.channel_email or client.channel_sms)
-            and (client.brand_name or client.client_type == PayflowClientType.THIRD_PARTY.value)
-        )
-        # Third party can use PayFlow defaults; require at least one channel
-        if not (client.channel_email or client.channel_sms):
-            branding_ok = False
+        branding_ok = len(self._branding_issues(client)) == 0
         ai_ok = bool(client.ai_mode)
         supervisors_ok = len(supervisors) > 0
         activation_ok = client.status == PayflowClientStatus.ACTIVE.value
+        mapping = self._mapping_summary(client)
+        mapped = int(mapping.get("mapped") or 0)
+        unmapped = int(mapping.get("unmapped") or 0)
+        attention = int(mapping.get("attention") or 0)
+        total_fields = int(mapping.get("total") or 0)
+        # Empty catalog → treat as complete; otherwise all required must be clean.
+        mapping_ok = total_fields == 0 or (
+            unmapped == 0 and attention == 0 and mapped > 0
+        )
 
         def step(ok: bool, started: bool = True) -> str:
             if ok:
@@ -2094,6 +2085,11 @@ class PayflowClientService:
                 "status": step(source_ok, client.data_source_type is not None),
             },
             {
+                "key": "data_mapping",
+                "label": "Data Mapping",
+                "status": step(mapping_ok, total_fields > 0 or is_crm),
+            },
+            {
                 "key": "branding",
                 "label": "Branding & Channels",
                 "status": step(branding_ok, True),
@@ -2105,7 +2101,7 @@ class PayflowClientService:
             },
             {
                 "key": "supervisors",
-                "label": "Supervisors",
+                "label": "Supervisor Assignment",
                 "status": step(supervisors_ok, True),
             },
             {
@@ -2137,6 +2133,34 @@ class PayflowClientService:
             "eligible_for_activation": len(self._activation_blockers(client)) == 0,
         }
 
+    def _branding_issues(self, client: PayflowClientModel) -> list[str]:
+        """Required branding/channel fields by client type (AC5)."""
+        issues: list[str] = []
+        if not client.channel_email and not client.channel_sms:
+            issues.append("At least one communication channel must be enabled")
+        is_first = client.client_type == PayflowClientType.FIRST_PARTY.value
+        brand = (client.brand_name or "").strip()
+        if is_first:
+            if not brand:
+                issues.append("Display / brand name is required for First Party clients")
+            if not (client.sender_name or "").strip():
+                issues.append("Sender name is required for First Party clients")
+            if client.channel_email and not (client.email_from or "").strip():
+                issues.append("Email from address is required when Email is enabled")
+            if client.channel_sms and not (client.sms_sender_id or "").strip():
+                issues.append("SMS sender ID is required when SMS is enabled")
+        elif not brand and not (client.name or "").strip():
+            issues.append(
+                "Client display / reference name is required for Third Party clients"
+            )
+        return issues
+
+    def _require_draft_for_branding(self, client: PayflowClientModel) -> None:
+        if client.status != PayflowClientStatus.DRAFT.value:
+            raise ValidationAppError(
+                "Branding & channels can only be updated while the client is in Draft status"
+            )
+
     def _activation_blockers(self, client: PayflowClientModel) -> list[str]:
         blockers: list[str] = []
         if not (client.name or "").strip():
@@ -2149,8 +2173,7 @@ class PayflowClientService:
             PayflowDataSourceType.CRM.value,
         ):
             blockers.append("A primary data source has not been selected")
-        if not client.channel_email and not client.channel_sms:
-            blockers.append("At least one communication channel must be enabled")
+        blockers.extend(self._branding_issues(client))
         if not self._supervisors(client):
             blockers.append("Assign at least one supervisor")
         return blockers
@@ -2183,6 +2206,21 @@ class PayflowClientService:
                 }
             )
 
+        progress = self._onboarding_progress(client)
+        # Match Lovable / FE banner chips (exclude AI & activation / portfolios).
+        _setup_chip_keys = {
+            "profile",
+            "data_source",
+            "data_mapping",
+            "branding",
+            "supervisors",
+        }
+        incomplete = [
+            s["label"]
+            for s in progress["steps"]
+            if s.get("key") in _setup_chip_keys
+            and s.get("status") != PayflowOnboardingStepStatus.COMPLETE.value
+        ]
         return {
             "id": client.id,
             "code": client.code,
@@ -2205,6 +2243,9 @@ class PayflowClientService:
                 client.connection_status or "", client.connection_status
             ),
             "supervisors": supervisors,
+            "setup_incomplete": incomplete,
+            "setup_steps_remaining": len(incomplete),
+            "onboarding": progress,
             "created_at": client.created_at,
             "updated_at": client.updated_at or client.created_at,
         }

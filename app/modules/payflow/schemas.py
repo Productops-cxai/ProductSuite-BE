@@ -61,6 +61,21 @@ class CreatePayflowUserRequest(BaseModel):
     permission_codes: List[str] = Field(default_factory=list)
 
 
+class PayflowOnboardingStepItem(BaseModel):
+    key: str
+    label: str
+    status: str
+    informational: Optional[bool] = False
+
+
+class PayflowOnboardingProgressItem(BaseModel):
+    steps: List[PayflowOnboardingStepItem] = Field(default_factory=list)
+    completed_required: int = 0
+    total_required: int = 0
+    percent: int = 0
+    eligible_for_activation: bool = False
+
+
 class PayflowClientItem(BaseModel):
     id: int
     code: str
@@ -79,6 +94,9 @@ class PayflowClientItem(BaseModel):
     connection_status: Optional[str] = None
     connection_status_label: Optional[str] = None
     supervisors: List[dict] = Field(default_factory=list)
+    setup_incomplete: List[str] = Field(default_factory=list)
+    setup_steps_remaining: int = 0
+    onboarding: Optional[PayflowOnboardingProgressItem] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

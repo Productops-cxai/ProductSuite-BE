@@ -566,6 +566,7 @@ class DatabaseSeeder:
             .filter(PayflowRoleModel.code == PayflowRoleCode.SUPERVISOR.value)
             .first()
         )
+        supervisor_created = False
         if not supervisor:
             supervisor = PayflowRoleModel(
                 code=PayflowRoleCode.SUPERVISOR.value,
@@ -576,6 +577,7 @@ class DatabaseSeeder:
             )
             db.add(supervisor)
             db.flush()
+            supervisor_created = True
 
         def ensure_role_perms(role: PayflowRoleModel, codes: list[str]) -> None:
             existing = {
@@ -594,8 +596,11 @@ class DatabaseSeeder:
                     )
                 )
 
+        # Ops Admin always keeps the full catalog (additive).
         ensure_role_perms(admin, list(perms.keys()))
-        ensure_role_perms(supervisor, _SUPERVISOR_PERMISSION_CODES)
+        # Supervisor defaults only on first create — later Edit access must stick.
+        if supervisor_created:
+            ensure_role_perms(supervisor, _SUPERVISOR_PERMISSION_CODES)
         db.flush()
 
     def _seed_payflow_menus(self, db: Session) -> None:

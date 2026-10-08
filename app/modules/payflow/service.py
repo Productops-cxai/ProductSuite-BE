@@ -15,6 +15,7 @@ from app.infrastructure.database.models import (
     PayflowRoleModel,
     PayflowRolePermissionModel,
     PayflowUserClientAssignmentModel,
+    PayflowUserClientPermissionModel,
     PayflowUserMembershipModel,
     PlatformRoleModel,
     ProductModel,
@@ -619,11 +620,23 @@ class PayflowUserService:
         role = self.db.query(PayflowRoleModel).filter(PayflowRoleModel.id == role_id).first()
         if not role:
             raise NotFoundError("Role not found")
-        if role.is_built_in:
-            raise ValidationAppError("Built-in roles cannot be edited")
+
+        # Platform-wide (Ops Admin): view-only. Client-scoped built-ins (Supervisor)
+        # may have their permission set edited — same as Lovable.
+        if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
+            if permission_codes is not None:
+                raise ValidationAppError("Platform-wide roles always hold all permissions")
+            if name is not None and name.strip() and name.strip() != role.name:
+                raise ValidationAppError("Platform-wide role name cannot be changed")
+            if description is not None:
+                role.description = description.strip() or None
+            self.db.commit()
+            return self.list_roles()
 
         if name is not None:
             name_clean = name.strip()
+            if role.is_built_in and name_clean != role.name:
+                raise ValidationAppError("Built-in role name cannot be changed")
             dup = (
                 self.db.query(PayflowRoleModel)
                 .filter(
@@ -640,8 +653,6 @@ class PayflowUserService:
             role.description = description.strip() or None
 
         if permission_codes is not None:
-            if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
-                raise ValidationAppError("Platform-wide roles always hold all permissions")
             if not permission_codes:
                 raise ValidationAppError("Select at least one permission")
             all_perms = {
@@ -665,6 +676,28 @@ class PayflowUserService:
                 self.db.add(
                     PayflowRolePermissionModel(payflow_role_id=role.id, permission_id=pid)
                 )
+            # Drop legacy per-assignment permission snapshots so role edits apply everywhere.
+            membership_ids = [
+                m.id
+                for m in self.db.query(PayflowUserMembershipModel)
+                .filter(PayflowUserMembershipModel.payflow_role_id == role.id)
+                .all()
+            ]
+            if membership_ids:
+                assignment_ids = [
+                    a.id
+                    for a in self.db.query(PayflowUserClientAssignmentModel)
+                    .filter(PayflowUserClientAssignmentModel.membership_id.in_(membership_ids))
+                    .all()
+                ]
+                if assignment_ids:
+                    (
+                        self.db.query(PayflowUserClientPermissionModel)
+                        .filter(
+                            PayflowUserClientPermissionModel.assignment_id.in_(assignment_ids)
+                        )
+                        .delete(synchronize_session=False)
+                    )
 
         self.db.commit()
         return self.list_roles()
