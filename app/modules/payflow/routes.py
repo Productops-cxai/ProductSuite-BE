@@ -527,8 +527,8 @@ async def validate_account_import(
     db: DbSession,
     file: UploadFile = File(...),
 ):
-    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(status_code=400, detail="Upload an .xlsx Excel file")
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
     data = await file.read()
     return PayflowImportService(db).validate_account_file(data, file.filename or "upload.xlsx")
 
@@ -540,8 +540,8 @@ async def upload_account_import(
     file: UploadFile = File(...),
 ):
     name = (file.filename or "").lower()
-    if not name.endswith((".xlsx", ".xlsm")):
-        raise HTTPException(status_code=400, detail="Upload an .xlsx Excel file")
+    if not name.endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
     data = await file.read()
     try:
         return PayflowImportService(db).process_account_file(admin, data, file.filename or "upload.xlsx")

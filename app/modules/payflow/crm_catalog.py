@@ -759,7 +759,47 @@ ACCOUNT_IMPORT_REQUIRED: tuple[str, ...] = (
     "email",
 )
 
+# CRM Debtor Summary / UAT dump column → PayFlow account import header.
+# Applied when loading CSV/XLSX so native CRM exports can be uploaded directly.
+ACCOUNT_HEADER_ALIASES: dict[str, str] = {
+    "account_number": "account_id",
+    "first_name": "customer_first_name",
+    "last_name": "customer_last_name",
+    "email_address": "email",
+    "principle_amount": "original_balance",
+    "id": "crm_case_id",
+    "date_last_email_sent": "last_email_sent_date",
+    "date_of_last_sms_sent": "last_sms_sent_date",
+    "date_of_last_contact": "last_contact_date",
+    "dn_client_demographic_is_provincial_hold": "provincial_hold",
+    "dn_debtorcaseaddress_province_hold_days": "hold_days",
+    "dn_currency_name": "currency_code",
+    "dn_collection_status_name": "collection_status",
+    "dn_debtorcaseaddress_address_line_1": "address_line1",
+    "dn_debtorcaseaddress_city_name": "city",
+    "dn_debtorcaseaddress_province_name": "province_state",
+    "dn_debtorcaseaddress_postal_code": "postal_code",
+    "dn_debtorcaseaddress_country_name": "country_code",
+    "dn_debtorcasephonenumber_phone_number": "phone_mobile",
+    "dn_client_demographic_product": "product_code",
+    "account_product": "product_code",
+    "updated_at": "source_updated_at",
+    "case_id": "crm_case_id",
+}
+
+# When CRM provides client_number, these PayFlow columns may be resolved/defaulted per row.
+ACCOUNT_CRM_RESOLVABLE_REQUIRED: tuple[str, ...] = (
+    "client_code",
+    "sub_client_code",
+    "product_code",
+    "country_code",
+    "currency_code",
+)
+
 AGE_GROUPS: tuple[str, ...] = ("18-24", "25-34", "35-44", "45-54", "55-64", "65+")
 ACCOUNT_IMPORT_LANGUAGES: tuple[str, ...] = ("EN", "FR")
 ACCOUNT_IMPORT_CURRENCIES: tuple[str, ...] = ("CAD", "USD")
 ACCOUNT_CRM_STATUSES: tuple[str, ...] = ("OPEN", "CLOSED")
+ACCOUNT_CRM_DEFAULT_COUNTRY = "CA"
+ACCOUNT_CRM_DEFAULT_CURRENCY = "CAD"
+ACCOUNT_CRM_DEFAULT_PRODUCT = "P4"

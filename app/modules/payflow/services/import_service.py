@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import re
 from datetime import date, datetime, timezone
@@ -21,7 +22,12 @@ from app.infrastructure.database.models import (
     UserModel,
 )
 from app.modules.payflow.crm_catalog import (
+    ACCOUNT_CRM_DEFAULT_COUNTRY,
+    ACCOUNT_CRM_DEFAULT_CURRENCY,
+    ACCOUNT_CRM_DEFAULT_PRODUCT,
+    ACCOUNT_CRM_RESOLVABLE_REQUIRED,
     ACCOUNT_CRM_STATUSES,
+    ACCOUNT_HEADER_ALIASES,
     ACCOUNT_IMPORT_CURRENCIES,
     ACCOUNT_IMPORT_HEADERS,
     ACCOUNT_IMPORT_LANGUAGES,
@@ -50,7 +56,7 @@ def _now() -> datetime:
 
 
 def _stamp() -> str:
-    return _now().strftime("%%d %%b %%Y, %%H:%%M")
+    return _now().strftime("%d %b %Y, %H:%M")
 
 
 def _cell(row: tuple, idx: dict[str, int], key: str) -> str:
@@ -681,19 +687,19 @@ class PayflowImportService:
         """Dry-run validation — no DB writes."""
         safe_name = Path(filename or "upload.xlsx").name
         try:
-            idx, data_rows = self._load_account_sheet(file_bytes)
+            idx, data_rows = self._load_account_rows(file_bytes, safe_name)
         except ValidationAppError as exc:
             return self._preview_file_fail(safe_name, self._guess_field(str(exc.message)), str(exc.message))
         except Exception:
             return self._preview_file_fail(
                 safe_name,
                 "File structure",
-                "The file is not a valid Excel workbook.",
+                "The file is not a valid CSV or Excel workbook.",
             )
 
-        clients = {c.code.lower(): c for c in self.db.query(PayflowClientModel).all()}
-        portfolios = self.db.query(PayflowPortfolioModel).all()
-        portfolios_by_key = {(p.client_id, p.code.lower()): p for p in portfolios}
+        lookups = self._build_client_lookups()
+        clients = lookups["by_code"]
+        portfolios_by_key = lookups["port_by_key"]
 
         seen_keys: set[tuple[str, str]] = set()
         created = updated = unchanged = failed = 0
@@ -703,10 +709,13 @@ class PayflowImportService:
 
         for row in data_rows:
             record_id = _cell(row, idx, "account_id") or "Row"
-            client_code = _cell(row, idx, "client_code")
+            client_code = _cell(row, idx, "client_code") or _cell(row, idx, "client_number")
             sub_code = _cell(row, idx, "sub_client_code")
             try:
                 parsed = self._parse_row(row, idx)
+                self._resolve_client_hierarchy(parsed, lookups)
+                client_code = parsed["client_code"]
+                sub_code = parsed["sub_client_code"]
                 key = (parsed["client_code"].lower(), parsed["account_id"].lower())
                 if key in seen_keys:
                     raise ValidationAppError("Duplicate record — this account appears twice in the file.")
@@ -813,31 +822,34 @@ class PayflowImportService:
         self.db.flush()
 
         try:
-            idx, data_rows = self._load_account_sheet(file_bytes)
+            idx, data_rows = self._load_account_rows(file_bytes, safe_name)
         except ValidationAppError as exc:
             return self._fail_run(run, self._guess_field(str(exc.message)), str(exc.message))
         except Exception as exc:
-            return self._fail_run(run, "File structure", "The file is not a valid Excel workbook.", exc)
+            return self._fail_run(
+                run, "File structure", "The file is not a valid CSV or Excel workbook.", exc
+            )
 
         run.status = "Processing"
         run.total_count = len(data_rows)
         self.db.flush()
 
-        clients = {c.code.lower(): c for c in self.db.query(PayflowClientModel).all()}
-        portfolios = (
-            self.db.query(PayflowPortfolioModel).all()
-        )
-        portfolios_by_key = {(p.client_id, p.code.lower()): p for p in portfolios}
+        lookups = self._build_client_lookups()
+        clients = lookups["by_code"]
+        portfolios_by_key = lookups["port_by_key"]
 
         seen_keys: set[tuple[str, str]] = set()
         created = updated = unchanged = failed = 0
 
         for row in data_rows:
             record_id = _cell(row, idx, "account_id") or "Row"
-            client_code = _cell(row, idx, "client_code")
+            client_code = _cell(row, idx, "client_code") or _cell(row, idx, "client_number")
             sub_code = _cell(row, idx, "sub_client_code")
             try:
                 parsed = self._parse_row(row, idx)
+                self._resolve_client_hierarchy(parsed, lookups)
+                client_code = parsed["client_code"]
+                sub_code = parsed["sub_client_code"]
                 key = (parsed["client_code"].lower(), parsed["account_id"].lower())
                 if key in seen_keys:
                     raise ValidationAppError("Duplicate record — this account appears twice in the file.")
@@ -936,7 +948,138 @@ class PayflowImportService:
             "accounts_in_files": row.created_count + row.updated_count + row.unchanged_count,
         }
 
-    def _load_account_sheet(self, file_bytes: bytes) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
+    def _load_account_rows(
+        self, file_bytes: bytes, filename: str
+    ) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
+        lower = (filename or "").lower()
+        if lower.endswith(".csv"):
+            return self._load_account_csv(file_bytes)
+        return self._load_account_xlsx(file_bytes)
+
+    def _normalize_account_headers(self, headers: list[str]) -> list[str]:
+        """Map CRM dump headers onto PayFlow names; first occurrence wins."""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in headers:
+            key = (raw or "").strip().lower()
+            canon = ACCOUNT_HEADER_ALIASES.get(key, key)
+            if canon in seen:
+                # Keep a unique placeholder so column indices stay aligned.
+                placeholder = f"__dup_{len(normalized)}_{key}"
+                normalized.append(placeholder)
+                continue
+            seen.add(canon)
+            normalized.append(canon)
+        return normalized
+
+    def _finalize_account_headers(
+        self, headers: list[str], data_rows: list[tuple[Any, ...]]
+    ) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
+        headers = self._normalize_account_headers(headers)
+        required = list(ACCOUNT_IMPORT_REQUIRED)
+        # Debtor dump style: client_number resolves client/sub-client; other fields default.
+        if "client_number" in headers:
+            required = [h for h in required if h not in ACCOUNT_CRM_RESOLVABLE_REQUIRED]
+        missing = [h for h in required if h not in headers]
+        if missing:
+            raise ValidationAppError(f"Missing required column(s): {', '.join(missing)}")
+        idx = {h: i for i, h in enumerate(headers)}
+        if not data_rows:
+            raise ValidationAppError("No account rows were found.")
+        return idx, data_rows
+
+    def _build_client_lookups(self) -> dict[str, Any]:
+        clients = list(self.db.query(PayflowClientModel).all())
+        portfolios = list(self.db.query(PayflowPortfolioModel).all())
+        by_code = {c.code.lower(): c for c in clients if c.code}
+        by_crm = {
+            (c.crm_client_number or "").strip().lower(): c
+            for c in clients
+            if (c.crm_client_number or "").strip()
+        }
+        port_by_key = {(p.client_id, p.code.lower()): p for p in portfolios if p.code}
+        port_by_crm = {
+            (p.crm_client_number or "").strip().lower(): p
+            for p in portfolios
+            if (p.crm_client_number or "").strip()
+        }
+        ports_by_client: dict[int, list[PayflowPortfolioModel]] = {}
+        for p in portfolios:
+            ports_by_client.setdefault(p.client_id, []).append(p)
+        return {
+            "by_code": by_code,
+            "by_crm": by_crm,
+            "port_by_key": port_by_key,
+            "port_by_crm": port_by_crm,
+            "ports_by_client": ports_by_client,
+            "clients_by_id": {c.id: c for c in clients},
+        }
+
+    def _resolve_client_hierarchy(
+        self, parsed: dict[str, Any], lookups: dict[str, Any]
+    ) -> None:
+        """Fill client_code / sub_client_code from CRM client_number when needed."""
+        if parsed.get("client_code") and parsed.get("sub_client_code"):
+            return
+        crm_num = (parsed.get("client_number") or "").strip()
+        if not crm_num:
+            raise ValidationAppError(
+                "client_code and sub_client_code are required (or provide client_number)"
+            )
+        key = crm_num.lower()
+        port = lookups["port_by_crm"].get(key)
+        if port is not None:
+            client = lookups["clients_by_id"].get(port.client_id)
+            if not client:
+                raise ValidationAppError(
+                    "Unknown Client — portfolio client_number is not linked to a PayFlow client."
+                )
+            parsed["client_code"] = client.code
+            parsed["sub_client_code"] = port.code
+            return
+        client = lookups["by_crm"].get(key)
+        if client is not None:
+            ports = lookups["ports_by_client"].get(client.id) or []
+            if len(ports) == 1:
+                parsed["client_code"] = client.code
+                parsed["sub_client_code"] = ports[0].code
+                return
+            if not ports:
+                raise ValidationAppError(
+                    "Unknown Sub-Client — this client has no portfolio in PayFlow."
+                )
+            raise ValidationAppError(
+                "client_number matches a master client with multiple portfolios; "
+                "provide sub_client_code or import the sub-client number."
+            )
+        raise ValidationAppError(
+            "Unknown Client — this client_number has not been set up in PayFlow."
+        )
+
+    def _load_account_csv(
+        self, file_bytes: bytes
+    ) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
+        try:
+            text = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValidationAppError(
+                "The CSV file could not be read. Save it as UTF-8 and try again."
+            ) from exc
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if not rows:
+            raise ValidationAppError("The file is empty.")
+        headers = [str(h or "").strip().lower() for h in rows[0]]
+        data_rows = [
+            tuple(row)
+            for row in rows[1:]
+            if row and any(str(c or "").strip() != "" for c in row)
+        ]
+        return self._finalize_account_headers(headers, data_rows)
+
+    def _load_account_xlsx(
+        self, file_bytes: bytes
+    ) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
         try:
             wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
         except Exception as exc:
@@ -948,19 +1091,12 @@ class PayflowImportService:
             raise ValidationAppError("The file is empty.")
 
         headers = [str(h or "").strip().lower() for h in rows[0]]
-        missing = [h for h in ACCOUNT_IMPORT_REQUIRED if h not in headers]
-        if missing:
-            raise ValidationAppError(f"Missing required column(s): {', '.join(missing)}")
-
-        idx = {h: i for i, h in enumerate(headers)}
         data_rows = [
             row
             for row in rows[1:]
             if row and any(c is not None and str(c).strip() != "" for c in row)
         ]
-        if not data_rows:
-            raise ValidationAppError("No account rows were found.")
-        return idx, data_rows
+        return self._finalize_account_headers(headers, data_rows)
 
     def _classify_account_action(
         self,
@@ -1047,37 +1183,87 @@ class PayflowImportService:
 
     def _parse_row(self, row: tuple, idx: dict[str, int]) -> dict[str, Any]:
         def c(key: str) -> str:
-            return _cell(row, idx, key)
+            raw = _cell(row, idx, key)
+            if raw.upper() == "NULL":
+                return ""
+            return raw
 
+        crm_number = c("client_number")
+        # CRM debtor dump defaults when columns are missing or corrupted after bucket_values.
+        country = c("country_code").upper()
+        if len(country) != 2:
+            country = ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else country
+        currency = c("currency_code").upper()
+        if currency not in ACCOUNT_IMPORT_CURRENCIES:
+            # Accept CRM labels: CDN, Canadian Dollars, US Dollar, …
+            if currency in {"CDN", "CAD"} or "CAD" in currency or "CANADIAN" in currency:
+                currency = "CAD"
+            elif "USD" in currency or "US DOLLAR" in currency or currency in {"USD", "US"}:
+                currency = "USD"
+            elif crm_number:
+                currency = ACCOUNT_CRM_DEFAULT_CURRENCY
+        product = c("product_code")
+        if crm_number:
+            # Debtor dump product columns are company/labels, not PayFlow product codes.
+            product = ACCOUNT_CRM_DEFAULT_PRODUCT
+        elif not product:
+            product = ""
+
+        account_status = c("account_status").upper()
+        if not account_status and "is_active" in idx:
+            active = c("is_active")
+            if active in ("1", "TRUE", "YES", "Y"):
+                account_status = "OPEN"
+            elif active in ("0", "FALSE", "NO", "N"):
+                account_status = "CLOSED"
+        account_status = account_status or "OPEN"
+
+        # Soft-fill so required check works for CRM dumps.
+        values = {
+            "client_code": c("client_code"),
+            "sub_client_code": c("sub_client_code"),
+            "account_id": c("account_id"),
+            "product_code": product,
+            "customer_first_name": c("customer_first_name"),
+            "customer_last_name": c("customer_last_name"),
+            "country_code": country,
+            "currency_code": currency,
+            "outstanding_balance": c("outstanding_balance"),
+            "email": c("email"),
+        }
         for key in ACCOUNT_IMPORT_REQUIRED:
-            if not c(key):
+            if key in ("client_code", "sub_client_code") and crm_number:
+                continue
+            if not values.get(key):
                 raise ValidationAppError(f"{key} is required")
 
-        email = c("email")
+        email = values["email"]
         if not _EMAIL_RE.match(email):
             raise ValidationAppError("email is not a valid address")
 
-        outstanding = _parse_float(c("outstanding_balance"), "outstanding_balance", required=True)
+        outstanding = _parse_float(
+            values["outstanding_balance"], "outstanding_balance", required=True
+        )
         if outstanding is None or outstanding < 0:
             raise ValidationAppError("outstanding_balance cannot be negative")
 
-        country = c("country_code").upper()
-        if len(country) != 2:
+        if len(values["country_code"]) != 2:
             raise ValidationAppError("country_code must be ISO-2 (e.g. CA)")
 
-        currency = c("currency_code").upper()
-        if currency not in ACCOUNT_IMPORT_CURRENCIES:
+        if values["currency_code"] not in ACCOUNT_IMPORT_CURRENCIES:
             raise ValidationAppError("currency_code must be CAD or USD")
 
         language = (c("language") or "EN").upper()
         if language not in ACCOUNT_IMPORT_LANGUAGES:
-            raise ValidationAppError("language must be EN or FR")
+            if crm_number:
+                language = "EN"
+            else:
+                raise ValidationAppError("language must be EN or FR")
 
         age_group = c("age_group")
         if age_group and age_group not in AGE_GROUPS:
             raise ValidationAppError("age_group is not a recognised band")
 
-        account_status = (c("account_status") or "OPEN").upper()
         if account_status not in ACCOUNT_CRM_STATUSES:
             raise ValidationAppError("account_status must be OPEN or CLOSED")
         if account_status == "CLOSED":
@@ -1087,70 +1273,143 @@ class PayflowImportService:
         if collection_raw:
             collection_status = _COLLECTION_BY_LOWER.get(collection_raw.lower())
             if not collection_status:
-                raise ValidationAppError("collection_status is not a recognised PayFlow status")
+                if crm_number:
+                    # Debtor dump columns after bucket_values are often shifted/corrupt.
+                    collection_status = PayflowCollectionStatus.ACTIVE.value
+                else:
+                    raise ValidationAppError("collection_status is not a recognised PayFlow status")
         else:
             collection_status = PayflowCollectionStatus.ACTIVE.value
 
         province = c("province_state")
+        # Skip clearly corrupted geo values from broken CSV quoting.
+        if province and ("{" in province or "amount" in province.lower()):
+            province = ""
         region = c("region") or province
-        first = c("customer_first_name")
-        last = c("customer_last_name")
+        first = values["customer_first_name"]
+        last = values["customer_last_name"]
+
+        def safe_text(key: str) -> str | None:
+            val = c(key)
+            if not val:
+                return None
+            if "{" in val or "amount" in val.lower() or "bucket_name" in val.lower():
+                return None
+            return val
+
         return {
-            "client_code": c("client_code"),
-            "sub_client_code": c("sub_client_code"),
-            "account_id": c("account_id"),
+            "client_code": values["client_code"],
+            "sub_client_code": values["sub_client_code"],
+            "client_number": crm_number or None,
+            "account_id": values["account_id"],
             "crm_case_id": c("crm_case_id") or c("case_id") or None,
             "debtor_id": c("debtor_id") or c("customer_debtor_id") or None,
             "client_reference_number": c("client_reference_number") or None,
-            "product_code": c("product_code"),
+            "product_code": values["product_code"],
             "customer_first_name": first,
             "customer_last_name": last,
             "customer_name": f"{first} {last}".strip(),
-            "date_of_birth": _parse_date(c("date_of_birth"), "date_of_birth"),
+            "date_of_birth": self._soft_date(
+                c("date_of_birth"), "date_of_birth", soft=bool(crm_number)
+            ),
             "age_group": age_group or None,
             "employment_status": c("employment_status") or c("employment_type") or None,
             "income_band": c("income_band") or None,
             "education_level": c("education_level") or None,
             "customer_segment": c("customer_segment") or c("persona") or None,
-            "address_line1": c("address_line1") or None,
-            "city": c("city") or None,
+            "address_line1": safe_text("address_line1"),
+            "city": safe_text("city"),
             "province_state": province or None,
-            "postal_code": c("postal_code") or None,
-            "country_code": country,
+            "postal_code": safe_text("postal_code"),
+            "country_code": values["country_code"],
             "region": region or None,
             "currency_code": currency,
             "outstanding_balance": outstanding,
             "original_balance": _parse_float(c("original_balance"), "original_balance", required=False),
             "fee_amount": _parse_float(c("fee_amount"), "fee_amount", required=False),
             "email": email,
-            "phone_mobile": c("phone_mobile") or None,
-            "phone_work": c("phone_work") or None,
+            "phone_mobile": safe_text("phone_mobile"),
+            "phone_work": safe_text("phone_work"),
             "language": language,
             "date_listed": _parse_date(c("date_listed") or c("placement_date"), "date_listed"),
-            "last_email_sent_date": _parse_date(c("last_email_sent_date"), "last_email_sent_date"),
-            "last_sms_sent_date": _parse_date(c("last_sms_sent_date"), "last_sms_sent_date"),
-            "last_contact_date": _parse_date(c("last_contact_date"), "last_contact_date"),
-            "provincial_hold": _parse_yn(
-                c("provincial_hold") or c("communication_hold"), "provincial_hold"
+            "last_email_sent_date": self._soft_date(
+                c("last_email_sent_date"), "last_email_sent_date", soft=bool(crm_number)
             ),
-            "hold_days": _parse_int(c("hold_days"), "hold_days"),
-            "email_consent": _parse_yn(
-                c("email_consent") or c("contact_permission"), "email_consent"
+            "last_sms_sent_date": self._soft_date(
+                c("last_sms_sent_date"), "last_sms_sent_date", soft=bool(crm_number)
             ),
-            "source_updated_at": _parse_datetime(c("source_updated_at"), "source_updated_at"),
+            "last_contact_date": self._soft_date(
+                c("last_contact_date"), "last_contact_date", soft=bool(crm_number)
+            ),
+            "provincial_hold": self._soft_yn(
+                c("provincial_hold") or c("communication_hold"), soft=bool(crm_number)
+            ),
+            "hold_days": self._soft_int(c("hold_days"), soft=bool(crm_number)),
+            "email_consent": self._soft_yn(
+                c("email_consent") or c("contact_permission"), soft=bool(crm_number)
+            ),
+            "source_updated_at": self._soft_datetime(
+                c("source_updated_at"), soft=bool(crm_number)
+            ),
             "last_payment_amount": _parse_float(c("last_payment_amount"), "last_payment_amount", required=False),
-            "last_payment_date": _parse_date(c("last_payment_date"), "last_payment_date"),
-            "last_payment_is_ptp": _parse_yn(c("last_payment_is_ptp"), "last_payment_is_ptp"),
+            "last_payment_date": self._soft_date(
+                c("last_payment_date"), "last_payment_date", soft=bool(crm_number)
+            ),
+            "last_payment_is_ptp": self._soft_yn(c("last_payment_is_ptp"), soft=bool(crm_number)),
             "ptp_code": c("ptp_code") or None,
             "ptp_amount": _parse_float(c("ptp_amount"), "ptp_amount", required=False),
-            "ptp_due_date": _parse_date(c("ptp_due_date"), "ptp_due_date"),
-            "due_date": _parse_date(c("due_date"), "due_date"),
-            "days_past_due": _parse_int(c("days_past_due"), "days_past_due"),
+            "ptp_due_date": self._soft_date(c("ptp_due_date"), "ptp_due_date", soft=bool(crm_number)),
+            "due_date": self._soft_date(c("due_date"), "due_date", soft=bool(crm_number)),
+            "days_past_due": self._soft_int(c("days_past_due"), soft=bool(crm_number)),
             "account_status": account_status,
             "collection_status": collection_status,
             "negative_balance_reason": c("negative_balance_reason") or None,
             "account_category": c("account_category") or None,
         }
+
+    @staticmethod
+    def _soft_date(raw: str, field: str, *, soft: bool) -> date | None:
+        if not raw:
+            return None
+        try:
+            return _parse_date(raw, field)
+        except ValidationAppError:
+            if soft:
+                return None
+            raise
+
+    @staticmethod
+    def _soft_datetime(raw: str, *, soft: bool) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            return _parse_datetime(raw, "source_updated_at")
+        except ValidationAppError:
+            if soft:
+                return None
+            raise
+
+    @staticmethod
+    def _soft_yn(raw: str, *, soft: bool) -> bool | None:
+        if not raw:
+            return None
+        try:
+            return _parse_yn(raw)
+        except ValidationAppError:
+            if soft:
+                return None
+            raise
+
+    @staticmethod
+    def _soft_int(raw: str, *, soft: bool) -> int | None:
+        if not raw:
+            return None
+        try:
+            return _parse_int(raw, "value")
+        except ValidationAppError:
+            if soft:
+                return None
+            raise
 
     def _upsert(
         self,
