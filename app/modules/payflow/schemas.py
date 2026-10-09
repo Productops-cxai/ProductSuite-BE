@@ -1001,6 +1001,8 @@ class PayflowImportCounts(BaseModel):
     updated: int = 0
     unchanged: int = 0
     failed: int = 0
+    rejected: int = 0
+    successful: int = 0
 
 
 class PayflowImportRunItem(BaseModel):
@@ -1026,6 +1028,8 @@ class PayflowImportPreviewRecord(BaseModel):
     client_name: str
     sub_client_name: str
     action: str
+    client_code: Optional[str] = None
+    is_sub: bool = False
     current_balance: Optional[float] = None
     incoming_balance: Optional[float] = None
     note: Optional[str] = None
@@ -1037,8 +1041,12 @@ class PayflowImportPreviewSummary(BaseModel):
     updated: int = 0
     unchanged: int = 0
     failed: int = 0
+    rejected: int = 0
+    successful: int = 0
     new_clients: int = 0
     existing_clients: int = 0
+    new_sub_clients: int = 0
+    existing_sub_clients: int = 0
 
 
 class PayflowImportPreviewResponse(BaseModel):
