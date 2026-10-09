@@ -42,6 +42,11 @@ class PayflowClientStatus(str, Enum):
     ACTIVE = "active"
 
 
+class PayflowClientAddedThrough(str, Enum):
+    ADD_CLIENT = "add_client"
+    FILE_UPLOAD = "file_upload"
+
+
 class PayflowClientType(str, Enum):
     FIRST_PARTY = "first_party"
     THIRD_PARTY = "third_party"

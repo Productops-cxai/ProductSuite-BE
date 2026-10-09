@@ -310,6 +310,8 @@ class PayflowClientModel(Base):
     channel_sms: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     channel_whatsapp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     governance_rules: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # How the client was first created: add_client | file_upload
+    added_through: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

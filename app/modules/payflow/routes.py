@@ -158,9 +158,11 @@ def list_roles(_: PayflowManageUsers, db: DbSession):
 
 
 @router.post("/roles", response_model=PayflowRolesListResponse)
-def create_role(payload: CreatePayflowRoleRequest, _: PayflowManageUsers, db: DbSession):
+def create_role(payload: CreatePayflowRoleRequest, admin: PayflowOpsAdmin, db: DbSession):
+    """Only Operations Admin may create roles."""
     try:
         return PayflowUserService(db).create_role(
+            actor=admin,
             name=payload.name,
             scope=payload.scope,
             description=payload.description,
@@ -174,12 +176,14 @@ def create_role(payload: CreatePayflowRoleRequest, _: PayflowManageUsers, db: Db
 def update_role(
     role_id: int,
     payload: UpdatePayflowRoleRequest,
-    _: PayflowManageUsers,
+    admin: PayflowOpsAdmin,
     db: DbSession,
 ):
+    """Only Operations Admin may edit roles / permissions."""
     try:
         return PayflowUserService(db).update_role(
             role_id,
+            actor=admin,
             name=payload.name,
             description=payload.description,
             permission_codes=payload.permission_codes,
@@ -191,10 +195,11 @@ def update_role(
 @router.post("/roles/{role_id}/delete", response_model=MessageResponse)
 def delete_role(
     role_id: int,
-    admin: PayflowManageUsers,
+    admin: PayflowOpsAdmin,
     db: DbSession,
     source: str | None = Query(default=None),
 ):
+    """Only Operations Admin may delete roles."""
     try:
         return PayflowUserService(db).delete_role(role_id, actor=admin, source=source)
     except AppError as exc:
@@ -991,7 +996,8 @@ def list_users(
 
 
 @router.post("/users", response_model=PayflowUserDetailResponse)
-def create_user(payload: CreatePayflowUserRequest, admin: PayflowManageUsers, db: DbSession):
+def create_user(payload: CreatePayflowUserRequest, admin: PayflowOpsAdmin, db: DbSession):
+    """Only Operations Admin may add users (not Supervisors with manage_users)."""
     try:
         return PayflowUserService(db).create_user(
             admin,
@@ -1018,14 +1024,16 @@ def get_user(user_id: UUID, _: PayflowManageUsers, db: DbSession):
 def update_user(
     user_id: UUID,
     payload: UpdatePayflowUserRequest,
-    _: PayflowManageUsers,
+    actor: PayflowManageUsers,
     db: DbSession,
 ):
     try:
         return PayflowUserService(db).update_user(
             user_id,
+            actor=actor,
             full_name=payload.full_name,
-            email=str(payload.email) if payload.email else None,
+            # Email is immutable — not applied even if sent.
+            email=None,
             role_code=payload.role_code,
             confirm_role_change=payload.confirm_role_change,
         )

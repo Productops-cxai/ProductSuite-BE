@@ -16,7 +16,7 @@ class CrmFieldDef(TypedDict):
     required: bool
     sample_value: str
     group: str
-    available: str  # Yes | Derived | Partial | Ambiguous | No | PayFlow-built
+    available: str  # Yes | Derived | Optional | PayFlow-built (Partial | Ambiguous | No = open)
 
 
 # Phase-1 INBOUND — CRM → PayFlow. required=True blocks activation if unmapped
@@ -524,6 +524,65 @@ CRM_INBOUND_FIELDS: list[CrmFieldDef] = [
         "available": "Yes",
     },
 ]
+
+
+# Align the catalog with what the real daily files actually carry
+# (placement feed + debtor dump / PayFlow daily template).
+#   Yes / Derived / PayFlow-built  -> available from the feed or built by PayFlow
+#   Optional                       -> NOT in the current CRM feed; optional daily-file
+#                                     column. Never blocks mapping or activation.
+_OPTIONAL_NOTE = (
+    " Optional: not in the current CRM feed. Add this column to the daily file only if "
+    "the source has it; otherwise leave it blank."
+)
+_CATALOG_OVERRIDES: dict[str, dict[str, str]] = {
+    "CUSTOMER_BALANCE or CONFIRMED_BALANCE": {
+        "available": "Yes",
+        "meaning": (
+            "Daily file column outstanding_balance. Absolute value of negative "
+            "decimals; collection is run against this balance."
+        ),
+    },
+    "CUSTOMER_PHONE_HOME": {
+        "available": "Yes",
+        "meaning": (
+            "Daily file column phone_mobile (placement feed labels it HOME). Optional; "
+            "email is the primary contact channel, SMS needs a mobile-capable number."
+        ),
+    },
+    "filename": {
+        "available": "Derived",
+        "meaning": "Daily file product column; defaults to P4 for CRM debtor exports.",
+    },
+}
+_OPTIONAL_NOT_IN_FEED: frozenset[str] = frozenset(
+    {
+        "FEE_AMOUNT",
+        "CUSTOMER_PHONE_WORK",
+        "TIMEZONE",
+        "AGE_GROUP",
+        "EMPLOYMENT_STATUS",
+        "INCOME_BAND",
+        "EDUCATION_LEVEL",
+        "CUSTOMER_SEGMENT",
+        "DUE_DATE",
+        "DAYS_PAST_DUE",
+        "LAST_PAYMENT_IS_PTP",
+        "PTP_CODE",
+        "PTP_AMOUNT",
+        "PTP_DUE_DATE",
+        "email_list[].consent / EMAIL_CONSENT",
+    }
+)
+
+for _field in CRM_INBOUND_FIELDS:
+    _src = _field["source_field"]
+    if _src in _CATALOG_OVERRIDES:
+        _field.update(_CATALOG_OVERRIDES[_src])  # type: ignore[typeddict-item]
+    elif _src in _OPTIONAL_NOT_IN_FEED:
+        _field["available"] = "Optional"
+        _field["required"] = False
+        _field["meaning"] = _field["meaning"].rstrip() + _OPTIONAL_NOTE
 
 
 class CrmOutboundFieldDef(TypedDict):

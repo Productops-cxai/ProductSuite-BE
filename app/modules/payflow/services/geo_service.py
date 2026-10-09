@@ -1,8 +1,9 @@
 """Server-side geo lookups.
 
 Countries are served from a bundled catalog (no outbound call) so the Add Client
-form always loads. Provinces / cities come from countriesnow.space via httpx
-(avoids browser CORS).
+form always loads. Provinces / cities prefer countriesnow.space via httpx
+(avoids browser CORS), with bundled CA/US fallbacks and soft failures so the
+form stays editable when the provider is down or CRM data is messy.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from app.core.exceptions import ValidationAppError
 
 _STATES_URL = "https://countriesnow.space/api/v0.1/countries/states"
 _CITIES_URL = "https://countriesnow.space/api/v0.1/countries/state/cities"
+_COUNTRY_CITIES_URL = "https://countriesnow.space/api/v0.1/countries/cities"
 
 # name, iso2, currencies, languages — enough for address / locale defaults.
 _COUNTRIES: list[dict[str, Any]] = [
@@ -143,6 +145,174 @@ _COUNTRIES: list[dict[str, Any]] = [
     {"name": "Zimbabwe", "iso2": "ZW", "currencies": ["ZWL", "USD"], "languages": ["English"]},
 ]
 
+# Offline fallbacks when the remote provider is unreachable / incomplete.
+_FALLBACK_STATES: dict[str, list[str]] = {
+    "canada": [
+        "Alberta",
+        "British Columbia",
+        "Manitoba",
+        "New Brunswick",
+        "Newfoundland and Labrador",
+        "Northwest Territories",
+        "Nova Scotia",
+        "Nunavut",
+        "Ontario",
+        "Prince Edward Island",
+        "Quebec",
+        "Saskatchewan",
+        "Yukon",
+    ],
+    "united states": [
+        "Alabama",
+        "Alaska",
+        "Arizona",
+        "Arkansas",
+        "California",
+        "Colorado",
+        "Connecticut",
+        "Delaware",
+        "District of Columbia",
+        "Florida",
+        "Georgia",
+        "Hawaii",
+        "Idaho",
+        "Illinois",
+        "Indiana",
+        "Iowa",
+        "Kansas",
+        "Kentucky",
+        "Louisiana",
+        "Maine",
+        "Maryland",
+        "Massachusetts",
+        "Michigan",
+        "Minnesota",
+        "Mississippi",
+        "Missouri",
+        "Montana",
+        "Nebraska",
+        "Nevada",
+        "New Hampshire",
+        "New Jersey",
+        "New Mexico",
+        "New York",
+        "North Carolina",
+        "North Dakota",
+        "Ohio",
+        "Oklahoma",
+        "Oregon",
+        "Pennsylvania",
+        "Rhode Island",
+        "South Carolina",
+        "South Dakota",
+        "Tennessee",
+        "Texas",
+        "Utah",
+        "Vermont",
+        "Virginia",
+        "Washington",
+        "West Virginia",
+        "Wisconsin",
+        "Wyoming",
+    ],
+}
+
+# Common CRM / ISO aliases → catalog country name.
+_COUNTRY_ALIASES: dict[str, str] = {
+    "ca": "Canada",
+    "can": "Canada",
+    "canada": "Canada",
+    "us": "United States",
+    "usa": "United States",
+    "u.s.": "United States",
+    "u.s.a.": "United States",
+    "united states of america": "United States",
+    "united states": "United States",
+    "uk": "United Kingdom",
+    "gb": "United Kingdom",
+    "great britain": "United Kingdom",
+    "england": "United Kingdom",
+}
+
+# Province / state aliases (CRM often stores codes or city names in the wrong field).
+_STATE_ALIASES: dict[str, dict[str, str]] = {
+    "canada": {
+        "ab": "Alberta",
+        "bc": "British Columbia",
+        "mb": "Manitoba",
+        "nb": "New Brunswick",
+        "nl": "Newfoundland and Labrador",
+        "nf": "Newfoundland and Labrador",
+        "nt": "Northwest Territories",
+        "ns": "Nova Scotia",
+        "nu": "Nunavut",
+        "on": "Ontario",
+        "ont": "Ontario",
+        "ontario": "Ontario",
+        "pe": "Prince Edward Island",
+        "pei": "Prince Edward Island",
+        "qc": "Quebec",
+        "que": "Quebec",
+        "quebec": "Quebec",
+        "sk": "Saskatchewan",
+        "yt": "Yukon",
+        "yk": "Yukon",
+    },
+    "united states": {
+        "al": "Alabama",
+        "ak": "Alaska",
+        "az": "Arizona",
+        "ar": "Arkansas",
+        "ca": "California",
+        "co": "Colorado",
+        "ct": "Connecticut",
+        "de": "Delaware",
+        "dc": "District of Columbia",
+        "fl": "Florida",
+        "ga": "Georgia",
+        "hi": "Hawaii",
+        "id": "Idaho",
+        "il": "Illinois",
+        "in": "Indiana",
+        "ia": "Iowa",
+        "ks": "Kansas",
+        "ky": "Kentucky",
+        "la": "Louisiana",
+        "me": "Maine",
+        "md": "Maryland",
+        "ma": "Massachusetts",
+        "mi": "Michigan",
+        "mn": "Minnesota",
+        "ms": "Mississippi",
+        "mo": "Missouri",
+        "mt": "Montana",
+        "ne": "Nebraska",
+        "nv": "Nevada",
+        "nh": "New Hampshire",
+        "nj": "New Jersey",
+        "nm": "New Mexico",
+        "ny": "New York",
+        "nc": "North Carolina",
+        "nd": "North Dakota",
+        "oh": "Ohio",
+        "ok": "Oklahoma",
+        "or": "Oregon",
+        "pa": "Pennsylvania",
+        "ri": "Rhode Island",
+        "sc": "South Carolina",
+        "sd": "South Dakota",
+        "tn": "Tennessee",
+        "tx": "Texas",
+        "ut": "Utah",
+        "vt": "Vermont",
+        "va": "Virginia",
+        "wa": "Washington",
+        "wv": "West Virginia",
+        "wi": "Wisconsin",
+        "wy": "Wyoming",
+    },
+}
+
 _states_cache: dict[str, list[str]] = {}
 _cities_cache: dict[str, list[str]] = {}
 
@@ -151,14 +321,39 @@ def _key(*parts: str) -> str:
     return "||".join(p.strip().lower() for p in parts)
 
 
-def _http_post(url: str, payload: dict[str, Any]) -> Any:
+def _normalize_country(country: str) -> str:
+    raw = (country or "").strip()
+    if not raw:
+        return ""
+    alias = _COUNTRY_ALIASES.get(raw.lower())
+    if alias:
+        return alias
+    for row in _COUNTRIES:
+        if row["name"].lower() == raw.lower() or row["iso2"].lower() == raw.lower():
+            return row["name"]
+    return raw
+
+
+def _normalize_state(country_name: str, state: str) -> str:
+    raw = (state or "").strip()
+    if not raw:
+        return ""
+    aliases = _STATE_ALIASES.get(country_name.lower()) or {}
+    mapped = aliases.get(raw.lower())
+    if mapped:
+        return mapped
+    return raw
+
+
+def _http_post(url: str, payload: dict[str, Any]) -> Any | None:
+    """Return JSON body or None on transport / HTTP failure (soft)."""
     try:
         with httpx.Client(timeout=45.0, follow_redirects=True) as client:
             res = client.post(url, json=payload)
             res.raise_for_status()
             return res.json()
-    except Exception as exc:  # noqa: BLE001
-        raise ValidationAppError(f"Could not reach geo provider ({exc})") from exc
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class PayflowGeoService:
@@ -166,31 +361,34 @@ class PayflowGeoService:
         return {"countries": list(_COUNTRIES)}
 
     def list_states(self, country: str) -> dict[str, Any]:
-        country_name = (country or "").strip()
+        country_name = _normalize_country(country)
         if not country_name:
             raise ValidationAppError("country is required")
         cache_key = _key("state", country_name)
         if cache_key in _states_cache:
             return {"country": country_name, "states": _states_cache[cache_key]}
 
+        states: list[str] = []
         body = _http_post(_STATES_URL, {"country": country_name})
-        if body.get("error"):
-            raise ValidationAppError(body.get("msg") or "Could not load provinces / states")
+        if body and not body.get("error"):
+            states = sorted(
+                {
+                    (s.get("name") or "").strip()
+                    for s in ((body.get("data") or {}).get("states") or [])
+                    if (s.get("name") or "").strip()
+                },
+                key=str.lower,
+            )
 
-        states = sorted(
-            {
-                (s.get("name") or "").strip()
-                for s in ((body.get("data") or {}).get("states") or [])
-                if (s.get("name") or "").strip()
-            },
-            key=str.lower,
-        )
+        if not states:
+            states = list(_FALLBACK_STATES.get(country_name.lower()) or [])
+
         _states_cache[cache_key] = states
         return {"country": country_name, "states": states}
 
     def list_cities(self, country: str, state: str) -> dict[str, Any]:
-        country_name = (country or "").strip()
-        state_name = (state or "").strip()
+        country_name = _normalize_country(country)
+        state_name = _normalize_state(country_name, state)
         if not country_name:
             raise ValidationAppError("country is required")
         if not state_name:
@@ -203,13 +401,30 @@ class PayflowGeoService:
                 "cities": _cities_cache[cache_key],
             }
 
-        body = _http_post(_CITIES_URL, {"country": country_name, "state": state_name})
-        if body.get("error"):
-            raise ValidationAppError(body.get("msg") or "Could not load cities")
-
-        cities = sorted(
-            {str(c).strip() for c in (body.get("data") or []) if str(c).strip()},
-            key=str.lower,
+        cities: list[str] = []
+        body = _http_post(
+            _CITIES_URL, {"country": country_name, "state": state_name}
         )
+        if body and not body.get("error"):
+            cities = sorted(
+                {str(c).strip() for c in (body.get("data") or []) if str(c).strip()},
+                key=str.lower,
+            )
+
+        # CRM sometimes stores a city in the province field — fall back to all
+        # cities for the country so the dropdown still has usable options.
+        if not cities:
+            body = _http_post(_COUNTRY_CITIES_URL, {"country": country_name})
+            if body and not body.get("error"):
+                cities = sorted(
+                    {
+                        str(c).strip()
+                        for c in (body.get("data") or [])
+                        if str(c).strip()
+                    },
+                    key=str.lower,
+                )
+
+        # Soft success even when empty — FE allows free-text edit.
         _cities_cache[cache_key] = cities
         return {"country": country_name, "state": state_name, "cities": cities}

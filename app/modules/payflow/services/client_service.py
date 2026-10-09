@@ -45,6 +45,7 @@ from app.modules.payflow.crm_catalog import (
 from app.shared.enums import (
     PayflowAiMode,
     PayflowBusinessDomain,
+    PayflowClientAddedThrough,
     PayflowClientStatus,
     PayflowClientType,
     PayflowConnectionStatus,
@@ -96,6 +97,11 @@ _MAPPING_FROM_LABEL.update({k: k for k in _MAPPING_LABELS})
 _STATUS_LABELS = {
     PayflowClientStatus.DRAFT.value: "Draft",
     PayflowClientStatus.ACTIVE.value: "Active",
+}
+
+_ADDED_THROUGH_LABELS = {
+    PayflowClientAddedThrough.ADD_CLIENT.value: "Add Client",
+    PayflowClientAddedThrough.FILE_UPLOAD.value: "File Upload",
 }
 
 
@@ -292,6 +298,14 @@ class PayflowClientService:
             self._assert_unique_code(code)
             if crm_number:
                 self._assert_unique_crm_number(crm_number)
+            added_raw = (payload.get("added_through") or "").strip().lower()
+            if added_raw in {
+                PayflowClientAddedThrough.ADD_CLIENT.value,
+                PayflowClientAddedThrough.FILE_UPLOAD.value,
+            }:
+                added_through = added_raw
+            else:
+                added_through = PayflowClientAddedThrough.ADD_CLIENT.value
             client = PayflowClientModel(
                 name=name,
                 code=code,
@@ -320,6 +334,7 @@ class PayflowClientService:
                 channel_sms=True,
                 channel_whatsapp=False,
                 governance_rules=[],
+                added_through=added_through,
                 updated_at=_utcnow(),
             )
             self._apply_primary_fields(client, payload, create=True)
@@ -1174,7 +1189,12 @@ class PayflowClientService:
                 entity_id = existing.id if existing else None
                 if not dry_run:
                     client, act = self.upsert_client(
-                        payload, commit=False, soft_client_type=True
+                        {
+                            **payload,
+                            "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
+                        },
+                        commit=False,
+                        soft_client_type=True,
                     )
                     # CRM export ingest counts as an established file-based CRM link
                     client.connection_status = PayflowConnectionStatus.CONNECTED.value
@@ -1428,6 +1448,7 @@ class PayflowClientService:
                             "industry": row.get("industry") or None,
                             "ai_mode": row.get("ai_mode") or "Supervised AI",
                             "data_source_type": "file",
+                            "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
                         },
                         commit=False,
                         soft_client_type=True,
@@ -2207,9 +2228,10 @@ class PayflowClientService:
             )
 
         progress = self._onboarding_progress(client)
-        # Match Lovable / FE banner chips (exclude AI & activation / portfolios).
+        # Match FE banner / clients-grid chips (exclude AI & activation).
         _setup_chip_keys = {
             "profile",
+            "portfolios",
             "data_source",
             "data_mapping",
             "branding",
@@ -2246,6 +2268,12 @@ class PayflowClientService:
             "setup_incomplete": incomplete,
             "setup_steps_remaining": len(incomplete),
             "onboarding": progress,
+            "added_through": client.added_through
+            or PayflowClientAddedThrough.ADD_CLIENT.value,
+            "added_through_label": _ADDED_THROUGH_LABELS.get(
+                client.added_through or PayflowClientAddedThrough.ADD_CLIENT.value,
+                "Add Client",
+            ),
             "created_at": client.created_at,
             "updated_at": client.updated_at or client.created_at,
         }
