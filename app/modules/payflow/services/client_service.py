@@ -2067,15 +2067,7 @@ class PayflowClientService:
         ai_ok = bool(client.ai_mode)
         supervisors_ok = len(supervisors) > 0
         activation_ok = client.status == PayflowClientStatus.ACTIVE.value
-        mapping = self._mapping_summary(client)
-        mapped = int(mapping.get("mapped") or 0)
-        unmapped = int(mapping.get("unmapped") or 0)
-        attention = int(mapping.get("attention") or 0)
-        total_fields = int(mapping.get("total") or 0)
-        # Empty catalog → treat as complete; otherwise all required must be clean.
-        mapping_ok = total_fields == 0 or (
-            unmapped == 0 and attention == 0 and mapped > 0
-        )
+        # Data Mapping is system-fixed (Administration → System Mapping) — not a client journey step.
 
         def step(ok: bool, started: bool = True) -> str:
             if ok:
@@ -2104,11 +2096,6 @@ class PayflowClientService:
                 "key": "data_source",
                 "label": "Data Source",
                 "status": step(source_ok, client.data_source_type is not None),
-            },
-            {
-                "key": "data_mapping",
-                "label": "Data Mapping",
-                "status": step(mapping_ok, total_fields > 0 or is_crm),
             },
             {
                 "key": "branding",
@@ -2228,12 +2215,11 @@ class PayflowClientService:
             )
 
         progress = self._onboarding_progress(client)
-        # Match FE banner / clients-grid chips (exclude AI & activation).
+        # Match FE banner / clients-grid chips (exclude AI, activation, Data Mapping).
         _setup_chip_keys = {
             "profile",
             "portfolios",
             "data_source",
-            "data_mapping",
             "branding",
             "supervisors",
         }
