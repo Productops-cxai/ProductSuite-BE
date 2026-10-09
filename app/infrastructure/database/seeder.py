@@ -163,7 +163,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/workflows",
                 "overview",
                 1,
-                True,  # disabled — FE redesign backup
+                False,
                 None,
                 "view_workflows",
             ),
@@ -611,9 +611,10 @@ class DatabaseSeeder:
             "rules",
             "users",
             "dashboard",
+            "workflows",
         }
-        # Visible but disabled until FE redesign is restored from _design_backup/payflow-ai-ops.
-        parked_disabled_keys = {"review", "workflows", "comms"}
+        # Still parked until Communications / Human Review FE is restored.
+        parked_disabled_keys = {"review", "comms"}
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)
