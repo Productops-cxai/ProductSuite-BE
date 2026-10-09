@@ -1,8 +1,8 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class PayflowRoleSummary(BaseModel):
@@ -639,15 +639,41 @@ class CreatePayflowRuleRequest(BaseModel):
     status: str = "Draft"
 
 
+class StrategyNodeConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    channel: Optional[str] = None
+    purpose: Optional[str] = None
+    reference_event: Optional[str] = None
+    amount: Optional[float] = None
+    unit: Optional[str] = None
+    direction: Optional[str] = None
+    attribute: Optional[str] = None
+    operator: Optional[str] = None
+    value: Optional[str] = None
+    action: Optional[str] = None
+    outcome: Optional[str] = None
+    note: Optional[str] = None
+    template_id: Optional[str] = None
+
+
 class StrategyStepItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: Optional[str] = None
     kind: str
     title: str
+    origin: Optional[str] = None
+    disabled: bool = False
+    config: Optional[StrategyNodeConfig] = None
+    next: Optional[str] = None
+    yes: Optional[str] = None
+    no: Optional[str] = None
+    # Legacy flat fields (still accepted / returned for compatibility)
     channel: Optional[str] = None
     purpose: Optional[str] = None
     timing: Optional[str] = None
     detail: Optional[str] = None
-    disabled: bool = False
 
 
 class StrategySegment(BaseModel):
@@ -660,9 +686,18 @@ class StrategySegment(BaseModel):
 
 
 class StrategyVersionItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     version: int
     date: str
     note: str
+    status: Optional[str] = None
+    origin: Optional[str] = None
+    approved_by: Optional[str] = None
+    approval_date: Optional[str] = None
+    steps: Optional[List[Any]] = None
+    segment: Optional[dict] = None
+    changes: List[str] = Field(default_factory=list)
 
 
 class StrategyStats(BaseModel):
@@ -670,11 +705,44 @@ class StrategyStats(BaseModel):
     branches: int = 0
     emails: int = 0
     sms: int = 0
+    payment_actions: int = 0
+    case_actions: int = 0
 
 
 class StrategyContextItem(BaseModel):
     label: str
     value: str
+
+
+class StrategyMessageTemplate(BaseModel):
+    id: str
+    name: str
+    channel: str
+    purpose: str
+    subject: Optional[str] = None
+    body: str
+
+
+class StrategyCatalog(BaseModel):
+    channels: List[str] = Field(default_factory=list)
+    message_purposes: List[str] = Field(default_factory=list)
+    reference_events: List[str] = Field(default_factory=list)
+    time_units: List[str] = Field(default_factory=list)
+    time_directions: List[str] = Field(default_factory=list)
+    condition_attributes: List[str] = Field(default_factory=list)
+    condition_operators: List[str] = Field(default_factory=list)
+    condition_values: dict[str, List[str]] = Field(default_factory=dict)
+    case_actions: List[str] = Field(default_factory=list)
+    payment_actions: List[str] = Field(default_factory=list)
+    outcomes: List[str] = Field(default_factory=list)
+    age_bands: List[str] = Field(default_factory=list)
+    postal_regions: List[str] = Field(default_factory=list)
+    balance_bands: List[str] = Field(default_factory=list)
+    delinquency_bands: List[str] = Field(default_factory=list)
+    language_preferences: List[str] = Field(default_factory=list)
+    tenure_bands: List[str] = Field(default_factory=list)
+    excluded_targeting_attributes: List[str] = Field(default_factory=list)
+    message_templates: List[StrategyMessageTemplate] = Field(default_factory=list)
 
 
 class PayflowStrategyItem(BaseModel):
@@ -688,17 +756,24 @@ class PayflowStrategyItem(BaseModel):
     portfolio_name: Optional[str] = None
     status: str
     origin: str
+    source: str = "Human Created"
     version: int = 1
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: dict = Field(default_factory=dict)
+    entry_node_id: Optional[str] = None
     steps: List[StrategyStepItem] = Field(default_factory=list)
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
+    ai_proposal_snapshot: Optional[dict] = None
     versions: List[StrategyVersionItem] = Field(default_factory=list)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None
+    reviewed_by: Optional[str] = None
     created_by: Optional[str] = None
+    human_modified: bool = False
+    awaiting_review: bool = False
     last_updated_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -707,8 +782,12 @@ class PayflowStrategyItem(BaseModel):
 class StrategiesSummary(BaseModel):
     total: int = 0
     ai_proposed: int = 0
-    active: int = 0
+    draft: int = 0
     under_review: int = 0
+    approved: int = 0
+    active: int = 0
+    inactive: int = 0
+    awaiting_review: int = 0
 
 
 class PayflowStrategiesListResponse(BaseModel):
@@ -716,17 +795,23 @@ class PayflowStrategiesListResponse(BaseModel):
     summary: StrategiesSummary
     statuses: List[str] = Field(default_factory=list)
     step_kinds: List[str] = Field(default_factory=list)
+    origins: List[str] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+    catalog: StrategyCatalog = Field(default_factory=StrategyCatalog)
 
 
 class CreatePayflowStrategyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     client_id: int
-    portfolio_id: Optional[int] = None
+    portfolio_id: int
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: Optional[dict] = None
     steps: List[StrategyStepItem] = Field(default_factory=list)
-    status: str = "Under Review"
+    entry_node_id: Optional[str] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
     ai_context: Optional[List[StrategyContextItem]] = None
 
 
@@ -734,8 +819,10 @@ class UpdatePayflowStrategyRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: Optional[dict] = None
     steps: Optional[List[StrategyStepItem]] = None
+    entry_node_id: Optional[str] = None
 
 
 class RejectStrategyRequest(BaseModel):

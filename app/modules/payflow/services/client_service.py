@@ -2402,6 +2402,7 @@ class PayflowClientService:
                     "code": s.code,
                     "status": s.status,
                     "origin": s.origin,
+                    "source": getattr(s, "source", None) or "Human Created",
                     "version": s.version,
                     "updated_at": s.updated_at or s.created_at,
                 }

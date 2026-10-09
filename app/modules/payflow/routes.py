@@ -832,7 +832,7 @@ def create_workflow(
 ):
     try:
         data = payload.model_dump()
-        data["steps"] = [s.model_dump() for s in payload.steps]
+        data["steps"] = [s.model_dump(exclude_none=True) for s in payload.steps]
         if payload.ai_context is not None:
             data["ai_context"] = [c.model_dump() for c in payload.ai_context]
         return PayflowStrategyService(db).create_strategy(user, data)
@@ -858,10 +858,9 @@ def update_workflow(
     try:
         data = payload.model_dump(exclude_unset=True)
         if "steps" in data and data["steps"] is not None:
-            data["steps"] = [s if isinstance(s, dict) else s for s in data["steps"]]
-            # ensure plain dicts
             data["steps"] = [
-                s.model_dump() if hasattr(s, "model_dump") else s for s in payload.steps or []
+                s.model_dump(exclude_none=True) if hasattr(s, "model_dump") else s
+                for s in payload.steps or []
             ]
         return PayflowStrategyService(db).update_strategy(user, strategy_id, data)
     except AppError as exc:
@@ -872,6 +871,22 @@ def update_workflow(
 def save_workflow_draft(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
     try:
         return PayflowStrategyService(db).save_draft(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/begin-review", response_model=PayflowStrategyItem)
+def begin_workflow_review(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+    try:
+        return PayflowStrategyService(db).begin_review(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/submit-review", response_model=PayflowStrategyItem)
+def submit_workflow_review(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+    try:
+        return PayflowStrategyService(db).submit_review(user, strategy_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -893,6 +908,22 @@ def reject_workflow(
 ):
     try:
         return PayflowStrategyService(db).reject(user, strategy_id, note=payload.note)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/activate", response_model=PayflowStrategyItem)
+def activate_workflow(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+    try:
+        return PayflowStrategyService(db).activate(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/deactivate", response_model=PayflowStrategyItem)
+def deactivate_workflow(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+    try:
+        return PayflowStrategyService(db).deactivate(user, strategy_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 

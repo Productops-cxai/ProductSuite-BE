@@ -548,17 +548,22 @@ class PayflowStrategyModel(Base):
     portfolio_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("payflow_portfolios.id"), nullable=True, index=True
     )
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Under Review")
-    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="Human Modified")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Draft")
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="Human Created")
+    # Nullable for additive schema_sync on existing DBs; app always sets on create.
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True, default="Human Created")
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     coverage: Mapped[str | None] = mapped_column(String(128), nullable=True)
     segment: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    entry_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ai_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    ai_proposal_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     versions: Mapped[list | None] = mapped_column(JSON, nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     approval_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

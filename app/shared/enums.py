@@ -145,6 +145,7 @@ class PayflowRuleLogic(str, Enum):
 
 class PayflowStrategyStatus(str, Enum):
     AI_PROPOSED = "AI Proposed"
+    DRAFT = "Draft"
     UNDER_REVIEW = "Under Review"
     APPROVED = "Approved"
     ACTIVE = "Active"
@@ -153,7 +154,13 @@ class PayflowStrategyStatus(str, Enum):
 
 class PayflowStrategyOrigin(str, Enum):
     AI_PROPOSED = "AI Proposed"
+    HUMAN_CREATED = "Human Created"
     HUMAN_MODIFIED = "Human Modified"
+
+
+class PayflowStrategySource(str, Enum):
+    AI_GENERATED = "AI Generated"
+    HUMAN_CREATED = "Human Created"
 
 
 class PayflowCommChannel(str, Enum):
