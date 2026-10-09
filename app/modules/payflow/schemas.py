@@ -1,8 +1,23 @@
+import re
 from datetime import datetime
 from typing import Any, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+# Canadian postal code: A1A 1A1
+_POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
+
+
+def _normalize_postal_code(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip().upper()
+    if not cleaned:
+        return None
+    if not _POSTAL_CODE_RE.fullmatch(cleaned):
+        raise ValueError("Postal code must match format A1A 1A1")
+    return cleaned
 
 
 class PayflowRoleSummary(BaseModel):
@@ -127,6 +142,11 @@ class CreatePayflowClientRequest(BaseModel):
     correspondence_language: Optional[str] = None
     currency_code: Optional[str] = None
 
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
+
 
 class MappingUpdateItem(BaseModel):
     source_field: str
@@ -171,6 +191,11 @@ class UpdatePayflowClientRequest(BaseModel):
     governance_rules: Optional[List[str]] = None
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
+
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
 
 
 class CreatePortfolioRequest(BaseModel):
