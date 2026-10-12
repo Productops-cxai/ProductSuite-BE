@@ -64,6 +64,9 @@ from app.modules.payflow.schemas import (
     PayflowImportListResponse,
     PayflowImportPreviewResponse,
     PayflowImportRunItem,
+    PortfolioSegmentsResponse,
+    SuggestWorkflowsRequest,
+    SuggestWorkflowsResponse,
 )
 from app.modules.platform.schemas import DeletionLogResponse
 from app.modules.payflow.service import PayflowUserService
@@ -79,6 +82,7 @@ from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
 
 # Default tag is overridden in app.core.openapi_tags for Swagger sections.
 router = APIRouter(prefix="/payflow", tags=["PayFlow · Access"])
@@ -91,6 +95,7 @@ def _map_error(exc: AppError) -> HTTPException:
         "not_found": status.HTTP_404_NOT_FOUND,
         "conflict": status.HTTP_409_CONFLICT,
         "validation_error": status.HTTP_400_BAD_REQUEST,
+        "service_unavailable": status.HTTP_502_BAD_GATEWAY,
     }
     return HTTPException(status_code=code_map.get(exc.code, 400), detail=exc.message)
 
@@ -937,6 +942,36 @@ def delete_workflow(
 ):
     try:
         return PayflowStrategyService(db).delete_strategy(admin, strategy_id, source=source)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Workflow suggestions (AI)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/clients/{client_id}/portfolios/{portfolio_id}/segments",
+    response_model=PortfolioSegmentsResponse,
+)
+def preview_portfolio_segments(
+    client_id: int, portfolio_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return WorkflowSuggestionService(db).preview_segments(user, client_id, portfolio_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/suggest", response_model=SuggestWorkflowsResponse)
+def suggest_workflows(
+    payload: SuggestWorkflowsRequest, user: PayflowManageWorkflows, db: DbSession
+):
+    try:
+        return WorkflowSuggestionService(db).suggest_workflows(
+            user, payload.client_id, payload.portfolio_id
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 

@@ -105,6 +105,12 @@ Documented here so FE + BE stay aligned. Deeper design notes: root `ARCHITECTURE
 
 - PayFlow **create/update/delete-style actions** use **POST** (e.g. `POST /payflow/clients/{id}/update`), not PATCH/PUT.
 
+### AI workflow suggestion
+
+- `GET /payflow/clients/{id}/portfolios/{id}/segments` — preview how a portfolio's accounts are grouped (no AI).
+- `POST /payflow/workflows/suggest` — AI suggests one workflow per segment, saved as "AI Proposed". Needs `GROQ_API_KEY` in `.env`; takes minutes on the Groq free tier.
+- Postman collection: `docs/postman/PayFlow_AI_Workflows.postman_collection.json`. Full guide: `docs/AI_WORKFLOW_SUGGESTION.md`.
+
 ---
 
 ## Related docs
@@ -114,3 +120,4 @@ Documented here so FE + BE stay aligned. Deeper design notes: root `ARCHITECTURE
 | Architecture | `../../ARCHITECTURE.md` |
 | Root quick start | `../../README.md` |
 | FE counterpart | `ProductSuite-FE/docs/samples/README.md` |
+| AI workflow suggestion | `../AI_WORKFLOW_SUGGESTION.md` |
