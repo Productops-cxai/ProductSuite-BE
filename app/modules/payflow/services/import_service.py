@@ -667,9 +667,11 @@ class PayflowImportService:
                 ws.append([row.get(h, "") for h in ACCOUNT_IMPORT_HEADERS])
         readme = wb.create_sheet("README")
         readme.append(["PayFlow daily CRM account file"])
+        readme.append(["Frequency: daily. Mode: upsert/refresh (not delete)."])
         readme.append(["Sheet Accounts, header row 1. Clients and sub-clients must already exist."])
-        readme.append(["Match key: client_code + account_id. Missing accounts in this file are not deleted."])
+        readme.append(["Match key: client_code + account_id. Missing accounts in this file are left unchanged (not deleted)."])
         readme.append(["original_balance is applied only when creating an account."])
+        readme.append(["Negative outstanding_balance values are coerced to absolute value per CRM contract."])
         readme.append(["account_status CLOSED rows are rejected. Dates YYYY-MM-DD. Y/N flags: last_payment_is_ptp, provincial_hold, email_consent."])
         readme.append(["Optional segmentation: employment_status, income_band, education_level, customer_segment."])
         readme.append(["Also: crm_case_id, debtor_id, client_reference_number, product_code*, date_listed, last_*_sent/contact, hold_days, source_updated_at."])
@@ -786,6 +788,8 @@ class PayflowImportService:
                         }
                     )
 
+        rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
+        successful = created + updated + unchanged
         return {
             "ok": True,
             "file_name": safe_name,
@@ -797,8 +801,12 @@ class PayflowImportService:
                 "updated": updated,
                 "unchanged": unchanged,
                 "failed": failed,
+                "rejected": rejected,
+                "successful": successful,
                 "new_clients": 0,
                 "existing_clients": 0,
+                "new_sub_clients": 0,
+                "existing_sub_clients": 0,
             },
             "preview": preview,
             "errors": errors,
@@ -816,9 +824,12 @@ class PayflowImportService:
             stored_path=str(stored.relative_to(_BE_ROOT)).replace("\\", "/"),
             uploaded_by_user_id=user.id,
             uploaded_by_name=user.full_name or user.email,
-            status="Validating",
+            status="Uploaded",
         )
         self.db.add(run)
+        self.db.flush()
+
+        run.status = "Validating"
         self.db.flush()
 
         try:
@@ -1146,8 +1157,12 @@ class PayflowImportService:
                 "updated": 0,
                 "unchanged": 0,
                 "failed": 0,
+                "rejected": 1,
+                "successful": 0,
                 "new_clients": 0,
                 "existing_clients": 0,
+                "new_sub_clients": 0,
+                "existing_sub_clients": 0,
             },
             "preview": [],
             "errors": [
@@ -1244,8 +1259,11 @@ class PayflowImportService:
         outstanding = _parse_float(
             values["outstanding_balance"], "outstanding_balance", required=True
         )
-        if outstanding is None or outstanding < 0:
-            raise ValidationAppError("outstanding_balance cannot be negative")
+        if outstanding is None:
+            raise ValidationAppError("outstanding_balance is required")
+        # CRM contract: use absolute value of negative balances.
+        if outstanding < 0:
+            outstanding = abs(outstanding)
 
         if len(values["country_code"]) != 2:
             raise ValidationAppError("country_code must be ISO-2 (e.g. CA)")
@@ -1584,6 +1602,19 @@ class PayflowImportService:
         return "record"
 
     def _serialize_run(self, run: PayflowImportRunModel) -> dict[str, Any]:
+        errors = [
+            {
+                "record_id": e.record_id,
+                "client": e.client,
+                "sub_client": e.sub_client,
+                "field": e.field,
+                "error": e.message,
+                "status": e.status,
+            }
+            for e in (run.errors or [])
+        ]
+        rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
+        successful = run.created_count + run.updated_count + run.unchanged_count
         return {
             "id": run.id,
             "kind": run.kind,
@@ -1597,18 +1628,10 @@ class PayflowImportService:
                 "updated": run.updated_count,
                 "unchanged": run.unchanged_count,
                 "failed": run.failed_count,
+                "rejected": rejected,
+                "successful": successful,
             },
-            "errors": [
-                {
-                    "record_id": e.record_id,
-                    "client": e.client,
-                    "sub_client": e.sub_client,
-                    "field": e.field,
-                    "error": e.message,
-                    "status": e.status,
-                }
-                for e in (run.errors or [])
-            ],
+            "errors": errors,
         }
 
 

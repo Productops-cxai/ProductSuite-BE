@@ -862,3 +862,43 @@ ACCOUNT_CRM_STATUSES: tuple[str, ...] = ("OPEN", "CLOSED")
 ACCOUNT_CRM_DEFAULT_COUNTRY = "CA"
 ACCOUNT_CRM_DEFAULT_CURRENCY = "CAD"
 ACCOUNT_CRM_DEFAULT_PRODUCT = "P4"
+
+# Agreed file behaviour for CRM → PayFlow ingest (Story 1 AC5 / AC6 baseline).
+CRM_FILE_BEHAVIOUR: dict = {
+    "catalog_version": "0.3",
+    "baseline_status": "Pending CRM/Product stakeholder sign-off",
+    "baseline_note": (
+        "PayFlow_CRM_Integration_Fields_v0.3 is the technical baseline for file ingestion. "
+        "Formal Ops/CRM approval confirms this contract for production use."
+    ),
+    "client_hierarchy": {
+        "frequency": "on-demand",
+        "mode": "upsert",
+        "full_or_incremental": "full file of clients/sub-clients in the upload; upsert by identifier",
+        "missing_from_file": "leave_unchanged",
+        "identifiers": {
+            "client": ["crm_client_number (client_number)", "client_code"],
+            "sub_client": ["crm_client_number scoped to parent", "client_code scoped to parent"],
+        },
+        "relationship": "Client (master) → Sub-Client/Portfolio via master_client__client_number",
+    },
+    "daily_accounts": {
+        "frequency": "daily",
+        "mode": "upsert_refresh",
+        "full_or_incremental": (
+            "upsert/refresh by Account Identifier; treat as current-state refresh for rows present. "
+            "CRM must confirm whether each file is the complete population or changed-only."
+        ),
+        "missing_from_file": "leave_unchanged",
+        "identifiers": {
+            "account": ["account_id (matched with client_id as account_reference)"],
+            "client": ["client_code", "client_number (CRM)"],
+            "sub_client": ["sub_client_code"],
+        },
+        "historical_preservation": [
+            "original_balance is set only on create and is not overwritten on refresh",
+            "account timeline appends CRM import/refresh events",
+        ],
+        "negative_balance": "coerce_to_absolute_value",
+    },
+}

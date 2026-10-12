@@ -1,8 +1,23 @@
+import re
 from datetime import datetime
 from typing import Any, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+# Canadian postal code: A1A 1A1
+_POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
+
+
+def _normalize_postal_code(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip().upper()
+    if not cleaned:
+        return None
+    if not _POSTAL_CODE_RE.fullmatch(cleaned):
+        raise ValueError("Postal code must match format A1A 1A1")
+    return cleaned
 
 
 class PayflowRoleSummary(BaseModel):
@@ -127,6 +142,11 @@ class CreatePayflowClientRequest(BaseModel):
     correspondence_language: Optional[str] = None
     currency_code: Optional[str] = None
 
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
+
 
 class MappingUpdateItem(BaseModel):
     source_field: str
@@ -171,6 +191,11 @@ class UpdatePayflowClientRequest(BaseModel):
     governance_rules: Optional[List[str]] = None
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
+
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
 
 
 class CreatePortfolioRequest(BaseModel):
@@ -1001,6 +1026,8 @@ class PayflowImportCounts(BaseModel):
     updated: int = 0
     unchanged: int = 0
     failed: int = 0
+    rejected: int = 0
+    successful: int = 0
 
 
 class PayflowImportRunItem(BaseModel):
@@ -1026,6 +1053,8 @@ class PayflowImportPreviewRecord(BaseModel):
     client_name: str
     sub_client_name: str
     action: str
+    client_code: Optional[str] = None
+    is_sub: bool = False
     current_balance: Optional[float] = None
     incoming_balance: Optional[float] = None
     note: Optional[str] = None
@@ -1037,8 +1066,12 @@ class PayflowImportPreviewSummary(BaseModel):
     updated: int = 0
     unchanged: int = 0
     failed: int = 0
+    rejected: int = 0
+    successful: int = 0
     new_clients: int = 0
     existing_clients: int = 0
+    new_sub_clients: int = 0
+    existing_sub_clients: int = 0
 
 
 class PayflowImportPreviewResponse(BaseModel):

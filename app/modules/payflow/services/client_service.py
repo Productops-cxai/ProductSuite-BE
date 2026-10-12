@@ -37,6 +37,7 @@ from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
     BULK_UPLOAD_HEADERS,
     CLIENT_IMPORT_MASTER_REQUIRED,
+    CRM_FILE_BEHAVIOUR,
     CRM_INBOUND_FIELDS,
     CRM_OUTBOUND_FIELDS,
     GOVERNANCE_RULE_LIBRARY,
@@ -203,7 +204,10 @@ class PayflowClientService:
             "outbound_fields": CRM_OUTBOUND_FIELDS,
             "payflow_fields": PAYFLOW_TARGET_FIELDS,
             "governance_rules": GOVERNANCE_RULE_LIBRARY,
-            "catalog_version": "0.3",
+            "catalog_version": CRM_FILE_BEHAVIOUR.get("catalog_version", "0.3"),
+            "file_behaviour": CRM_FILE_BEHAVIOUR,
+            "baseline_status": CRM_FILE_BEHAVIOUR.get("baseline_status"),
+            "baseline_note": CRM_FILE_BEHAVIOUR.get("baseline_note"),
         }
 
     # ------------------------------------------------------------------
@@ -1152,10 +1156,11 @@ class PayflowClientService:
         user: UserModel | None,
         file_bytes: bytes | None,
     ) -> dict:
-        preview: list[dict] = []
+        preview_masters: list[dict] = []
+        preview_subs: list[dict] = []
         errors: list[dict] = []
-        created = updated = failed = 0
-        preview_limit = 80
+        created = updated = unchanged = failed = 0
+        new_clients = existing_clients = new_sub_clients = existing_sub_clients = 0
         masters_in_file: dict[str, dict[str, str]] = {}
         seen_codes: set[str] = set()
         seen_numbers: set[str] = set()
@@ -1185,41 +1190,56 @@ class PayflowClientService:
 
                 payload = self._crm_row_to_client_payload(row, data_source="crm")
                 existing = self._find_client(crm_number=number, code=code)
-                action = "Update" if existing else "Create"
                 entity_id = existing.id if existing else None
-                if not dry_run:
-                    client, act = self.upsert_client(
-                        {
-                            **payload,
-                            "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
-                        },
-                        commit=False,
-                        soft_client_type=True,
-                    )
-                    # CRM export ingest counts as an established file-based CRM link
-                    client.connection_status = PayflowConnectionStatus.CONNECTED.value
-                    entity_id = client.id
-                    action = "Create" if act == "created" else "Update"
-                if action == "Create":
-                    created += 1
-                else:
+                if existing and self._client_crm_unchanged(existing, payload):
+                    action = "No Change"
+                    unchanged += 1
+                    existing_clients += 1
+                elif existing:
+                    action = "Update"
+                    if not dry_run:
+                        client, _act = self.upsert_client(
+                            {
+                                **payload,
+                                "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
+                            },
+                            commit=False,
+                            soft_client_type=True,
+                        )
+                        client.connection_status = PayflowConnectionStatus.CONNECTED.value
+                        entity_id = client.id
                     updated += 1
-                if len(preview) < preview_limit:
-                    preview.append(
-                        {
-                            "id": f"master-{row_num}",
-                            "record_id": record_id,
-                            "client": name,
-                            "client_name": name,
-                            "client_code": code,
-                            "sub_client": "—",
-                            "sub_client_name": "—",
-                            "action": action,
-                            "note": number,
-                            "is_sub": False,
-                            "entity_id": entity_id,
-                        }
-                    )
+                    existing_clients += 1
+                else:
+                    action = "Create"
+                    if not dry_run:
+                        client, _act = self.upsert_client(
+                            {
+                                **payload,
+                                "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
+                            },
+                            commit=False,
+                            soft_client_type=True,
+                        )
+                        client.connection_status = PayflowConnectionStatus.CONNECTED.value
+                        entity_id = client.id
+                    created += 1
+                    new_clients += 1
+                preview_masters.append(
+                    {
+                        "id": f"master-{row_num}",
+                        "record_id": record_id,
+                        "client": code,
+                        "client_name": name,
+                        "client_code": code,
+                        "sub_client": "—",
+                        "sub_client_name": "—",
+                        "action": action,
+                        "note": number,
+                        "is_sub": False,
+                        "entity_id": entity_id,
+                    }
+                )
             except (ValidationAppError, ConflictError) as exc:
                 failed += 1
                 errors.append(
@@ -1300,53 +1320,81 @@ class PayflowClientService:
                     if parent
                     else None
                 )
-                action = "Update" if existing else "Create"
+                description = (row.get("product") or "").strip() or None
                 entity_id = existing.id if existing else None
-                if not dry_run:
-                    if parent is None:
-                        # Master should have been upserted in pass 1
-                        parent = self._find_client(crm_number=master_number, code=None)
-                    if parent is None:
-                        raise ValidationAppError(
-                            f"Unknown master client_number: {master_number}"
+                if existing and self._portfolio_crm_unchanged(
+                    existing, name=name, code=code, crm_number=number or None, description=description
+                ):
+                    action = "No Change"
+                    unchanged += 1
+                    existing_sub_clients += 1
+                elif existing:
+                    action = "Update"
+                    if not dry_run:
+                        if parent is None:
+                            parent = self._find_client(crm_number=master_number, code=None)
+                        if parent is None:
+                            raise ValidationAppError(
+                                f"Unknown master client_number: {master_number}"
+                            )
+                        port, _act = self.upsert_portfolio(
+                            parent.id,
+                            {
+                                "name": name,
+                                "code": code,
+                                "crm_client_number": number or None,
+                                "description": description,
+                                "status": PayflowPortfolioStatus.ONBOARDING.value,
+                            },
+                            commit=False,
                         )
-                    port, act = self.upsert_portfolio(
-                        parent.id,
-                        {
-                            "name": name,
-                            "code": code,
-                            "crm_client_number": number or None,
-                            "description": (row.get("product") or "").strip() or None,
-                            "status": PayflowPortfolioStatus.ONBOARDING.value,
-                        },
-                        commit=False,
-                    )
-                    entity_id = port.id
-                    action = "Create" if act == "created" else "Update"
-                    db_masters_by_number[master_number.lower()] = parent
-                    parent_name = parent.name
-                    parent_code = parent.code
-
-                if action == "Create":
-                    created += 1
-                else:
+                        entity_id = port.id
+                        db_masters_by_number[master_number.lower()] = parent
+                        parent_name = parent.name
+                        parent_code = parent.code
                     updated += 1
-                if len(preview) < preview_limit:
-                    preview.append(
-                        {
-                            "id": f"sub-{row_num}",
-                            "record_id": record_id,
-                            "client": parent_name,
-                            "client_name": parent_name,
-                            "client_code": parent_code or "—",
-                            "sub_client": code,
-                            "sub_client_name": name,
-                            "action": action,
-                            "note": number or code,
-                            "is_sub": True,
-                            "entity_id": entity_id,
-                        }
-                    )
+                    existing_sub_clients += 1
+                else:
+                    action = "Create"
+                    if not dry_run:
+                        if parent is None:
+                            parent = self._find_client(crm_number=master_number, code=None)
+                        if parent is None:
+                            raise ValidationAppError(
+                                f"Unknown master client_number: {master_number}"
+                            )
+                        port, _act = self.upsert_portfolio(
+                            parent.id,
+                            {
+                                "name": name,
+                                "code": code,
+                                "crm_client_number": number or None,
+                                "description": description,
+                                "status": PayflowPortfolioStatus.ONBOARDING.value,
+                            },
+                            commit=False,
+                        )
+                        entity_id = port.id
+                        db_masters_by_number[master_number.lower()] = parent
+                        parent_name = parent.name
+                        parent_code = parent.code
+                    created += 1
+                    new_sub_clients += 1
+                preview_subs.append(
+                    {
+                        "id": f"sub-{row_num}",
+                        "record_id": record_id,
+                        "client": parent_code or "—",
+                        "client_name": parent_name,
+                        "client_code": parent_code or "—",
+                        "sub_client": code,
+                        "sub_client_name": name,
+                        "action": action,
+                        "note": number or code,
+                        "is_sub": True,
+                        "entity_id": entity_id,
+                    }
+                )
             except (ValidationAppError, ConflictError) as exc:
                 failed += 1
                 errors.append(
@@ -1362,6 +1410,23 @@ class PayflowClientService:
                     }
                 )
 
+        preview = self._assemble_client_hierarchy_preview(preview_masters, preview_subs)
+        rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
+        successful = created + updated + unchanged
+        summary = {
+            "total": created + updated + unchanged + failed,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "failed": failed,
+            "rejected": rejected,
+            "successful": successful,
+            "new_clients": new_clients,
+            "existing_clients": existing_clients,
+            "new_sub_clients": new_sub_clients,
+            "existing_sub_clients": existing_sub_clients,
+        }
+
         if not dry_run:
             run = self._persist_client_import_run(
                 user=user,
@@ -1369,6 +1434,7 @@ class PayflowClientService:
                 file_bytes=file_bytes,
                 created=created,
                 updated=updated,
+                unchanged=unchanged,
                 failed=failed,
                 errors=errors,
             )
@@ -1379,15 +1445,7 @@ class PayflowClientService:
                 "status": run.status if run else ("Completed with Errors" if failed else "Completed"),
                 "import_id": run.id if run else None,
                 "message": None,
-                "summary": {
-                    "total": created + updated + failed,
-                    "created": created,
-                    "updated": updated,
-                    "unchanged": 0,
-                    "failed": failed,
-                    "new_clients": created,
-                    "existing_clients": updated,
-                },
+                "summary": summary,
                 "preview": preview,
                 "errors": errors,
             }
@@ -1397,18 +1455,58 @@ class PayflowClientService:
             "file_name": filename,
             "status": "Ready",
             "message": None,
-            "summary": {
-                "total": created + updated + failed,
-                "created": created,
-                "updated": updated,
-                "unchanged": 0,
-                "failed": failed,
-                "new_clients": created,
-                "existing_clients": updated,
-            },
+            "summary": summary,
             "preview": preview,
             "errors": errors,
         }
+
+    @staticmethod
+    def _assemble_client_hierarchy_preview(
+        masters: list[dict],
+        subs: list[dict],
+        *,
+        limit: int = 120,
+    ) -> list[dict]:
+        """Build a hierarchical preview: parent then its sub-clients (not masters-only)."""
+        subs_by_parent: dict[str, list[dict]] = {}
+        for s in subs:
+            key = (s.get("client_name") or "").strip().lower()
+            if not key:
+                key = (s.get("client_code") or s.get("client") or "").strip().lower()
+            subs_by_parent.setdefault(key, []).append(s)
+
+        with_subs = [
+            m
+            for m in masters
+            if (m.get("client_name") or "").strip().lower() in subs_by_parent
+        ]
+        alone = [
+            m
+            for m in masters
+            if (m.get("client_name") or "").strip().lower() not in subs_by_parent
+        ]
+        ordered_masters = with_subs + alone
+
+        preview: list[dict] = []
+        included_sub_ids: set[str] = set()
+        for m in ordered_masters:
+            if len(preview) >= limit:
+                break
+            preview.append(m)
+            key = (m.get("client_name") or "").strip().lower()
+            for s in subs_by_parent.get(key, []):
+                if len(preview) >= limit:
+                    break
+                preview.append(s)
+                included_sub_ids.add(str(s.get("id")))
+
+        for s in subs:
+            if len(preview) >= limit:
+                break
+            if str(s.get("id")) in included_sub_ids:
+                continue
+            preview.append(s)
+        return preview
 
     def _process_simple_clients(
         self,
@@ -1421,7 +1519,7 @@ class PayflowClientService:
     ) -> dict:
         preview: list[dict] = []
         errors: list[dict] = []
-        created = updated = failed = 0
+        created = updated = unchanged = failed = 0
         seen_codes: set[str] = set()
         for row_num, row in enumerate(data_rows, start=2):
             name = (row.get("client_name") or row.get("company_name") or "").strip()
@@ -1436,29 +1534,36 @@ class PayflowClientService:
                     raise ConflictError(f"Duplicate client code in file: {code}")
                 seen_codes.add(code.lower())
                 existing = self._find_client(crm_number=None, code=code)
-                action = "Update" if existing else "Create"
+                payload = {
+                    "name": name,
+                    "code": code,
+                    "client_type": row.get("client_type") or "Third Party",
+                    "business_domain": row.get("business_domain") or "Collections",
+                    "industry": row.get("industry") or None,
+                    "ai_mode": row.get("ai_mode") or "Supervised AI",
+                    "data_source_type": "file",
+                    "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
+                }
                 entity_id = existing.id if existing else None
-                if not dry_run:
-                    client, act = self.upsert_client(
-                        {
-                            "name": name,
-                            "code": code,
-                            "client_type": row.get("client_type") or "Third Party",
-                            "business_domain": row.get("business_domain") or "Collections",
-                            "industry": row.get("industry") or None,
-                            "ai_mode": row.get("ai_mode") or "Supervised AI",
-                            "data_source_type": "file",
-                            "added_through": PayflowClientAddedThrough.FILE_UPLOAD.value,
-                        },
-                        commit=False,
-                        soft_client_type=True,
-                    )
-                    entity_id = client.id
-                    action = "Create" if act == "created" else "Update"
-                if action == "Create":
-                    created += 1
-                else:
+                if existing and (existing.name or "").strip() == name and (existing.code or "").lower() == code.lower():
+                    action = "No Change"
+                    unchanged += 1
+                elif existing:
+                    action = "Update"
+                    if not dry_run:
+                        client, _act = self.upsert_client(
+                            payload, commit=False, soft_client_type=True
+                        )
+                        entity_id = client.id
                     updated += 1
+                else:
+                    action = "Create"
+                    if not dry_run:
+                        client, _act = self.upsert_client(
+                            payload, commit=False, soft_client_type=True
+                        )
+                        entity_id = client.id
+                    created += 1
                 if len(preview) < 50:
                     preview.append(
                         {
@@ -1488,6 +1593,22 @@ class PayflowClientService:
                     }
                 )
 
+        rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
+        successful = created + updated + unchanged
+        summary = {
+            "total": created + updated + unchanged + failed,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "failed": failed,
+            "rejected": rejected,
+            "successful": successful,
+            "new_clients": created,
+            "existing_clients": updated + unchanged,
+            "new_sub_clients": 0,
+            "existing_sub_clients": 0,
+        }
+
         if not dry_run:
             run = self._persist_client_import_run(
                 user=user,
@@ -1495,6 +1616,7 @@ class PayflowClientService:
                 file_bytes=file_bytes,
                 created=created,
                 updated=updated,
+                unchanged=unchanged,
                 failed=failed,
                 errors=errors,
             )
@@ -1505,15 +1627,7 @@ class PayflowClientService:
                 "status": run.status if run else ("Completed with Errors" if failed else "Completed"),
                 "import_id": run.id if run else None,
                 "message": None,
-                "summary": {
-                    "total": created + updated + failed,
-                    "created": created,
-                    "updated": updated,
-                    "unchanged": 0,
-                    "failed": failed,
-                    "new_clients": created,
-                    "existing_clients": updated,
-                },
+                "summary": summary,
                 "preview": preview,
                 "errors": errors,
             }
@@ -1523,15 +1637,7 @@ class PayflowClientService:
             "file_name": filename,
             "status": "Ready",
             "message": None,
-            "summary": {
-                "total": created + updated + failed,
-                "created": created,
-                "updated": updated,
-                "unchanged": 0,
-                "failed": failed,
-                "new_clients": created,
-                "existing_clients": updated,
-            },
+            "summary": summary,
             "preview": preview,
             "errors": errors,
         }
@@ -1594,6 +1700,7 @@ class PayflowClientService:
         file_bytes: bytes | None,
         created: int,
         updated: int,
+        unchanged: int = 0,
         failed: int,
         errors: list[dict],
     ) -> PayflowImportRunModel | None:
@@ -1608,7 +1715,9 @@ class PayflowClientService:
             except ValueError:
                 stored_path = str(dest)
 
-        if created or updated:
+        # Status lifecycle: Uploaded → Validating → Processing → terminal
+        # (client hierarchy is processed synchronously before persist; record Uploaded then terminal.)
+        if created or updated or unchanged:
             status = "Completed with Errors" if failed else "Completed"
         else:
             status = "Failed"
@@ -1619,16 +1728,21 @@ class PayflowClientService:
             stored_path=stored_path,
             uploaded_by_user_id=user.id if user else None,
             uploaded_by_name=(user.full_name if user else None) or (user.email if user else "System"),
-            status=status,
-            total_count=created + updated + failed,
+            status="Uploaded",
+            total_count=created + updated + unchanged + failed,
             created_count=created,
             updated_count=updated,
-            unchanged_count=0,
+            unchanged_count=unchanged,
             failed_count=failed,
-            completed_at=_utcnow(),
         )
         self.db.add(run)
         self.db.flush()
+        run.status = "Validating"
+        self.db.flush()
+        run.status = "Processing"
+        self.db.flush()
+        run.status = status
+        run.completed_at = _utcnow()
         for err in errors:
             self.db.add(
                 PayflowImportErrorModel(
@@ -1644,6 +1758,54 @@ class PayflowClientService:
         return run
 
     @staticmethod
+    def _client_crm_unchanged(client: PayflowClientModel, payload: dict[str, Any]) -> bool:
+        name = (payload.get("name") or "").strip()
+        code = _normalize_code(payload.get("code") or "")
+        crm_number = (payload.get("crm_client_number") or "").strip() or None
+        industry = (payload.get("industry") or payload.get("category") or "").strip() or None
+        brand = (payload.get("brand_name") or payload.get("short_name") or "").strip() or ""
+        if (client.name or "").strip() != name:
+            return False
+        if (client.code or "").lower() != code.lower():
+            return False
+        if (client.crm_client_number or None) != crm_number:
+            return False
+        if (client.category or None) != industry:
+            return False
+        if brand and (client.brand_name or "") != brand:
+            return False
+        for field in _PRIMARY_CONTACT_FIELDS:
+            if field not in payload:
+                continue
+            incoming = (str(payload[field]).strip() if payload.get(field) is not None else None) or None
+            current = getattr(client, field, None) or None
+            if isinstance(current, str):
+                current = current.strip() or None
+            if incoming != current:
+                return False
+        return True
+
+    @staticmethod
+    def _portfolio_crm_unchanged(
+        row: PayflowPortfolioModel,
+        *,
+        name: str,
+        code: str,
+        crm_number: str | None,
+        description: str | None,
+    ) -> bool:
+        if (row.name or "").strip() != name:
+            return False
+        if (row.code or "").lower() != code.lower():
+            return False
+        if (row.crm_client_number or None) != (crm_number or None):
+            return False
+        desc = (description or "").strip() or None
+        if (row.description or None) != desc:
+            return False
+        return True
+
+    @staticmethod
     def _bulk_preview_fail(file_name: str, field: str, message: str) -> dict:
         return {
             "ok": False,
@@ -1656,8 +1818,12 @@ class PayflowClientService:
                 "updated": 0,
                 "unchanged": 0,
                 "failed": 0,
+                "rejected": 1,
+                "successful": 0,
                 "new_clients": 0,
                 "existing_clients": 0,
+                "new_sub_clients": 0,
+                "existing_sub_clients": 0,
             },
             "preview": [],
             "errors": [
