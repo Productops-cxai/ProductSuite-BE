@@ -399,6 +399,11 @@ class PayflowAccountItem(BaseModel):
     client_reference_number: Optional[str] = None
     product_code: Optional[str] = None
     date_listed: Optional[str] = None
+    date_incurred: Optional[str] = None
+    delinquency_date: Optional[str] = None
+    paid_amount: Optional[float] = None
+    settlement_rate: Optional[float] = None
+    commission_rate: Optional[float] = None
     last_email_sent_date: Optional[str] = None
     last_sms_sent_date: Optional[str] = None
     last_contact_date: Optional[str] = None
@@ -498,6 +503,53 @@ class ReviewHistoryItem(BaseModel):
     by: Optional[str] = None
 
 
+class ReviewCommunicationItem(BaseModel):
+    id: int
+    code: str
+    channel: str
+    purpose: str
+    status: str
+    engagement: Optional[str] = None
+    date_label: Optional[str] = None
+    time_label: Optional[str] = None
+    subject: Optional[str] = None
+
+
+class ReviewPaymentContext(BaseModel):
+    last_payment_amount: Optional[float] = None
+    last_payment_date: Optional[str] = None
+    last_payment_is_ptp: Optional[bool] = None
+    ptp_code: Optional[str] = None
+    ptp_amount: Optional[float] = None
+    ptp_due_date: Optional[str] = None
+    paid_amount: Optional[float] = None
+
+
+class ReviewWorkflowContext(BaseModel):
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
+    current_workflow: Optional[str] = None
+    collection_status: Optional[str] = None
+    last_action: Optional[str] = None
+    next_action: Optional[str] = None
+    action_blocked: bool = False
+
+
+class ReviewAuditItem(BaseModel):
+    id: int
+    event: str
+    detail: Optional[str] = None
+    actor_name: Optional[str] = None
+    before_status: Optional[str] = None
+    after_status: Optional[str] = None
+    before_values: Optional[dict] = None
+    after_values: Optional[dict] = None
+    created_at: Optional[datetime] = None
+
+
 class PayflowReviewItem(BaseModel):
     id: int
     code: str
@@ -529,13 +581,26 @@ class PayflowReviewItem(BaseModel):
     waiting_label: Optional[str] = None
     status: str
     assigned_supervisor: Optional[str] = None
+    assigned_user_id: Optional[str] = None
+    decided_by_user_id: Optional[str] = None
+    decided_at: Optional[datetime] = None
     final_action: Optional[str] = None
     guidance: Optional[str] = None
     rejection_reason: Optional[str] = None
     hold_until: Optional[str] = None
     history: List[ReviewHistoryItem] = Field(default_factory=list)
+    audit_trail: List[ReviewAuditItem] = Field(default_factory=list)
+    communications: List[ReviewCommunicationItem] = Field(default_factory=list)
+    payment_context: Optional[ReviewPaymentContext] = None
+    workflow_context: Optional[ReviewWorkflowContext] = None
+    available_actions: List[str] = Field(default_factory=list)
+    decision_version: Optional[int] = None
+    strategy_id: Optional[int] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
     can_decide: Optional[bool] = None
     can_modify: Optional[bool] = None
+    can_release: Optional[bool] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -550,31 +615,69 @@ class ReviewsSummary(BaseModel):
 class PayflowReviewsListResponse(BaseModel):
     reviews: List[PayflowReviewItem]
     summary: ReviewsSummary
+    page: int = 1
+    page_size: int = 50
+    total: int = 0
+    total_pages: int = 0
     statuses: List[str] = Field(default_factory=list)
     priorities: List[str] = Field(default_factory=list)
     reasons: List[str] = Field(default_factory=list)
     proposed_actions: List[str] = Field(default_factory=list)
     rejection_reasons: List[str] = Field(default_factory=list)
     waiting_buckets: List[str] = Field(default_factory=list)
+    sort_by: Optional[str] = None
+    sort_dir: Optional[str] = None
+
+
+class CreateHumanReviewRequest(BaseModel):
+    account_id: int
+    reason: str
+    proposed_action: str
+    priority: Optional[str] = "Normal"
+    rule_id: Optional[int] = None
+    condition_text: Optional[str] = None
+    observed_value: Optional[str] = None
+    confidence: Optional[float] = None
+    explanation: List[str] = Field(default_factory=list)
+    context: List[ReviewContextItem] = Field(default_factory=list)
+    strategy_id: Optional[int] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
+    assigned_user_id: Optional[str] = None
+    assigned_supervisor: Optional[str] = None
+
+
+class AssignReviewRequest(BaseModel):
+    assigned_user_id: Optional[str] = None
+    assigned_supervisor: Optional[str] = None
 
 
 class ApproveReviewRequest(BaseModel):
     note: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class ModifyReviewRequest(BaseModel):
     action: str
     guidance: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class RejectReviewRequest(BaseModel):
     reason: str
     comment: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class HoldReviewRequest(BaseModel):
     until: Optional[str] = None
     reason: Optional[str] = None
+    decision_version: Optional[int] = None
+
+
+class ReleaseReviewRequest(BaseModel):
+    note: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class RuleConditionItem(BaseModel):

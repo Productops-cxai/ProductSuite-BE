@@ -24,6 +24,8 @@ from app.modules.payflow.deps import (
 from app.modules.payflow.schemas import (
     AccessContextResponse,
     ApproveReviewRequest,
+    AssignReviewRequest,
+    CreateHumanReviewRequest,
     CreatePayflowClientRequest,
     CreatePayflowRoleRequest,
     CreatePayflowRuleRequest,
@@ -55,6 +57,7 @@ from app.modules.payflow.schemas import (
     PayflowUsersListResponse,
     RejectReviewRequest,
     RejectStrategyRequest,
+    ReleaseReviewRequest,
     UpdatePayflowClientRequest,
     UpdatePayflowRoleRequest,
     UpdatePayflowStrategyRequest,
@@ -629,8 +632,14 @@ def list_reviews(
     status_filter: str | None = Query(default=None, alias="status"),
     priority: str | None = Query(default=None),
     reason: str | None = Query(default=None),
+    rule_id: int | None = Query(default=None),
+    proposed_action: str | None = Query(default=None),
     search: str | None = Query(default=None),
     waiting_bucket: str | None = Query(default=None),
+    sort_by: str = Query(default="waiting_minutes"),
+    sort_dir: str = Query(default="desc"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
 ):
     try:
         return PayflowReviewService(db).list_reviews(
@@ -639,8 +648,28 @@ def list_reviews(
             status=status_filter,
             priority=priority,
             reason=reason,
+            rule_id=rule_id,
+            proposed_action=proposed_action,
             search=search,
             waiting_bucket=waiting_bucket,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            page=page,
+            page_size=page_size,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews", response_model=PayflowReviewItem)
+def create_review(
+    payload: CreateHumanReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).create_review_for_user(
+            user, payload.model_dump()
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -654,6 +683,24 @@ def get_review(review_id: int, user: RequirePayflowProduct, db: DbSession):
         raise _map_error(exc) from exc
 
 
+@router.post("/reviews/{review_id}/assign", response_model=PayflowReviewItem)
+def assign_review(
+    review_id: int,
+    payload: AssignReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).assign_review(
+            user,
+            review_id,
+            assigned_user_id=payload.assigned_user_id,
+            assigned_supervisor=payload.assigned_supervisor,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.post("/reviews/{review_id}/approve", response_model=PayflowReviewItem)
 def approve_review(
     review_id: int,
@@ -662,7 +709,12 @@ def approve_review(
     db: DbSession,
 ):
     try:
-        return PayflowReviewService(db).approve(user, review_id, note=payload.note)
+        return PayflowReviewService(db).approve(
+            user,
+            review_id,
+            note=payload.note,
+            decision_version=payload.decision_version,
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -676,7 +728,11 @@ def modify_review(
 ):
     try:
         return PayflowReviewService(db).modify(
-            user, review_id, action=payload.action, guidance=payload.guidance
+            user,
+            review_id,
+            action=payload.action,
+            guidance=payload.guidance,
+            decision_version=payload.decision_version,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -691,7 +747,11 @@ def reject_review(
 ):
     try:
         return PayflowReviewService(db).reject(
-            user, review_id, reason=payload.reason, comment=payload.comment
+            user,
+            review_id,
+            reason=payload.reason,
+            comment=payload.comment,
+            decision_version=payload.decision_version,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -706,7 +766,29 @@ def hold_review(
 ):
     try:
         return PayflowReviewService(db).hold(
-            user, review_id, until=payload.until, reason=payload.reason
+            user,
+            review_id,
+            until=payload.until,
+            reason=payload.reason,
+            decision_version=payload.decision_version,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/reviews/{review_id}/release", response_model=PayflowReviewItem)
+def release_review(
+    review_id: int,
+    payload: ReleaseReviewRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        return PayflowReviewService(db).release(
+            user,
+            review_id,
+            note=payload.note,
+            decision_version=payload.decision_version,
         )
     except AppError as exc:
         raise _map_error(exc) from exc

@@ -451,6 +451,11 @@ class PayflowAccountModel(Base):
     client_reference_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
     product_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     date_listed: Mapped[date | None] = mapped_column(Date, nullable=True)
+    date_incurred: Mapped[date | None] = mapped_column(Date, nullable=True)
+    delinquency_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    paid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settlement_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    commission_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_email_sent_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     last_sms_sent_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     last_contact_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -672,6 +677,11 @@ class PayflowHumanReviewModel(Base):
     rule_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("payflow_rules.id"), nullable=True, index=True
     )
+    strategy_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_strategies.id"), nullable=True, index=True
+    )
+    workflow_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    exception_step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     priority: Mapped[str] = mapped_column(String(32), nullable=False, default="Normal")
     reason: Mapped[str] = mapped_column(String(255), nullable=False)
     condition_text: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -684,12 +694,21 @@ class PayflowHumanReviewModel(Base):
     waiting_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="Awaiting Review")
     assigned_supervisor: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     final_action: Mapped[str | None] = mapped_column(String(512), nullable=True)
     guidance: Mapped[str | None] = mapped_column(Text, nullable=True)
     rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hold_until: Mapped[str | None] = mapped_column(String(128), nullable=True)
     history: Mapped[list | None] = mapped_column(JSON, nullable=True)
     days_past_due: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Optimistic concurrency token — bumped on every lifecycle/decision write.
+    decision_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -700,6 +719,42 @@ class PayflowHumanReviewModel(Base):
     client = relationship("PayflowClientModel", back_populates="reviews")
     account = relationship("PayflowAccountModel", back_populates="reviews")
     rule = relationship("PayflowRuleModel", back_populates="reviews")
+    strategy = relationship("PayflowStrategyModel")
+    assigned_user = relationship("UserModel", foreign_keys=[assigned_user_id])
+    decided_by_user = relationship("UserModel", foreign_keys=[decided_by_user_id])
+    audit_events = relationship(
+        "PayflowHumanReviewAuditModel",
+        back_populates="review",
+        cascade="all, delete-orphan",
+        order_by="PayflowHumanReviewAuditModel.id",
+    )
+
+
+class PayflowHumanReviewAuditModel(Base):
+    """Immutable audit trail for Human Review lifecycle and decisions."""
+
+    __tablename__ = "payflow_human_review_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    review_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_human_reviews.id"), nullable=False, index=True
+    )
+    event: Mapped[str] = mapped_column(String(128), nullable=False)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    actor_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    before_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    after_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    before_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after_values: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    review = relationship("PayflowHumanReviewModel", back_populates="audit_events")
+    actor = relationship("UserModel")
 
 
 class PayflowClientFieldMappingModel(Base):

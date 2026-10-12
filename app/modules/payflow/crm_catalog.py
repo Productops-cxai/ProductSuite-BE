@@ -6,7 +6,7 @@ Inbound mapped to real placement files:
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class CrmFieldDef(TypedDict):
@@ -17,6 +17,8 @@ class CrmFieldDef(TypedDict):
     sample_value: str
     group: str
     available: str  # Yes | Derived | Optional | PayFlow-built (Partial | Ambiguous | No = open)
+    # Which PayFlow ingest file this mapping applies to (System Mapping UI split).
+    feed: NotRequired[str]  # client_hierarchy | daily_accounts
 
 
 # Phase-1 INBOUND — CRM → PayFlow. required=True blocks activation if unmapped
@@ -351,13 +353,69 @@ CRM_INBOUND_FIELDS: list[CrmFieldDef] = [
         "available": "Yes",
     },
     {
-        "source_field": "COLLECTION_STATUS",
+        "source_field": "dn_collection_status_name / case_life_status",
         "payflow_field": "collection_status",
-        "meaning": "PayFlow collection status including Promise to Pay.",
+        "meaning": (
+            "Account collection status from the daily CRM file. Prefer "
+            "dn_collection_status_name; case_life_status is a supporting signal. "
+            "Mapped into PayFlow statuses: Active / Promise to Pay / Payment Plan / "
+            "Human Review / Resolved (unknown CRM values default to Active)."
+        ),
         "required": False,
         "sample_value": "Active",
         "group": "Account and Loan",
         "available": "Yes",
+        "feed": "daily_accounts",
+    },
+    {
+        "source_field": "date_incurred",
+        "payflow_field": "date_incurred",
+        "meaning": "Date the debt / obligation was incurred (YYYY-MM-DD).",
+        "required": False,
+        "sample_value": "2020-01-26",
+        "group": "Balances and Dates",
+        "available": "Yes",
+        "feed": "daily_accounts",
+    },
+    {
+        "source_field": "delinquency_date",
+        "payflow_field": "delinquency_date",
+        "meaning": "Date the account entered delinquency (YYYY-MM-DD).",
+        "required": False,
+        "sample_value": "2024-11-18",
+        "group": "Balances and Dates",
+        "available": "Yes",
+        "feed": "daily_accounts",
+    },
+    {
+        "source_field": "paid_amount",
+        "payflow_field": "paid_amount",
+        "meaning": "Total amount paid to date on the account (not only last payment).",
+        "required": False,
+        "sample_value": "121.00",
+        "group": "Balances and Dates",
+        "available": "Yes",
+        "feed": "daily_accounts",
+    },
+    {
+        "source_field": "settlement_rate",
+        "payflow_field": "settlement_rate",
+        "meaning": "Settlement rate percent from CRM (e.g. 45.00 = 45%).",
+        "required": False,
+        "sample_value": "45.00",
+        "group": "Balances and Dates",
+        "available": "Yes",
+        "feed": "daily_accounts",
+    },
+    {
+        "source_field": "commission_rate",
+        "payflow_field": "commission_rate",
+        "meaning": "Agency / placement commission rate percent from CRM.",
+        "required": False,
+        "sample_value": "18.00",
+        "group": "Balances and Dates",
+        "available": "Yes",
+        "feed": "daily_accounts",
     },
     # ----- Collection history (daily file + PayFlow activity) -----
     {
@@ -583,7 +641,153 @@ for _field in CRM_INBOUND_FIELDS:
         _field["available"] = "Optional"
         _field["required"] = False
         _field["meaning"] = _field["meaning"].rstrip() + _OPTIONAL_NOTE
+    # Default: daily account file (placement / debtor dump).
+    if not _field.get("feed"):
+        _field["feed"] = "daily_accounts"
 
+# Client hierarchy bulk-upload columns (separate System Mapping section).
+CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
+    {
+        "source_field": "client_number",
+        "payflow_field": "crm_client_number",
+        "meaning": "CRM client number. Masters and sub-clients are matched on this identifier.",
+        "required": True,
+        "sample_value": "M-alectra",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "client_code",
+        "payflow_field": "client_code",
+        "meaning": "PayFlow client / portfolio code from the clients file.",
+        "required": True,
+        "sample_value": "alectra",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "is_master_client",
+        "payflow_field": "is_master_client",
+        "meaning": "True = Client (master); False = Sub-Client/Portfolio under a master.",
+        "required": True,
+        "sample_value": "True",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "master_client__client_number",
+        "payflow_field": "master_client_number",
+        "meaning": "Parent Client identifier for Sub-Client/Portfolio rows.",
+        "required": False,
+        "sample_value": "M-alectra-utilities-corporation",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "company_name",
+        "payflow_field": "client_name",
+        "meaning": "Legal / display name for the Client (or portfolio company name).",
+        "required": True,
+        "sample_value": "Alectra Utilities Corporation",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "short_name",
+        "payflow_field": "brand_name",
+        "meaning": "Short / brand name. Used as Sub-Client display name when present.",
+        "required": False,
+        "sample_value": "ALECTRA_UTILITIES_CORPORATION",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "client_type__name",
+        "payflow_field": "client_type",
+        "meaning": "First Party / Third Party (or Commercial labels mapped softly).",
+        "required": False,
+        "sample_value": "Commercial",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "client_industry__name",
+        "payflow_field": "industry",
+        "meaning": "Industry / category for the Client.",
+        "required": False,
+        "sample_value": "Financial",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "email_address / clientdemographiccontactinformation__email_address",
+        "payflow_field": "contact_email",
+        "meaning": "Primary contact email on the Client record.",
+        "required": False,
+        "sample_value": "ops@client.com",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "phone_number / clientdemographiccontactinformation__phone_number",
+        "payflow_field": "contact_phone",
+        "meaning": "Primary contact phone on the Client record.",
+        "required": False,
+        "sample_value": "4165550100",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "address_line_1 / city__name / province__name / country__name / zip_code",
+        "payflow_field": "client_address",
+        "meaning": "Client mailing address fields from the clients file.",
+        "required": False,
+        "sample_value": "5060 Address, Mississauga, ON, Canada",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "currency__name",
+        "payflow_field": "currency_code",
+        "meaning": "Default currency for the Client (e.g. Canadian Dollars → CAD).",
+        "required": False,
+        "sample_value": "Canadian Dollars",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "correspondence_language__name",
+        "payflow_field": "correspondence_language",
+        "meaning": "Default correspondence language for the Client.",
+        "required": False,
+        "sample_value": "English",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
+        "source_field": "client_status__name",
+        "payflow_field": "crm_status",
+        "meaning": "CRM status label for the Client (e.g. Enable).",
+        "required": False,
+        "sample_value": "Enable",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+]
 
 class CrmOutboundFieldDef(TypedDict):
     file: str
@@ -784,6 +988,11 @@ ACCOUNT_IMPORT_HEADERS: list[str] = [
     "phone_work",
     "language",
     "date_listed",
+    "date_incurred",
+    "delinquency_date",
+    "paid_amount",
+    "settlement_rate",
+    "commission_rate",
     "last_email_sent_date",
     "last_sms_sent_date",
     "last_contact_date",
@@ -801,6 +1010,7 @@ ACCOUNT_IMPORT_HEADERS: list[str] = [
     "days_past_due",
     "account_status",
     "collection_status",
+    "case_life_status",
     "negative_balance_reason",
     "account_category",
 ]
@@ -834,6 +1044,7 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "dn_debtorcaseaddress_province_hold_days": "hold_days",
     "dn_currency_name": "currency_code",
     "dn_collection_status_name": "collection_status",
+    "case_life_status": "case_life_status",
     "dn_debtorcaseaddress_address_line_1": "address_line1",
     "dn_debtorcaseaddress_city_name": "city",
     "dn_debtorcaseaddress_province_name": "province_state",
@@ -865,7 +1076,7 @@ ACCOUNT_CRM_DEFAULT_PRODUCT = "P4"
 
 # Agreed file behaviour for CRM → PayFlow ingest (Story 1 AC5 / AC6 baseline).
 CRM_FILE_BEHAVIOUR: dict = {
-    "catalog_version": "0.3",
+    "catalog_version": "0.4",
     "baseline_status": "Pending CRM/Product stakeholder sign-off",
     "baseline_note": (
         "PayFlow_CRM_Integration_Fields_v0.3 is the technical baseline for file ingestion. "

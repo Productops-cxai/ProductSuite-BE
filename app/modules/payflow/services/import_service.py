@@ -674,7 +674,11 @@ class PayflowImportService:
         readme.append(["Negative outstanding_balance values are coerced to absolute value per CRM contract."])
         readme.append(["account_status CLOSED rows are rejected. Dates YYYY-MM-DD. Y/N flags: last_payment_is_ptp, provincial_hold, email_consent."])
         readme.append(["Optional segmentation: employment_status, income_band, education_level, customer_segment."])
-        readme.append(["Also: crm_case_id, debtor_id, client_reference_number, product_code*, date_listed, last_*_sent/contact, hold_days, source_updated_at."])
+        readme.append([
+            "Also: crm_case_id, debtor_id, client_reference_number, product_code*, date_listed, "
+            "date_incurred, delinquency_date, paid_amount, settlement_rate, commission_rate, "
+            "case_life_status (status fallback), last_*_sent/contact, hold_days, source_updated_at."
+        ])
         readme.append(["Required: " + ", ".join(ACCOUNT_IMPORT_REQUIRED)])
         buf = io.BytesIO()
         wb.save(buf)
@@ -1287,12 +1291,29 @@ class PayflowImportService:
         if account_status == "CLOSED":
             raise ValidationAppError("CLOSED accounts are excluded at intake")
 
-        collection_raw = c("collection_status")
+        # Prefer dn_collection_status_name (aliased to collection_status); fall back to case_life_status.
+        collection_raw = c("collection_status") or c("case_life_status")
+        if collection_raw and (
+            "{" in collection_raw
+            or "amount" in collection_raw.lower()
+            or "bucket_name" in collection_raw.lower()
+        ):
+            # Shifted/corrupt debtor-dump cell after broken bucket_values quoting.
+            collection_raw = ""
         if collection_raw:
             collection_status = _COLLECTION_BY_LOWER.get(collection_raw.lower())
             if not collection_status:
-                if crm_number:
-                    # Debtor dump columns after bucket_values are often shifted/corrupt.
+                # Light CRM → PayFlow status mapping for common closed/paid labels.
+                low = collection_raw.lower()
+                if any(tok in low for tok in ("paid", "pif", "resolved", "settled", "closed")):
+                    collection_status = PayflowCollectionStatus.RESOLVED.value
+                elif "promise" in low or "ptp" in low:
+                    collection_status = PayflowCollectionStatus.PROMISE_TO_PAY.value
+                elif "payment plan" in low or "arrangement" in low:
+                    collection_status = PayflowCollectionStatus.PAYMENT_PLAN.value
+                elif "review" in low:
+                    collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
+                elif crm_number:
                     collection_status = PayflowCollectionStatus.ACTIVE.value
                 else:
                     raise ValidationAppError("collection_status is not a recognised PayFlow status")
@@ -1350,6 +1371,15 @@ class PayflowImportService:
             "phone_work": safe_text("phone_work"),
             "language": language,
             "date_listed": _parse_date(c("date_listed") or c("placement_date"), "date_listed"),
+            "date_incurred": self._soft_date(
+                c("date_incurred"), "date_incurred", soft=bool(crm_number)
+            ),
+            "delinquency_date": self._soft_date(
+                c("delinquency_date"), "delinquency_date", soft=bool(crm_number)
+            ),
+            "paid_amount": _parse_float(c("paid_amount"), "paid_amount", required=False),
+            "settlement_rate": _parse_float(c("settlement_rate"), "settlement_rate", required=False),
+            "commission_rate": _parse_float(c("commission_rate"), "commission_rate", required=False),
             "last_email_sent_date": self._soft_date(
                 c("last_email_sent_date"), "last_email_sent_date", soft=bool(crm_number)
             ),
@@ -1467,6 +1497,7 @@ class PayflowImportService:
             row.last_crm_refresh_at = now
             self.db.add(row)
             self.db.flush()
+            self._ensure_human_review_request(row)
             return "created"
 
         if self._is_unchanged(existing, parsed, portfolio.id):
@@ -1492,7 +1523,24 @@ class PayflowImportService:
         existing.timeline = events[-40:]
         self._apply_crm_fields(existing, parsed, original_locked=True)
         existing.last_crm_refresh_at = now
+        self._ensure_human_review_request(existing)
         return "updated"
+
+    def _ensure_human_review_request(self, account: PayflowAccountModel) -> None:
+        """Enqueue a Human Review row when import marks the case for review."""
+        if not account.human_review and account.collection_status != (
+            PayflowCollectionStatus.HUMAN_REVIEW.value
+        ):
+            return
+        from app.modules.payflow.services.review_service import PayflowReviewService
+
+        PayflowReviewService(self.db).ensure_review_for_account(
+            account,
+            reason="High balance treatment",
+            proposed_action="Move to stronger collection treatment",
+            actor_name="CRM import",
+            commit=False,
+        )
 
     def _apply_crm_fields(self, row: PayflowAccountModel, parsed: dict[str, Any], *, original_locked: bool) -> None:
         row.customer_first_name = parsed["customer_first_name"]
@@ -1533,6 +1581,11 @@ class PayflowImportService:
         row.client_reference_number = parsed["client_reference_number"]
         row.product_code = parsed["product_code"]
         row.date_listed = parsed["date_listed"]
+        row.date_incurred = parsed.get("date_incurred")
+        row.delinquency_date = parsed.get("delinquency_date")
+        row.paid_amount = parsed.get("paid_amount")
+        row.settlement_rate = parsed.get("settlement_rate")
+        row.commission_rate = parsed.get("commission_rate")
         row.last_email_sent_date = parsed["last_email_sent_date"]
         row.last_sms_sent_date = parsed["last_sms_sent_date"]
         row.last_contact_date = parsed["last_contact_date"]
@@ -1579,6 +1632,11 @@ class PayflowImportService:
             (row.client_reference_number, parsed["client_reference_number"]),
             (row.product_code, parsed["product_code"]),
             (row.date_listed, parsed["date_listed"]),
+            (row.date_incurred, parsed.get("date_incurred")),
+            (row.delinquency_date, parsed.get("delinquency_date")),
+            (_round2(row.paid_amount), _round2(parsed.get("paid_amount"))),
+            (_round2(row.settlement_rate), _round2(parsed.get("settlement_rate"))),
+            (_round2(row.commission_rate), _round2(parsed.get("commission_rate"))),
             (row.last_email_sent_date, parsed["last_email_sent_date"]),
             (row.last_sms_sent_date, parsed["last_sms_sent_date"]),
             (row.last_contact_date, parsed["last_contact_date"]),

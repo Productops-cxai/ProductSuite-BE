@@ -104,6 +104,11 @@ class PayflowAccountService:
             "client_reference_number": row.client_reference_number,
             "product_code": row.product_code,
             "date_listed": row.date_listed.isoformat() if row.date_listed else None,
+            "date_incurred": row.date_incurred.isoformat() if row.date_incurred else None,
+            "delinquency_date": row.delinquency_date.isoformat() if row.delinquency_date else None,
+            "paid_amount": float(row.paid_amount) if row.paid_amount is not None else None,
+            "settlement_rate": float(row.settlement_rate) if row.settlement_rate is not None else None,
+            "commission_rate": float(row.commission_rate) if row.commission_rate is not None else None,
             "last_email_sent_date": row.last_email_sent_date.isoformat()
             if row.last_email_sent_date
             else None,

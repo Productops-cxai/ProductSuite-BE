@@ -37,6 +37,7 @@ from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
     BULK_UPLOAD_HEADERS,
     CLIENT_IMPORT_MASTER_REQUIRED,
+    CRM_CLIENT_HIERARCHY_FIELDS,
     CRM_FILE_BEHAVIOUR,
     CRM_INBOUND_FIELDS,
     CRM_OUTBOUND_FIELDS,
@@ -199,8 +200,15 @@ class PayflowClientService:
     # ------------------------------------------------------------------
 
     def mapping_catalog(self) -> dict:
+        account_fields = [
+            {**f, "feed": f.get("feed") or "daily_accounts"} for f in CRM_INBOUND_FIELDS
+        ]
+        client_fields = list(CRM_CLIENT_HIERARCHY_FIELDS)
         return {
-            "fields": CRM_INBOUND_FIELDS,
+            # Back-compat: `fields` = daily account mappings (existing callers).
+            "fields": account_fields,
+            "account_fields": account_fields,
+            "client_fields": client_fields,
             "outbound_fields": CRM_OUTBOUND_FIELDS,
             "payflow_fields": PAYFLOW_TARGET_FIELDS,
             "governance_rules": GOVERNANCE_RULE_LIBRARY,
