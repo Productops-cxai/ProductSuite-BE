@@ -1082,3 +1082,46 @@ class PayflowImportPreviewResponse(BaseModel):
     summary: PayflowImportPreviewSummary
     preview: List[PayflowImportPreviewRecord] = Field(default_factory=list)
     errors: List[PayflowImportErrorItem] = Field(default_factory=list)
+
+
+# AI workflow suggestion
+
+
+class PortfolioSegmentStats(BaseModel):
+    accounts: int
+    total_outstanding: float
+    avg_outstanding: float
+    avg_days_past_due: Optional[int] = None
+    with_email_pct: int
+    with_mobile_pct: int
+    email_consent_pct: int
+    languages: dict[str, int] = Field(default_factory=dict)
+
+
+class PortfolioSegmentItem(BaseModel):
+    segment_id: str
+    label: str
+    segment: dict[str, str]
+    stats: PortfolioSegmentStats
+
+
+class PortfolioSegmentsResponse(BaseModel):
+    client_id: int
+    portfolio_id: int
+    portfolio_name: str
+    total_accounts: int
+    eligible_accounts: int
+    excluded: dict[str, int]
+    segments: List[PortfolioSegmentItem] = Field(default_factory=list)
+
+
+class SuggestWorkflowsRequest(BaseModel):
+    client_id: int
+    portfolio_id: int
+
+
+class SuggestWorkflowsResponse(BaseModel):
+    client_id: int
+    portfolio_id: int
+    portfolio_name: str
+    workflows: List[PayflowStrategyItem] = Field(default_factory=list)

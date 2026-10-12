@@ -28,3 +28,10 @@ class ForbiddenError(AppError):
 class ValidationAppError(AppError):
     def __init__(self, message: str = "Validation failed"):
         super().__init__(message, code="validation_error")
+
+
+class ServiceUnavailableError(AppError):
+    """An external service (e.g. the LLM provider) failed or is not configured."""
+
+    def __init__(self, message: str = "External service unavailable"):
+        super().__init__(message, code="service_unavailable")

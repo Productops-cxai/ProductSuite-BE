@@ -254,6 +254,7 @@ user_product_assignments
 | `strategy_service.py` | Workflows/strategies create/update/draft/approve/reject |
 | `communication_service.py` | Communications list/detail (scoped) |
 | `notification_service.py` | In-app notifications create/list/mark-read |
+| `workflow_suggestion/` | **AI workflow suggestion**: segments a portfolio's accounts, asks an LLM (Groq) for one workflow per segment, validates, saves as "AI Proposed". APIs: `GET /payflow/clients/{id}/portfolios/{id}/segments`, `POST /payflow/workflows/suggest`. See [`docs/AI_WORKFLOW_SUGGESTION.md`](docs/AI_WORKFLOW_SUGGESTION.md) |
 
 ### Authorization layers (PayFlow)
 
@@ -408,6 +409,11 @@ User: GET /me/products
 | `SMTP_USER` / `SMTP_PASSWORD` | SMTP auth |
 | `SMTP_FROM` | From address |
 | `SMTP_USE_TLS` | STARTTLS flag |
+| `GROQ_API_KEY` | LLM key for AI workflow suggestion |
+| `GROQ_MODEL` | LLM model (default `openai/gpt-oss-120b`) |
+| `GROQ_TIMEOUT_SECONDS` | Per LLM call timeout |
+| `GROQ_REASONING_EFFORT` | `low` / `medium` / `high` |
+| `GROQ_SEGMENTS_PER_CALL` | Free-tier batching (segments per LLM call; `0` = one call) |
 
 ---
 
@@ -422,5 +428,6 @@ User: GET /me/products
 7. **Entitlement gate** — org granted + user assigned + product active, then PayFlow membership for in-product RBAC.
 8. **File-first clients** — daily file / import is the primary onboarding path; System Mapping is global, not per-client.
 9. **Geo via BE proxy** — public geo APIs are never called from the browser.
+10. **AI suggests, code decides** — for AI workflow suggestion, code builds segments and enforces rules / limits; the LLM only designs workflow steps; results are saved as "AI Proposed" for human review ([`docs/AI_WORKFLOW_SUGGESTION.md`](docs/AI_WORKFLOW_SUGGESTION.md)).
 
 Operational start + recent changelog: `docs/samples/README.md`.
