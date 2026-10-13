@@ -6,7 +6,7 @@ PayFlow can suggest **collection workflows** for a portfolio using an LLM. Code 
 |---|---|
 | **Owner** | AI team |
 | **Code** | `app/modules/payflow/services/workflow_suggestion/` |
-| **APIs** | `GET /payflow/clients/{client_id}/portfolios/{portfolio_id}/segments` · `POST /payflow/workflows/suggest` |
+| **APIs** | `GET /payflow/clients/{client_id}/portfolios/{portfolio_id}/segments` · `POST /payflow/workflows/suggest` · `POST /payflow/workflows/{id}/regenerate` |
 | **LLM** | Groq · `openai/gpt-oss-120b` |
 | **Build plan / history** | [`WORKFLOW_SUGGESTION_PLAN.md`](WORKFLOW_SUGGESTION_PLAN.md) |
 
@@ -92,7 +92,7 @@ No eligible accounts → `400`.
 |---|---|
 | Allowed channels | Client settings (Email / SMS) |
 | Max messages per 7 days | "Prevent Communication when Messages Sent (7 days) ≥ N" rules — the strictest wins |
-| 3–12 steps, max 5 messages, a Wait between messages | Config |
+| 3–15 steps, max 5 messages, a Wait between messages | Config |
 
 ### Step 5 — Batches (free tier only)
 The Groq free tier allows 8,000 tokens/minute, so segments are sent `GROQ_SEGMENTS_PER_CALL` at a time (e.g. 2 → `[A,B] [C,D] [E,F]`). `0` = all in one call.
@@ -100,12 +100,12 @@ The Groq free tier allows 8,000 tokens/minute, so segments are sent `GROQ_SEGMEN
 ### Step 6 — Ask the AI and check the answer (per batch)
 
 **6a. Prompt (`prompt.py`)**
-- *System:* role · flowchart rules (unique ids, Trigger first, `next` / `yes` / `no`, which steps may end a path, no loops) · what each step kind needs · allowed values from the workflow catalog (only enabled channels and their templates) · limits from Step 4 · strategy guidance · 2 example workflows.
+- *System:* role · flowchart rules (unique ids, Trigger first, `next` / `yes` / `no`, which steps may end a path, no loops) · what each step kind needs · allowed values from the workflow catalog (only enabled channels and their templates) · limits from Step 4 · strategy guidance (incl. branching on delivery, link clicks, disputes, high balances) · 3 example workflows, one with real branches (email bounced → SMS, dispute → hold).
 - *User:* client summary · portfolio · the batch's segments (label + stats).
 
-**6b. Groq call (`llm.py`)** — low reasoning effort, JSON schema with the catalog's allowed values (`segment_id` limited to the batch). Rate limited (429) → waits as told and retries (max 5). Other failures → `502`.
+**6b. Groq call (`llm.py`)** — the AI returns each workflow with a structured `reasoning` object (`segment_fit`, `channels`, `timing`, `escalation`, and `changes_made` on regenerate), each 1–2 sentences quoting the segment's numbers. Low reasoning effort, JSON schema with the catalog's allowed values (`segment_id` limited to the batch). Rate limited (429) → waits as told and retries (max 5). Other failures → `502`.
 
-**6c. Validate (`validator.py`)** — structure, flowchart, allowed values, step settings, limits (see [§6](#6-code-map)). Returns plain errors such as `Workflow B: has 13 steps (allowed 3-12)`.
+**6c. Validate (`validator.py`)** — structure, flowchart, allowed values, step settings, limits (see [§6](#6-code-map)). Returns plain errors such as `Workflow B: has 16 steps (allowed 3-15)`.
 
 **6d. Fix** — good workflows are kept; broken ones go back to the AI **with the error list** (max 2 fix attempts per batch). Still broken → `502`, nothing saved.
 
@@ -120,7 +120,7 @@ All batches must pass before anything is saved.
 | `segment` | UI dropdown values + `situation` + `contact_state` |
 | `steps`, `entry_node_id` | The AI flowchart (timing labels added automatically) |
 | `cases_covered` | Accounts in the segment |
-| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, **AI rationale**, one **"Governed by"** line per rule |
+| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule |
 | `ai_proposal_snapshot` | Frozen copy of the AI original (kept after human edits) |
 
 Supervisors are notified (existing behaviour).
@@ -136,6 +136,7 @@ AI Proposed ──begin-review / edit──► Under Review ──approve──�
      └──── reject ("regeneration requested")                           deactivate ──► Inactive
 ```
 Editing an AI workflow marks it **Human Modified**; the AI original stays in `ai_proposal_snapshot`.
+To ask the AI for an improved version instead, a reviewer calls **Regenerate** with remarks ([§3.3](#33-regenerate-a-workflow)) — a new linked "AI Proposed" workflow is created and the original is left as it is.
 
 ---
 
@@ -251,7 +252,10 @@ Each item in `workflows` is a normal workflow (`PayflowStrategyItem`). Real exam
     { "label": "Avg outstanding", "value": "7,238.13 CAD" },
     { "label": "Avg days past due", "value": "14" },
     { "label": "Email consent", "value": "79%" },
-    { "label": "AI rationale", "value": "Never-contacted accounts with full email coverage and good mobile reach; a gentle email followed by an SMS link maximizes contact chances before manual intervention." },
+    { "label": "Why it fits", "value": "Accounts are 1-29 days past due with balances $1,500-$5,000; early-stage cases respond well to gentle reminders and an easy payment option." },
+    { "label": "Channels", "value": "Both email and SMS have 100% reach, so we start with email (high consent) and follow with SMS for a quick payment link." },
+    { "label": "Timing", "value": "Wait 3 days after the email to give time for payment, then 5 days after the SMS link before escalating." },
+    { "label": "Escalation", "value": "If no payment after the SMS link, a Human Review step lets a supervisor decide on further action." },
     { "label": "Governed by", "value": "Quiet Period Guard (system rule): IF Messages Sent (7 days) greater than or equal to 4 THEN Prevent Communication" }
   ]
 }
@@ -259,7 +263,37 @@ Each item in `workflows` is a normal workflow (`PayflowStrategyItem`). Real exam
 
 > In real responses every step's `config` lists all fields, unused ones as `null`.
 
-### 3.3 Errors
+### 3.3 Regenerate a workflow
+
+```
+POST /payflow/workflows/{strategy_id}/regenerate
+```
+
+```json
+{ "remarks": "Less aggressive: no SMS in the first 7 days, and wait at least 5 days between messages." }
+```
+
+Creates an **improved version** of one AI workflow, guided by a reviewer's remarks.
+
+| | |
+|---|---|
+| Permission | **Create / Edit Workflows** for the client |
+| Allowed for | AI-generated workflows with status **AI Proposed** or **Under Review** (not Approved / Active / Inactive, not human-made) |
+| `remarks` | Required, 3–2,000 characters |
+| Response | The new workflow (`PayflowStrategyItem`), status **AI Proposed** |
+| Time | One AI call — ~10–40 s on the free tier |
+
+How it works: the current workflow (including any human edits) + its stored segment and stats + the remarks go into the same prompt as Suggest → AI → same validator and retries → saved as a **new row** with a **new id**. The **original is not changed**. The new workflow's `ai_context` links them:
+
+```json
+{ "label": "Revision of", "value": "#1 Early Stage Friendly Email & SMS Link (v1)" },
+{ "label": "Reviewer remarks", "value": "Less aggressive: no SMS in the first 7 days, and wait at least 5 days between messages." },
+{ "label": "Changes made", "value": "Removed the SMS 3 days after the email; added a 5-day wait; second contact is now an email payment link; SMS moved after day 7." }
+```
+
+Live example: original *Email day 0 → SMS day 3* became *Email day 0 → Email day 5 → SMS day 10*. After regenerating, both are "AI Proposed" — the reviewer approves one and rejects / deletes the other.
+
+### 3.4 Errors
 
 Errors use the project's normal format: `{ "detail": "<message>" }`.
 
@@ -267,9 +301,10 @@ Errors use the project's normal format: `{ "detail": "<message>" }`.
 |---|---|---|
 | 401 | Not logged in / bad token | `Not authenticated` |
 | 403 | Missing Create / Edit Workflows, or no access to the client | `Permission required: create_edit_workflows` |
-| 404 | Client or portfolio not found, or portfolio of another client | `Portfolio not found for this client` |
-| 400 | No eligible accounts | `This portfolio has no accounts that need a workflow` |
-| 502 | AI not configured / unreachable / reply cut off / still invalid after 2 fixes — **nothing saved** | `AI could not produce valid workflows: Workflow B: has 13 steps (allowed 3-12); …` |
+| 404 | Client, portfolio or workflow not found, or portfolio of another client | `Portfolio not found for this client` |
+| 400 | No eligible accounts (suggest); not an AI workflow or wrong status (regenerate) | `Only AI Proposed or Under Review workflows can be regenerated` |
+| 422 | Request body invalid (e.g. empty `remarks`) | FastAPI validation detail |
+| 502 | AI not configured / unreachable / reply cut off / still invalid after 2 fixes — **nothing saved** | `AI could not produce valid workflows: Workflow B: has 16 steps (allowed 3-15); …` |
 
 ---
 
@@ -305,7 +340,7 @@ Code constants:
 | Constant | Default | File |
 |---|---|---|
 | `MIN_SEGMENT_SIZE` / `MAX_SEGMENTS` | 20 / 8 | `workflow_suggestion/config.py` |
-| `MIN_STEPS` / `MAX_STEPS` / `MAX_COMMUNICATIONS` | 3 / 12 / 5 | `workflow_suggestion/config.py` |
+| `MIN_STEPS` / `MAX_STEPS` / `MAX_COMMUNICATIONS` | 3 / 15 / 5 | `workflow_suggestion/config.py` |
 | Band meanings (days late, balance, age, tenure, region, language) | catalog bands | `workflow_suggestion/config.py` |
 | `MAX_FIX_ATTEMPTS` | 2 | `workflow_suggestion/service.py` |
 | `RATE_LIMIT_RETRIES` | 5 | `workflow_suggestion/llm.py` |
@@ -325,12 +360,12 @@ All in `app/modules/payflow/services/workflow_suggestion/` unless noted.
 | `context.py` | `load_client_context`, `load_rules`, `load_portfolio_accounts` | Load data |
 | `segmenter.py` | `build_segments`, `filter_eligible`, `label_account`, `group_accounts`, `merge_small_groups`, `describe_segment`, **`match_account_to_segment`** | Segments; matching accounts to segments |
 | `rules.py` | `design_limits`, `governing_rules` | Rules → limits; "Governed by" text |
-| `prompt.py` + `prompts/workflow_examples.json` | `build_messages`, `build_feedback` | Prompt, retry feedback, examples |
+| `prompt.py` + `prompts/workflow_examples.json` | `build_messages`, `build_feedback`, `build_revision` | Prompt, retry feedback, regenerate text, examples |
 | `llm.py` | `build_output_schema`, `call_llm` | Groq call, JSON schema, rate-limit waits |
 | `validator.py` | `validate_all` (+ `validate_structure`, `validate_flowchart`, `validate_catalog_values`, `validate_step_config`, `validate_limits`) | Checks AI workflows |
-| `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`; `_batches` | Orchestration, retries, saving |
-| `app/modules/payflow/routes.py` | `preview_portfolio_segments`, `suggest_workflows` | Routes ("Workflow suggestions (AI)" section) |
-| `app/modules/payflow/schemas.py` | `PortfolioSegmentsResponse`, `SuggestWorkflowsRequest`, `SuggestWorkflowsResponse` | Request / response models |
+| `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`, `.regenerate_workflow`; `_batches` | Orchestration, retries, saving |
+| `app/modules/payflow/routes.py` | `preview_portfolio_segments`, `suggest_workflows`, `regenerate_workflow` | Routes ("Workflow suggestions (AI)" section) |
+| `app/modules/payflow/schemas.py` | `PortfolioSegmentsResponse`, `SuggestWorkflowsRequest`, `SuggestWorkflowsResponse`, `RegenerateWorkflowRequest` | Request / response models |
 | `app/core/exceptions.py` | `ServiceUnavailableError` | AI failures → `502` |
 | `app/core/config.py` | `GROQ_*` settings | |
 
@@ -351,7 +386,8 @@ venv\Scripts\python.exe -m pytest
 | `tests/test_workflow_segmenter.py` | 14 | Filtering, labels, merge order, every account in exactly one segment, determinism, matching |
 | `tests/test_workflow_prompt_llm.py` | 17 | Limits from rules, prompt content, examples valid, schema, Groq errors, rate-limit waits |
 | `tests/test_workflow_validator.py` | 27 | One failing case per check; prompt examples pass |
-| `tests/test_workflow_suggestion_api.py` | 12 | Both APIs: success, retry-then-pass, give-up (nothing saved), batching, 400 / 403 / 404 / 502 |
+| `tests/test_workflow_suggestion_api.py` | 12 | Preview + suggest: success, retry-then-pass, give-up (nothing saved), batching, 400 / 403 / 404 / 502 |
+| `tests/test_workflow_regenerate.py` | 15 | Regenerate: new linked version, original unchanged, retry, give-up, allowed / refused statuses, 400 / 403 / 404 / 422 / 502 |
 
 ### Manual testing with Postman
 
@@ -409,7 +445,7 @@ Most rules (e.g. Balance > 10,000 → Human Review, Dispute → Hold) can only b
 - **Preview segments** button on a portfolio → show segment labels and stats (fast).
 - **Suggest workflows** button → long-running; show progress and do not time out. Handle `502` (show `detail`; nothing was saved) and `400` (no eligible accounts).
 - New workflows appear in the normal workflows list with status **AI Proposed** and `source = "AI Generated"`.
-- Worth showing on workflow detail: the segment ("Who it applies to" — `segment`), `cases_covered`, the **AI rationale** and **"Governed by"** lines (`ai_context`), and the AI original vs edited version (`ai_proposal_snapshot`).
+- Worth showing on workflow detail: the segment ("Who it applies to" — `segment`), `cases_covered`, the AI's **reasoning** lines ("Why it fits", "Channels", "Timing", "Escalation", "Changes made") and **"Governed by"** lines (`ai_context`), and the AI original vs edited version (`ai_proposal_snapshot`).
 - `segment` has two extra keys the dropdowns don't know (`situation`, `contact_state`) — show them as text or ignore them; do not drop them when saving edits.
 
 ---
@@ -419,8 +455,8 @@ Most rules (e.g. Balance > 10,000 → Human Review, Dispute → Hold) can only b
 | # | Issue | Recommendation |
 |---|---|---|
 | 1 | With 3 segments per call the AI reply can be **cut off** (Groq's default reply limit is 3,072 tokens) → `502` | Set `max_completion_tokens` in `call_llm` (~4,500 on the free tier, higher on paid). Until then use `GROQ_SEGMENTS_PER_CALL=2` |
-| 2 | Most retries are the AI using **13–15 steps** (max 12) | Raise `MAX_STEPS` to ~15, or stress the limit more in the prompt |
-| 3 | Retry budget (2 fixes) was sometimes fully used | Allow 3, or fix #2 |
+| 2 | ~~Most retries were the AI using 13–15 steps (max 12)~~ | **Done:** `MAX_STEPS` raised to 15, plus branching guidance and a branching example. Live run: real two-path branches went from 5% to 37% of branches. New small one: the AI sometimes writes balance `5000` instead of `5,000` — normalise numbers in the validator to save a retry |
+| 3 | Retry budget (2 fixes) was sometimes fully used — one live run failed with `502` ("no Wait between messages" not fixed in 2 tries) | Allow 3, or fix #2 |
 | 4 | Free tier: 1–5 min per request, ~40k tokens per portfolio | Development only. Paid tier + `GROQ_SEGMENTS_PER_CALL=0` for customers |
 | 5 | Request too long for normal HTTPS limits | Background job (see [§8](#long-requests)) |
 | 6 | Pre-existing (not this feature): email logging prints `→`, which crashes when the server's output is redirected on Windows (cp1252) | Set `PYTHONIOENCODING=utf-8`, or remove the special character from the log message |

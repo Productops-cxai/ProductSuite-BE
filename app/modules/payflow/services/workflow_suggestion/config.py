@@ -82,8 +82,19 @@ BAND_DEFINITIONS: dict[str, dict] = {
 
 # Workflow limits — stated in the prompt and enforced by the validator.
 MIN_STEPS = 3
-MAX_STEPS = 12
+MAX_STEPS = 15  # room for real branches (raised from 12 — the AI often needed 13–15)
 MAX_COMMUNICATIONS = 5
+
+# Why the AI chose a workflow — one short text per field, saved as ai_context lines.
+# changes_made is only filled on regenerate.
+REASONING_LABELS: dict[str, str] = {
+    "segment_fit": "Why it fits",
+    "channels": "Channels",
+    "timing": "Timing",
+    "escalation": "Escalation",
+    "changes_made": "Changes made",
+}
+REASONING_FIELDS = tuple(REASONING_LABELS)
 
 # Segmenting — small groups are merged until each has MIN_SEGMENT_SIZE accounts.
 # MAX_SEGMENTS = Promise to Pay + Payment Plan + up to 6 Active segments.

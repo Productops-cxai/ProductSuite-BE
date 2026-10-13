@@ -70,6 +70,7 @@ from app.modules.payflow.schemas import (
     PortfolioSegmentsResponse,
     SuggestWorkflowsRequest,
     SuggestWorkflowsResponse,
+    RegenerateWorkflowRequest,
 )
 from app.modules.platform.schemas import DeletionLogResponse
 from app.modules.payflow.service import PayflowUserService
@@ -1054,6 +1055,19 @@ def suggest_workflows(
         return WorkflowSuggestionService(db).suggest_workflows(
             user, payload.client_id, payload.portfolio_id
         )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/regenerate", response_model=PayflowStrategyItem)
+def regenerate_workflow(
+    strategy_id: int,
+    payload: RegenerateWorkflowRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    try:
+        return WorkflowSuggestionService(db).regenerate_workflow(user, strategy_id, payload.remarks)
     except AppError as exc:
         raise _map_error(exc) from exc
 

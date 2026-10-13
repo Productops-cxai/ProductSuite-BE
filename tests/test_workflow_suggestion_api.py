@@ -197,7 +197,8 @@ def test_suggest_saves_ai_proposed_workflows(client, admin_token, portfolio):
     assert workflow["segment"]["situation"] == "Active"
     assert workflow["ai_proposal_snapshot"] is not None
     labels = {item["label"] for item in workflow["ai_context"]}
-    assert {"Segment", "Accounts", "AI rationale"} <= labels
+    assert {"Segment", "Accounts", "Why it fits", "Channels", "Timing", "Escalation"} <= labels
+    assert "AI rationale" not in labels and "Changes made" not in labels
 
 
 def test_suggest_retries_with_errors_then_saves(client, admin_token, portfolio):
