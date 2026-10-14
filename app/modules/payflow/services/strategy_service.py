@@ -729,7 +729,11 @@ class PayflowStrategyService:
         self._assert_view(user, row.client_id)
         return self._serialize(row)
 
-    def create_strategy(self, user: UserModel, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_strategy(
+        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True
+    ) -> dict[str, Any]:
+        """commit=False only flushes and skips the notification: the caller saves several
+        workflows together, commits once, then calls notify_awaiting for each."""
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Strategy name is required")
@@ -844,11 +848,21 @@ class PayflowStrategyService:
             created_by=user.full_name,
         )
         self.db.add(row)
+        if not commit:
+            # Flush gives the row its id and makes its code visible to _unique_code.
+            self.db.flush()
+            return self._serialize(self._get_row(row.id))
         self.db.commit()
         self.db.refresh(row)
         if row.status in AWAITING_STATUSES:
             self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
+
+    def notify_awaiting(self, user: UserModel, strategy_id: int) -> None:
+        """Notify reviewers about a saved workflow (for create_strategy(commit=False) callers)."""
+        row = self._get_row(strategy_id)
+        if row.status in AWAITING_STATUSES:
+            self._notify_awaiting(row, user)
 
     def begin_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)

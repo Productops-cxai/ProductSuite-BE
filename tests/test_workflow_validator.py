@@ -108,6 +108,9 @@ def _add_orphan(workflow):
         # Step config
         (_drop("s3", "amount", in_config=True), "step s3 (Wait): missing amount"),
         (_drop("s2", "template_id", in_config=True), "step s2 (Communication): missing template_id"),
+        # Timing without a reference_event (rejected by the save step)
+        (_set_config("s4", unit="Days"), "step s4 (Condition): has timing (amount / unit) but no reference_event"),
+        (_set_config("s8", amount=2), "step s8 (Human Review): has timing (amount / unit) but no reference_event"),
         # Message spacing: s3 is no longer a Wait, so s2 and s5 go out back to back
         (_set("s3", kind="AI Reassessment", config={"note": "check"}), "steps s2 and s5 send messages with no Wait"),
     ],
@@ -129,6 +132,11 @@ def test_each_check_reports_a_clear_error(change, expected):
 def test_limits(limits, expected):
     errors = errors_for(lambda w: None, limits)
     assert any(expected in e for e in errors), errors
+
+
+def test_missing_reference_event_is_reported_once():
+    errors = errors_for(_drop("s3", "reference_event", in_config=True))
+    assert [e for e in errors if "reference_event" in e] == ["Workflow A, step s3 (Wait): missing reference_event"]
 
 
 def test_weekly_cap_counts_wait_time():
