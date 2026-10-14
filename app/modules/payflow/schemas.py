@@ -1228,3 +1228,15 @@ class SuggestWorkflowsResponse(BaseModel):
     portfolio_id: int
     portfolio_name: str
     workflows: List[PayflowStrategyItem] = Field(default_factory=list)
+
+
+class RegenerateWorkflowRequest(BaseModel):
+    remarks: str = Field(min_length=3, max_length=2000, description="Reviewer remarks the AI should address")
+
+    @field_validator("remarks")
+    @classmethod
+    def remarks_required(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if len(cleaned) < 3:
+            raise ValueError("Remarks are required")
+        return cleaned

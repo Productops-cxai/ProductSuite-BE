@@ -23,6 +23,7 @@ from app.modules.payflow.services.strategy_service import (
     TIME_DIRECTIONS,
     TIME_UNITS,
 )
+from app.modules.payflow.services.workflow_suggestion.config import REASONING_FIELDS
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 RATE_LIMIT_RETRIES = 5
 MAX_RATE_LIMIT_WAIT_SECONDS = 60
@@ -73,16 +74,21 @@ def build_output_schema(segment_ids: list[str], channels: list[str]) -> dict[str
         },
         required=["id", "kind", "title", "config"],
     )
+    text = {"type": "string"}
+    reasoning = _object(
+        {field: text for field in REASONING_FIELDS},
+        required=[field for field in REASONING_FIELDS if field != "changes_made"],  # changes_made: regenerate only
+    )
     workflow = _object(
         {
             "segment_id": _enum(segment_ids),
-            "name": {"type": "string"},
-            "summary": {"type": "string"},
-            "rationale": {"type": "string"},
-            "entry_node_id": {"type": "string"},
+            "name": text,
+            "summary": text,
+            "reasoning": reasoning,
+            "entry_node_id": text,
             "steps": {"type": "array", "items": step},
         },
-        required=["segment_id", "name", "summary", "rationale", "entry_node_id", "steps"],
+        required=["segment_id", "name", "summary", "reasoning", "entry_node_id", "steps"],
     )
     return _object({"workflows": {"type": "array", "items": workflow}}, required=["workflows"])
 

@@ -10,20 +10,32 @@ from app.core.config import settings
 from app.core.exceptions import ServiceUnavailableError, ValidationAppError
 from app.infrastructure.database.models import UserModel
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.workflow_suggestion.config import REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
     load_portfolio_accounts,
     load_rules,
 )
 from app.modules.payflow.services.workflow_suggestion.llm import build_output_schema, call_llm
-from app.modules.payflow.services.workflow_suggestion.prompt import build_messages
+from app.modules.payflow.services.workflow_suggestion.prompt import build_messages, build_revision
 from app.modules.payflow.services.workflow_suggestion.rules import design_limits, governing_rules
 from app.modules.payflow.services.workflow_suggestion.segmenter import build_segments
 from app.modules.payflow.services.workflow_suggestion.validator import validate_all
-from app.shared.enums import PayflowStrategySource
+from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 
 # After the first AI answer, failing workflows are sent back to the AI this many times.
 MAX_FIX_ATTEMPTS = 2
+
+# Approved / Active / Inactive workflows are never regenerated.
+REGENERATE_STATUSES = {PayflowStrategyStatus.AI_PROPOSED.value, PayflowStrategyStatus.UNDER_REVIEW.value}
+# ai_context lines rewritten on every revision (the rest is kept from the original).
+_REWRITTEN_CONTEXT = {
+    "AI rationale",  # older workflows (before the structured reasoning)
+    *REASONING_LABELS.values(),
+    "Revision of",
+    "Reviewer remarks",
+    "Governed by",
+}
 
 
 class WorkflowSuggestionService:
@@ -58,10 +70,20 @@ class WorkflowSuggestionService:
             workflows.update(self._suggest_batch(client, portfolio.name, batch, limits))
 
         governed_by = governing_rules(client, rules)
-        saved = [
-            self._save(user, client, portfolio.id, segment, workflows[segment["segment_id"]], governed_by)
-            for segment in segments
-        ]
+        saved = []
+        for segment in segments:
+            workflow = workflows[segment["segment_id"]]
+            saved.append(
+                self._save(
+                    user,
+                    client["id"],
+                    portfolio.id,
+                    workflow,
+                    segment=segment["segment"],
+                    cases_covered=segment["stats"]["accounts"],
+                    ai_context=_ai_context(client, segment, workflow, governed_by),
+                )
+            )
         return {
             "client_id": client_id,
             "portfolio_id": portfolio.id,
@@ -69,19 +91,60 @@ class WorkflowSuggestionService:
             "workflows": saved,
         }
 
+    def regenerate_workflow(self, user: UserModel, strategy_id: int, remarks: str) -> dict[str, Any]:
+        """New "AI Proposed" version of an AI workflow, guided by reviewer remarks.
+
+        The original workflow is not changed; the new one records "Revision of #id".
+        """
+        original = self.strategies.get_strategy(user, strategy_id)
+        if original["source"] != PayflowStrategySource.AI_GENERATED.value:
+            raise ValidationAppError("Only AI-generated workflows can be regenerated")
+        if original["status"] not in REGENERATE_STATUSES:
+            raise ValidationAppError("Only AI Proposed or Under Review workflows can be regenerated")
+        self.strategies._assert_manage(user, original["client_id"])
+        client = load_client_context(self.db, original["client_id"])
+        rules = load_rules(self.db, original["client_id"])
+        limits = design_limits(client, rules)
+
+        # The workflow already stores its segment and stats — reuse them as the AI's context.
+        kept = [item for item in original["ai_context"] if item["label"] not in _REWRITTEN_CONTEXT]
+        segment = {
+            "segment_id": "A",
+            "label": next((i["value"] for i in kept if i["label"] == "Segment"), "Current segment"),
+            "stats": {i["label"]: i["value"] for i in kept if i["label"] != "Segment"},
+        }
+        revision = build_revision(segment["segment_id"], original, remarks)
+        workflow = self._suggest_batch(client, original["portfolio_name"] or "", [segment], limits, revision)["A"]
+
+        ai_context = kept + _reasoning_context(workflow) + [
+            {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
+            {"label": "Reviewer remarks", "value": remarks},
+        ]
+        ai_context += [{"label": "Governed by", "value": line} for line in governing_rules(client, rules)]
+        return self._save(
+            user,
+            original["client_id"],
+            original["portfolio_id"],
+            workflow,
+            segment=original["segment"],
+            cases_covered=original["cases_covered"],
+            ai_context=ai_context,
+        )
+
     def _suggest_batch(
         self,
         client: dict[str, Any],
         portfolio_name: str,
         batch: list[dict[str, Any]],
         limits: dict[str, Any],
+        revision: str | None = None,
     ) -> dict[str, dict]:
         """One valid workflow per segment, retrying only the ones that fail validation."""
         accepted: dict[str, dict] = {}
         pending: list[dict[str, Any]] = batch
         feedback: list[dict[str, Any]] = []
         for _ in range(1 + MAX_FIX_ATTEMPTS):
-            messages = build_messages(client, portfolio_name, pending, limits, feedback)
+            messages = build_messages(client, portfolio_name, pending, limits, feedback, revision)
             schema = build_output_schema([s["segment_id"] for s in pending], limits["channels"])
             reply = _workflows_by_segment(call_llm(messages, schema))
 
@@ -107,26 +170,28 @@ class WorkflowSuggestionService:
     def _save(
         self,
         user: UserModel,
-        client: dict[str, Any],
+        client_id: int,
         portfolio_id: int,
-        segment: dict[str, Any],
         workflow: dict[str, Any],
-        governed_by: list[str],
+        *,
+        segment: dict[str, Any],
+        cases_covered: int | None,
+        ai_context: list[dict[str, str]],
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         return self.strategies.create_strategy(
             user,
             {
                 "name": workflow["name"],
-                "client_id": client["id"],
+                "client_id": client_id,
                 "portfolio_id": portfolio_id,
                 "summary": workflow.get("summary"),
-                "segment": segment["segment"],
-                "cases_covered": segment["stats"]["accounts"],
+                "segment": segment,
+                "cases_covered": cases_covered,
                 "entry_node_id": workflow["entry_node_id"],
                 "steps": workflow["steps"],
                 "source": PayflowStrategySource.AI_GENERATED.value,
-                "ai_context": _ai_context(client, segment, workflow, governed_by),
+                "ai_context": ai_context,
             },
         )
 
@@ -162,6 +227,15 @@ def _ai_context(
         {"label": "Avg outstanding", "value": f"{stats['avg_outstanding']:,.2f} {client.get('currency') or 'CAD'}"},
         {"label": "Avg days past due", "value": "Unknown" if dpd is None else str(dpd)},
         {"label": "Email consent", "value": f"{stats['email_consent_pct']}%"},
-        {"label": "AI rationale", "value": workflow.get("rationale") or "—"},
     ]
-    return context + [{"label": "Governed by", "value": line} for line in governed_by]
+    return context + _reasoning_context(workflow) + [{"label": "Governed by", "value": line} for line in governed_by]
+
+
+def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:
+    """The AI's reasoning as ai_context lines ("Why it fits", "Channels", …); empty fields are skipped."""
+    reasoning = workflow.get("reasoning") if isinstance(workflow.get("reasoning"), dict) else {}
+    return [
+        {"label": label, "value": str(reasoning[field]).strip()}
+        for field, label in REASONING_LABELS.items()
+        if str(reasoning.get(field) or "").strip()
+    ]

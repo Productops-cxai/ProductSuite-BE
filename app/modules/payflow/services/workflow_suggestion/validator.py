@@ -23,7 +23,10 @@ from app.modules.payflow.services.strategy_service import (
     TIME_DIRECTIONS,
     TIME_UNITS,
 )
+from app.modules.payflow.services.workflow_suggestion.config import REASONING_FIELDS
 from app.modules.payflow.services.workflow_suggestion.prompt import END_STEP_KINDS
+
+REQUIRED_REASONING = [f for f in REASONING_FIELDS if f != "changes_made"]  # changes_made: regenerate only
 
 TIMING = ["reference_event", "amount", "unit", "direction"]
 REQUIRED_CONFIG: dict[str, list[str]] = {
@@ -82,6 +85,10 @@ def validate_structure(workflows: list[dict[str, Any]], segment_ids: list[str]) 
         seen.add(segment_id)
         if not (workflow.get("name") or "").strip():
             errors.append(f"{name}: name is missing")
+        reasoning = workflow.get("reasoning") if isinstance(workflow.get("reasoning"), dict) else {}
+        missing = [f for f in REQUIRED_REASONING if not str(reasoning.get(f) or "").strip()]
+        if missing:
+            errors.append(f"{name}: reasoning is missing {', '.join(missing)}")
         if not isinstance(workflow.get("steps"), list) or not workflow["steps"]:
             errors.append(f"{name}: has no steps")
     errors += [f"Segment {s}: no workflow was suggested" for s in segment_ids if s not in seen]

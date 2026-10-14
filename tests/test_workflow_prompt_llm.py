@@ -219,3 +219,20 @@ def test_governing_rules_text():
         "THEN Prevent Communication",
         "High Balance Human Review (client governance setting)",
     ]
+
+
+def test_schema_asks_for_structured_reasoning():
+    workflow = llm.build_output_schema(["A"], ["Email"])["properties"]["workflows"]["items"]
+    assert "reasoning" in workflow["required"] and "rationale" not in workflow["properties"]
+    reasoning = workflow["properties"]["reasoning"]
+    assert reasoning["required"] == ["segment_fit", "channels", "timing", "escalation"]
+    assert "changes_made" in reasoning["properties"]  # optional: regenerate only
+
+
+def test_prompt_explains_reasoning_and_revision_asks_for_changes():
+    from app.modules.payflow.services.workflow_suggestion.prompt import build_revision
+
+    limits = design_limits(CLIENT, {"system": [], "client": []})
+    system = build_messages(CLIENT, "Residential", SEGMENTS, limits)[0]["content"]
+    assert "reasoning (each field" in system and "segment_fit" in system
+    assert "reasoning.changes_made" in build_revision("A", {"steps": []}, "fewer SMS")

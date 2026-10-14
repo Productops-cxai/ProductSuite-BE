@@ -135,3 +135,14 @@ def test_weekly_cap_counts_wait_time():
     # s2 at day 0, s5 after a 10-day wait → never 2 messages in the same 7 days.
     errors = errors_for(_set_config("s3", amount=10), {"max_messages_per_7_days": 1})
     assert errors == []
+
+
+def test_reasoning_is_required():
+    workflow = valid_workflow()
+    workflow["reasoning"].pop("timing")
+    workflow["reasoning"]["channels"] = "  "
+    errors = validate_all([workflow], SEGMENTS, LIMITS)
+    assert "Workflow A: reasoning is missing channels, timing" in errors
+    assert validate_all([{**valid_workflow(), "reasoning": None}], SEGMENTS, LIMITS) == [
+        "Workflow A: reasoning is missing segment_fit, channels, timing, escalation"
+    ]
