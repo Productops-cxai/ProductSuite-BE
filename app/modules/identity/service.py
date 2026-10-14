@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, UnauthorizedError, ValidationAppError
+from app.core.request_context import get_frontend_url
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -577,7 +578,7 @@ class IdentityService:
             AuthTokenType.PASSWORD_RESET,
             minutes=minutes,
         )
-        link = f"{settings.FRONTEND_URL}/reset-password?token={raw}"
+        link = f"{get_frontend_url()}/reset-password?token={raw}"
         expiry_label = (
             f"{minutes} minute{'s' if minutes != 1 else ''}"
             if minutes < 60
@@ -618,7 +619,7 @@ class IdentityService:
         raw = self.create_auth_token(
             user.id, AuthTokenType.ACTIVATION, minutes=minutes
         )
-        link = f"{settings.FRONTEND_URL}/activate?token={raw}"
+        link = f"{get_frontend_url()}/activate?token={raw}"
         expiry_label = (
             f"{minutes} minute{'s' if minutes != 1 else ''}"
             if minutes < 60
