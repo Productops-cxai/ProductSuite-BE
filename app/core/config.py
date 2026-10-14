@@ -33,5 +33,14 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SMTP_USE_TLS: bool = True
 
+    # AI workflow suggestion — Groq (OpenAI-compatible API).
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_TIMEOUT_SECONDS: int = 60
+    GROQ_REASONING_EFFORT: str = "low"  # low | medium | high
+    # FREE-TIER BATCHING: free tier allows 8k tokens/min, so send 3 segments per call.
+    # Set 0 to send all segments in one call (paid tier).
+    GROQ_SEGMENTS_PER_CALL: int = 3
+
 
 settings = Settings()

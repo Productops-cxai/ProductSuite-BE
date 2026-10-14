@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     OrganizationModel,
     OrganizationProductEntitlementModel,
@@ -15,6 +15,7 @@ from app.infrastructure.database.models import (
     PayflowRoleModel,
     PayflowRolePermissionModel,
     PayflowUserClientAssignmentModel,
+    PayflowUserClientPermissionModel,
     PayflowUserMembershipModel,
     PlatformRoleModel,
     ProductModel,
@@ -24,6 +25,13 @@ from app.modules.identity.service import IdentityService
 from app.modules.payflow.membership import (
     ensure_payflow_membership_for_role,
     ensure_user_product_assignment,
+)
+from app.modules.payflow.services.access_context_service import AccessContextService
+from app.shared.deletion import (
+    list_deletion_logs,
+    purge_user_identity,
+    record_deletion,
+    snapshot_model,
 )
 from app.shared.enums import (
     EntitlementStatus,
@@ -52,6 +60,41 @@ class PayflowUserService:
         if not role:
             raise NotFoundError(f"PayFlow role '{code}' not found — run seeder")
         return role
+
+    @staticmethod
+    def _role_rank(role: PayflowRoleModel | None) -> int:
+        """Higher number = higher privilege. Platform-wide / Ops Admin = 2; client-scoped = 1."""
+        if not role:
+            return 0
+        if (
+            role.scope == PayflowRoleScope.PLATFORM_WIDE.value
+            or role.code == PayflowRoleCode.OPERATIONS_ADMIN.value
+        ):
+            return 2
+        return 1
+
+    def _actor_payflow_role(self, actor: UserModel) -> PayflowRoleModel:
+        membership = (
+            self.db.query(PayflowUserMembershipModel)
+            .options(joinedload(PayflowUserMembershipModel.role))
+            .filter(PayflowUserMembershipModel.user_id == actor.id)
+            .first()
+        )
+        if not membership or not membership.role:
+            raise ForbiddenError("PayFlow membership required")
+        return membership.role
+
+    def _assert_ops_admin(self, actor: UserModel, *, action: str = "perform this action") -> None:
+        if not AccessContextService(self.db).is_operations_admin(actor):
+            raise ForbiddenError(f"Only Operations Admin can {action}")
+
+    def _assert_can_manage_role(self, actor: UserModel, target_role: PayflowRoleModel) -> None:
+        """Actor may only manage / assign roles at or below their own rank."""
+        actor_role = self._actor_payflow_role(actor)
+        if self._role_rank(target_role) > self._role_rank(actor_role):
+            raise ForbiddenError(
+                "You cannot add or edit users for a higher role than your own"
+            )
 
     def _platform_user_role(self) -> PlatformRoleModel:
         role = (
@@ -257,8 +300,11 @@ class PayflowUserService:
         client_ids: Optional[list[int]] = None,
         permission_codes: Optional[list[str]] = None,
     ) -> dict:
+        # Only Operations Admin may create users (even if another role has manage_users).
+        self._assert_ops_admin(actor, action="add users")
         role_code = role_code.strip().lower()
         pf_role = self._payflow_role(role_code)
+        self._assert_can_manage_role(actor, pf_role)
         email_norm = email.lower().strip()
         if self.db.query(UserModel).filter(UserModel.email == email_norm).first():
             raise ConflictError("A user with this email already exists")
@@ -327,6 +373,7 @@ class PayflowUserService:
         self,
         user_id: UUID,
         *,
+        actor: UserModel,
         full_name: Optional[str] = None,
         email: Optional[str] = None,
         role_code: Optional[str] = None,
@@ -340,17 +387,13 @@ class PayflowUserService:
         if not membership:
             raise NotFoundError("PayFlow user not found")
         user = membership.user
+        target_role = membership.role
+        if not target_role:
+            raise NotFoundError("PayFlow role not found for user")
+        self._assert_can_manage_role(actor, target_role)
 
-        if email is not None:
-            email_norm = email.lower().strip()
-            other = (
-                self.db.query(UserModel)
-                .filter(UserModel.email == email_norm, UserModel.id != user_id)
-                .first()
-            )
-            if other:
-                raise ConflictError("A user with this email already exists")
-            user.email = email_norm
+        # Email is immutable after create — ignore any client-supplied value.
+        _ = email
 
         if full_name is not None:
             user.full_name = full_name.strip()
@@ -363,6 +406,7 @@ class PayflowUserService:
                         "Role change affects access. Set confirm_role_change=true to proceed."
                     )
                 new_role = self._payflow_role(role_code)
+                self._assert_can_manage_role(actor, new_role)
                 membership.payflow_role_id = new_role.id
                 # Ops Admin / platform-wide: clear client assignments (no longer apply)
                 if new_role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
@@ -398,6 +442,8 @@ class PayflowUserService:
         if not membership:
             raise NotFoundError("PayFlow user not found")
         user = membership.user
+        if membership.role:
+            self._assert_can_manage_role(actor, membership.role)
         if user.id == actor.id:
             raise ValidationAppError("You cannot deactivate your own account")
         if user.status != UserStatus.ACTIVE.value:
@@ -416,6 +462,8 @@ class PayflowUserService:
         if not membership:
             raise NotFoundError("PayFlow user not found")
         user = membership.user
+        if membership.role:
+            self._assert_can_manage_role(actor, membership.role)
         if user.id == actor.id:
             raise ValidationAppError("You cannot change status on your own account this way")
         if user.status != UserStatus.DISABLED.value:
@@ -432,6 +480,37 @@ class PayflowUserService:
         detail = self.get_user(user_id)
         detail["activation_link"] = link
         return detail
+
+    def delete_user(self, user_id: UUID, *, actor: UserModel, source: str | None = None) -> dict:
+        membership = (
+            self._membership_query()
+            .filter(PayflowUserMembershipModel.user_id == user_id)
+            .first()
+        )
+        if not membership:
+            raise NotFoundError("PayFlow user not found")
+        user = membership.user
+        if membership.role:
+            self._assert_can_manage_role(actor, membership.role)
+        if user.id == actor.id:
+            raise ValidationAppError("You cannot delete your own account")
+        snapshot = snapshot_model(user)
+        snapshot["payflow_role"] = membership.role.code if membership.role else None
+        snapshot["payflow_role_name"] = membership.role.name if membership.role else None
+        related = purge_user_identity(self.db, user, actor=actor)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="payflow_user",
+            entity_id=user_id,
+            entity_label=f"{snapshot.get('full_name')} ({snapshot.get('email')})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.commit()
+        return {"message": "User deleted"}
 
     def list_roles(self) -> dict:
         roles = self.db.query(PayflowRoleModel).order_by(PayflowRoleModel.id).all()
@@ -475,6 +554,7 @@ class PayflowUserService:
             "governance": "GOVERNANCE",
             "analytics": "ANALYTICS",
             "client_configuration": "CLIENT CONFIGURATION",
+            "administration": "ADMINISTRATION",
         }
         rows = (
             self.db.query(PayflowPermissionModel)
@@ -521,11 +601,13 @@ class PayflowUserService:
     def create_role(
         self,
         *,
+        actor: UserModel,
         name: str,
         scope: str,
         description: Optional[str],
         permission_codes: list[str],
     ) -> dict:
+        self._assert_ops_admin(actor, action="add or edit roles")
         scope_norm = scope.strip().lower().replace("-", "_")
         if scope_norm in ("platformwide", "platform_wide"):
             scope_norm = PayflowRoleScope.PLATFORM_WIDE.value
@@ -578,18 +660,32 @@ class PayflowUserService:
         self,
         role_id: int,
         *,
+        actor: UserModel,
         name: Optional[str] = None,
         description: Optional[str] = None,
         permission_codes: Optional[list[str]] = None,
     ) -> dict:
+        self._assert_ops_admin(actor, action="add or edit roles")
         role = self.db.query(PayflowRoleModel).filter(PayflowRoleModel.id == role_id).first()
         if not role:
             raise NotFoundError("Role not found")
-        if role.is_built_in:
-            raise ValidationAppError("Built-in roles cannot be edited")
+
+        # Platform-wide (Ops Admin): view-only. Client-scoped built-ins (Supervisor)
+        # may have their permission set edited — same as Lovable.
+        if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
+            if permission_codes is not None:
+                raise ValidationAppError("Platform-wide roles always hold all permissions")
+            if name is not None and name.strip() and name.strip() != role.name:
+                raise ValidationAppError("Platform-wide role name cannot be changed")
+            if description is not None:
+                role.description = description.strip() or None
+            self.db.commit()
+            return self.list_roles()
 
         if name is not None:
             name_clean = name.strip()
+            if role.is_built_in and name_clean != role.name:
+                raise ValidationAppError("Built-in role name cannot be changed")
             dup = (
                 self.db.query(PayflowRoleModel)
                 .filter(
@@ -606,8 +702,6 @@ class PayflowUserService:
             role.description = description.strip() or None
 
         if permission_codes is not None:
-            if role.scope == PayflowRoleScope.PLATFORM_WIDE.value:
-                raise ValidationAppError("Platform-wide roles always hold all permissions")
             if not permission_codes:
                 raise ValidationAppError("Select at least one permission")
             all_perms = {
@@ -631,11 +725,34 @@ class PayflowUserService:
                 self.db.add(
                     PayflowRolePermissionModel(payflow_role_id=role.id, permission_id=pid)
                 )
+            # Drop legacy per-assignment permission snapshots so role edits apply everywhere.
+            membership_ids = [
+                m.id
+                for m in self.db.query(PayflowUserMembershipModel)
+                .filter(PayflowUserMembershipModel.payflow_role_id == role.id)
+                .all()
+            ]
+            if membership_ids:
+                assignment_ids = [
+                    a.id
+                    for a in self.db.query(PayflowUserClientAssignmentModel)
+                    .filter(PayflowUserClientAssignmentModel.membership_id.in_(membership_ids))
+                    .all()
+                ]
+                if assignment_ids:
+                    (
+                        self.db.query(PayflowUserClientPermissionModel)
+                        .filter(
+                            PayflowUserClientPermissionModel.assignment_id.in_(assignment_ids)
+                        )
+                        .delete(synchronize_session=False)
+                    )
 
         self.db.commit()
         return self.list_roles()
 
-    def delete_role(self, role_id: int) -> dict:
+    def delete_role(self, role_id: int, *, actor: UserModel, source: str | None = None) -> dict:
+        self._assert_ops_admin(actor, action="add or edit roles")
         role = self.db.query(PayflowRoleModel).filter(PayflowRoleModel.id == role_id).first()
         if not role:
             raise NotFoundError("Role not found")
@@ -648,13 +765,43 @@ class PayflowUserService:
         )
         if users > 0:
             raise ValidationAppError("Cannot delete a role that is assigned to users")
+        snapshot = snapshot_model(role)
         links = (
             self.db.query(PayflowRolePermissionModel)
             .filter(PayflowRolePermissionModel.payflow_role_id == role_id)
             .all()
         )
+        related = [
+            {"entity_type": "role_permission", "id": str(link.id), "label": str(link.permission_id)}
+            for link in links
+        ]
         for link in links:
             self.db.delete(link)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="payflow",
+            entity_type="role",
+            entity_id=role.id,
+            entity_label=role.name,
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
         self.db.delete(role)
         self.db.commit()
         return {"message": "Role deleted"}
+
+    def list_deletion_logs(
+        self,
+        search: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: int = 200,
+    ) -> list:
+        return list_deletion_logs(
+            self.db,
+            module="payflow",
+            search=search,
+            entity_type=entity_type,
+            limit=limit,
+        )

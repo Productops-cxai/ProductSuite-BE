@@ -295,7 +295,7 @@ class PayflowDashboardService:
                 "label": f"Integration Issues · {integration_issues}",
                 "count": integration_issues,
                 "tone": "rose",
-                "href": "/payflow/integrations?status=Attention%20Required",
+                "href": "/payflow/system-mapping",
             },
         ]
 

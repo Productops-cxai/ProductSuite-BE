@@ -1,8 +1,23 @@
+import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+# Canadian postal code: A1A 1A1
+_POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
+
+
+def _normalize_postal_code(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip().upper()
+    if not cleaned:
+        return None
+    if not _POSTAL_CODE_RE.fullmatch(cleaned):
+        raise ValueError("Postal code must match format A1A 1A1")
+    return cleaned
 
 
 class PayflowRoleSummary(BaseModel):
@@ -61,6 +76,21 @@ class CreatePayflowUserRequest(BaseModel):
     permission_codes: List[str] = Field(default_factory=list)
 
 
+class PayflowOnboardingStepItem(BaseModel):
+    key: str
+    label: str
+    status: str
+    informational: Optional[bool] = False
+
+
+class PayflowOnboardingProgressItem(BaseModel):
+    steps: List[PayflowOnboardingStepItem] = Field(default_factory=list)
+    completed_required: int = 0
+    total_required: int = 0
+    percent: int = 0
+    eligible_for_activation: bool = False
+
+
 class PayflowClientItem(BaseModel):
     id: int
     code: str
@@ -79,6 +109,9 @@ class PayflowClientItem(BaseModel):
     connection_status: Optional[str] = None
     connection_status_label: Optional[str] = None
     supervisors: List[dict] = Field(default_factory=list)
+    setup_incomplete: List[str] = Field(default_factory=list)
+    setup_steps_remaining: int = 0
+    onboarding: Optional[PayflowOnboardingProgressItem] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -94,6 +127,25 @@ class CreatePayflowClientRequest(BaseModel):
     business_domain: Optional[str] = "Collections"
     industry: Optional[str] = None
     ai_mode: Optional[str] = "Supervised AI"
+    data_source_type: Optional[str] = None
+    crm_client_number: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address_line1: Optional[str] = None
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    correspondence_language: Optional[str] = None
+    currency_code: Optional[str] = None
+
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
 
 
 class MappingUpdateItem(BaseModel):
@@ -115,6 +167,20 @@ class UpdatePayflowClientRequest(BaseModel):
     connection_status: Optional[str] = None
     crm_system_name: Optional[str] = None
     integration_ref: Optional[str] = None
+    crm_client_number: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_title: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    address_line1: Optional[str] = None
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    country: Optional[str] = None
+    postal_code: Optional[str] = None
+    correspondence_language: Optional[str] = None
+    currency_code: Optional[str] = None
+    crm_status: Optional[str] = None
     environment: Optional[str] = None
     sync_frequency: Optional[str] = None
     brand_name: Optional[str] = None
@@ -126,12 +192,18 @@ class UpdatePayflowClientRequest(BaseModel):
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
+    @field_validator("postal_code")
+    @classmethod
+    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_postal_code(value)
+
 
 class CreatePortfolioRequest(BaseModel):
     name: str = Field(max_length=255, description="Portfolio name")
     code: str = Field(max_length=64, description="Portfolio code / reference")
     status: Optional[str] = "onboarding"
     description: Optional[str] = None
+    crm_client_number: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -155,6 +227,7 @@ class UpdatePortfolioRequest(BaseModel):
     code: Optional[str] = Field(default=None, max_length=64)
     status: Optional[str] = None
     description: Optional[str] = None
+    crm_client_number: Optional[str] = None
 
     @field_validator("name")
     @classmethod
@@ -289,6 +362,56 @@ class PayflowAccountItem(BaseModel):
     next_action: Optional[str] = None
     human_review: bool = False
     timeline: List[AccountTimelineEvent] = Field(default_factory=list)
+    portfolio_code: Optional[str] = None
+    customer_first_name: Optional[str] = None
+    customer_last_name: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    age_group: Optional[str] = None
+    employment_status: Optional[str] = None
+    income_band: Optional[str] = None
+    education_level: Optional[str] = None
+    customer_segment: Optional[str] = None
+    address_line1: Optional[str] = None
+    city: Optional[str] = None
+    province_state: Optional[str] = None
+    postal_code: Optional[str] = None
+    country_code: Optional[str] = None
+    region: Optional[str] = None
+    email: Optional[str] = None
+    phone_mobile: Optional[str] = None
+    phone_work: Optional[str] = None
+    language: Optional[str] = None
+    currency_code: Optional[str] = None
+    fee_amount: Optional[float] = None
+    due_date: Optional[str] = None
+    days_past_due: Optional[int] = None
+    last_payment_amount: Optional[float] = None
+    last_payment_date: Optional[str] = None
+    last_payment_is_ptp: Optional[bool] = None
+    ptp_code: Optional[str] = None
+    ptp_amount: Optional[float] = None
+    ptp_due_date: Optional[str] = None
+    account_status: Optional[str] = None
+    account_category: Optional[str] = None
+    negative_balance_reason: Optional[str] = None
+    crm_case_id: Optional[str] = None
+    debtor_id: Optional[str] = None
+    client_reference_number: Optional[str] = None
+    product_code: Optional[str] = None
+    date_listed: Optional[str] = None
+    date_incurred: Optional[str] = None
+    delinquency_date: Optional[str] = None
+    paid_amount: Optional[float] = None
+    settlement_rate: Optional[float] = None
+    commission_rate: Optional[float] = None
+    last_email_sent_date: Optional[str] = None
+    last_sms_sent_date: Optional[str] = None
+    last_contact_date: Optional[str] = None
+    provincial_hold: Optional[bool] = None
+    hold_days: Optional[int] = None
+    email_consent: Optional[bool] = None
+    source_updated_at: Optional[str] = None
+    last_crm_refresh_at: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -380,6 +503,53 @@ class ReviewHistoryItem(BaseModel):
     by: Optional[str] = None
 
 
+class ReviewCommunicationItem(BaseModel):
+    id: int
+    code: str
+    channel: str
+    purpose: str
+    status: str
+    engagement: Optional[str] = None
+    date_label: Optional[str] = None
+    time_label: Optional[str] = None
+    subject: Optional[str] = None
+
+
+class ReviewPaymentContext(BaseModel):
+    last_payment_amount: Optional[float] = None
+    last_payment_date: Optional[str] = None
+    last_payment_is_ptp: Optional[bool] = None
+    ptp_code: Optional[str] = None
+    ptp_amount: Optional[float] = None
+    ptp_due_date: Optional[str] = None
+    paid_amount: Optional[float] = None
+
+
+class ReviewWorkflowContext(BaseModel):
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
+    current_workflow: Optional[str] = None
+    collection_status: Optional[str] = None
+    last_action: Optional[str] = None
+    next_action: Optional[str] = None
+    action_blocked: bool = False
+
+
+class ReviewAuditItem(BaseModel):
+    id: int
+    event: str
+    detail: Optional[str] = None
+    actor_name: Optional[str] = None
+    before_status: Optional[str] = None
+    after_status: Optional[str] = None
+    before_values: Optional[dict] = None
+    after_values: Optional[dict] = None
+    created_at: Optional[datetime] = None
+
+
 class PayflowReviewItem(BaseModel):
     id: int
     code: str
@@ -411,13 +581,26 @@ class PayflowReviewItem(BaseModel):
     waiting_label: Optional[str] = None
     status: str
     assigned_supervisor: Optional[str] = None
+    assigned_user_id: Optional[str] = None
+    decided_by_user_id: Optional[str] = None
+    decided_at: Optional[datetime] = None
     final_action: Optional[str] = None
     guidance: Optional[str] = None
     rejection_reason: Optional[str] = None
     hold_until: Optional[str] = None
     history: List[ReviewHistoryItem] = Field(default_factory=list)
+    audit_trail: List[ReviewAuditItem] = Field(default_factory=list)
+    communications: List[ReviewCommunicationItem] = Field(default_factory=list)
+    payment_context: Optional[ReviewPaymentContext] = None
+    workflow_context: Optional[ReviewWorkflowContext] = None
+    available_actions: List[str] = Field(default_factory=list)
+    decision_version: Optional[int] = None
+    strategy_id: Optional[int] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
     can_decide: Optional[bool] = None
     can_modify: Optional[bool] = None
+    can_release: Optional[bool] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -432,31 +615,69 @@ class ReviewsSummary(BaseModel):
 class PayflowReviewsListResponse(BaseModel):
     reviews: List[PayflowReviewItem]
     summary: ReviewsSummary
+    page: int = 1
+    page_size: int = 50
+    total: int = 0
+    total_pages: int = 0
     statuses: List[str] = Field(default_factory=list)
     priorities: List[str] = Field(default_factory=list)
     reasons: List[str] = Field(default_factory=list)
     proposed_actions: List[str] = Field(default_factory=list)
     rejection_reasons: List[str] = Field(default_factory=list)
     waiting_buckets: List[str] = Field(default_factory=list)
+    sort_by: Optional[str] = None
+    sort_dir: Optional[str] = None
+
+
+class CreateHumanReviewRequest(BaseModel):
+    account_id: int
+    reason: str
+    proposed_action: str
+    priority: Optional[str] = "Normal"
+    rule_id: Optional[int] = None
+    condition_text: Optional[str] = None
+    observed_value: Optional[str] = None
+    confidence: Optional[float] = None
+    explanation: List[str] = Field(default_factory=list)
+    context: List[ReviewContextItem] = Field(default_factory=list)
+    strategy_id: Optional[int] = None
+    workflow_version: Optional[int] = None
+    exception_step_id: Optional[str] = None
+    assigned_user_id: Optional[str] = None
+    assigned_supervisor: Optional[str] = None
+
+
+class AssignReviewRequest(BaseModel):
+    assigned_user_id: Optional[str] = None
+    assigned_supervisor: Optional[str] = None
 
 
 class ApproveReviewRequest(BaseModel):
     note: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class ModifyReviewRequest(BaseModel):
     action: str
     guidance: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class RejectReviewRequest(BaseModel):
     reason: str
     comment: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class HoldReviewRequest(BaseModel):
     until: Optional[str] = None
     reason: Optional[str] = None
+    decision_version: Optional[int] = None
+
+
+class ReleaseReviewRequest(BaseModel):
+    note: Optional[str] = None
+    decision_version: Optional[int] = None
 
 
 class RuleConditionItem(BaseModel):
@@ -546,15 +767,41 @@ class CreatePayflowRuleRequest(BaseModel):
     status: str = "Draft"
 
 
+class StrategyNodeConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    channel: Optional[str] = None
+    purpose: Optional[str] = None
+    reference_event: Optional[str] = None
+    amount: Optional[float] = None
+    unit: Optional[str] = None
+    direction: Optional[str] = None
+    attribute: Optional[str] = None
+    operator: Optional[str] = None
+    value: Optional[str] = None
+    action: Optional[str] = None
+    outcome: Optional[str] = None
+    note: Optional[str] = None
+    template_id: Optional[str] = None
+
+
 class StrategyStepItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: Optional[str] = None
     kind: str
     title: str
+    origin: Optional[str] = None
+    disabled: bool = False
+    config: Optional[StrategyNodeConfig] = None
+    next: Optional[str] = None
+    yes: Optional[str] = None
+    no: Optional[str] = None
+    # Legacy flat fields (still accepted / returned for compatibility)
     channel: Optional[str] = None
     purpose: Optional[str] = None
     timing: Optional[str] = None
     detail: Optional[str] = None
-    disabled: bool = False
 
 
 class StrategySegment(BaseModel):
@@ -567,9 +814,18 @@ class StrategySegment(BaseModel):
 
 
 class StrategyVersionItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     version: int
     date: str
     note: str
+    status: Optional[str] = None
+    origin: Optional[str] = None
+    approved_by: Optional[str] = None
+    approval_date: Optional[str] = None
+    steps: Optional[List[Any]] = None
+    segment: Optional[dict] = None
+    changes: List[str] = Field(default_factory=list)
 
 
 class StrategyStats(BaseModel):
@@ -577,11 +833,44 @@ class StrategyStats(BaseModel):
     branches: int = 0
     emails: int = 0
     sms: int = 0
+    payment_actions: int = 0
+    case_actions: int = 0
 
 
 class StrategyContextItem(BaseModel):
     label: str
     value: str
+
+
+class StrategyMessageTemplate(BaseModel):
+    id: str
+    name: str
+    channel: str
+    purpose: str
+    subject: Optional[str] = None
+    body: str
+
+
+class StrategyCatalog(BaseModel):
+    channels: List[str] = Field(default_factory=list)
+    message_purposes: List[str] = Field(default_factory=list)
+    reference_events: List[str] = Field(default_factory=list)
+    time_units: List[str] = Field(default_factory=list)
+    time_directions: List[str] = Field(default_factory=list)
+    condition_attributes: List[str] = Field(default_factory=list)
+    condition_operators: List[str] = Field(default_factory=list)
+    condition_values: dict[str, List[str]] = Field(default_factory=dict)
+    case_actions: List[str] = Field(default_factory=list)
+    payment_actions: List[str] = Field(default_factory=list)
+    outcomes: List[str] = Field(default_factory=list)
+    age_bands: List[str] = Field(default_factory=list)
+    postal_regions: List[str] = Field(default_factory=list)
+    balance_bands: List[str] = Field(default_factory=list)
+    delinquency_bands: List[str] = Field(default_factory=list)
+    language_preferences: List[str] = Field(default_factory=list)
+    tenure_bands: List[str] = Field(default_factory=list)
+    excluded_targeting_attributes: List[str] = Field(default_factory=list)
+    message_templates: List[StrategyMessageTemplate] = Field(default_factory=list)
 
 
 class PayflowStrategyItem(BaseModel):
@@ -595,17 +884,24 @@ class PayflowStrategyItem(BaseModel):
     portfolio_name: Optional[str] = None
     status: str
     origin: str
+    source: str = "Human Created"
     version: int = 1
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: dict = Field(default_factory=dict)
+    entry_node_id: Optional[str] = None
     steps: List[StrategyStepItem] = Field(default_factory=list)
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
+    ai_proposal_snapshot: Optional[dict] = None
     versions: List[StrategyVersionItem] = Field(default_factory=list)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None
+    reviewed_by: Optional[str] = None
     created_by: Optional[str] = None
+    human_modified: bool = False
+    awaiting_review: bool = False
     last_updated_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -614,8 +910,12 @@ class PayflowStrategyItem(BaseModel):
 class StrategiesSummary(BaseModel):
     total: int = 0
     ai_proposed: int = 0
-    active: int = 0
+    draft: int = 0
     under_review: int = 0
+    approved: int = 0
+    active: int = 0
+    inactive: int = 0
+    awaiting_review: int = 0
 
 
 class PayflowStrategiesListResponse(BaseModel):
@@ -623,17 +923,23 @@ class PayflowStrategiesListResponse(BaseModel):
     summary: StrategiesSummary
     statuses: List[str] = Field(default_factory=list)
     step_kinds: List[str] = Field(default_factory=list)
+    origins: List[str] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+    catalog: StrategyCatalog = Field(default_factory=StrategyCatalog)
 
 
 class CreatePayflowStrategyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     client_id: int
-    portfolio_id: Optional[int] = None
+    portfolio_id: int
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: Optional[dict] = None
     steps: List[StrategyStepItem] = Field(default_factory=list)
-    status: str = "Under Review"
+    entry_node_id: Optional[str] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
     ai_context: Optional[List[StrategyContextItem]] = None
 
 
@@ -641,8 +947,10 @@ class UpdatePayflowStrategyRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     summary: Optional[str] = None
     coverage: Optional[str] = None
+    cases_covered: Optional[int] = None
     segment: Optional[dict] = None
     steps: Optional[List[StrategyStepItem]] = None
+    entry_node_id: Optional[str] = None
 
 
 class RejectStrategyRequest(BaseModel):
@@ -804,3 +1112,131 @@ class PayflowDashboardResponse(BaseModel):
     outcomes: List[DashboardOutcomeItem] = Field(default_factory=list)
     clients_attention: List[DashboardClientAttentionItem] = Field(default_factory=list)
     activity: List[DashboardActivityItem] = Field(default_factory=list)
+
+
+class PayflowImportErrorItem(BaseModel):
+    record_id: str
+    client: str
+    sub_client: str
+    field: str
+    error: str
+    status: str
+
+
+class PayflowImportCounts(BaseModel):
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    rejected: int = 0
+    successful: int = 0
+
+
+class PayflowImportRunItem(BaseModel):
+    id: int
+    kind: str
+    file_name: str
+    date_time: str
+    uploaded_by: str
+    status: str
+    counts: PayflowImportCounts
+    errors: List[PayflowImportErrorItem] = Field(default_factory=list)
+
+
+class PayflowImportListResponse(BaseModel):
+    imports: List[PayflowImportRunItem]
+
+
+class PayflowImportPreviewRecord(BaseModel):
+    id: str
+    record_id: str
+    client: str
+    sub_client: str
+    client_name: str
+    sub_client_name: str
+    action: str
+    client_code: Optional[str] = None
+    is_sub: bool = False
+    current_balance: Optional[float] = None
+    incoming_balance: Optional[float] = None
+    note: Optional[str] = None
+
+
+class PayflowImportPreviewSummary(BaseModel):
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    rejected: int = 0
+    successful: int = 0
+    new_clients: int = 0
+    existing_clients: int = 0
+    new_sub_clients: int = 0
+    existing_sub_clients: int = 0
+
+
+class PayflowImportPreviewResponse(BaseModel):
+    ok: bool
+    file_name: str
+    status: str
+    message: Optional[str] = None
+    summary: PayflowImportPreviewSummary
+    preview: List[PayflowImportPreviewRecord] = Field(default_factory=list)
+    errors: List[PayflowImportErrorItem] = Field(default_factory=list)
+
+
+# AI workflow suggestion
+
+
+class PortfolioSegmentStats(BaseModel):
+    accounts: int
+    total_outstanding: float
+    avg_outstanding: float
+    avg_days_past_due: Optional[int] = None
+    with_email_pct: int
+    with_mobile_pct: int
+    email_consent_pct: int
+    languages: dict[str, int] = Field(default_factory=dict)
+
+
+class PortfolioSegmentItem(BaseModel):
+    segment_id: str
+    label: str
+    segment: dict[str, str]
+    stats: PortfolioSegmentStats
+
+
+class PortfolioSegmentsResponse(BaseModel):
+    client_id: int
+    portfolio_id: int
+    portfolio_name: str
+    total_accounts: int
+    eligible_accounts: int
+    excluded: dict[str, int]
+    segments: List[PortfolioSegmentItem] = Field(default_factory=list)
+
+
+class SuggestWorkflowsRequest(BaseModel):
+    client_id: int
+    portfolio_id: int
+
+
+class SuggestWorkflowsResponse(BaseModel):
+    client_id: int
+    portfolio_id: int
+    portfolio_name: str
+    workflows: List[PayflowStrategyItem] = Field(default_factory=list)
+
+
+class RegenerateWorkflowRequest(BaseModel):
+    remarks: str = Field(min_length=3, max_length=2000, description="Reviewer remarks the AI should address")
+
+    @field_validator("remarks")
+    @classmethod
+    def remarks_required(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if len(cleaned) < 3:
+            raise ValueError("Remarks are required")
+        return cleaned

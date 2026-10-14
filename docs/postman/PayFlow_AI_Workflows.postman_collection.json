@@ -1,0 +1,238 @@
+{
+  "info": {
+    "name": "PayFlow - AI Workflow Suggestion",
+    "description": "Try the AI workflow suggestion APIs against a local backend.\n\nRun '1. Login' first (it saves the token). Suggest calls take 1-5 minutes on the Groq free tier - keep Postman's request timeout at 0 (no limit).\n\nDemo data: client 'Maple Energy (Demo)' with portfolios Residential and Small Business. Adjust the collection variables if your ids differ.\n\nRegenerate: run it after 'Get workflow' (the workflow must be AI Proposed or Under Review). It saves the new revision's id as workflowId, so the review / approve / activate requests act on the revision.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "email",
+      "value": "admin@payflow.ai"
+    },
+    {
+      "key": "password",
+      "value": "Admin@12345"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "clientId",
+      "value": "4"
+    },
+    {
+      "key": "residentialPortfolioId",
+      "value": "2"
+    },
+    {
+      "key": "businessPortfolioId",
+      "value": "3"
+    },
+    {
+      "key": "workflowId",
+      "value": ""
+    },
+    {
+      "key": "originalWorkflowId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Login",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('logged in', () => pm.response.to.have.status(200));",
+              "pm.collectionVariables.set('token', pm.response.json().access_token);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "auth": {
+          "type": "noauth"
+        },
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+        },
+        "url": "{{baseUrl}}/auth/login"
+      }
+    },
+    {
+      "name": "2. Preview segments - Residential",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/clients/{{clientId}}/portfolios/{{residentialPortfolioId}}/segments"
+      }
+    },
+    {
+      "name": "3. Preview segments - Small Business",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/clients/{{clientId}}/portfolios/{{businessPortfolioId}}/segments"
+      }
+    },
+    {
+      "name": "4. Suggest workflows - Small Business (faster)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('workflows suggested', () => pm.response.to.have.status(200));",
+              "const workflows = pm.response.json().workflows || [];",
+              "if (workflows.length) pm.collectionVariables.set('workflowId', workflows[0].id);",
+              "console.log(`${workflows.length} workflows in ${pm.response.responseTime / 1000}s`);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": {{clientId}},\n  \"portfolio_id\": {{businessPortfolioId}}\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/suggest"
+      }
+    },
+    {
+      "name": "5. Suggest workflows - Residential",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('workflows suggested', () => pm.response.to.have.status(200));",
+              "const workflows = pm.response.json().workflows || [];",
+              "if (workflows.length) pm.collectionVariables.set('workflowId', workflows[0].id);",
+              "console.log(`${workflows.length} workflows in ${pm.response.responseTime / 1000}s`);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": {{clientId}},\n  \"portfolio_id\": {{residentialPortfolioId}}\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/suggest"
+      }
+    },
+    {
+      "name": "6. List workflows - Small Business",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/workflows?portfolio_id={{businessPortfolioId}}"
+      }
+    },
+    {
+      "name": "7. Get workflow",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}"
+      }
+    },
+    {
+      "name": "8. Regenerate workflow (with remarks)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('revised workflow created', () => pm.response.to.have.status(200));",
+              "pm.collectionVariables.set('originalWorkflowId', pm.collectionVariables.get('workflowId'));",
+              "pm.collectionVariables.set('workflowId', pm.response.json().id);",
+              "console.log(`revision #${pm.response.json().id} of #${pm.collectionVariables.get('originalWorkflowId')} in ${pm.response.responseTime / 1000}s`);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"remarks\": \"Less aggressive: no SMS in the first 7 days, and wait at least 5 days between messages.\"\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/regenerate"
+      }
+    },
+    {
+      "name": "9. Begin review",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/begin-review"
+      }
+    },
+    {
+      "name": "10. Approve",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/approve"
+      }
+    },
+    {
+      "name": "11. Activate",
+      "request": {
+        "method": "POST",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/activate"
+      }
+    },
+    {
+      "name": "12. Rules for this client",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/rules?client_id={{clientId}}"
+      }
+    }
+  ]
+}

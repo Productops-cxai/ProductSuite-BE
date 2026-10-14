@@ -42,6 +42,11 @@ class PayflowClientStatus(str, Enum):
     ACTIVE = "active"
 
 
+class PayflowClientAddedThrough(str, Enum):
+    ADD_CLIENT = "add_client"
+    FILE_UPLOAD = "file_upload"
+
+
 class PayflowClientType(str, Enum):
     FIRST_PARTY = "first_party"
     THIRD_PARTY = "third_party"
@@ -58,6 +63,7 @@ class PayflowAiMode(str, Enum):
 
 class PayflowDataSourceType(str, Enum):
     CRM = "crm"
+    FILE = "file"
 
 
 class PayflowConnectionStatus(str, Enum):
@@ -139,6 +145,7 @@ class PayflowRuleLogic(str, Enum):
 
 class PayflowStrategyStatus(str, Enum):
     AI_PROPOSED = "AI Proposed"
+    DRAFT = "Draft"
     UNDER_REVIEW = "Under Review"
     APPROVED = "Approved"
     ACTIVE = "Active"
@@ -147,7 +154,13 @@ class PayflowStrategyStatus(str, Enum):
 
 class PayflowStrategyOrigin(str, Enum):
     AI_PROPOSED = "AI Proposed"
+    HUMAN_CREATED = "Human Created"
     HUMAN_MODIFIED = "Human Modified"
+
+
+class PayflowStrategySource(str, Enum):
+    AI_GENERATED = "AI Generated"
+    HUMAN_CREATED = "Human Created"
 
 
 class PayflowCommChannel(str, Enum):

@@ -2,7 +2,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -22,8 +22,13 @@ from app.infrastructure.database.models import (
     RefreshTokenModel,
     TokenDenylistModel,
     UserModel,
+    UserSessionModel,
 )
 from app.infrastructure.email.service import send_email
+from app.modules.identity.session_messages import (
+    SESSION_ENDED_MESSAGE,
+    SESSION_REPLACED_MESSAGE,
+)
 from app.modules.platform.services.entitlement_service import get_effective_products
 from app.shared.enums import AuthTokenType, LoginNextStep, PlatformRole, UserStatus
 
@@ -55,25 +60,80 @@ def user_brief_dict(user: UserModel) -> dict:
     }
 
 
-def issue_tokens(db: Session, user: UserModel) -> Tuple[str, str]:
+def _revoke_user_sessions(
+    db: Session,
+    user_id,
+    *,
+    reason: str,
+    except_session_id=None,
+) -> None:
+    now = datetime.now(timezone.utc)
+    session_q = db.query(UserSessionModel).filter(
+        UserSessionModel.user_id == user_id,
+        UserSessionModel.revoked_at.is_(None),
+    )
+    if except_session_id is not None:
+        session_q = session_q.filter(UserSessionModel.id != except_session_id)
+    for session in session_q.all():
+        session.revoked_at = now
+        session.revoke_reason = reason
+
+    token_q = db.query(RefreshTokenModel).filter(
+        RefreshTokenModel.user_id == user_id,
+        RefreshTokenModel.revoked_at.is_(None),
+    )
+    if except_session_id is not None:
+        token_q = token_q.filter(
+            (RefreshTokenModel.session_id.is_(None))
+            | (RefreshTokenModel.session_id != except_session_id)
+        )
+    for token in token_q.all():
+        token.revoked_at = now
+
+
+def issue_tokens(
+    db: Session,
+    user: UserModel,
+    *,
+    session: UserSessionModel | None = None,
+    replace_existing: bool = False,
+) -> Tuple[str, str]:
+    now = datetime.now(timezone.utc)
+    if replace_existing:
+        _revoke_user_sessions(db, user.id, reason="replaced")
+
     access_jti = str(uuid4())
     refresh_jti = str(uuid4())
+
+    if session is None:
+        session = UserSessionModel(user_id=user.id, refresh_jti=refresh_jti)
+        db.add(session)
+        db.flush()
+    else:
+        session.refresh_jti = refresh_jti
+
+    sid = str(session.id)
     access = create_access_token(
         subject=str(user.id),
         claims={
             "jti": access_jti,
+            "sid": sid,
             "email": user.email,
             "role": user.role_code,
             "org_id": str(user.organization_id),
         },
     )
-    refresh = create_refresh_token(subject=str(user.id), jti=refresh_jti)
+    refresh = create_refresh_token(
+        subject=str(user.id),
+        jti=refresh_jti,
+        session_id=sid,
+    )
     db.add(
         RefreshTokenModel(
             user_id=user.id,
+            session_id=session.id,
             jti=refresh_jti,
-            expires_at=datetime.now(timezone.utc)
-            + timedelta(days=settings.JWT_REFRESH_EXPIRE_DAYS),
+            expires_at=now + timedelta(days=settings.JWT_REFRESH_EXPIRE_DAYS),
         )
     )
     db.commit()
@@ -100,7 +160,7 @@ class IdentityService:
             raise UnauthorizedError("Invalid email or password")
 
         products = get_effective_products(self.db, user)
-        access, refresh = issue_tokens(self.db, user)
+        access, refresh = issue_tokens(self.db, user, replace_existing=True)
         return {
             "access_token": access,
             "refresh_token": refresh,
@@ -234,6 +294,34 @@ class IdentityService:
         user.password_hash = hash_password(new_password)
         self.db.commit()
 
+    def _session_for_refresh_row(
+        self, row: RefreshTokenModel | None, payload: dict
+    ) -> UserSessionModel | None:
+        if row and row.session_id:
+            return (
+                self.db.query(UserSessionModel)
+                .filter(UserSessionModel.id == row.session_id)
+                .first()
+            )
+        sid = payload.get("sid")
+        if sid:
+            try:
+                return (
+                    self.db.query(UserSessionModel)
+                    .filter(UserSessionModel.id == UUID(str(sid)))
+                    .first()
+                )
+            except (TypeError, ValueError):
+                return None
+        jti = payload.get("jti")
+        if jti:
+            return (
+                self.db.query(UserSessionModel)
+                .filter(UserSessionModel.refresh_jti == jti)
+                .first()
+            )
+        return None
+
     def refresh(self, refresh_token: str) -> dict:
         payload = safe_decode_token(refresh_token)
         if not payload or payload.get("type") != "refresh":
@@ -242,14 +330,38 @@ class IdentityService:
         jti = payload.get("jti")
         row = (
             self.db.query(RefreshTokenModel)
-            .filter(
-                RefreshTokenModel.jti == jti,
-                RefreshTokenModel.revoked_at.is_(None),
-            )
+            .filter(RefreshTokenModel.jti == jti)
             .first()
         )
-        if not row or row.expires_at < datetime.now(timezone.utc):
+        session = self._session_for_refresh_row(row, payload)
+        now = datetime.now(timezone.utc)
+
+        if session and session.revoked_at is not None:
+            if session.revoke_reason == "replaced":
+                raise UnauthorizedError(
+                    SESSION_REPLACED_MESSAGE, code="session_replaced"
+                )
+            raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
+
+        if not row or row.revoked_at is not None or row.expires_at < now:
+            # Login elsewhere revoked this refresh — surface a clear reason when we can.
+            if row is not None:
+                newer = (
+                    self.db.query(UserSessionModel)
+                    .filter(
+                        UserSessionModel.user_id == row.user_id,
+                        UserSessionModel.revoked_at.is_(None),
+                    )
+                    .first()
+                )
+                if newer is not None:
+                    raise UnauthorizedError(
+                        SESSION_REPLACED_MESSAGE, code="session_replaced"
+                    )
             raise UnauthorizedError("Refresh token expired or revoked")
+
+        if session is None or session.revoked_at is not None:
+            raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
 
         user = (
             self.db.query(UserModel)
@@ -260,49 +372,76 @@ class IdentityService:
         if not user or user.status != UserStatus.ACTIVE.value:
             raise UnauthorizedError("User not active")
 
-        row.revoked_at = datetime.now(timezone.utc)
-        access, new_refresh = issue_tokens(self.db, user)
+        row.revoked_at = now
+        access, new_refresh = issue_tokens(self.db, user, session=session)
         return {"access_token": access, "refresh_token": new_refresh, "token_type": "bearer"}
 
     def logout(self, user: UserModel, access_token: str | None, refresh_token: str | None) -> None:
         now = datetime.now(timezone.utc)
-        if access_token:
-            payload = safe_decode_token(access_token)
-            if payload and payload.get("jti"):
-                exp = payload.get("exp")
-                expires_at = (
-                    datetime.fromtimestamp(exp, tz=timezone.utc)
-                    if isinstance(exp, (int, float))
-                    else now + timedelta(minutes=settings.JWT_ACCESS_EXPIRE_MINUTES)
-                )
-                existing = (
-                    self.db.query(TokenDenylistModel)
-                    .filter(TokenDenylistModel.jti == payload["jti"])
-                    .first()
-                )
-                if not existing:
-                    self.db.add(TokenDenylistModel(jti=payload["jti"], expires_at=expires_at))
-
-        for token in (
-            self.db.query(RefreshTokenModel)
-            .filter(
-                RefreshTokenModel.user_id == user.id,
-                RefreshTokenModel.revoked_at.is_(None),
+        session_id = None
+        access_payload = safe_decode_token(access_token) if access_token else None
+        if access_payload and access_payload.get("jti"):
+            exp = access_payload.get("exp")
+            expires_at = (
+                datetime.fromtimestamp(exp, tz=timezone.utc)
+                if isinstance(exp, (int, float))
+                else now + timedelta(minutes=settings.JWT_ACCESS_EXPIRE_MINUTES)
             )
-            .all()
-        ):
-            token.revoked_at = now
-
-        if refresh_token:
-            payload = safe_decode_token(refresh_token)
-            if payload and payload.get("jti"):
-                row = (
-                    self.db.query(RefreshTokenModel)
-                    .filter(RefreshTokenModel.jti == payload["jti"])
-                    .first()
+            existing = (
+                self.db.query(TokenDenylistModel)
+                .filter(TokenDenylistModel.jti == access_payload["jti"])
+                .first()
+            )
+            if not existing:
+                self.db.add(
+                    TokenDenylistModel(jti=access_payload["jti"], expires_at=expires_at)
                 )
-                if row:
-                    row.revoked_at = now
+            if access_payload.get("sid"):
+                try:
+                    session_id = UUID(str(access_payload["sid"]))
+                except (TypeError, ValueError):
+                    session_id = None
+
+        refresh_payload = safe_decode_token(refresh_token) if refresh_token else None
+        if session_id is None and refresh_payload and refresh_payload.get("sid"):
+            try:
+                session_id = UUID(str(refresh_payload["sid"]))
+            except (TypeError, ValueError):
+                session_id = None
+
+        if session_id is not None:
+            session = (
+                self.db.query(UserSessionModel)
+                .filter(
+                    UserSessionModel.id == session_id,
+                    UserSessionModel.user_id == user.id,
+                    UserSessionModel.revoked_at.is_(None),
+                )
+                .first()
+            )
+            if session:
+                session.revoked_at = now
+                session.revoke_reason = "logout"
+            for token in (
+                self.db.query(RefreshTokenModel)
+                .filter(
+                    RefreshTokenModel.session_id == session_id,
+                    RefreshTokenModel.revoked_at.is_(None),
+                )
+                .all()
+            ):
+                token.revoked_at = now
+        else:
+            _revoke_user_sessions(self.db, user.id, reason="logout")
+
+        if refresh_payload and refresh_payload.get("jti"):
+            row = (
+                self.db.query(RefreshTokenModel)
+                .filter(RefreshTokenModel.jti == refresh_payload["jti"])
+                .first()
+            )
+            if row and row.revoked_at is None:
+                row.revoked_at = now
 
         self.db.commit()
 
@@ -471,16 +610,7 @@ class IdentityService:
 
         user.password_hash = hash_password(new_password)
         self._consume_auth_token(row)
-        now = datetime.now(timezone.utc)
-        for rt in (
-            self.db.query(RefreshTokenModel)
-            .filter(
-                RefreshTokenModel.user_id == user.id,
-                RefreshTokenModel.revoked_at.is_(None),
-            )
-            .all()
-        ):
-            rt.revoked_at = now
+        _revoke_user_sessions(self.db, user.id, reason="password_reset")
         self.db.commit()
 
     def send_activation_invite(self, user: UserModel) -> str:

@@ -17,6 +17,12 @@ from app.infrastructure.database.models import (
     UserModel,
     UserProductAssignmentModel,
 )
+from app.shared.deletion import (
+    list_deletion_logs,
+    purge_user_identity,
+    record_deletion,
+    snapshot_model,
+)
 from app.modules.identity.service import IdentityService
 from app.modules.platform.services.entitlement_service import get_effective_products, has_product_access
 from app.shared.enums import (
@@ -177,6 +183,53 @@ class PlatformService:
         self.db.commit()
         self.db.refresh(product)
         return product
+
+    def delete_product(self, product_id: int, *, actor: UserModel, source: str | None = None) -> dict:
+        product = self.get_product(product_id)
+        snapshot = snapshot_model(product)
+        related = []
+        entitlements = (
+            self.db.query(OrganizationProductEntitlementModel)
+            .filter(OrganizationProductEntitlementModel.product_id == product_id)
+            .all()
+        )
+        for row in entitlements:
+            related.append(
+                {
+                    "entity_type": "organization_entitlement",
+                    "id": str(row.id),
+                    "label": f"org:{row.organization_id}",
+                }
+            )
+            self.db.delete(row)
+        assignments = (
+            self.db.query(UserProductAssignmentModel)
+            .filter(UserProductAssignmentModel.product_id == product_id)
+            .all()
+        )
+        for row in assignments:
+            related.append(
+                {
+                    "entity_type": "user_product_assignment",
+                    "id": str(row.id),
+                    "label": str(row.user_id),
+                }
+            )
+            self.db.delete(row)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="platform",
+            entity_type="product",
+            entity_id=product.id,
+            entity_label=f"{product.name} ({product.code})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.delete(product)
+        self.db.commit()
+        return {"message": "Product deleted"}
 
     # ---- Organizations ----
     def list_organizations(self) -> List[OrganizationModel]:
@@ -447,6 +500,31 @@ class PlatformService:
         self.db.commit()
         return self._user_response(self._load_user(user.id))
 
+    def delete_person(self, user_id: UUID, *, actor: UserModel, source: str | None = None) -> dict:
+        user = self._load_user(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        snapshot = snapshot_model(user)
+        snapshot["organization_name"] = user.organization.name if user.organization else None
+        snapshot["assigned_products"] = [
+            {"id": link.product_id, "code": link.product.code if link.product else None}
+            for link in user.product_links
+        ]
+        related = purge_user_identity(self.db, user, actor=actor)
+        record_deletion(
+            self.db,
+            actor=actor,
+            module="platform",
+            entity_type="person",
+            entity_id=user_id,
+            entity_label=f"{snapshot.get('full_name')} ({snapshot.get('email')})",
+            source=source,
+            record_snapshot=snapshot,
+            related_deleted=related,
+        )
+        self.db.commit()
+        return {"message": "Person deleted"}
+
     def assign_product(self, user_id: UUID, product_id: int) -> dict:
         user = self._load_user(user_id)
         if not user:
@@ -529,6 +607,19 @@ class PlatformService:
             }
             for r in rows
         ]
+
+    def list_deletion_logs(
+        self,
+        search: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[dict]:
+        return list_deletion_logs(
+            self.db,
+            search=search,
+            entity_type=entity_type,
+            limit=limit,
+        )
 
     def enter_product(self, user: UserModel, code: str) -> dict:
         product = self.get_product_by_code(code)

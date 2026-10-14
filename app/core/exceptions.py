@@ -16,8 +16,8 @@ class ConflictError(AppError):
 
 
 class UnauthorizedError(AppError):
-    def __init__(self, message: str = "Unauthorized"):
-        super().__init__(message, code="unauthorized")
+    def __init__(self, message: str = "Unauthorized", code: str = "unauthorized"):
+        super().__init__(message, code=code)
 
 
 class ForbiddenError(AppError):
@@ -28,3 +28,10 @@ class ForbiddenError(AppError):
 class ValidationAppError(AppError):
     def __init__(self, message: str = "Validation failed"):
         super().__init__(message, code="validation_error")
+
+
+class ServiceUnavailableError(AppError):
+    """An external service (e.g. the LLM provider) failed or is not configured."""
+
+    def __init__(self, message: str = "External service unavailable"):
+        super().__init__(message, code="service_unavailable")

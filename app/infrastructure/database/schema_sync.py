@@ -86,10 +86,20 @@ def _add_missing_columns(engine: Engine) -> None:
                 if not column.nullable:
                     if column.name == "product_code":
                         default_sql = " DEFAULT ''"
+                    elif column.name == "source":
+                        default_sql = " DEFAULT 'Human Created'"
                     elif hasattr(column.type, "python_type") and column.type.python_type is bool:
                         default_sql = " DEFAULT FALSE" if engine.dialect.name != "sqlite" else " DEFAULT 0"
                     elif column.name in ("is_built_in", "is_coming_soon", "is_active"):
                         default_sql = " DEFAULT FALSE" if engine.dialect.name != "sqlite" else " DEFAULT 0"
+                    elif (
+                        hasattr(column.type, "python_type")
+                        and column.type.python_type is int
+                        and column.default is not None
+                        and getattr(column.default, "arg", None) is not None
+                        and isinstance(column.default.arg, int)
+                    ):
+                        default_sql = f" DEFAULT {column.default.arg}"
                     else:
                         # Skip non-nullable without safe default — create_all already handled new tables
                         continue
