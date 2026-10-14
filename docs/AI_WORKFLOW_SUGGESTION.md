@@ -43,7 +43,7 @@ Portfolio accounts
 
 - **Code decides the groups, the AI designs the strategy.** Segments are built by code, so they are repeatable and every account fits exactly one.
 - **Rules are handled by code, not the AI.** Rule text never goes into the prompt (see [§4](#4-how-rules-are-handled)).
-- **Nothing broken is ever saved.** Every workflow passes the validator, or the request fails and saves nothing.
+- **Nothing broken is ever saved.** Every workflow passes the validator, or the request fails and saves nothing. All workflows of a request are saved together — if one fails to save, none are.
 - **Existing code is reused.** Saving uses the normal workflow create path, so AI workflows behave like any other workflow.
 
 ---
@@ -105,7 +105,7 @@ The Groq free tier allows 8,000 tokens/minute, so segments are sent `GROQ_SEGMEN
 
 **6b. Groq call (`llm.py`)** — the AI returns each workflow with a structured `reasoning` object (`segment_fit`, `channels`, `timing`, `escalation`, and `changes_made` on regenerate), each 1–2 sentences quoting the segment's numbers. Low reasoning effort, JSON schema with the catalog's allowed values (`segment_id` limited to the batch). Rate limited (429) → waits as told and retries (max 5). Other failures → `502`.
 
-**6c. Validate (`validator.py`)** — structure, flowchart, allowed values, step settings, limits (see [§6](#6-code-map)). Returns plain errors such as `Workflow B: has 16 steps (allowed 3-15)`.
+**6c. Validate (`validator.py`)** — structure, flowchart, allowed values, step settings (incl. the save step's rule that timing needs a reference event), limits (see [§6](#6-code-map)). Returns plain errors such as `Workflow B: has 16 steps (allowed 3-15)`.
 
 **6d. Fix** — good workflows are kept; broken ones go back to the AI **with the error list** (max 2 fix attempts per batch). Still broken → `502`, nothing saved.
 
@@ -123,7 +123,7 @@ All batches must pass before anything is saved.
 | `ai_context` | Segment, accounts, avg owed, avg days late, email consent, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule |
 | `ai_proposal_snapshot` | Frozen copy of the AI original (kept after human edits) |
 
-Supervisors are notified (existing behaviour).
+All workflows are saved in **one transaction** (`create_strategy(..., commit=False)`, then one commit): if any save fails, it is rolled back and nothing is saved. Ops Admins and the client's supervisors are notified **after** the commit, one notification per workflow (existing behaviour) — notifications commit on their own, so sending them earlier would save half a result.
 
 ### Step 8 — Response
 The saved workflows, in the same shape as `GET /payflow/workflows/{id}`.
@@ -278,7 +278,7 @@ Creates an **improved version** of one AI workflow, guided by a reviewer's remar
 | | |
 |---|---|
 | Permission | **Create / Edit Workflows** for the client |
-| Allowed for | AI-generated workflows with status **AI Proposed** or **Under Review** (not Approved / Active / Inactive, not human-made) |
+| Allowed for | AI-generated workflows with status **AI Proposed** or **Under Review** (not Approved / Active / Inactive, not human-made) that belong to a portfolio — old workflows from before the workflow rework may have none and are refused before the AI is called |
 | `remarks` | Required, 3–2,000 characters |
 | Response | The new workflow (`PayflowStrategyItem`), status **AI Proposed** |
 | Time | One AI call — ~10–40 s on the free tier |
@@ -302,7 +302,7 @@ Errors use the project's normal format: `{ "detail": "<message>" }`.
 | 401 | Not logged in / bad token | `Not authenticated` |
 | 403 | Missing Create / Edit Workflows, or no access to the client | `Permission required: create_edit_workflows` |
 | 404 | Client, portfolio or workflow not found, or portfolio of another client | `Portfolio not found for this client` |
-| 400 | No eligible accounts (suggest); not an AI workflow or wrong status (regenerate) | `Only AI Proposed or Under Review workflows can be regenerated` |
+| 400 | No eligible accounts (suggest); not an AI workflow, wrong status or no portfolio (regenerate) | `Only AI Proposed or Under Review workflows can be regenerated` |
 | 422 | Request body invalid (e.g. empty `remarks`) | FastAPI validation detail |
 | 502 | AI not configured / unreachable / reply cut off / still invalid after 2 fixes — **nothing saved** | `AI could not produce valid workflows: Workflow B: has 16 steps (allowed 3-15); …` |
 
@@ -365,6 +365,7 @@ All in `app/modules/payflow/services/workflow_suggestion/` unless noted.
 | `validator.py` | `validate_all` (+ `validate_structure`, `validate_flowchart`, `validate_catalog_values`, `validate_step_config`, `validate_limits`) | Checks AI workflows |
 | `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`, `.regenerate_workflow`; `_batches` | Orchestration, retries, saving |
 | `app/modules/payflow/routes.py` | `preview_portfolio_segments`, `suggest_workflows`, `regenerate_workflow` | Routes ("Workflow suggestions (AI)" section) |
+| `app/modules/payflow/services/strategy_service.py` | `create_strategy(..., commit=False)`, `notify_awaiting` | Existing save path; `commit=False` + `notify_awaiting` let Suggest save all workflows in one transaction |
 | `app/modules/payflow/schemas.py` | `PortfolioSegmentsResponse`, `SuggestWorkflowsRequest`, `SuggestWorkflowsResponse`, `RegenerateWorkflowRequest` | Request / response models |
 | `app/core/exceptions.py` | `ServiceUnavailableError` | AI failures → `502` |
 | `app/core/config.py` | `GROQ_*` settings | |
@@ -385,9 +386,9 @@ venv\Scripts\python.exe -m pytest
 | `tests/test_workflow_context.py` | 5 | Loaders; only Active + own-client rules |
 | `tests/test_workflow_segmenter.py` | 14 | Filtering, labels, merge order, every account in exactly one segment, determinism, matching |
 | `tests/test_workflow_prompt_llm.py` | 17 | Limits from rules, prompt content, examples valid, schema, Groq errors, rate-limit waits |
-| `tests/test_workflow_validator.py` | 27 | One failing case per check; prompt examples pass |
-| `tests/test_workflow_suggestion_api.py` | 12 | Preview + suggest: success, retry-then-pass, give-up (nothing saved), batching, 400 / 403 / 404 / 502 |
-| `tests/test_workflow_regenerate.py` | 15 | Regenerate: new linked version, original unchanged, retry, give-up, allowed / refused statuses, 400 / 403 / 404 / 422 / 502 |
+| `tests/test_workflow_validator.py` | 31 | One failing case per check; prompt examples pass |
+| `tests/test_workflow_suggestion_api.py` | 15 | Preview + suggest: success, retry-then-pass (incl. timing without a reference event), give-up (nothing saved), all-or-nothing save, notifications after saving, batching, 400 / 403 / 404 / 502 |
+| `tests/test_workflow_regenerate.py` | 17 | Regenerate: new linked version, original unchanged, retry, give-up, allowed / refused statuses, no portfolio (AI not called), 400 / 403 / 404 / 422 / 502 |
 
 ### Manual testing with Postman
 

@@ -9,6 +9,7 @@ from app.infrastructure.database.models import (
     OrganizationModel,
     PayflowAccountModel,
     PayflowClientModel,
+    PayflowNotificationModel,
     PayflowPortfolioModel,
     PayflowRoleModel,
     PayflowStrategyModel,
@@ -211,6 +212,24 @@ def test_suggest_retries_with_errors_then_saves(client, admin_token, portfolio):
     assert "template 'em-nope' does not exist" in retry_prompt
 
 
+def test_suggest_fixes_timing_without_reference_event(client, admin_token, portfolio):
+    """Timing on a Condition step would fail at save — the validator sends it back to the AI instead."""
+    calls = []
+
+    def call(messages, schema):
+        calls.append(messages)
+        workflow = _workflow_for("A")
+        if len(calls) == 1:
+            workflow["steps"][3]["config"]["unit"] = "Days"  # s4 "Paid?" Condition
+        return {"workflows": [workflow]}
+
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        response = _suggest(client, admin_token, portfolio["client_id"], portfolio["portfolio_id"])
+    assert response.status_code == 200, response.json()
+    assert len(calls) == 2
+    assert "has timing (amount / unit) but no reference_event" in calls[1][1]["content"]
+
+
 def test_suggest_gives_up_and_saves_nothing(client, admin_token, portfolio, db_session):
     call, calls = fake_llm(broken_calls=99)
     with patch.object(suggestion_service, "call_llm", side_effect=call):
@@ -219,6 +238,39 @@ def test_suggest_gives_up_and_saves_nothing(client, admin_token, portfolio, db_s
     assert "AI could not produce valid workflows" in response.json()["detail"]
     assert len(calls) == 1 + suggestion_service.MAX_FIX_ATTEMPTS
     assert db_session.query(PayflowStrategyModel).count() == 0
+
+
+def test_suggest_saves_all_or_nothing(client, admin_token, portfolio, db_session):
+    """If one workflow fails to save, none are saved and nobody is notified."""
+
+    def call(messages, schema):
+        ids = schema["properties"]["workflows"]["items"]["properties"]["segment_id"]["enum"]
+        workflows = [_workflow_for(i) for i in ids]
+        for workflow in workflows:
+            if workflow["segment_id"] == "B":
+                workflow["steps"][3]["config"]["unit"] = "Days"  # rejected by the save step
+        return {"workflows": workflows}
+
+    # Validator switched off, so B reaches the save step (as a future validator gap would).
+    with patch.object(suggestion_service, "call_llm", side_effect=call), patch.object(
+        suggestion_service, "validate_all", return_value=[]
+    ):
+        response = _suggest(client, admin_token, portfolio["client_id"], portfolio["mixed_id"])
+    assert response.status_code == 400
+    assert "timing must use an explicit reference event" in response.json()["detail"]
+    assert db_session.query(PayflowStrategyModel).count() == 0
+    assert db_session.query(PayflowNotificationModel).count() == 0
+
+
+def test_suggest_notifies_after_saving(client, admin_token, portfolio, db_session):
+    call, _ = fake_llm()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        response = _suggest(client, admin_token, portfolio["client_id"], portfolio["mixed_id"])
+    assert response.status_code == 200, response.json()
+    # The other Ops Admin gets one notification per workflow (the requester is skipped).
+    ids = {str(workflow["id"]) for workflow in response.json()["workflows"]}
+    notified = {n.entity_id for n in db_session.query(PayflowNotificationModel).all()}
+    assert len(ids) == 4 and notified == ids
 
 
 @pytest.mark.parametrize("per_call, expected_calls", [(3, 2), (0, 1)])

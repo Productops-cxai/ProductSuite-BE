@@ -189,6 +189,30 @@ def test_api_approved_workflow_is_refused(client, admin_token, admin, db_session
     assert response.json()["detail"] == "Only AI Proposed or Under Review workflows can be regenerated"
 
 
+def test_api_workflow_without_portfolio_is_refused(client, admin_token, db_session, portfolio):  # noqa: F811
+    """Old workflows (before the rework) may have no portfolio — refused before the AI is called."""
+    old = PayflowStrategyModel(
+        code="old-ai-workflow",
+        name="Old AI workflow",
+        client_id=portfolio["client_id"],
+        portfolio_id=None,
+        status="AI Proposed",
+        origin="AI Proposed",
+        source="AI Generated",
+        steps=load_examples()[0]["steps"],
+        entry_node_id="s1",
+    )
+    db_session.add(old)
+    db_session.commit()
+    count = db_session.query(PayflowStrategyModel).count()
+    with patch.object(suggestion_service, "call_llm") as call:
+        response = _post(client, admin_token, old.id)
+    assert response.status_code == 400
+    assert response.json()["detail"] == "This workflow has no portfolio, so it cannot be regenerated"
+    call.assert_not_called()
+    assert db_session.query(PayflowStrategyModel).count() == count
+
+
 def test_api_needs_workflow_permission(client, supervisor_token, ai_workflow):  # noqa: F811
     with patch.object(suggestion_service, "call_llm") as call:
         response = _post(client, supervisor_token, ai_workflow["id"])

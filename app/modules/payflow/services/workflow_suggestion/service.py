@@ -70,20 +70,30 @@ class WorkflowSuggestionService:
             workflows.update(self._suggest_batch(client, portfolio.name, batch, limits))
 
         governed_by = governing_rules(client, rules)
+        # Save all workflows together: if one fails, none are saved.
         saved = []
-        for segment in segments:
-            workflow = workflows[segment["segment_id"]]
-            saved.append(
-                self._save(
-                    user,
-                    client["id"],
-                    portfolio.id,
-                    workflow,
-                    segment=segment["segment"],
-                    cases_covered=segment["stats"]["accounts"],
-                    ai_context=_ai_context(client, segment, workflow, governed_by),
+        try:
+            for segment in segments:
+                workflow = workflows[segment["segment_id"]]
+                saved.append(
+                    self._save(
+                        user,
+                        client["id"],
+                        portfolio.id,
+                        workflow,
+                        segment=segment["segment"],
+                        cases_covered=segment["stats"]["accounts"],
+                        ai_context=_ai_context(client, segment, workflow, governed_by),
+                        commit=False,
+                    )
                 )
-            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        # Notifications commit on their own, so they are sent only after the save.
+        for workflow in saved:
+            self.strategies.notify_awaiting(user, workflow["id"])
         return {
             "client_id": client_id,
             "portfolio_id": portfolio.id,
@@ -101,6 +111,9 @@ class WorkflowSuggestionService:
             raise ValidationAppError("Only AI-generated workflows can be regenerated")
         if original["status"] not in REGENERATE_STATUSES:
             raise ValidationAppError("Only AI Proposed or Under Review workflows can be regenerated")
+        # Old workflows (before the rework) may have no portfolio; saving would fail after the AI call.
+        if original["portfolio_id"] is None:
+            raise ValidationAppError("This workflow has no portfolio, so it cannot be regenerated")
         self.strategies._assert_manage(user, original["client_id"])
         client = load_client_context(self.db, original["client_id"])
         rules = load_rules(self.db, original["client_id"])
@@ -177,6 +190,7 @@ class WorkflowSuggestionService:
         segment: dict[str, Any],
         cases_covered: int | None,
         ai_context: list[dict[str, str]],
+        commit: bool = True,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         return self.strategies.create_strategy(
@@ -193,6 +207,7 @@ class WorkflowSuggestionService:
                 "source": PayflowStrategySource.AI_GENERATED.value,
                 "ai_context": ai_context,
             },
+            commit=commit,
         )
 
 
