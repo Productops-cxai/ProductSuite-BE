@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from app.core.deps import CurrentPerson, DbSession, SuperAdmin
 from app.core.exceptions import AppError
 from app.modules.platform.schemas import (
+    AiSuggestJobResponse,
     AssignProductRequest,
     EmailLogResponse,
     EnterProductResponse,
@@ -215,6 +216,26 @@ def list_deletion_logs(
     limit: int = Query(default=200, ge=1, le=500),
 ):
     return PlatformService(db).list_deletion_logs(search, entity_type, limit)
+
+
+@router.get("/ai-suggest-jobs", response_model=List[AiSuggestJobResponse])
+def list_ai_suggest_jobs(
+    _: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    client_id: Optional[int] = Query(default=None),
+    portfolio_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Platform ops view of auto AI workflow suggestion jobs (not exposed in PayFlow)."""
+    return PlatformService(db).list_ai_suggest_jobs(
+        search=search,
+        status=status_filter,
+        client_id=client_id,
+        portfolio_id=portfolio_id,
+        limit=limit,
+    )
 
 
 @router.get("/me/products", response_model=List[ProductResponse])

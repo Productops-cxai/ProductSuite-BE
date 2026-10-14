@@ -538,6 +538,45 @@ class PayflowImportErrorModel(Base):
     run = relationship("PayflowImportRunModel", back_populates="errors")
 
 
+class PayflowAiSuggestJobModel(Base):
+    """Background auto-suggest run history (Platform ops view)."""
+
+    __tablename__ = "payflow_ai_suggest_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    portfolio_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_portfolios.id"), nullable=False, index=True
+    )
+    trigger: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
+    skip_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    import_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_import_runs.id"), nullable=True, index=True
+    )
+    workflows_created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    workflow_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    segments_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    batches_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    groq_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    client = relationship("PayflowClientModel")
+    portfolio = relationship("PayflowPortfolioModel")
+    requested_by = relationship("UserModel")
+
+
 class PayflowStrategyModel(Base):
     """Collection strategy / visual workflow for a client (optionally portfolio-scoped)."""
 

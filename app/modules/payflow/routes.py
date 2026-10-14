@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
 from app.core.deps import DbSession
@@ -86,6 +86,7 @@ from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
 
 # Default tag is overridden in app.core.openapi_tags for Swagger sections.
@@ -367,9 +368,16 @@ def delete_client_logo(client_id: int, _: PayflowEditClient, db: DbSession):
 
 
 @router.post("/clients/{client_id}/activate")
-def activate_client(client_id: int, _: PayflowEditClient, db: DbSession):
+def activate_client(
+    client_id: int,
+    admin: PayflowEditClient,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+):
     try:
-        return PayflowClientService(db).activate_client(client_id)
+        detail, job_ids = PayflowClientService(db).activate_client(client_id, user=admin)
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return detail
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -414,13 +422,19 @@ def update_portfolio(
     client_id: int,
     portfolio_id: int,
     payload: UpdatePortfolioRequest,
-    _: PayflowEditClient,
+    admin: PayflowEditClient,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ):
     try:
-        return PayflowClientService(db).update_portfolio(
-            client_id, portfolio_id, payload.model_dump(exclude_unset=True)
+        detail, job_ids = PayflowClientService(db).update_portfolio(
+            client_id,
+            portfolio_id,
+            payload.model_dump(exclude_unset=True),
+            user=admin,
         )
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return detail
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -551,6 +565,7 @@ async def validate_account_import(
 async def upload_account_import(
     admin: PayflowImportAccounts,
     db: DbSession,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
     name = (file.filename or "").lower()
@@ -558,7 +573,11 @@ async def upload_account_import(
         raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
     data = await file.read()
     try:
-        return PayflowImportService(db).process_account_file(admin, data, file.filename or "upload.xlsx")
+        result, job_ids = PayflowImportService(db).process_account_file(
+            admin, data, file.filename or "upload.xlsx"
+        )
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return result
     except AppError as exc:
         raise _map_error(exc) from exc
 

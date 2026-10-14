@@ -587,7 +587,7 @@ class PayflowClientService:
         self.db.refresh(client)
         return self._detail(client)
 
-    def activate_client(self, client_id: int) -> dict:
+    def activate_client(self, client_id: int, user: UserModel | None = None) -> tuple[dict, list[int]]:
         client = self._get_or_404(client_id)
         blockers = self._activation_blockers(client)
         if blockers:
@@ -596,7 +596,17 @@ class PayflowClientService:
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(client)
-        return self._detail(client)
+
+        from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+        job_ids = AiSuggestJobService(self.db).enqueue_for_client(
+            client_id,
+            trigger="client_activated",
+            requested_by_user_id=user.id if user else None,
+        )
+        if job_ids:
+            self.db.commit()
+        return self._detail(client), job_ids
 
     # ------------------------------------------------------------------
     # Portfolios
@@ -695,7 +705,13 @@ class PayflowClientService:
             self.db.flush()
         return row, action
 
-    def update_portfolio(self, client_id: int, portfolio_id: int, payload: dict[str, Any]) -> dict:
+    def update_portfolio(
+        self,
+        client_id: int,
+        portfolio_id: int,
+        payload: dict[str, Any],
+        user: UserModel | None = None,
+    ) -> tuple[dict, list[int]]:
         client = self._get_or_404(client_id)
         row = (
             self.db.query(PayflowPortfolioModel)
@@ -708,6 +724,7 @@ class PayflowClientService:
         if not row:
             raise NotFoundError("Portfolio not found")
 
+        became_active = False
         if "name" in payload and payload["name"] is not None:
             name = str(payload["name"]).strip()
             if not name:
@@ -733,7 +750,12 @@ class PayflowClientService:
             status = str(payload["status"]).strip().lower()
             if status not in {s.value for s in PayflowPortfolioStatus}:
                 raise ValidationAppError("Invalid portfolio status")
+            prev = (row.status or "").lower()
             row.status = status
+            became_active = (
+                status == PayflowPortfolioStatus.ACTIVE.value
+                and prev != PayflowPortfolioStatus.ACTIVE.value
+            )
         if "description" in payload:
             row.description = (
                 str(payload["description"]).strip() if payload["description"] else None
@@ -746,7 +768,21 @@ class PayflowClientService:
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(row)
-        return self._portfolio_item(row)
+
+        job_ids: list[int] = []
+        if became_active:
+            from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+            job = AiSuggestJobService(self.db).enqueue(
+                client_id,
+                portfolio_id,
+                trigger="portfolio_activated",
+                requested_by_user_id=user.id if user else None,
+            )
+            if job:
+                job_ids = [job.id]
+                self.db.commit()
+        return self._portfolio_item(row), job_ids
 
     def _purge_account(self, account: PayflowAccountModel) -> list[dict[str, str]]:
         related: list[dict[str, str]] = []

@@ -34,6 +34,7 @@ from app.modules.payflow.crm_catalog import (
     ACCOUNT_IMPORT_REQUIRED,
     AGE_GROUPS,
 )
+from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
 from app.shared.enums import PayflowCollectionStatus, PayflowPortfolioStatus
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -816,7 +817,9 @@ class PayflowImportService:
             "errors": errors,
         }
 
-    def process_account_file(self, user: UserModel, file_bytes: bytes, filename: str) -> dict[str, Any]:
+    def process_account_file(
+        self, user: UserModel, file_bytes: bytes, filename: str
+    ) -> tuple[dict[str, Any], list[int]]:
         _UPLOADS.mkdir(parents=True, exist_ok=True)
         safe_name = Path(filename or "upload.xlsx").name
         stored = _UPLOADS / f"{int(_now().timestamp())}-{safe_name}"
@@ -839,10 +842,13 @@ class PayflowImportService:
         try:
             idx, data_rows = self._load_account_rows(file_bytes, safe_name)
         except ValidationAppError as exc:
-            return self._fail_run(run, self._guess_field(str(exc.message)), str(exc.message))
+            return self._fail_run(run, self._guess_field(str(exc.message)), str(exc.message)), []
         except Exception as exc:
-            return self._fail_run(
-                run, "File structure", "The file is not a valid CSV or Excel workbook.", exc
+            return (
+                self._fail_run(
+                    run, "File structure", "The file is not a valid CSV or Excel workbook.", exc
+                ),
+                [],
             )
 
         run.status = "Processing"
@@ -855,6 +861,7 @@ class PayflowImportService:
 
         seen_keys: set[tuple[str, str]] = set()
         created = updated = unchanged = failed = 0
+        touched_portfolios: set[tuple[int, int]] = set()
 
         for row in data_rows:
             record_id = _cell(row, idx, "account_id") or "Row"
@@ -894,6 +901,7 @@ class PayflowImportService:
                     updated += 1
                 else:
                     unchanged += 1
+                touched_portfolios.add((client.id, portfolio.id))
             except ValidationAppError as exc:
                 failed += 1
                 self.db.add(
@@ -917,9 +925,19 @@ class PayflowImportService:
         run.unchanged_count = unchanged
         run.failed_count = failed
         run.completed_at = _now()
+
+        ai_job_ids: list[int] = []
+        if run.status in ("Completed", "Completed with Errors") and touched_portfolios:
+            ai_job_ids = AiSuggestJobService(self.db).enqueue_many(
+                touched_portfolios,
+                trigger="import",
+                requested_by_user_id=user.id,
+                import_run_id=run.id,
+            )
+
         self.db.commit()
         self.db.refresh(run)
-        return self._serialize_run(run)
+        return self._serialize_run(run), ai_job_ids
 
     def list_imports(self, kind: str | None = None) -> dict[str, Any]:
         q = self.db.query(PayflowImportRunModel).options(joinedload(PayflowImportRunModel.errors))

@@ -391,6 +391,14 @@ class DatabaseSeeder:
         log_items = [
             ("email_logs", "Email Logs", "/platform/email-logs", "mail", 1, False),
             ("deletion_logs", "Deletion Logs", "/platform/deletion-logs", "billing", 2, False),
+            (
+                "ai_suggest_jobs",
+                "AI Suggest Jobs",
+                "/platform/ai-suggest-jobs",
+                "document",
+                3,
+                False,
+            ),
         ]
         for key, label, route, icon, sort_order, soon in log_items:
             exists = (

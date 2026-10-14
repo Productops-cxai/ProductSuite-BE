@@ -192,6 +192,31 @@ class EmailLogResponse(BaseModel):
     created_at: datetime
 
 
+class AiSuggestJobResponse(BaseModel):
+    id: int
+    client_id: int
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
+    portfolio_id: int
+    portfolio_name: Optional[str] = None
+    portfolio_code: Optional[str] = None
+    trigger: str
+    status: str
+    skip_reason: Optional[str] = None
+    error_message: Optional[str] = None
+    requested_by_user_id: Optional[str] = None
+    import_run_id: Optional[int] = None
+    workflows_created: int = 0
+    workflow_ids: list[int] = []
+    segments_count: Optional[int] = None
+    batches_count: Optional[int] = None
+    groq_calls: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
+    created_at: datetime
+
+
 class InviteResendResponse(BaseModel):
     message: str = "Invitation sent"
     activation_link: Optional[str] = None

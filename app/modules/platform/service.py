@@ -608,6 +608,24 @@ class PlatformService:
             for r in rows
         ]
 
+    def list_ai_suggest_jobs(
+        self,
+        search: Optional[str] = None,
+        status: Optional[str] = None,
+        client_id: Optional[int] = None,
+        portfolio_id: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+        return AiSuggestJobService(self.db).list_jobs(
+            search=search,
+            status=status,
+            client_id=client_id,
+            portfolio_id=portfolio_id,
+            limit=limit,
+        )
+
     def list_deletion_logs(
         self,
         search: Optional[str] = None,
