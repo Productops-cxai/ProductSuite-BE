@@ -711,7 +711,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "client_type__name",
         "payflow_field": "client_type",
         "meaning": "First Party / Third Party (or Commercial labels mapped softly).",
-        "required": False,
+        "required": True,
         "sample_value": "Commercial",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -728,10 +728,20 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "feed": "client_hierarchy",
     },
     {
+        "source_field": "clientdemographiccontactinformation__full_name",
+        "payflow_field": "contact_name",
+        "meaning": "Primary contact name on the Client record.",
+        "required": True,
+        "sample_value": "Jane Contact",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
         "source_field": "email_address / clientdemographiccontactinformation__email_address",
         "payflow_field": "contact_email",
         "meaning": "Primary contact email on the Client record.",
-        "required": False,
+        "required": True,
         "sample_value": "ops@client.com",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -741,7 +751,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "phone_number / clientdemographiccontactinformation__phone_number",
         "payflow_field": "contact_phone",
         "meaning": "Primary contact phone on the Client record.",
-        "required": False,
+        "required": True,
         "sample_value": "4165550100",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -750,8 +760,8 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
     {
         "source_field": "address_line_1 / city__name / province__name / country__name / zip_code",
         "payflow_field": "client_address",
-        "meaning": "Client mailing address fields from the clients file.",
-        "required": False,
+        "meaning": "Client mailing address fields from the clients file. Country is required for master clients.",
+        "required": True,
         "sample_value": "5060 Address, Mississauga, ON, Canada",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -761,7 +771,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "currency__name",
         "payflow_field": "currency_code",
         "meaning": "Default currency for the Client (e.g. Canadian Dollars → CAD).",
-        "required": False,
+        "required": True,
         "sample_value": "Canadian Dollars",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -771,7 +781,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "correspondence_language__name",
         "payflow_field": "correspondence_language",
         "meaning": "Default correspondence language for the Client.",
-        "required": False,
+        "required": True,
         "sample_value": "English",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -955,6 +965,31 @@ CLIENT_IMPORT_MASTER_REQUIRED: tuple[str, ...] = (
     "client_code",
     "is_master_client",
 )
+
+# At least one name column must be present for master / sub display names.
+CLIENT_IMPORT_NAME_COLUMNS: tuple[str, ...] = (
+    "company_name",
+    "short_name",
+)
+
+# Master-client profile columns (parity with Add Client mandatory fields).
+# For each logical field, at least one alias header must exist in the file.
+CLIENT_IMPORT_MASTER_PROFILE_HEADERS: dict[str, tuple[str, ...]] = {
+    "client_type": ("client_type__name",),
+    "contact_name": ("clientdemographiccontactinformation__full_name",),
+    "email": (
+        "email_address",
+        "clientdemographiccontactinformation__email_address",
+    ),
+    "phone": (
+        "phone_number",
+        "cell_number",
+        "clientdemographiccontactinformation__phone_number",
+    ),
+    "country": ("country__name",),
+    "language": ("correspondence_language__name",),
+    "currency": ("currency__name",),
+}
 
 # Daily CRM account file — one sheet "Accounts". Clients/portfolios must already exist.
 ACCOUNT_IMPORT_HEADERS: list[str] = [

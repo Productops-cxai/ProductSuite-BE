@@ -36,7 +36,9 @@ from app.infrastructure.database.models import (
 from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
     BULK_UPLOAD_HEADERS,
+    CLIENT_IMPORT_MASTER_PROFILE_HEADERS,
     CLIENT_IMPORT_MASTER_REQUIRED,
+    CLIENT_IMPORT_NAME_COLUMNS,
     CRM_CLIENT_HIERARCHY_FIELDS,
     CRM_FILE_BEHAVIOUR,
     CRM_INBOUND_FIELDS,
@@ -147,6 +149,67 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in ("true", "1", "yes", "y")
+
+
+def _row_first(row: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        val = (row.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _guess_client_import_field(message: str) -> str:
+    text = (message or "").lower()
+    checks = (
+        ("client_number", "client_number"),
+        ("client_code", "client_code"),
+        ("company_name", "company_name"),
+        ("short_name", "short_name"),
+        ("master_client", "master_client__client_number"),
+        ("contact name", "clientdemographiccontactinformation__full_name"),
+        ("contact email", "email_address"),
+        ("email", "email_address"),
+        ("contact phone", "phone_number"),
+        ("phone", "phone_number"),
+        ("country", "country__name"),
+        ("language", "correspondence_language__name"),
+        ("currency", "currency__name"),
+        ("client type", "client_type__name"),
+        ("client_type", "client_type__name"),
+        ("duplicate", "client_code"),
+    )
+    for needle, field in checks:
+        if needle in text:
+            return field
+    return "File structure"
+
+
+def _cell_to_str(val: Any) -> str:
+    """Normalize Excel/CSV cell values (phones as floats, TRUE/FALSE, etc.)."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "True" if val else "False"
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        if val.is_integer():
+            return str(int(val))
+        # Scientific / non-integer float — keep compact digit form when phone-like
+        text = f"{val:.0f}" if abs(val) >= 1e9 else str(val).strip()
+        return text
+    text = str(val).strip()
+    # Excel often rewrites long phones as 1.4165550101E+10
+    if re.fullmatch(r"[+-]?\d+(\.\d+)?[eE][+-]?\d+", text):
+        try:
+            return str(int(float(text)))
+        except ValueError:
+            return text
+    return text
 
 
 _PRIMARY_CONTACT_FIELDS = (
@@ -1010,7 +1073,8 @@ class PayflowClientService:
         ws = wb.active
         ws.title = "Clients"
         ws.append(BULK_UPLOAD_HEADERS)
-        ws.append(
+        # Minimal aligned examples only (header shape) — not product mock CRM data.
+        examples = [
             [
                 "2026-0001-001",
                 "EX-MASTER",
@@ -1034,9 +1098,7 @@ class PayflowClientService:
                 "English",
                 "Canadian Dollars",
                 "Enable",
-            ]
-        )
-        ws.append(
+            ],
             [
                 "2026-0001-002",
                 "EX-SUB-01",
@@ -1060,8 +1122,21 @@ class PayflowClientService:
                 "English",
                 "Canadian Dollars",
                 "Enable",
-            ]
-        )
+            ],
+        ]
+        phone_cols = {
+            i + 1
+            for i, h in enumerate(BULK_UPLOAD_HEADERS)
+            if "phone" in h or h == "zip_code"
+        }
+        for row in examples:
+            ws.append(row)
+            r_idx = ws.max_row
+            for c_idx in phone_cols:
+                cell = ws.cell(row=r_idx, column=c_idx)
+                cell.number_format = "@"
+                if cell.value is not None:
+                    cell.value = str(cell.value)
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
@@ -1079,13 +1154,20 @@ class PayflowClientService:
 
     def bulk_upload(self, file_bytes: bytes, *, user: UserModel | None = None, filename: str = "upload.xlsx") -> dict:
         safe_name = (filename or "upload.xlsx").split("/")[-1]
-        headers, data_rows = self._load_client_rows(file_bytes, filename)
-        result = self._process_client_hierarchy(
-            headers, data_rows, filename=safe_name, dry_run=False, user=user, file_bytes=file_bytes
-        )
+        try:
+            headers, data_rows = self._load_client_rows(file_bytes, filename)
+        except ValidationAppError as exc:
+            result = self._bulk_preview_fail(safe_name, "File structure", exc.message)
+        else:
+            result = self._process_client_hierarchy(
+                headers, data_rows, filename=safe_name, dry_run=False, user=user, file_bytes=file_bytes
+            )
         # Back-compat shape for older FE callers
         result["created_count"] = result.get("summary", {}).get("created", 0)
-        result["error_count"] = result.get("summary", {}).get("failed", 0)
+        result["error_count"] = max(
+            result.get("summary", {}).get("failed", 0),
+            result.get("summary", {}).get("rejected", 0),
+        )
         result["created"] = [
             {
                 "row": p.get("record_id"),
@@ -1115,15 +1197,37 @@ class PayflowClientService:
                 text = file_bytes.decode("utf-8-sig")
             except UnicodeDecodeError:
                 text = file_bytes.decode("latin-1")
-            reader = csv.DictReader(io.StringIO(text))
+            # excel dialect tolerates quoted commas so columns do not shift mid-row
+            sample = text[:4096]
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(
+                io.StringIO(text), dialect=dialect, restkey="__overflow__"
+            )
             if not reader.fieldnames:
                 raise ValidationAppError("CSV file is empty or missing headers")
             headers = [str(h or "").strip().lower() for h in reader.fieldnames]
+            if any(not h for h in headers):
+                raise ValidationAppError(
+                    "Header row has empty column name(s). Remove blank columns so "
+                    "email / phone / contact stay aligned."
+                )
+            expected = len(headers)
             rows: list[dict[str, str]] = []
-            for raw in reader:
+            for line_no, raw in enumerate(reader, start=2):
+                overflow = raw.get("__overflow__")
+                if overflow:
+                    raise ValidationAppError(
+                        f"Row {line_no} has more columns than the header "
+                        f"({expected}). Check for an extra comma or a value "
+                        "that shifted email/phone into the wrong column."
+                    )
                 row = {
-                    str(k or "").strip().lower(): ("" if v is None else str(v).strip())
+                    str(k or "").strip().lower(): _cell_to_str(v)
                     for k, v in raw.items()
+                    if k is not None and k != "__overflow__"
                 }
                 if any(row.values()):
                     rows.append(row)
@@ -1137,17 +1241,38 @@ class PayflowClientService:
         raw_rows = list(ws.iter_rows(values_only=True))
         if not raw_rows:
             raise ValidationAppError("Excel file is empty")
-        headers = [str(h or "").strip().lower() for h in raw_rows[0]]
+        headers = [_cell_to_str(h).lower() for h in raw_rows[0]]
+        if any(not h for h in headers):
+            # Allow trailing blank headers, but not blanks in the middle
+            trimmed = list(headers)
+            while trimmed and not trimmed[-1]:
+                trimmed.pop()
+            if any(not h for h in trimmed):
+                raise ValidationAppError(
+                    "Header row has empty column name(s). Remove blank columns so "
+                    "email / phone / contact stay aligned."
+                )
+            headers = trimmed
         rows = []
-        for raw in raw_rows[1:]:
-            if not raw or all(c is None or str(c).strip() == "" for c in raw):
+        for row_num, raw in enumerate(raw_rows[1:], start=2):
+            if not raw or all(c is None or _cell_to_str(c) == "" for c in raw):
                 continue
+            cells = list(raw)
+            # Ignore trailing empty cells beyond header width
+            while len(cells) > len(headers) and _cell_to_str(cells[-1]) == "":
+                cells.pop()
+            if len(cells) > len(headers):
+                raise ValidationAppError(
+                    f"Row {row_num} has more columns than the header "
+                    f"({len(headers)}). A value is shifted — usually email/phone "
+                    "or product landed in the wrong column."
+                )
             row = {}
             for i, h in enumerate(headers):
                 if not h:
                     continue
-                val = raw[i] if i < len(raw) else None
-                row[h] = "" if val is None else str(val).strip()
+                val = cells[i] if i < len(cells) else None
+                row[h] = _cell_to_str(val)
             if any(row.values()):
                 rows.append(row)
         return headers, rows
@@ -1167,13 +1292,32 @@ class PayflowClientService:
         user: UserModel | None,
         file_bytes: bytes | None = None,
     ) -> dict:
+        if not data_rows:
+            return self._bulk_preview_fail(
+                filename,
+                "File structure",
+                "File has no data rows. Add at least one client record below the header row.",
+            )
+
         if self._is_hierarchy_format(headers):
             missing = [h for h in CLIENT_IMPORT_MASTER_REQUIRED if h not in headers]
-            if missing:
+            if not any(h in headers for h in CLIENT_IMPORT_NAME_COLUMNS):
+                missing.append("company_name or short_name")
+            for _label, aliases in CLIENT_IMPORT_MASTER_PROFILE_HEADERS.items():
+                if not any(a in headers for a in aliases):
+                    missing.append(aliases[0])
+            # De-dupe while preserving order
+            seen: set[str] = set()
+            missing_unique = []
+            for m in missing:
+                if m not in seen:
+                    seen.add(m)
+                    missing_unique.append(m)
+            if missing_unique:
                 return self._bulk_preview_fail(
                     filename,
                     "File structure",
-                    f"Missing required column(s): {', '.join(missing)}",
+                    f"Missing required column(s): {', '.join(missing_unique)}",
                 )
             return self._process_crm_hierarchy(
                 data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
@@ -1190,6 +1334,47 @@ class PayflowClientService:
         return self._process_simple_clients(
             data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
         )
+
+    def _validate_master_profile_row(self, row: dict[str, str]) -> None:
+        """Enforce Add Client mandatory fields on master rows."""
+        client_type = _row_first(row, "client_type__name")
+        if not client_type:
+            raise ValidationAppError("Client type is required")
+
+        contact_name = _row_first(row, "clientdemographiccontactinformation__full_name")
+        if not contact_name:
+            raise ValidationAppError("Primary contact name is required")
+
+        email = _row_first(
+            row,
+            "email_address",
+            "clientdemographiccontactinformation__email_address",
+        )
+        if not email:
+            raise ValidationAppError("Primary contact email is required")
+        if not _EMAIL_RE.match(email):
+            raise ValidationAppError("Enter a valid primary contact email")
+
+        phone = _row_first(
+            row,
+            "phone_number",
+            "cell_number",
+            "clientdemographiccontactinformation__phone_number",
+        )
+        if not phone:
+            raise ValidationAppError("Primary contact phone is required")
+
+        country = _row_first(row, "country__name")
+        if not country:
+            raise ValidationAppError("Country is required")
+
+        language = _row_first(row, "correspondence_language__name")
+        if not language:
+            raise ValidationAppError("Language is required")
+
+        currency = _row_first(row, "currency__name")
+        if not currency:
+            raise ValidationAppError("Currency is required")
 
     def _process_crm_hierarchy(
         self,
@@ -1224,6 +1409,7 @@ class PayflowClientService:
                     raise ValidationAppError("client_code is required")
                 if not name:
                     raise ValidationAppError("company_name or short_name is required")
+                self._validate_master_profile_row(row)
                 if number.lower() in seen_numbers:
                     raise ConflictError(f"Duplicate client_number in file: {number}")
                 if code.lower() in seen_codes:
@@ -1286,14 +1472,30 @@ class PayflowClientService:
                 )
             except (ValidationAppError, ConflictError) as exc:
                 failed += 1
+                field = _guess_client_import_field(exc.message)
                 errors.append(
                     {
-                        "record_id": record_id,
-                        "client": name or "—",
+                        "record_id": record_id or f"Row {row_num}",
+                        "client": name or code or "—",
                         "sub_client": "—",
-                        "field": "client_number",
+                        "field": field,
                         "error": exc.message,
                         "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
+                    }
+                )
+                preview_masters.append(
+                    {
+                        "id": f"master-err-{row_num}",
+                        "record_id": record_id or f"Row {row_num}",
+                        "client": code or "—",
+                        "client_name": name or code or f"Row {row_num}",
+                        "client_code": code or "—",
+                        "sub_client": "—",
+                        "sub_client_name": "—",
+                        "action": "Error",
+                        "note": exc.message,
+                        "is_sub": False,
+                        "entity_id": None,
                     }
                 )
 
@@ -1441,16 +1643,30 @@ class PayflowClientService:
                 )
             except (ValidationAppError, ConflictError) as exc:
                 failed += 1
+                field = _guess_client_import_field(exc.message)
                 errors.append(
                     {
-                        "record_id": record_id,
+                        "record_id": record_id or f"Row {row_num}",
                         "client": master_number or "—",
                         "sub_client": code or name or "—",
-                        "field": "master_client__client_number"
-                        if not master_number
-                        else "client_code",
+                        "field": field,
                         "error": exc.message,
                         "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
+                    }
+                )
+                preview_subs.append(
+                    {
+                        "id": f"sub-err-{row_num}",
+                        "record_id": record_id or f"Row {row_num}",
+                        "client": master_number or "—",
+                        "client_name": master_number or "—",
+                        "client_code": master_number or "—",
+                        "sub_client": code or "—",
+                        "sub_client_name": name or code or f"Row {row_num}",
+                        "action": "Error",
+                        "note": exc.message,
+                        "is_sub": True,
+                        "entity_id": None,
                     }
                 )
 
@@ -1492,6 +1708,32 @@ class PayflowClientService:
                 "summary": summary,
                 "preview": preview,
                 "errors": errors,
+            }
+
+        # Validate/preview: fail the file when nothing is importable.
+        if successful == 0:
+            return {
+                "ok": False,
+                "file_name": filename,
+                "status": "Failed",
+                "message": (
+                    errors[0]["error"]
+                    if len(errors) == 1
+                    else "No valid client records found. Fix the errors below and upload again."
+                ),
+                "summary": summary,
+                "preview": preview,
+                "errors": errors
+                or [
+                    {
+                        "record_id": "File",
+                        "client": "—",
+                        "sub_client": "—",
+                        "field": "File structure",
+                        "error": "No valid client records found in the file.",
+                        "status": "Rejected",
+                    }
+                ],
             }
 
         return {
@@ -1626,16 +1868,33 @@ class PayflowClientService:
                     )
             except (ValidationAppError, ConflictError) as exc:
                 failed += 1
+                field = _guess_client_import_field(exc.message)
                 errors.append(
                     {
                         "record_id": record_id,
                         "client": name or "—",
                         "sub_client": "—",
-                        "field": "client_code",
+                        "field": field,
                         "error": exc.message,
                         "status": "Skipped" if "Duplicate" in exc.message else "Rejected",
                     }
                 )
+                if len(preview) < 50:
+                    preview.append(
+                        {
+                            "id": f"row-err-{row_num}",
+                            "record_id": record_id,
+                            "client": name or code or "—",
+                            "client_name": name or code or record_id,
+                            "client_code": code or "—",
+                            "sub_client": "—",
+                            "sub_client_name": "—",
+                            "action": "Error",
+                            "note": exc.message,
+                            "is_sub": False,
+                            "entity_id": None,
+                        }
+                    )
 
         rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
         successful = created + updated + unchanged
@@ -1674,6 +1933,31 @@ class PayflowClientService:
                 "summary": summary,
                 "preview": preview,
                 "errors": errors,
+            }
+
+        if successful == 0:
+            return {
+                "ok": False,
+                "file_name": filename,
+                "status": "Failed",
+                "message": (
+                    errors[0]["error"]
+                    if len(errors) == 1
+                    else "No valid client records found. Fix the errors below and upload again."
+                ),
+                "summary": summary,
+                "preview": preview,
+                "errors": errors
+                or [
+                    {
+                        "record_id": "File",
+                        "client": "—",
+                        "sub_client": "—",
+                        "field": "File structure",
+                        "error": "No valid client records found in the file.",
+                        "status": "Rejected",
+                    }
+                ],
             }
 
         return {
