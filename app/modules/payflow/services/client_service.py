@@ -16,9 +16,11 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     PayflowAccountModel,
+    PayflowAiSuggestJobModel,
     PayflowClientFieldMappingModel,
     PayflowClientModel,
     PayflowCommunicationModel,
+    PayflowHumanReviewAuditModel,
     PayflowHumanReviewModel,
     PayflowImportErrorModel,
     PayflowImportRunModel,
@@ -847,6 +849,39 @@ class PayflowClientService:
                 self.db.commit()
         return self._portfolio_item(row), job_ids
 
+    def _purge_review(self, review: PayflowHumanReviewModel) -> list[dict[str, str]]:
+        related: list[dict[str, str]] = []
+        audits = (
+            self.db.query(PayflowHumanReviewAuditModel)
+            .filter(PayflowHumanReviewAuditModel.review_id == review.id)
+            .all()
+        )
+        for audit in audits:
+            self.db.delete(audit)
+        related.append({"entity_type": "review", "id": str(review.id), "label": review.code})
+        self.db.delete(review)
+        return related
+
+    def _purge_ai_suggest_jobs(
+        self, *, client_id: int | None = None, portfolio_id: int | None = None
+    ) -> list[dict[str, str]]:
+        q = self.db.query(PayflowAiSuggestJobModel)
+        if client_id is not None:
+            q = q.filter(PayflowAiSuggestJobModel.client_id == client_id)
+        if portfolio_id is not None:
+            q = q.filter(PayflowAiSuggestJobModel.portfolio_id == portfolio_id)
+        related: list[dict[str, str]] = []
+        for job in q.all():
+            related.append(
+                {
+                    "entity_type": "ai_suggest_job",
+                    "id": str(job.id),
+                    "label": f"{job.trigger}:{job.status}",
+                }
+            )
+            self.db.delete(job)
+        return related
+
     def _purge_account(self, account: PayflowAccountModel) -> list[dict[str, str]]:
         related: list[dict[str, str]] = []
         comms = (
@@ -865,8 +900,7 @@ class PayflowClientService:
             .all()
         )
         for review in reviews:
-            related.append({"entity_type": "review", "id": str(review.id), "label": review.code})
-            self.db.delete(review)
+            related.extend(self._purge_review(review))
         related.append(
             {
                 "entity_type": "account",
@@ -898,6 +932,7 @@ class PayflowClientService:
             raise NotFoundError("Portfolio not found")
         snapshot = snapshot_model(row)
         related: list[dict[str, str]] = []
+        related.extend(self._purge_ai_suggest_jobs(portfolio_id=portfolio_id))
         accounts = (
             self.db.query(PayflowAccountModel)
             .filter(PayflowAccountModel.portfolio_id == portfolio_id)
@@ -968,6 +1003,9 @@ class PayflowClientService:
             )
             self.db.delete(assignment)
 
+        # Must go before portfolios — FK payflow_ai_suggest_jobs_portfolio_id_fkey
+        related.extend(self._purge_ai_suggest_jobs(client_id=client_id))
+
         comms = (
             self.db.query(PayflowCommunicationModel)
             .filter(PayflowCommunicationModel.client_id == client_id)
@@ -985,8 +1023,7 @@ class PayflowClientService:
             .all()
         )
         for review in reviews:
-            related.append({"entity_type": "review", "id": str(review.id), "label": review.code})
-            self.db.delete(review)
+            related.extend(self._purge_review(review))
 
         accounts = (
             self.db.query(PayflowAccountModel)
@@ -994,14 +1031,9 @@ class PayflowClientService:
             .all()
         )
         for account in accounts:
-            related.append(
-                {
-                    "entity_type": "account",
-                    "id": str(account.id),
-                    "label": f"{account.customer_name} ({account.account_reference})",
-                }
-            )
-            self.db.delete(account)
+            # Comms/reviews for this client already removed above; remove any
+            # leftover account-scoped rows then the account itself.
+            related.extend(self._purge_account(account))
 
         strategies = (
             self.db.query(PayflowStrategyModel)
