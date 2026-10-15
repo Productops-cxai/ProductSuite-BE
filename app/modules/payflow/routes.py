@@ -72,6 +72,9 @@ from app.modules.payflow.schemas import (
     SuggestWorkflowsRequest,
     SuggestWorkflowsResponse,
     RegenerateWorkflowRequest,
+    PayflowWorkflowRunItem,
+    PayflowWorkflowRunsResponse,
+    PayflowWorkflowWorkerLogsResponse,
 )
 from app.modules.platform.schemas import DeletionLogResponse
 from app.modules.payflow.service import PayflowUserService
@@ -1135,6 +1138,72 @@ def get_comm(communication_id: int, user: RequirePayflowProduct, db: DbSession):
         return PayflowCommunicationService(db).get_communication(user, communication_id)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Workflow worker / runs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/workflow-worker-logs", response_model=PayflowWorkflowWorkerLogsResponse)
+def list_workflow_worker_logs(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    strategy_id: int | None = Query(default=None),
+    event_type: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    items = WorkflowExecutionService(db).list_worker_logs(
+        client_id=client_id,
+        portfolio_id=portfolio_id,
+        account_id=account_id,
+        strategy_id=strategy_id,
+        event_type=event_type,
+        level=level,
+        search=search,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@router.get("/workflow-runs", response_model=PayflowWorkflowRunsResponse)
+def list_workflow_runs(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    strategy_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    items = WorkflowExecutionService(db).list_runs(
+        client_id=client_id,
+        strategy_id=strategy_id,
+        account_id=account_id,
+        status=status_filter,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@router.get("/workflow-runs/{run_id}", response_model=PayflowWorkflowRunItem)
+def get_workflow_run(run_id: int, user: RequirePayflowProduct, db: DbSession):
+    from app.core.exceptions import NotFoundError
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    item = WorkflowExecutionService(db).get_run(run_id)
+    if not item:
+        raise _map_error(NotFoundError("Workflow run not found"))
+    return item
 
 
 # ---------------------------------------------------------------------------

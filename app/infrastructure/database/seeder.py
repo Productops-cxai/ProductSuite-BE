@@ -146,7 +146,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/review",
                 "access",
                 3,
-                True,  # disabled / coming soon — FE parked in _design_backup/payflow-ai-ops
+                False,
                 None,
                 "view_human_reviews",
             ),
@@ -173,9 +173,19 @@ _PAYFLOW_NAV: list[
                 "/payflow/comms",
                 "mail",
                 2,
-                True,  # disabled — FE redesign backup
+                False,
                 None,
                 "view_communications",
+            ),
+            (
+                "worker_logs",
+                "Workflow Worker Logs",
+                "/payflow/worker-logs",
+                "document",
+                3,
+                False,
+                None,
+                "view_workflows",
             ),
         ],
     ),
@@ -390,13 +400,22 @@ class DatabaseSeeder:
 
         log_items = [
             ("email_logs", "Email Logs", "/platform/email-logs", "mail", 1, False),
-            ("deletion_logs", "Deletion Logs", "/platform/deletion-logs", "billing", 2, False),
+            ("sms_logs", "SMS Logs", "/platform/sms-logs", "mail", 2, False),
+            (
+                "workflow_worker_logs",
+                "Workflow Worker Logs",
+                "/platform/worker-logs",
+                "document",
+                3,
+                False,
+            ),
+            ("deletion_logs", "Deletion Logs", "/platform/deletion-logs", "billing", 4, False),
             (
                 "ai_suggest_jobs",
                 "AI Suggest Jobs",
                 "/platform/ai-suggest-jobs",
                 "document",
-                3,
+                5,
                 False,
             ),
         ]
@@ -620,9 +639,11 @@ class DatabaseSeeder:
             "users",
             "dashboard",
             "workflows",
+            "review",
+            "comms",
+            "worker_logs",
         }
-        # Still parked until Communications / Human Review FE is restored.
-        parked_disabled_keys = {"review", "comms"}
+        parked_disabled_keys: set[str] = set()
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)

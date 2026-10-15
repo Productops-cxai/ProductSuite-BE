@@ -98,8 +98,8 @@ class PlatformService:
                     continue
                 if item.required_role_code and item.required_role_code != role:
                     continue
-                # Email Logs is a private ops view for the seeded suite admin only
-                if item.key == "email_logs" and caller_email != email_logs_admin:
+                # Email / SMS Logs are private ops views for the seeded suite admin only
+                if item.key in {"email_logs", "sms_logs"} and caller_email != email_logs_admin:
                     continue
                 items.append(
                     {
@@ -608,6 +608,47 @@ class PlatformService:
             for r in rows
         ]
 
+    def list_sms_logs(
+        self,
+        actor_email: str,
+        search: Optional[str] = None,
+        sms_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        if (actor_email or "").lower() != settings.SEED_SUPER_ADMIN_EMAIL.lower():
+            raise ForbiddenError("SMS Logs are only available to the suite admin")
+
+        from app.infrastructure.database.models import SmsLogModel
+
+        query = self.db.query(SmsLogModel)
+        if sms_type:
+            query = query.filter(SmsLogModel.sms_type == sms_type)
+        if search:
+            like = f"%{search.lower()}%"
+            query = query.filter(
+                or_(
+                    SmsLogModel.to_phone.ilike(like),
+                    SmsLogModel.body.ilike(like),
+                )
+            )
+        rows = query.order_by(SmsLogModel.id.desc()).limit(min(limit, 500)).all()
+        return [
+            {
+                "id": r.id,
+                "to_phone": r.to_phone,
+                "body": r.body,
+                "sms_type": r.sms_type,
+                "status": r.status,
+                "provider_id": r.provider_id,
+                "error": r.error,
+                "account_id": r.account_id,
+                "run_id": r.run_id,
+                "client_id": r.client_id,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+
     def list_ai_suggest_jobs(
         self,
         search: Optional[str] = None,
@@ -623,6 +664,30 @@ class PlatformService:
             status=status,
             client_id=client_id,
             portfolio_id=portfolio_id,
+            limit=limit,
+        )
+
+    def list_workflow_worker_logs(
+        self,
+        search: Optional[str] = None,
+        event_type: Optional[str] = None,
+        level: Optional[str] = None,
+        client_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+        strategy_id: Optional[int] = None,
+        limit: int = 200,
+    ) -> List[dict]:
+        from app.modules.payflow.services.workflow_execution_service import (
+            WorkflowExecutionService,
+        )
+
+        return WorkflowExecutionService(self.db).list_worker_logs(
+            client_id=client_id,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            event_type=event_type,
+            level=level,
+            search=search,
             limit=limit,
         )
 

@@ -143,6 +143,11 @@ def describe_segment(segment_id: str, key: tuple, members: list) -> dict[str, An
 # --------------------------------------------------------------------------- matching
 
 
+def account_fits_segment(account, segment: dict, today: date | None = None) -> bool:
+    """True when the account matches the workflow targeting `segment` dict."""
+    return _fits(account, segment or {}, today or date.today())
+
+
 def match_account_to_segment(account, items: list[dict], today: date | None = None) -> dict | None:
     """Most specific item whose `segment` the account fits, or None.
 

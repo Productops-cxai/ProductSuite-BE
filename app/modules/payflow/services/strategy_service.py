@@ -1305,6 +1305,19 @@ class PayflowStrategyService:
         )
         self.db.commit()
         self.db.refresh(row)
+        # Enqueue account enrollment for the workflow worker (PostgreSQL due-queue).
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_strategy_activated(row.id)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.strategy").exception(
+                "Failed to enqueue workflow enroll for strategy_id=%s", row.id
+            )
         return self._serialize(self._get_row(row.id))
 
     def deactivate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
@@ -1326,6 +1339,18 @@ class PayflowStrategyService:
         )
         self.db.commit()
         self.db.refresh(row)
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_strategy_deactivated(row.id)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.strategy").exception(
+                "Failed to cancel runs for deactivated strategy_id=%s", row.id
+            )
         return self._serialize(self._get_row(row.id))
 
     def delete_strategy(

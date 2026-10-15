@@ -42,5 +42,23 @@ class Settings(BaseSettings):
     # Set 0 to send all segments in one call (paid tier).
     GROQ_SEGMENTS_PER_CALL: int = 3
 
+    # Collection email — SendGrid (empty key = log-only).
+    SENDGRID_API_KEY: str = ""
+    SENDGRID_FROM_EMAIL: str = ""
+    SENDGRID_FROM_NAME: str = "PayFlow"
+
+    # Collection SMS — Twilio (empty credentials = log-only).
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_FROM_NUMBER: str = ""
+
+    # Workflow worker (PostgreSQL due-queue).
+    WORKFLOW_WORKER_ID: str = ""
+    WORKFLOW_WORKER_CONCURRENCY: int = 8
+    WORKFLOW_WORKER_BATCH_SIZE: int = 50
+    WORKFLOW_WORKER_SWEEP_SECONDS: int = 20
+    WORKFLOW_JOB_NOTIFY_CHANNEL: str = "workflow_jobs"
+    WORKFLOW_PAYMENT_LINK_BASE: str = "https://pay.payflow.local/pay"
+
 
 settings = Settings()

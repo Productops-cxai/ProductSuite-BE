@@ -192,6 +192,22 @@ class EmailLogResponse(BaseModel):
     created_at: datetime
 
 
+class SmsLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    to_phone: str
+    body: str
+    sms_type: str
+    status: str
+    provider_id: Optional[str] = None
+    error: Optional[str] = None
+    account_id: Optional[int] = None
+    run_id: Optional[int] = None
+    client_id: Optional[int] = None
+    created_at: datetime
+
+
 class AiSuggestJobResponse(BaseModel):
     id: int
     client_id: int
@@ -215,6 +231,22 @@ class AiSuggestJobResponse(BaseModel):
     finished_at: Optional[datetime] = None
     duration_ms: Optional[int] = None
     created_at: datetime
+
+
+class WorkflowWorkerLogResponse(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: str
+    detail: Optional[str] = None
+    client_id: Optional[int] = None
+    portfolio_id: Optional[int] = None
+    account_id: Optional[int] = None
+    strategy_id: Optional[int] = None
+    run_id: Optional[int] = None
+    job_id: Optional[int] = None
+    step_id: Optional[str] = None
+    created_at: Optional[datetime] = None
 
 
 class InviteResendResponse(BaseModel):

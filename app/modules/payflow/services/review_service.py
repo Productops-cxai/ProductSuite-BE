@@ -605,6 +605,24 @@ class PayflowReviewService:
         self._assert_decision_version(row, decision_version)
         return row
 
+    def _resume_workflow_after_review(
+        self, review_id: int, *, continue_workflow: bool
+    ) -> None:
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_human_review_decided(
+                review_id, continue_workflow=continue_workflow
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger("app.review").exception(
+                "Failed to resume workflow after review_id=%s", review_id
+            )
+
     def _mark_review_notifications_read(self, review_id: int) -> None:
         try:
             from app.modules.payflow.services.notification_service import (
@@ -1218,6 +1236,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def modify(
@@ -1282,6 +1301,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def reject(
@@ -1348,6 +1368,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=False)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def hold(

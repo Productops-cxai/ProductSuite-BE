@@ -199,6 +199,35 @@ class PayflowNotificationType(str, Enum):
     CLIENT_ACTIVATED = "client_activated"
     REVIEW_DECIDED = "review_decided"
     WORKFLOW_DECIDED = "workflow_decided"
+    WORKFLOW_STEP_FAILED = "workflow_step_failed"
+    WORKFLOW_RULE_BLOCKED = "workflow_rule_blocked"
+    WORKFLOW_RUN_SUPERSEDED = "workflow_run_superseded"
+    PROVIDER_SEND_FAILED = "provider_send_failed"
+
+
+class PayflowWorkflowRunStatus(str, Enum):
+    ACTIVE = "Active"
+    WAITING = "Waiting"
+    PAUSED_HUMAN_REVIEW = "PausedHumanReview"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    FAILED = "Failed"
+    SUPERSEDED = "Superseded"
+
+
+class PayflowWorkflowJobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class PayflowWorkflowJobType(str, Enum):
+    ENROLL_STRATEGY = "enroll_strategy"
+    EXECUTE_STEP = "execute_step"
+    RESUME_RUN = "resume_run"
+    GAP_FILL = "gap_fill"
 
 
 class PayflowOnboardingStepStatus(str, Enum):

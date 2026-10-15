@@ -9,6 +9,8 @@ from app.modules.platform.schemas import (
     AiSuggestJobResponse,
     AssignProductRequest,
     EmailLogResponse,
+    SmsLogResponse,
+    WorkflowWorkerLogResponse,
     EnterProductResponse,
     GrantAccessRequest,
     InviteResendResponse,
@@ -207,6 +209,21 @@ def list_email_logs(
         raise _map_error(exc) from exc
 
 
+@router.get("/sms-logs", response_model=List[SmsLogResponse])
+def list_sms_logs(
+    admin: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    sms_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Outbound SMS archive (Twilio / log-only). Suite admin only."""
+    try:
+        return PlatformService(db).list_sms_logs(admin.email, search, sms_type, limit)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.get("/deletion-logs", response_model=List[DeletionLogResponse])
 def list_deletion_logs(
     _: SuperAdmin,
@@ -234,6 +251,30 @@ def list_ai_suggest_jobs(
         status=status_filter,
         client_id=client_id,
         portfolio_id=portfolio_id,
+        limit=limit,
+    )
+
+
+@router.get("/workflow-worker-logs", response_model=List[WorkflowWorkerLogResponse])
+def list_workflow_worker_logs(
+    _: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    event_type: Optional[str] = Query(default=None),
+    level: Optional[str] = Query(default=None),
+    client_id: Optional[int] = Query(default=None),
+    account_id: Optional[int] = Query(default=None),
+    strategy_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    """Platform ops view of workflow worker enrollment / step / send events."""
+    return PlatformService(db).list_workflow_worker_logs(
+        search=search,
+        event_type=event_type,
+        level=level,
+        client_id=client_id,
+        account_id=account_id,
+        strategy_id=strategy_id,
         limit=limit,
     )
 

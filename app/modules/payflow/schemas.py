@@ -1251,3 +1251,56 @@ class RegenerateWorkflowRequest(BaseModel):
         if len(cleaned) < 3:
             raise ValueError("Remarks are required")
         return cleaned
+
+
+class PayflowWorkflowWorkerLogItem(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: str
+    detail: Optional[str] = None
+    client_id: Optional[int] = None
+    portfolio_id: Optional[int] = None
+    account_id: Optional[int] = None
+    strategy_id: Optional[int] = None
+    run_id: Optional[int] = None
+    job_id: Optional[int] = None
+    step_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class PayflowWorkflowWorkerLogsResponse(BaseModel):
+    items: List[PayflowWorkflowWorkerLogItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowStepRunItem(BaseModel):
+    id: int
+    step_id: str
+    kind: str
+    attempt: int
+    status: str
+    scheduled_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+    result_json: Optional[dict[str, Any]] = None
+
+
+class PayflowWorkflowRunItem(BaseModel):
+    id: int
+    account_id: int
+    strategy_id: int
+    strategy_version: Optional[int] = None
+    client_id: Optional[int] = None
+    portfolio_id: Optional[int] = None
+    status: str
+    current_step_id: Optional[str] = None
+    human_review_id: Optional[int] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    step_runs: List[PayflowWorkflowStepRunItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowRunsResponse(BaseModel):
+    items: List[PayflowWorkflowRunItem] = Field(default_factory=list)
