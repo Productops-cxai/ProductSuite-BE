@@ -756,6 +756,9 @@ class PayflowRulesListResponse(BaseModel):
 
 
 class CreatePayflowRuleRequest(BaseModel):
+    """Create or update a rule. When ``id`` is set, the same POST updates that rule."""
+
+    id: Optional[int] = None
     name: str = Field(min_length=1, max_length=255)
     description: Optional[str] = None
     rule_type: str = "Client Rule"

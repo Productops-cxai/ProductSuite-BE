@@ -852,19 +852,18 @@ def list_rules(
 
 
 @router.post("/rules", response_model=PayflowRuleItem)
-def create_rule(
+def create_or_update_rule(
     payload: CreatePayflowRuleRequest,
     user: RequirePayflowProduct,
     db: DbSession,
 ):
+    """Create a rule, or update when ``id`` is present in the body (same POST)."""
     try:
-        return PayflowRuleService(db).create_rule(
-            user,
-            {
-                **payload.model_dump(),
-                "conditions": [c.model_dump() for c in payload.conditions],
-            },
-        )
+        body = {
+            **payload.model_dump(),
+            "conditions": [c.model_dump() for c in payload.conditions],
+        }
+        return PayflowRuleService(db).create_rule(user, body)
     except AppError as exc:
         raise _map_error(exc) from exc
 
