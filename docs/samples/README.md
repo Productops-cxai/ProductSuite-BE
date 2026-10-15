@@ -110,6 +110,8 @@ Documented here so FE + BE stay aligned. Deeper design notes: root `ARCHITECTURE
 - `GET /payflow/clients/{id}/portfolios/{id}/segments` — preview how a portfolio's accounts are grouped (no AI).
 - `POST /payflow/workflows/suggest` — AI suggests one workflow per segment, saved as "AI Proposed". Needs `GROQ_API_KEY` in `.env`; takes minutes on the Groq free tier.
 - Postman collection: `docs/postman/PayFlow_AI_Workflows.postman_collection.json`. Full guide: `docs/AI_WORKFLOW_SUGGESTION.md`.
+- **Reviewer notes (optional, additive):** `POST /payflow/workflows/{id}/approve` accepts an optional body `{"note": "…"}` (no body still works); `POST /payflow/workflows/{id}/update` accepts an optional `"note"`. Saved as `reviewer_note` on that action's entry in the workflow's `versions` history. An edit with a note but no step change still gets a history entry.
+- **"Human Modified" is now accurate:** an AI workflow gets `origin = "Human Modified"` only when its steps or segment really change. Renaming, summary edits, re-sending the same steps and `save-draft` no longer set it, so an approved workflow with `origin = "AI Proposed"` was approved as the AI wrote it. Existing rows are not backfilled.
 
 ---
 

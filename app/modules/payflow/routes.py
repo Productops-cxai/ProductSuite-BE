@@ -24,6 +24,7 @@ from app.modules.payflow.deps import (
 from app.modules.payflow.schemas import (
     AccessContextResponse,
     ApproveReviewRequest,
+    ApproveStrategyRequest,
     AssignReviewRequest,
     CreateHumanReviewRequest,
     CreatePayflowClientRequest,
@@ -999,9 +1000,15 @@ def submit_workflow_review(strategy_id: int, user: PayflowManageWorkflows, db: D
 
 
 @router.post("/workflows/{strategy_id}/approve", response_model=PayflowStrategyItem)
-def approve_workflow(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+def approve_workflow(
+    strategy_id: int,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+    payload: ApproveStrategyRequest | None = None,  # body is optional
+):
     try:
-        return PayflowStrategyService(db).approve(user, strategy_id)
+        note = payload.note if payload else None
+        return PayflowStrategyService(db).approve(user, strategy_id, note=note)
     except AppError as exc:
         raise _map_error(exc) from exc
 

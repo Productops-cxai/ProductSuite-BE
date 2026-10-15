@@ -826,6 +826,7 @@ class StrategyVersionItem(BaseModel):
     steps: Optional[List[Any]] = None
     segment: Optional[dict] = None
     changes: List[str] = Field(default_factory=list)
+    reviewer_note: Optional[str] = None  # why the reviewer approved / edited (optional)
 
 
 class StrategyStats(BaseModel):
@@ -895,6 +896,7 @@ class PayflowStrategyItem(BaseModel):
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
     ai_proposal_snapshot: Optional[dict] = None
+    revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
     versions: List[StrategyVersionItem] = Field(default_factory=list)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None
@@ -951,6 +953,11 @@ class UpdatePayflowStrategyRequest(BaseModel):
     segment: Optional[dict] = None
     steps: Optional[List[StrategyStepItem]] = None
     entry_node_id: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why this edit was made")
+
+
+class ApproveStrategyRequest(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why it was approved")
 
 
 class RejectStrategyRequest(BaseModel):

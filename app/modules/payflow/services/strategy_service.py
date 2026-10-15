@@ -434,6 +434,19 @@ def _is_human_modified(row: PayflowStrategyModel, steps: list[dict]) -> bool:
     return any(s.get("origin") == PayflowStrategyOrigin.HUMAN_MODIFIED.value for s in steps)
 
 
+def _step_content(step: dict[str, Any]) -> dict[str, Any]:
+    """Everything a step holds except its origin marker (empty values ignored)."""
+    content = {key: value for key, value in step.items() if key != "origin" and value is not None}
+    content["config"] = {key: value for key, value in _cfg(step).items() if value is not None}
+    content["disabled"] = bool(step.get("disabled"))
+    return content
+
+
+def _steps_changed(before: list[dict], after: list[dict]) -> bool:
+    """True when the steps really differ — re-sending the same steps is not a change."""
+    return [_step_content(s) for s in before] != [_step_content(s) for s in after]
+
+
 def _row_source(row: PayflowStrategyModel) -> str:
     if row.source:
         return row.source
@@ -444,6 +457,11 @@ def _row_source(row: PayflowStrategyModel) -> str:
 
 def _awaiting_review(status: str) -> bool:
     return status in AWAITING_STATUSES
+
+
+def _clean_note(note: str | None) -> str | None:
+    """Optional reviewer note: trimmed, and blank means no note."""
+    return (note or "").strip() or None
 
 
 def _catalog() -> dict[str, Any]:
@@ -656,6 +674,7 @@ class PayflowStrategyService:
             "stats": stats,
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
+            "revision_of_id": row.revision_of_id,
             "versions": list(row.versions or []),
             "approved_by": row.approved_by,
             "approval_date": row.approval_date,
@@ -830,6 +849,7 @@ class PayflowStrategyService:
             entry_node_id=entry_node_id,
             ai_context=ai_context,
             ai_proposal_snapshot=ai_snapshot,
+            revision_of_id=payload.get("revision_of_id"),  # set by Regenerate only
             versions=[
                 self._version_entry(
                     version=1,
@@ -913,7 +933,9 @@ class PayflowStrategyService:
             row.name = name
         if "summary" in payload:
             row.summary = (payload.get("summary") or "").strip() or None
+        segment_changed = False
         if "segment" in payload and payload["segment"] is not None:
+            segment_changed = payload["segment"] != (row.segment or {})
             row.segment = payload["segment"]
         if "entry_node_id" in payload:
             row.entry_node_id = payload.get("entry_node_id")
@@ -921,13 +943,18 @@ class PayflowStrategyService:
             row.coverage = _coverage_value(payload, row.coverage)
 
         source = _row_source(row)
+        steps_changed = False
         if "steps" in payload and payload["steps"] is not None:
             default_origin = (
                 PayflowStrategyOrigin.HUMAN_MODIFIED.value
                 if source == PayflowStrategySource.AI_GENERATED.value
                 else PayflowStrategyOrigin.HUMAN_CREATED.value
             )
-            row.steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            new_steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            steps_changed = _steps_changed(before_steps, new_steps)
+            # Same steps sent back: keep the stored ones, so step origins are not re-stamped.
+            if steps_changed:
+                row.steps = new_steps
             if not row.entry_node_id and row.steps:
                 row.entry_node_id = row.steps[0].get("id")
 
@@ -949,27 +976,33 @@ class PayflowStrategyService:
             }
 
         if source == PayflowStrategySource.AI_GENERATED.value:
-            row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
             row.source = PayflowStrategySource.AI_GENERATED.value
-        elif row.origin == PayflowStrategyOrigin.AI_PROPOSED.value:
+        # "Human Modified" only when what the workflow does changed: its steps or who it applies to.
+        # Name / summary edits do not count.
+        if (steps_changed or segment_changed) and (
+            source == PayflowStrategySource.AI_GENERATED.value
+            or row.origin == PayflowStrategyOrigin.AI_PROPOSED.value
+        ):
             row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
 
         if was_ai_proposed or row.status == PayflowStrategyStatus.AI_PROPOSED.value:
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
             row.reviewed_by = row.reviewed_by or user.full_name
 
-        if changes:
-            self._prepend_version(
-                row,
-                {
-                    "version": int(row.version or 1),
-                    "date": _stamp(),
-                    "note": f"Updated by {user.full_name}",
-                    "changes": changes,
-                    "status": row.status,
-                    "origin": row.origin,
-                },
-            )
+        # A reviewer note is kept even when no step changed (e.g. only the summary was edited).
+        note = _clean_note(payload.get("note"))
+        if changes or note:
+            entry = {
+                "version": int(row.version or 1),
+                "date": _stamp(),
+                "note": f"Updated by {user.full_name}",
+                "changes": changes,
+                "status": row.status,
+                "origin": row.origin,
+            }
+            if note:
+                entry["reviewer_note"] = note
+            self._prepend_version(row, entry)
 
         # Editing never activates
         if row.status == PayflowStrategyStatus.ACTIVE.value:
@@ -1007,14 +1040,11 @@ class PayflowStrategyService:
                     "ai_context": copy.deepcopy(list(row.ai_context or [])),
                 }
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
-            row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
             row.source = PayflowStrategySource.AI_GENERATED.value
             row.reviewed_by = row.reviewed_by or user.full_name
         elif row.status == PayflowStrategyStatus.DRAFT.value:
             pass  # remain Draft
-        elif row.status == PayflowStrategyStatus.UNDER_REVIEW.value:
-            if _row_source(row) == PayflowStrategySource.AI_GENERATED.value:
-                row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
+        # Save Draft carries no edits, so it never marks "Human Modified" (update_strategy does).
 
         self._prepend_version(
             row,
@@ -1056,7 +1086,7 @@ class PayflowStrategyService:
         self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
 
-    def approve(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
+    def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
         if row.status != PayflowStrategyStatus.UNDER_REVIEW.value:
@@ -1079,14 +1109,15 @@ class PayflowStrategyService:
         row.approval_date = _stamp()
         row.reviewed_by = row.reviewed_by or user.full_name
         row.version = int(row.version or 1) + 1
-        self._prepend_version(
-            row,
-            self._version_entry(
-                version=row.version,
-                note=f"Approved by {user.full_name}",
-                row=row,
-            ),
+        entry = self._version_entry(
+            version=row.version,
+            note=f"Approved by {user.full_name}",
+            row=row,
         )
+        note = _clean_note(note)
+        if note:
+            entry["reviewer_note"] = note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
         self._mark_notifications_read(row)
@@ -1116,17 +1147,19 @@ class PayflowStrategyService:
             row.origin = PayflowStrategyOrigin.HUMAN_CREATED.value
             row.source = PayflowStrategySource.HUMAN_CREATED.value
 
-        self._prepend_version(
-            row,
-            {
-                "version": int(row.version or 1),
-                "date": _stamp(),
-                "note": note or f"Rejected / regeneration requested by {user.full_name}",
-                "changes": [],
-                "status": row.status,
-                "origin": row.origin,
-            },
-        )
+        entry = {
+            "version": int(row.version or 1),
+            "date": _stamp(),
+            "note": note or f"Rejected / regeneration requested by {user.full_name}",
+            "changes": [],
+            "status": row.status,
+            "origin": row.origin,
+        }
+        # Same key as approve / update, so the AI can find the reviewer's reason.
+        reviewer_note = _clean_note(note)
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
         if row.status in AWAITING_STATUSES:

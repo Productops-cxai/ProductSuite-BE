@@ -103,6 +103,28 @@ The Groq free tier allows 8,000 tokens/minute, so segments are sent `GROQ_SEGMEN
 - *System:* role · flowchart rules (unique ids, Trigger first, `next` / `yes` / `no`, which steps may end a path, no loops) · what each step kind needs · allowed values from the workflow catalog (only enabled channels and their templates) · limits from Step 4 · strategy guidance (incl. branching on delivery, link clicks, disputes, high balances) · 3 example workflows, one with real branches (email bounced → SMS, dispute → hold).
 - *User:* client summary · portfolio · the batch's segments (label + stats).
 
+**Learning from the client's past reviews (`learning.py`, Suggest only)** — the AI learns from what this client's reviewers already approved, edited and rejected. **Same client only**, from all its portfolios (so a new portfolio learns too).
+
+| | What | Rules |
+|---|---|---|
+| **Examples** | Up to **2** of the client's own workflows **for similar segments only** take generic slots; free slots keep generic examples; the generic branching example **always** stays (3 examples in total, as before) | Approved / Active only · must pass today's checks (old-format or now-invalid ones are skipped) · **similar = same situation** (Active / Promise to Pay / Payment Plan) · per segment: same situation + days-late band → same situation → same portfolio → edited or written by people → newest · no similar workflow → the generic examples |
+| **Lessons** | One line per review: **where + what changed + why** | Every edit, plus rejects / approvals with a reviewer note, plus Regenerate remarks · duplicates removed · per AI call: **similar segments first** (same situation + band, then same situation), then the rest · newest first within each · max **15** lines, max 3 changes per line |
+
+```
+## Lessons from this client's past reviews (guidance, not rules)
+... Treat them as the client's preferences, not as hard rules: follow a lesson where it fits a segment's
+situation and stats, and depart from it where it does not (then say why in reasoning).
+Only the Limits and Allowed values above are hard rules.
+- [Active · 1 – 29 days past due · Never contacted · Under $500] REJECTED: Email Payment Reminder → wait 3 Days → SMS Payment Link → wait 5 Days → Human Review. WHY: Too aggressive
+- [Active · 1 – 29 days past due · Never contacted · Under $500] EDITED: Wait 3 days: timing changed from 3 Days After Previous Email to 7 Days After Previous Email. WHY: SMS was too early
+```
+
+- **Lessons are guidance, not rules** — the prompt says so; hard requirements belong in **Rules**.
+- **No history → the prompt is exactly today's** (3 generic examples, no lessons section).
+- Each saved workflow gets an `ai_context` line **"Learned from"**, e.g. `examples #8; 6 reviewer lessons`.
+- Cost: examples are the same size; lessons add up to ~750 tokens per AI call.
+- Not yet: summarising many lessons into an approved **client playbook** (later, when clients have lots of feedback).
+
 **6b. Groq call (`llm.py`)** — the AI returns each workflow with a structured `reasoning` object (`segment_fit`, `channels`, `timing`, `escalation`, and `changes_made` on regenerate), each 1–2 sentences quoting the segment's numbers. Low reasoning effort, JSON schema with the catalog's allowed values (`segment_id` limited to the batch). Rate limited (429) → waits as told and retries (max 5). Other failures → `502`.
 
 **6c. Validate (`validator.py`)** — structure, flowchart, allowed values, step settings (incl. the save step's rule that timing needs a reference event), limits (see [§6](#6-code-map)). Returns plain errors such as `Workflow B: has 16 steps (allowed 3-15)`.
@@ -120,7 +142,7 @@ All batches must pass before anything is saved.
 | `segment` | UI dropdown values + `situation` + `contact_state` |
 | `steps`, `entry_node_id` | The AI flowchart (timing labels added automatically) |
 | `cases_covered` | Accounts in the segment |
-| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule |
+| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule, and **"Learned from"** when the client's past reviews were used |
 | `ai_proposal_snapshot` | Frozen copy of the AI original (kept after human edits) |
 
 All workflows are saved in **one transaction** (`create_strategy(..., commit=False)`, then one commit): if any save fails, it is rolled back and nothing is saved. Ops Admins and the client's supervisors are notified **after** the commit, one notification per workflow (existing behaviour) — notifications commit on their own, so sending them earlier would save half a result.
@@ -135,7 +157,8 @@ AI Proposed ──begin-review / edit──► Under Review ──approve──�
      ▲                                                                                  │
      └──── reject ("regeneration requested")                           deactivate ──► Inactive
 ```
-Editing an AI workflow marks it **Human Modified**; the AI original stays in `ai_proposal_snapshot`.
+Changing an AI workflow's **steps** or **segment** marks it **Human Modified** (renaming, summary edits, re-sending the same steps and Save Draft do not); the AI original stays in `ai_proposal_snapshot`. So an Approved workflow's `origin` tells reviewers apart: `AI Proposed` = approved as the AI wrote it, `Human Modified` = approved after changes.
+Reviewers can add an optional **note** on approve (`{"note": "…"}`) and on edit (`"note"` in the update body). It is saved as `reviewer_note` on that action's `versions` entry, next to the automatic list of `changes` — *what* changed plus *why*. (Feeding these notes back to the AI is a later step.)
 To ask the AI for an improved version instead, a reviewer calls **Regenerate** with remarks ([§3.3](#33-regenerate-a-workflow)) — a new linked "AI Proposed" workflow is created and the original is left as it is.
 
 ---
@@ -283,7 +306,19 @@ Creates an **improved version** of one AI workflow, guided by a reviewer's remar
 | Response | The new workflow (`PayflowStrategyItem`), status **AI Proposed** |
 | Time | One AI call — ~10–40 s on the free tier |
 
-How it works: the current workflow (including any human edits) + its stored segment and stats + the remarks go into the same prompt as Suggest → AI → same validator and retries → saved as a **new row** with a **new id**. The **original is not changed**. The new workflow's `ai_context` links them:
+How it works: the current workflow (including any human edits) + its stored segment and stats + its **review history** + the remarks go into the same prompt as Suggest → AI → same validator and retries → saved as a **new row** with a **new id**. The **original is not changed**.
+
+**Review history** (`build_review_history` in `prompt.py`): from the workflow's `versions`, oldest first, only entries with feedback — edits (change list + `reviewer_note`), rejects and approvals with a `reviewer_note`; plain status moves are skipped; last 10 entries max. The AI is told to keep reviewers' changes unless the remarks say otherwise:
+
+```
+Review history (oldest first). Keep what reviewers changed unless the remarks say otherwise:
+- Updated by Sara. Changed: Wait 3 days: timing changed from 3 Days After Previous Email to 7 Days After Previous Email. Reason: SMS was too early
+- Rejected. Reason: Too aggressive for this segment
+```
+
+The new workflow stores **`revision_of_id`** (the workflow it was regenerated from). Regenerate follows this chain back (#10 → #9 → #8) and sends the feedback of the whole chain, so earlier reasons are not lost. The chain stops at a deleted workflow, and only workflows of the **same client** are used. Workflows regenerated before 2026-10-15 have no `revision_of_id`, and reject notes saved before then have no `reviewer_note` — both are skipped.
+
+The new workflow's `ai_context` links them:
 
 ```json
 { "label": "Revision of", "value": "#1 Early Stage Friendly Email & SMS Link (v1)" },
@@ -343,6 +378,7 @@ Code constants:
 | `MIN_STEPS` / `MAX_STEPS` / `MAX_COMMUNICATIONS` | 3 / 15 / 5 | `workflow_suggestion/config.py` |
 | Band meanings (days late, balance, age, tenure, region, language) | catalog bands | `workflow_suggestion/config.py` |
 | `MAX_FIX_ATTEMPTS` | 2 | `workflow_suggestion/service.py` |
+| `MAX_CLIENT_EXAMPLES` / `MAX_LESSONS` / `MAX_CHANGES_PER_LESSON` | 2 / 15 / 3 | `workflow_suggestion/learning.py` |
 | `RATE_LIMIT_RETRIES` | 5 | `workflow_suggestion/llm.py` |
 
 ### Removing free-tier batching (paid customers)
@@ -361,6 +397,7 @@ All in `app/modules/payflow/services/workflow_suggestion/` unless noted.
 | `segmenter.py` | `build_segments`, `filter_eligible`, `label_account`, `group_accounts`, `merge_small_groups`, `describe_segment`, **`match_account_to_segment`** | Segments; matching accounts to segments |
 | `rules.py` | `design_limits`, `governing_rules` | Rules → limits; "Governed by" text |
 | `prompt.py` + `prompts/workflow_examples.json` | `build_messages`, `build_feedback`, `build_revision` | Prompt, retry feedback, regenerate text, examples |
+| `learning.py` | `load_client_learning`, `pick_examples`, `pick_lessons`, `learned_from` | Suggest: the client's own example workflows + lesson lines from its past reviews |
 | `llm.py` | `build_output_schema`, `call_llm` | Groq call, JSON schema, rate-limit waits |
 | `validator.py` | `validate_all` (+ `validate_structure`, `validate_flowchart`, `validate_catalog_values`, `validate_step_config`, `validate_limits`) | Checks AI workflows |
 | `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`, `.regenerate_workflow`; `_batches` | Orchestration, retries, saving |
@@ -385,10 +422,11 @@ venv\Scripts\python.exe -m pytest
 | `tests/test_workflow_config.py` | 4 | Band meanings match the catalog; no gaps / overlaps |
 | `tests/test_workflow_context.py` | 5 | Loaders; only Active + own-client rules |
 | `tests/test_workflow_segmenter.py` | 14 | Filtering, labels, merge order, every account in exactly one segment, determinism, matching |
-| `tests/test_workflow_prompt_llm.py` | 17 | Limits from rules, prompt content, examples valid, schema, Groq errors, rate-limit waits |
+| `tests/test_workflow_prompt_llm.py` | 21 | Limits from rules, prompt content, examples valid, schema, Groq errors, rate-limit waits, review history |
 | `tests/test_workflow_validator.py` | 31 | One failing case per check; prompt examples pass |
 | `tests/test_workflow_suggestion_api.py` | 15 | Preview + suggest: success, retry-then-pass (incl. timing without a reference event), give-up (nothing saved), all-or-nothing save, notifications after saving, batching, 400 / 403 / 404 / 502 |
-| `tests/test_workflow_regenerate.py` | 17 | Regenerate: new linked version, original unchanged, retry, give-up, allowed / refused statuses, no portfolio (AI not called), 400 / 403 / 404 / 422 / 502 |
+| `tests/test_workflow_learning.py` | 6 | Suggest learns from the client: similar examples + lessons in the prompt, generic examples when nothing is similar, branching example always kept, other clients / old-format workflows ignored, no history = today's prompt, similar-first lessons, lesson cap |
+| `tests/test_workflow_regenerate.py` | 21 | Regenerate: new linked version (`revision_of_id`), original unchanged, review history in the prompt (whole chain, same client only, deleted parent), retry, give-up, allowed / refused statuses, no portfolio (AI not called), 400 / 403 / 404 / 422 / 502 |
 
 ### Manual testing with Postman
 
@@ -446,8 +484,9 @@ Most rules (e.g. Balance > 10,000 → Human Review, Dispute → Hold) can only b
 - **Preview segments** button on a portfolio → show segment labels and stats (fast).
 - **Suggest workflows** button → long-running; show progress and do not time out. Handle `502` (show `detail`; nothing was saved) and `400` (no eligible accounts).
 - New workflows appear in the normal workflows list with status **AI Proposed** and `source = "AI Generated"`.
-- Worth showing on workflow detail: the segment ("Who it applies to" — `segment`), `cases_covered`, the AI's **reasoning** lines ("Why it fits", "Channels", "Timing", "Escalation", "Changes made") and **"Governed by"** lines (`ai_context`), and the AI original vs edited version (`ai_proposal_snapshot`).
+- Worth showing on workflow detail: the segment ("Who it applies to" — `segment`), `cases_covered`, the AI's **reasoning** lines ("Why it fits", "Channels", "Timing", "Escalation", "Changes made"), **"Governed by"** lines and the **"Learned from"** line (`ai_context`), and the AI original vs edited version (`ai_proposal_snapshot`).
 - `segment` has two extra keys the dropdowns don't know (`situation`, `contact_state`) — show them as text or ignore them; do not drop them when saving edits.
+- **Why boxes (optional):** an optional "Why?" text box on **Approve** → send `{"note": "…"}` (today `approvePayflowWorkflow` sends no body); an optional "Describe your change" box next to **Save** on edit → add `"note"` to the update payload. Show `versions[].reviewer_note` in the workflow's history. Max 2,000 characters; never required.
 
 ---
 
