@@ -604,6 +604,9 @@ class PayflowStrategyModel(Base):
     entry_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ai_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
     ai_proposal_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Regenerate: id of the workflow this one was regenerated from. Plain id (no foreign key),
+    # so deleting the parent never blocks or breaks — following the chain just stops there.
+    revision_of_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     versions: Mapped[list | None] = mapped_column(JSON, nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     approval_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
