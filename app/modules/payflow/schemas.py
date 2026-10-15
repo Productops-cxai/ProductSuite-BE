@@ -819,6 +819,7 @@ class StrategySegment(BaseModel):
 class StrategyVersionItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    id: Optional[int] = None  # payflow_strategy_versions.id when from immutable table
     version: int
     date: str
     note: str

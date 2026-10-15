@@ -9,7 +9,10 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.exceptions import ServiceUnavailableError, ValidationAppError
 from app.infrastructure.database.models import PayflowStrategyModel, UserModel
-from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.strategy_service import (
+    PayflowStrategyService,
+    read_strategy_versions,
+)
 from app.modules.payflow.services.workflow_suggestion.config import REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
@@ -172,7 +175,7 @@ class WorkflowSuggestionService:
 
     def _review_history(self, workflow: dict[str, Any]) -> list[dict[str, Any]]:
         """History entries (newest first) of this workflow and of the ones it was regenerated from."""
-        versions = list(workflow["versions"])
+        versions = list(workflow.get("versions") or [])
         seen = {workflow["id"]}
         parent_id = workflow.get("revision_of_id")
         while parent_id and parent_id not in seen:
@@ -181,7 +184,7 @@ class WorkflowSuggestionService:
             if parent is None or parent.client_id != workflow["client_id"]:
                 break
             seen.add(parent.id)
-            versions += list(parent.versions or [])
+            versions += read_strategy_versions(self.db, parent)
             parent_id = parent.revision_of_id
         return versions
 

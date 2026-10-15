@@ -21,6 +21,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.infrastructure.database.models import PayflowStrategyModel
+from app.modules.payflow.services.strategy_service import read_strategy_versions
 from app.modules.payflow.services.workflow_suggestion.prompt import compact_step
 from app.modules.payflow.services.workflow_suggestion.segmenter import CONTACT_STATES
 from app.modules.payflow.services.workflow_suggestion.validator import (
@@ -49,8 +50,12 @@ def load_client_learning(db: Session, client_id: int, limits: dict[str, Any]) ->
     )
     return {
         # Newest first — pick_examples relies on this order to prefer recent workflows.
-        "pool": [_candidate(row) for row in rows if row.status in EXAMPLE_STATUSES and _valid_today(row, limits)],
-        "lessons": _lessons(rows),
+        "pool": [
+            _candidate(db, row)
+            for row in rows
+            if row.status in EXAMPLE_STATUSES and _valid_today(row, limits)
+        ],
+        "lessons": _lessons(db, rows),
     }
 
 
@@ -99,8 +104,13 @@ def _valid_today(row: PayflowStrategyModel, limits: dict[str, Any]) -> bool:
     return not errors
 
 
-def _candidate(row: PayflowStrategyModel) -> dict[str, Any]:
-    notes = [entry["reviewer_note"] for entry in row.versions or [] if isinstance(entry, dict) and entry.get("reviewer_note")]
+def _candidate(db: Session, row: PayflowStrategyModel) -> dict[str, Any]:
+    history = read_strategy_versions(db, row)
+    notes = [
+        entry["reviewer_note"]
+        for entry in history
+        if isinstance(entry, dict) and entry.get("reviewer_note")
+    ]
     example = {
         "for_segment": _segment_label(row.segment or {}),
         "name": row.name,
@@ -131,7 +141,7 @@ def _rank(item: dict, segment: dict, portfolio_id: int) -> tuple:
     return (_match(item["segment"], segment["segment"]), item["portfolio_id"] == portfolio_id, item["human_touched"])
 
 
-def _lessons(rows: list[PayflowStrategyModel]) -> list[dict]:
+def _lessons(db: Session, rows: list[PayflowStrategyModel]) -> list[dict]:
     """All lessons, newest first: workflows by last update, then each one's history (stored newest first).
 
     [{"segment": the workflow's segment, "line": "- [where] WHAT. WHY: …"}], exact repeats removed.
@@ -140,7 +150,12 @@ def _lessons(rows: list[PayflowStrategyModel]) -> list[dict]:
     for row in rows:
         segment = row.segment or {}
         label = _segment_label(segment)
-        lines = [_lesson(entry, label, row.steps or []) for entry in row.versions or [] if isinstance(entry, dict)]
+        history = read_strategy_versions(db, row)
+        lines = [
+            _lesson(entry, label, row.steps or [])
+            for entry in history
+            if isinstance(entry, dict)
+        ]
         # Regenerate remarks are stored on the new workflow, not in its history.
         lines += [
             f"- [{label}] REVISION REQUESTED. WHY: {item['value']}"

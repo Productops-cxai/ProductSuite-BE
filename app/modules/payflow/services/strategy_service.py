@@ -12,6 +12,7 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowPortfolioModel,
     PayflowStrategyModel,
+    PayflowStrategyVersionModel,
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
@@ -21,6 +22,11 @@ from app.shared.enums import (
     PayflowStrategySource,
     PayflowStrategyStatus,
 )
+
+
+def read_strategy_versions(db: Session, strategy: PayflowStrategyModel) -> list[dict[str, Any]]:
+    """Newest-first history for callers outside PayflowStrategyService (learning, suggest)."""
+    return PayflowStrategyService(db)._list_versions(strategy)
 
 STRATEGY_STEP_KINDS = [
     "Trigger",
@@ -593,6 +599,23 @@ class PayflowStrategyService:
         if not self.access.can(user, "create_edit_workflows", client_id):
             raise ForbiddenError("Create / Edit Workflows permission required")
 
+    @staticmethod
+    def _version_row_to_dict(ver: PayflowStrategyVersionModel) -> dict[str, Any]:
+        return {
+            "id": ver.id,
+            "version": ver.version,
+            "date": ver.event_date,
+            "note": ver.note or "",
+            "status": ver.status,
+            "origin": ver.origin,
+            "approved_by": ver.approved_by,
+            "approval_date": ver.approval_date,
+            "reviewer_note": ver.reviewer_note,
+            "changes": list(ver.changes or []),
+            "steps": copy.deepcopy(list(ver.steps or [])) if ver.steps is not None else None,
+            "segment": copy.deepcopy(ver.segment) if ver.segment is not None else None,
+        }
+
     def _version_entry(
         self,
         *,
@@ -604,6 +627,7 @@ class PayflowStrategyService:
         changes: list[str] | None = None,
         status: str | None = None,
         origin: str | None = None,
+        reviewer_note: str | None = None,
     ) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "version": version,
@@ -611,6 +635,8 @@ class PayflowStrategyService:
             "note": note,
             "changes": list(changes or []),
         }
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
         if row is not None:
             entry["status"] = status or row.status
             entry["origin"] = origin or row.origin
@@ -629,10 +655,87 @@ class PayflowStrategyService:
                 entry["origin"] = origin
         return entry
 
+    def _migrate_legacy_versions(self, row: PayflowStrategyModel) -> None:
+        """One-time copy of JSON ``versions`` into payflow_strategy_versions."""
+        if not row.id:
+            return
+        existing = (
+            self.db.query(PayflowStrategyVersionModel.id)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .limit(1)
+            .first()
+        )
+        if existing:
+            return
+        legacy = list(row.versions or [])
+        if not legacy:
+            return
+        # Legacy list is newest-first; insert oldest-first so ids increase chronologically.
+        for entry in reversed(legacy):
+            if not isinstance(entry, dict):
+                continue
+            self.db.add(
+                PayflowStrategyVersionModel(
+                    strategy_id=row.id,
+                    version=int(entry.get("version") or row.version or 1),
+                    event_date=str(entry.get("date") or _stamp()),
+                    note=str(entry.get("note") or ""),
+                    status=entry.get("status"),
+                    origin=entry.get("origin"),
+                    approved_by=entry.get("approved_by"),
+                    approval_date=entry.get("approval_date"),
+                    reviewer_note=entry.get("reviewer_note"),
+                    changes=list(entry.get("changes") or []),
+                    steps=copy.deepcopy(entry.get("steps"))
+                    if entry.get("steps") is not None
+                    else None,
+                    segment=copy.deepcopy(entry.get("segment"))
+                    if entry.get("segment") is not None
+                    else None,
+                )
+            )
+        row.versions = []
+        self.db.flush()
+
+    def _list_versions(self, row: PayflowStrategyModel) -> list[dict[str, Any]]:
+        """Newest-first history from the immutable version table."""
+        self._migrate_legacy_versions(row)
+        rows = (
+            self.db.query(PayflowStrategyVersionModel)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .order_by(PayflowStrategyVersionModel.id.desc())
+            .all()
+        )
+        return [self._version_row_to_dict(v) for v in rows]
+
     def _prepend_version(self, row: PayflowStrategyModel, entry: dict[str, Any]) -> None:
-        versions = list(row.versions or [])
-        versions.insert(0, entry)
-        row.versions = versions
+        """Append an immutable history row (API still returns newest-first)."""
+        if not row.id:
+            self.db.flush()
+        self._migrate_legacy_versions(row)
+        self.db.add(
+            PayflowStrategyVersionModel(
+                strategy_id=row.id,
+                version=int(entry.get("version") or row.version or 1),
+                event_date=str(entry.get("date") or _stamp()),
+                note=str(entry.get("note") or ""),
+                status=entry.get("status"),
+                origin=entry.get("origin"),
+                approved_by=entry.get("approved_by"),
+                approval_date=entry.get("approval_date"),
+                reviewer_note=entry.get("reviewer_note"),
+                changes=list(entry.get("changes") or []),
+                steps=copy.deepcopy(entry.get("steps"))
+                if entry.get("steps") is not None
+                else None,
+                segment=copy.deepcopy(entry.get("segment"))
+                if entry.get("segment") is not None
+                else None,
+            )
+        )
+        # Stop growing the legacy JSON column.
+        if row.versions:
+            row.versions = []
 
     def _archive_current(self, row: PayflowStrategyModel, *, note: str, changes: list[str] | None = None) -> None:
         self._prepend_version(
@@ -675,7 +778,7 @@ class PayflowStrategyService:
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
             "revision_of_id": row.revision_of_id,
-            "versions": list(row.versions or []),
+            "versions": self._list_versions(row),
             "approved_by": row.approved_by,
             "approval_date": row.approval_date,
             "reviewed_by": row.reviewed_by,
@@ -850,27 +953,29 @@ class PayflowStrategyService:
             ai_context=ai_context,
             ai_proposal_snapshot=ai_snapshot,
             revision_of_id=payload.get("revision_of_id"),  # set by Regenerate only
-            versions=[
-                self._version_entry(
-                    version=1,
-                    note=(
-                        "Proposed by PayFlow AI"
-                        if ai_generated
-                        else f"Created by {user.full_name}"
-                    ),
-                    steps=steps,
-                    segment=segment,
-                    status=status,
-                    origin=origin,
-                )
-            ],
+            versions=[],
             reviewed_by=None,
             created_by=user.full_name,
         )
         self.db.add(row)
+        self.db.flush()
+        self._prepend_version(
+            row,
+            self._version_entry(
+                version=1,
+                note=(
+                    "Proposed by PayFlow AI"
+                    if ai_generated
+                    else f"Created by {user.full_name}"
+                ),
+                steps=steps,
+                segment=segment,
+                status=status,
+                origin=origin,
+            ),
+        )
         if not commit:
-            # Flush gives the row its id and makes its code visible to _unique_code.
-            self.db.flush()
+            # Already flushed above so the row has an id and version history.
             return self._serialize(self._get_row(row.id))
         self.db.commit()
         self.db.refresh(row)
@@ -1230,6 +1335,21 @@ class PayflowStrategyService:
             raise ForbiddenError("Operations Admin access required")
         row = self._get_row(strategy_id)
         snapshot = snapshot_model(row)
+        version_rows = (
+            self.db.query(PayflowStrategyVersionModel)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .all()
+        )
+        related = [
+            {
+                "entity_type": "workflow_version",
+                "id": str(v.id),
+                "label": f"v{v.version}",
+            }
+            for v in version_rows
+        ]
+        for v in version_rows:
+            self.db.delete(v)
         record_deletion(
             self.db,
             actor=user,
@@ -1239,7 +1359,7 @@ class PayflowStrategyService:
             entity_label=row.name,
             source=source,
             record_snapshot=snapshot,
-            related_deleted=[],
+            related_deleted=related,
         )
         self.db.delete(row)
         self.db.commit()

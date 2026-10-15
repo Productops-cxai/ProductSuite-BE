@@ -607,6 +607,8 @@ class PayflowStrategyModel(Base):
     # Regenerate: id of the workflow this one was regenerated from. Plain id (no foreign key),
     # so deleting the parent never blocks or breaks — following the chain just stops there.
     revision_of_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Legacy JSON history — kept for one-time migration into payflow_strategy_versions.
+    # New writes go to PayflowStrategyVersionModel only.
     versions: Mapped[list | None] = mapped_column(JSON, nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     approval_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -621,6 +623,42 @@ class PayflowStrategyModel(Base):
 
     client = relationship("PayflowClientModel", back_populates="strategies")
     portfolio = relationship("PayflowPortfolioModel", back_populates="strategies")
+    version_rows = relationship(
+        "PayflowStrategyVersionModel",
+        back_populates="strategy",
+        cascade="all, delete-orphan",
+        order_by="PayflowStrategyVersionModel.id.desc()",
+    )
+
+
+class PayflowStrategyVersionModel(Base):
+    """Immutable workflow change-history row (one entry per archive / approve / edit)."""
+
+    __tablename__ = "payflow_strategy_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("payflow_strategies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    event_date: Mapped[str] = mapped_column(String(64), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    origin: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approval_date: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reviewer_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    segment: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    strategy = relationship("PayflowStrategyModel", back_populates="version_rows")
 
 
 class PayflowCommunicationModel(Base):
