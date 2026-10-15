@@ -691,6 +691,16 @@ class PlatformService:
             limit=limit,
         )
 
+    def get_workflow_worker_log(self, log_id: int) -> dict:
+        from app.modules.payflow.services.workflow_execution_service import (
+            WorkflowExecutionService,
+        )
+
+        item = WorkflowExecutionService(self.db).get_worker_log(log_id)
+        if not item:
+            raise NotFoundError("Workflow worker log not found")
+        return item
+
     def list_deletion_logs(
         self,
         search: Optional[str] = None,

@@ -177,16 +177,6 @@ _PAYFLOW_NAV: list[
                 None,
                 "view_communications",
             ),
-            (
-                "worker_logs",
-                "Workflow Worker Logs",
-                "/payflow/worker-logs",
-                "document",
-                3,
-                False,
-                None,
-                "view_workflows",
-            ),
         ],
     ),
     (
@@ -641,7 +631,6 @@ class DatabaseSeeder:
             "workflows",
             "review",
             "comms",
-            "worker_logs",
         }
         parked_disabled_keys: set[str] = set()
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
@@ -708,7 +697,7 @@ class DatabaseSeeder:
             db.query(NavigationItemModel)
             .join(NavigationSectionModel)
             .filter(
-                NavigationItemModel.key == "deletion_logs",
+                NavigationItemModel.key.in_(("deletion_logs", "worker_logs")),
                 NavigationSectionModel.product_code == "PAYFLOW",
             )
             .all()

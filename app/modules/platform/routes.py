@@ -279,6 +279,15 @@ def list_workflow_worker_logs(
     )
 
 
+@router.get("/workflow-worker-logs/{log_id}", response_model=WorkflowWorkerLogResponse)
+def get_workflow_worker_log(log_id: int, _: SuperAdmin, db: DbSession):
+    """Single worker event with related run/account timeline."""
+    try:
+        return PlatformService(db).get_workflow_worker_log(log_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.get("/me/products", response_model=List[ProductResponse])
 def my_products(person: CurrentPerson, db: DbSession):
     return get_effective_products(db, person)

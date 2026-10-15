@@ -1260,13 +1260,22 @@ class PayflowWorkflowWorkerLogItem(BaseModel):
     message: str
     detail: Optional[str] = None
     client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
     portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
+    portfolio_code: Optional[str] = None
     account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
     strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
     run_id: Optional[int] = None
     job_id: Optional[int] = None
     step_id: Optional[str] = None
     created_at: Optional[datetime] = None
+    related_events: Optional[List["PayflowWorkflowWorkerLogItem"]] = None
 
 
 class PayflowWorkflowWorkerLogsResponse(BaseModel):

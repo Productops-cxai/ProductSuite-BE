@@ -8,12 +8,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.infrastructure.database.models import (
     PayflowAccountModel,
+    PayflowClientModel,
     PayflowCommunicationModel,
+    PayflowPortfolioModel,
     PayflowStrategyModel,
     PayflowWorkflowRunModel,
     PayflowWorkflowStepRunModel,
@@ -972,6 +975,90 @@ class WorkflowExecutionService:
             logger.exception("provider failed notify failed")
 
     # ------------------------------------------------------------------ list APIs
+    def _enrich_worker_logs(
+        self, rows: list[PayflowWorkflowWorkerLogModel]
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        client_ids = {r.client_id for r in rows if r.client_id}
+        portfolio_ids = {r.portfolio_id for r in rows if r.portfolio_id}
+        account_ids = {r.account_id for r in rows if r.account_id}
+        strategy_ids = {r.strategy_id for r in rows if r.strategy_id}
+
+        clients = {
+            c.id: c
+            for c in (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id.in_(client_ids))
+                .all()
+                if client_ids
+                else []
+            )
+        }
+        portfolios = {
+            p.id: p
+            for p in (
+                self.db.query(PayflowPortfolioModel)
+                .filter(PayflowPortfolioModel.id.in_(portfolio_ids))
+                .all()
+                if portfolio_ids
+                else []
+            )
+        }
+        accounts = {
+            a.id: a
+            for a in (
+                self.db.query(PayflowAccountModel)
+                .filter(PayflowAccountModel.id.in_(account_ids))
+                .all()
+                if account_ids
+                else []
+            )
+        }
+        strategies = {
+            s.id: s
+            for s in (
+                self.db.query(PayflowStrategyModel)
+                .filter(PayflowStrategyModel.id.in_(strategy_ids))
+                .all()
+                if strategy_ids
+                else []
+            )
+        }
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            client = clients.get(r.client_id) if r.client_id else None
+            portfolio = portfolios.get(r.portfolio_id) if r.portfolio_id else None
+            account = accounts.get(r.account_id) if r.account_id else None
+            strategy = strategies.get(r.strategy_id) if r.strategy_id else None
+            out.append(
+                {
+                    "id": r.id,
+                    "event_type": r.event_type,
+                    "level": r.level,
+                    "message": r.message,
+                    "detail": r.detail,
+                    "client_id": r.client_id,
+                    "client_name": client.name if client else None,
+                    "client_code": client.code if client else None,
+                    "portfolio_id": r.portfolio_id,
+                    "portfolio_name": portfolio.name if portfolio else None,
+                    "portfolio_code": portfolio.code if portfolio else None,
+                    "account_id": r.account_id,
+                    "account_reference": account.account_reference if account else None,
+                    "customer_name": account.customer_name if account else None,
+                    "strategy_id": r.strategy_id,
+                    "strategy_name": strategy.name if strategy else None,
+                    "strategy_code": strategy.code if strategy else None,
+                    "run_id": r.run_id,
+                    "job_id": r.job_id,
+                    "step_id": r.step_id,
+                    "created_at": r.created_at,
+                }
+            )
+        return out
+
     def list_worker_logs(
         self,
         *,
@@ -999,26 +1086,85 @@ class WorkflowExecutionService:
             q = q.filter(PayflowWorkflowWorkerLogModel.level == level)
         if search:
             like = f"%{search}%"
-            q = q.filter(PayflowWorkflowWorkerLogModel.message.ilike(like))
-        rows = q.order_by(PayflowWorkflowWorkerLogModel.id.desc()).limit(min(limit, 500)).all()
-        return [
-            {
-                "id": r.id,
-                "event_type": r.event_type,
-                "level": r.level,
-                "message": r.message,
-                "detail": r.detail,
-                "client_id": r.client_id,
-                "portfolio_id": r.portfolio_id,
-                "account_id": r.account_id,
-                "strategy_id": r.strategy_id,
-                "run_id": r.run_id,
-                "job_id": r.job_id,
-                "step_id": r.step_id,
-                "created_at": r.created_at,
-            }
-            for r in rows
-        ]
+            q = (
+                q.outerjoin(
+                    PayflowClientModel,
+                    PayflowWorkflowWorkerLogModel.client_id == PayflowClientModel.id,
+                )
+                .outerjoin(
+                    PayflowPortfolioModel,
+                    PayflowWorkflowWorkerLogModel.portfolio_id == PayflowPortfolioModel.id,
+                )
+                .outerjoin(
+                    PayflowAccountModel,
+                    PayflowWorkflowWorkerLogModel.account_id == PayflowAccountModel.id,
+                )
+                .outerjoin(
+                    PayflowStrategyModel,
+                    PayflowWorkflowWorkerLogModel.strategy_id == PayflowStrategyModel.id,
+                )
+                .filter(
+                    or_(
+                        PayflowWorkflowWorkerLogModel.message.ilike(like),
+                        PayflowWorkflowWorkerLogModel.event_type.ilike(like),
+                        PayflowClientModel.name.ilike(like),
+                        PayflowClientModel.code.ilike(like),
+                        PayflowPortfolioModel.name.ilike(like),
+                        PayflowPortfolioModel.code.ilike(like),
+                        PayflowAccountModel.account_reference.ilike(like),
+                        PayflowAccountModel.customer_name.ilike(like),
+                        PayflowStrategyModel.name.ilike(like),
+                        PayflowStrategyModel.code.ilike(like),
+                    )
+                )
+                .distinct()
+            )
+        rows = (
+            q.order_by(PayflowWorkflowWorkerLogModel.id.desc())
+            .limit(min(limit, 500))
+            .all()
+        )
+        return self._enrich_worker_logs(rows)
+
+    def get_worker_log(self, log_id: int) -> dict[str, Any] | None:
+        row = self.db.get(PayflowWorkflowWorkerLogModel, log_id)
+        if not row:
+            return None
+        item = self._enrich_worker_logs([row])[0]
+        related: list[PayflowWorkflowWorkerLogModel] = []
+        related_q = self.db.query(PayflowWorkflowWorkerLogModel).filter(
+            PayflowWorkflowWorkerLogModel.id != log_id
+        )
+        if row.run_id is not None:
+            related = (
+                related_q.filter(PayflowWorkflowWorkerLogModel.run_id == row.run_id)
+                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
+                .limit(40)
+                .all()
+            )
+        elif row.account_id is not None:
+            related = (
+                related_q.filter(PayflowWorkflowWorkerLogModel.account_id == row.account_id)
+                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
+                .limit(40)
+                .all()
+            )
+        elif row.job_id is not None:
+            related = (
+                related_q.filter(PayflowWorkflowWorkerLogModel.job_id == row.job_id)
+                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
+                .limit(40)
+                .all()
+            )
+        elif row.strategy_id is not None:
+            related = (
+                related_q.filter(PayflowWorkflowWorkerLogModel.strategy_id == row.strategy_id)
+                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
+                .limit(40)
+                .all()
+            )
+        item["related_events"] = self._enrich_worker_logs(related)
+        return item
 
     def list_runs(
         self,

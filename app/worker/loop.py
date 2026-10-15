@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.infrastructure.database.session import SessionLocal, engine
-from app.worker.claim import claim_due_jobs
+from app.worker.claim import claim_due_jobs, reclaim_stale_running_jobs
 from app.worker.handlers import process_job
 
 logger = logging.getLogger("app.worker")
@@ -41,10 +41,23 @@ def _handle_signal(signum, _frame) -> None:  # noqa: ANN001
     _stop = True
 
 
-def _drain_due(worker_id: str, pool: ThreadPoolExecutor, in_flight: set) -> None:
+def _drain_due(
+    worker_id: str,
+    pool: ThreadPoolExecutor,
+    in_flight: set,
+    *,
+    stale_seconds: int,
+) -> None:
     db = SessionLocal()
     try:
-        jobs = claim_due_jobs(
+        # Crash / dead-worker recovery: RUNNING locks older than stale window
+        # go back to PENDING so they can be claimed again.
+        reclaim_stale_running_jobs(
+            db,
+            stale_seconds=stale_seconds,
+            batch_size=max(50, int(settings.WORKFLOW_WORKER_BATCH_SIZE or 50) * 4),
+        )
+        job_ids = claim_due_jobs(
             db,
             worker_id=worker_id,
             batch_size=int(settings.WORKFLOW_WORKER_BATCH_SIZE or 50),
@@ -52,8 +65,8 @@ def _drain_due(worker_id: str, pool: ThreadPoolExecutor, in_flight: set) -> None
     finally:
         db.close()
 
-    for job in jobs:
-        fut = pool.submit(process_job, job.id)
+    for job_id in job_ids:
+        fut = pool.submit(process_job, job_id)
         in_flight.add(fut)
         fut.add_done_callback(in_flight.discard)
 
@@ -71,13 +84,15 @@ def run_worker() -> None:
     worker_id = _worker_id()
     concurrency = max(1, int(settings.WORKFLOW_WORKER_CONCURRENCY or 8))
     sweep_seconds = max(5, int(settings.WORKFLOW_WORKER_SWEEP_SECONDS or 20))
+    stale_seconds = max(30, int(settings.WORKFLOW_WORKER_STALE_SECONDS or 300))
     channel = settings.WORKFLOW_JOB_NOTIFY_CHANNEL or "workflow_jobs"
 
     logger.info(
-        "PayFlow workflow worker starting id=%s concurrency=%s sweep=%ss channel=%s",
+        "PayFlow workflow worker starting id=%s concurrency=%s sweep=%ss stale=%ss channel=%s",
         worker_id,
         concurrency,
         sweep_seconds,
+        stale_seconds,
         channel,
     )
 
@@ -86,7 +101,7 @@ def run_worker() -> None:
 
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="wf") as pool:
         # Initial drain
-        _drain_due(worker_id, pool, in_flight)
+        _drain_due(worker_id, pool, in_flight, stale_seconds=stale_seconds)
 
         # Dedicated connection for LISTEN (psycopg2).
         raw = engine.raw_connection()
@@ -99,7 +114,7 @@ def run_worker() -> None:
             while not _stop:
                 now = time.monotonic()
                 if now - last_sweep >= sweep_seconds:
-                    _drain_due(worker_id, pool, in_flight)
+                    _drain_due(worker_id, pool, in_flight, stale_seconds=stale_seconds)
                     last_sweep = now
 
                 # Wait for notify or timeout (sweep cadence).
@@ -118,7 +133,7 @@ def run_worker() -> None:
                     while raw.notifies:
                         raw.notifies.pop(0)
                     if notified:
-                        _drain_due(worker_id, pool, in_flight)
+                        _drain_due(worker_id, pool, in_flight, stale_seconds=stale_seconds)
                         last_sweep = time.monotonic()
 
                 # Reap completed futures without blocking the loop hard.

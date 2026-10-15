@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     WORKFLOW_WORKER_CONCURRENCY: int = 8
     WORKFLOW_WORKER_BATCH_SIZE: int = 50
     WORKFLOW_WORKER_SWEEP_SECONDS: int = 20
+    # Reclaim RUNNING jobs whose lock is older than this (crash / dead worker).
+    WORKFLOW_WORKER_STALE_SECONDS: int = 300
     WORKFLOW_JOB_NOTIFY_CHANNEL: str = "workflow_jobs"
     WORKFLOW_PAYMENT_LINK_BASE: str = "https://pay.payflow.local/pay"
 
