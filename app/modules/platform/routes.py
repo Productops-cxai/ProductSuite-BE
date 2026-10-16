@@ -1,12 +1,14 @@
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 from app.core.deps import CurrentPerson, DbSession, SuperAdmin
 from app.core.exceptions import AppError
+from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.platform.schemas import (
     AiSuggestJobResponse,
+    AiSuggestRequeueResponse,
     AssignProductRequest,
     EmailLogResponse,
     SmsLogResponse,
@@ -253,6 +255,26 @@ def list_ai_suggest_jobs(
         portfolio_id=portfolio_id,
         limit=limit,
     )
+
+
+@router.post("/ai-suggest-jobs/requeue-missing", response_model=AiSuggestRequeueResponse)
+def requeue_missing_ai_suggest_jobs(
+    admin: SuperAdmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    client_id: Optional[int] = Query(default=None),
+):
+    """Re-enqueue AI suggest for active clients/portfolios that have no AI workflows.
+
+    Use after wiping strategies/jobs while leaving clients active — activate alone
+    does not re-fire because status already is active.
+    """
+    result = PlatformService(db).requeue_missing_ai_suggest_jobs(
+        requested_by_user_id=admin.id,
+        client_id=client_id,
+    )
+    schedule_ai_suggest_jobs(background_tasks, result.get("job_ids") or [])
+    return result
 
 
 @router.get("/workflow-worker-logs", response_model=List[WorkflowWorkerLogResponse])

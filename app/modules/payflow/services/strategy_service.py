@@ -1404,7 +1404,7 @@ class PayflowStrategyService:
                 strategy_name=row.name,
                 client_id=row.client_id,
                 actor_user_id=user.id,
-                send_mail=True,
+                send_mail=False,
             )
         except Exception:
             pass

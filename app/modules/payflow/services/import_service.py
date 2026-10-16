@@ -38,6 +38,7 @@ from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobServ
 from app.shared.enums import PayflowCollectionStatus, PayflowPortfolioStatus
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PHONE_DIGITS_RE = re.compile(r"\D+")
 _BE_ROOT = Path(__file__).resolve().parents[4]
 _UPLOADS = _BE_ROOT / "uploads" / "imports"
 _SAMPLE_PATH = _BE_ROOT / "docs" / "samples" / "payflow_daily_accounts_sample.xlsx"
@@ -72,6 +73,20 @@ def _cell(row: tuple, idx: dict[str, int], key: str) -> str:
     if isinstance(val, date):
         return val.isoformat()
     return str(val).strip()
+
+
+def _normalize_phone(raw: str | None) -> str | None:
+    """Keep digits only; NANP 10-digit numbers get a leading 1 for SMS readiness."""
+    if not raw:
+        return None
+    digits = _PHONE_DIGITS_RE.sub("", raw)
+    if not digits:
+        return None
+    if len(digits) == 10:
+        digits = f"1{digits}"
+    if len(digits) < 10 or len(digits) > 15:
+        return None
+    return digits
 
 
 def _parse_date(raw: str, field: str) -> date | None:
@@ -1255,6 +1270,8 @@ class PayflowImportService:
                 account_status = "CLOSED"
         account_status = account_status or "OPEN"
 
+        # Account debtor contact — collection email/SMS targets. Not client.contact_email.
+        email_raw = (c("email") or "").strip().lower()
         # Soft-fill so required check works for CRM dumps.
         values = {
             "client_code": c("client_code"),
@@ -1266,17 +1283,26 @@ class PayflowImportService:
             "country_code": country,
             "currency_code": currency,
             "outstanding_balance": c("outstanding_balance"),
-            "email": c("email"),
+            "email": email_raw,
         }
         for key in ACCOUNT_IMPORT_REQUIRED:
             if key in ("client_code", "sub_client_code") and crm_number:
                 continue
             if not values.get(key):
-                raise ValidationAppError(f"{key} is required")
+                raise ValidationAppError(
+                    f"{key} is required"
+                    + (
+                        " (account customer email — used for collection alerts)"
+                        if key == "email"
+                        else ""
+                    )
+                )
 
         email = values["email"]
         if not _EMAIL_RE.match(email):
-            raise ValidationAppError("email is not a valid address")
+            raise ValidationAppError(
+                "email is not a valid address (account customer email for alerts)"
+            )
 
         outstanding = _parse_float(
             values["outstanding_balance"], "outstanding_balance", required=True
@@ -1385,8 +1411,8 @@ class PayflowImportService:
             "original_balance": _parse_float(c("original_balance"), "original_balance", required=False),
             "fee_amount": _parse_float(c("fee_amount"), "fee_amount", required=False),
             "email": email,
-            "phone_mobile": safe_text("phone_mobile"),
-            "phone_work": safe_text("phone_work"),
+            "phone_mobile": _normalize_phone(safe_text("phone_mobile")),
+            "phone_work": _normalize_phone(safe_text("phone_work")),
             "language": language,
             "date_listed": _parse_date(c("date_listed") or c("placement_date"), "date_listed"),
             "date_incurred": self._soft_date(

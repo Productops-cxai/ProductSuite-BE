@@ -1063,13 +1063,35 @@ ACCOUNT_IMPORT_REQUIRED: tuple[str, ...] = (
     "email",
 )
 
-# CRM Debtor Summary / UAT dump column → PayFlow account import header.
+# CRM Debtor Summary / UAT dump / daily placement column → PayFlow account import header.
 # Applied when loading CSV/XLSX so native CRM exports can be uploaded directly.
+# Account email/phone are the debtor contact channels used for collection alerts —
+# never confuse with client.contact_email (organization ops contact).
 ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "account_number": "account_id",
     "first_name": "customer_first_name",
     "last_name": "customer_last_name",
+    # Email (debtor / account customer)
     "email_address": "email",
+    "customer_email": "email",
+    "customer_email_address": "email",
+    "debtor_email": "email",
+    "acct_email": "email",
+    # Mobile / home phone (SMS channel)
+    "dn_debtorcasephonenumber_phone_number": "phone_mobile",
+    "customer_phone_home": "phone_mobile",
+    "customer_phone": "phone_mobile",
+    "phone_home": "phone_mobile",
+    "home_phone": "phone_mobile",
+    "phone_number": "phone_mobile",
+    "mobile_phone": "phone_mobile",
+    "mobile": "phone_mobile",
+    "alt_phn": "phone_mobile",
+    "customer_phone_alt": "phone_mobile",
+    # Work phone
+    "customer_phone_work": "phone_work",
+    "phone_work_number": "phone_work",
+    "work_phone": "phone_work",
     "principle_amount": "original_balance",
     "id": "crm_case_id",
     "date_last_email_sent": "last_email_sent_date",
@@ -1085,7 +1107,6 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "dn_debtorcaseaddress_province_name": "province_state",
     "dn_debtorcaseaddress_postal_code": "postal_code",
     "dn_debtorcaseaddress_country_name": "country_code",
-    "dn_debtorcasephonenumber_phone_number": "phone_mobile",
     "dn_client_demographic_product": "product_code",
     "account_product": "product_code",
     "updated_at": "source_updated_at",

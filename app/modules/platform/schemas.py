@@ -208,6 +208,11 @@ class SmsLogResponse(BaseModel):
     created_at: datetime
 
 
+class AiSuggestRequeueResponse(BaseModel):
+    enqueued: int
+    job_ids: List[int] = []
+
+
 class AiSuggestJobResponse(BaseModel):
     id: int
     client_id: int
@@ -255,6 +260,9 @@ class WorkflowWorkerLogResponse(BaseModel):
     job_id: Optional[int] = None
     step_id: Optional[str] = None
     created_at: Optional[datetime] = None
+    event_count: Optional[int] = 1
+    group_key: Optional[str] = None
+    step_summary: Optional[str] = None
     related_events: Optional[List["WorkflowWorkerLogResponse"]] = None
 
 

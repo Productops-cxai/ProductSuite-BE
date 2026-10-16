@@ -667,6 +667,21 @@ class PlatformService:
             limit=limit,
         )
 
+    def requeue_missing_ai_suggest_jobs(
+        self,
+        *,
+        requested_by_user_id,
+        client_id: Optional[int] = None,
+    ) -> dict:
+        from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+        job_ids = AiSuggestJobService(self.db).requeue_missing(
+            requested_by_user_id=requested_by_user_id,
+            client_id=client_id,
+            trigger="requeue_missing",
+        )
+        return {"enqueued": len(job_ids), "job_ids": job_ids}
+
     def list_workflow_worker_logs(
         self,
         search: Optional[str] = None,

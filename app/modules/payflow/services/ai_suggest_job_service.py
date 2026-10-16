@@ -26,6 +26,7 @@ from app.modules.payflow.services.workflow_suggestion.gates import (
 )
 from app.modules.payflow.services.workflow_suggestion.segmenter import build_segments
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService, _batches
+from app.shared.enums import PayflowClientStatus, PayflowPortfolioStatus, UserStatus
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -37,8 +38,6 @@ STATUS_FAILED = "failed"
 
 # Do not enqueue another job while one is waiting or in flight.
 _BLOCKING_STATUSES = {STATUS_PENDING, STATUS_RUNNING}
-# Successful completion — idempotent until manually cleared (new AI rows would duplicate).
-_DONE_STATUS = STATUS_DONE
 
 
 def _utcnow() -> datetime:
@@ -58,21 +57,33 @@ class AiSuggestJobService:
         requested_by_user_id: uuid.UUID | None = None,
         import_run_id: int | None = None,
     ) -> PayflowAiSuggestJobModel | None:
-        """Create a pending job unless one is already pending/running/done for this portfolio."""
-        existing = (
+        """Create a pending job unless one is already pending/running.
+
+        A prior ``done`` job only blocks when the portfolio still has AI-generated
+        strategies. After strategies are wiped, a new job can be enqueued again.
+        """
+        in_flight = (
             self.db.query(PayflowAiSuggestJobModel)
             .filter(
                 PayflowAiSuggestJobModel.portfolio_id == portfolio_id,
-                PayflowAiSuggestJobModel.status.in_([*_BLOCKING_STATUSES, _DONE_STATUS]),
+                PayflowAiSuggestJobModel.status.in_(list(_BLOCKING_STATUSES)),
             )
             .order_by(PayflowAiSuggestJobModel.id.desc())
             .first()
         )
-        if existing:
+        if in_flight:
             logger.info(
                 "AI suggest skip enqueue portfolio=%s status=%s trigger=%s",
                 portfolio_id,
-                existing.status,
+                in_flight.status,
+                trigger,
+            )
+            return None
+
+        if portfolio_has_ai_workflows(self.db, client_id, portfolio_id):
+            logger.info(
+                "AI suggest skip enqueue portfolio=%s already has AI workflows trigger=%s",
+                portfolio_id,
                 trigger,
             )
             return None
@@ -138,6 +149,45 @@ class AiSuggestJobService:
             trigger=trigger,
             requested_by_user_id=requested_by_user_id,
         )
+
+    def requeue_missing(
+        self,
+        *,
+        requested_by_user_id: uuid.UUID | None = None,
+        client_id: int | None = None,
+        trigger: str = "requeue_missing",
+    ) -> list[int]:
+        """Enqueue AI suggest for active portfolios that have no AI-generated workflows.
+
+        Use after wiping strategies / jobs while clients+portfolios stay active —
+        activate/import alone will not re-fire in that state.
+        """
+        q = (
+            self.db.query(PayflowPortfolioModel)
+            .join(PayflowClientModel, PayflowPortfolioModel.client_id == PayflowClientModel.id)
+            .filter(
+                PayflowClientModel.status == PayflowClientStatus.ACTIVE.value,
+                PayflowPortfolioModel.status == PayflowPortfolioStatus.ACTIVE.value,
+            )
+        )
+        if client_id is not None:
+            q = q.filter(PayflowPortfolioModel.client_id == client_id)
+        portfolios = q.all()
+        pairs = [(p.client_id, p.id) for p in portfolios]
+        job_ids = self.enqueue_many(
+            pairs,
+            trigger=trigger,
+            requested_by_user_id=requested_by_user_id,
+        )
+        if job_ids:
+            self.db.commit()
+        logger.info(
+            "AI suggest requeue_missing scanned=%s enqueued=%s client_id=%s",
+            len(pairs),
+            len(job_ids),
+            client_id,
+        )
+        return job_ids
 
     def process(self, job_id: int) -> None:
         job = (
@@ -294,12 +344,20 @@ class AiSuggestJobService:
 
     def _resolve_user(self, job: PayflowAiSuggestJobModel) -> UserModel | None:
         if job.requested_by_user_id:
-            return (
+            user = (
                 self.db.query(UserModel)
                 .filter(UserModel.id == job.requested_by_user_id)
                 .first()
             )
-        return None
+            if user:
+                return user
+        # Fallback so requeue / import without actor still can create strategies.
+        return (
+            self.db.query(UserModel)
+            .filter(UserModel.status == UserStatus.ACTIVE.value)
+            .order_by(UserModel.created_at.asc())
+            .first()
+        )
 
     def _finish(
         self,

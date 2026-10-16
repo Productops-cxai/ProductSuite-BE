@@ -145,7 +145,7 @@ class PayflowNotificationService:
         review: PayflowHumanReviewModel,
         *,
         actor_user_id: UUID | None = None,
-        send_mail: bool = True,
+        send_mail: bool = False,
     ) -> list[PayflowNotificationModel]:
         if review.status != PayflowReviewStatus.AWAITING_REVIEW.value:
             return []
@@ -176,7 +176,7 @@ class PayflowNotificationService:
         strategy_name: str,
         client_id: int,
         actor_user_id: UUID | None = None,
-        send_mail: bool = True,
+        send_mail: bool = False,
     ) -> list[PayflowNotificationModel]:
         users = self.recipients_for_client(client_id)
         return self.notify(
@@ -201,7 +201,7 @@ class PayflowNotificationService:
         client_id: int,
         channel: str,
         purpose: str,
-        send_mail: bool = True,
+        send_mail: bool = False,
     ) -> list[PayflowNotificationModel]:
         users = self.recipients_for_client(client_id)
         return self.notify(

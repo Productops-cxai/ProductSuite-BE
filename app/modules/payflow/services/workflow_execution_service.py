@@ -58,6 +58,30 @@ def _cfg(step: dict) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+# Headline ranking for grouped list rows (higher = more important to show).
+_LEVEL_RANK = {"error": 3, "warn": 2, "info": 1}
+_EVENT_RANK = {
+    "run_failed": 100,
+    "step_failed": 95,
+    "human_review_paused": 90,
+    "rule_matched": 80,
+    "email_skipped": 70,
+    "sms_skipped": 70,
+    "run_superseded": 65,
+    "run_cancelled": 60,
+    "human_review_cancelled_run": 55,
+    "account_enrolled": 50,
+    "step_done": 45,
+    "run_resumed": 40,
+    "human_review_continue": 38,
+    "enroll_complete": 30,
+    "enroll_queued": 20,
+    "step_skipped": 15,
+}
+# Strategy bookends (no account) — keep in DB/detail, hide from the main list.
+_LIST_HIDE_NO_ACCOUNT_EVENTS = frozenset({"enroll_queued", "enroll_complete"})
+
+
 class WorkflowExecutionService:
     def __init__(self, db: Session):
         self.db = db
@@ -80,6 +104,28 @@ class WorkflowExecutionService:
         step_id: str | None = None,
         commit: bool = False,
     ) -> PayflowWorkflowWorkerLogModel:
+        # Always stamp client / portfolio / account from the run when possible
+        # so the list is scannable (no "—" for account-level events).
+        if run_id is not None and (
+            client_id is None
+            or portfolio_id is None
+            or account_id is None
+            or strategy_id is None
+        ):
+            run = self.db.get(PayflowWorkflowRunModel, run_id)
+            if run:
+                client_id = client_id if client_id is not None else run.client_id
+                portfolio_id = portfolio_id if portfolio_id is not None else run.portfolio_id
+                account_id = account_id if account_id is not None else run.account_id
+                strategy_id = strategy_id if strategy_id is not None else run.strategy_id
+        if account_id is not None and (client_id is None or portfolio_id is None):
+            account = self.db.get(PayflowAccountModel, account_id)
+            if account:
+                client_id = client_id if client_id is not None else account.client_id
+                portfolio_id = (
+                    portfolio_id if portfolio_id is not None else account.portfolio_id
+                )
+
         row = PayflowWorkflowWorkerLogModel(
             event_type=event_type,
             level=level,
@@ -802,7 +848,11 @@ class WorkflowExecutionService:
         subject = self._render(subject, account, strategy)
         body = self._render(body, account, strategy)
 
+        # Collection alerts → account debtor only (account.email / phone_*).
+        # Never client.contact_email and never supervisor mailboxes.
+        # Supervisors see activity via in-app notification / Human Review / Communications.
         send_status = "logged"
+        recipient = ""
         if channel == "SMS":
             phone = (account.phone_mobile or account.phone_work or "").strip()
             if not phone:
@@ -816,6 +866,7 @@ class WorkflowExecutionService:
                     strategy_id=strategy.id,
                 )
                 return
+            recipient = phone
             sms = send_collection_sms(
                 self.db,
                 to_phone=phone,
@@ -843,6 +894,7 @@ class WorkflowExecutionService:
                     strategy_id=strategy.id,
                 )
                 return
+            recipient = email
             log = send_collection_email(
                 self.db,
                 to_email=email,
@@ -879,7 +931,20 @@ class WorkflowExecutionService:
             balance=float(account.outstanding_balance or 0),
         )
         self.db.add(comm)
-        step_run.result_json = {"channel": channel, "status": send_status, "comm_code": code}
+        step_run.result_json = {
+            "channel": channel,
+            "status": send_status,
+            "comm_code": code,
+            "to": recipient,
+        }
+        if send_status in {"sent", "logged"}:
+            self._notify_comm_sent(
+                run,
+                account,
+                channel=channel,
+                recipient=recipient,
+                comm_code=code,
+            )
 
     def _render(self, text: str, account: PayflowAccountModel, strategy: PayflowStrategyModel) -> str:
         if not text:
@@ -934,6 +999,7 @@ class WorkflowExecutionService:
                 client_id=run.client_id,
                 entity_type="workflow_run",
                 entity_id=str(run.id),
+                send_mail=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("rule block notify failed")
@@ -952,6 +1018,7 @@ class WorkflowExecutionService:
                 client_id=run.client_id,
                 entity_type="workflow_run",
                 entity_id=str(run.id),
+                send_mail=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("step failed notify failed")
@@ -970,20 +1037,186 @@ class WorkflowExecutionService:
                 client_id=run.client_id,
                 entity_type="workflow_run",
                 entity_id=str(run.id),
+                send_mail=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("provider failed notify failed")
 
+    def _notify_comm_sent(
+        self,
+        run: PayflowWorkflowRunModel,
+        account: PayflowAccountModel,
+        *,
+        channel: str,
+        recipient: str,
+        comm_code: str,
+    ) -> None:
+        """In-app only: supervisors see that collection email/SMS went to the account customer."""
+        try:
+            from app.modules.payflow.services.notification_service import PayflowNotificationService
+
+            svc = PayflowNotificationService(self.db)
+            svc.notify(
+                users=svc.recipients_for_client(run.client_id),
+                notification_type=PayflowNotificationType.COMM_SENT.value,
+                title=f"{channel} sent · {account.customer_name}",
+                body=f"To {recipient} · {account.account_reference} · {comm_code}",
+                link=f"/payflow/cases/{account.id}",
+                client_id=run.client_id,
+                entity_type="communication",
+                entity_id=comm_code,
+                send_mail=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("comm sent notify failed run=%s", run.id)
+
     # ------------------------------------------------------------------ list APIs
+    @staticmethod
+    def _worker_log_group_key(item: dict[str, Any]) -> str:
+        if item.get("run_id") is not None:
+            return f"run:{item['run_id']}"
+        if item.get("account_id") is not None and item.get("job_id") is not None:
+            return f"acct:{item['account_id']}:job:{item['job_id']}"
+        if item.get("job_id") is not None:
+            return f"job:{item['job_id']}"
+        return f"solo:{item['id']}"
+
+    @staticmethod
+    def _headline_score(item: dict[str, Any]) -> tuple[int, int, int]:
+        return (
+            _LEVEL_RANK.get(str(item.get("level") or "info"), 0),
+            _EVENT_RANK.get(str(item.get("event_type") or ""), 0),
+            int(item.get("id") or 0),
+        )
+
+    def _group_worker_logs(
+        self, items: list[dict[str, Any]], *, limit: int
+    ) -> list[dict[str, Any]]:
+        """One list row per account run — enroll bookends without account stay off the list."""
+        # Drop strategy-level enroll_queued / enroll_complete (Account shows "—").
+        list_items = [
+            item
+            for item in items
+            if not (
+                item.get("account_id") is None
+                and (item.get("event_type") or "") in _LIST_HIDE_NO_ACCOUNT_EVENTS
+            )
+        ]
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for item in list_items:
+            key = self._worker_log_group_key(item)
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(item)
+
+        grouped: list[dict[str, Any]] = []
+        for key in order:
+            events = buckets[key]
+            headline = max(events, key=self._headline_score)
+            latest = max(events, key=lambda e: int(e.get("id") or 0))
+            # Prefer context fields from any event that has them filled.
+            for src in (headline, latest, *events):
+                for field in (
+                    "client_id",
+                    "client_name",
+                    "client_code",
+                    "portfolio_id",
+                    "portfolio_name",
+                    "portfolio_code",
+                    "account_id",
+                    "account_reference",
+                    "customer_name",
+                    "strategy_id",
+                    "strategy_name",
+                    "strategy_code",
+                    "run_id",
+                    "job_id",
+                ):
+                    if headline.get(field) in (None, "") and src.get(field) not in (None, ""):
+                        headline[field] = src[field]
+            count = len(events)
+            types = []
+            for e in sorted(events, key=lambda x: int(x.get("id") or 0)):
+                t = e.get("event_type")
+                if t and t not in types:
+                    types.append(t)
+            row = dict(headline)
+            row["event_count"] = count
+            row["group_key"] = key
+            row["created_at"] = latest.get("created_at") or headline.get("created_at")
+            if count > 1:
+                row["message"] = f"{headline.get('message') or ''} · {count} steps".strip(" ·")
+            row["detail"] = None
+            row["step_summary"] = " → ".join(types[:8])
+            grouped.append(row)
+            if len(grouped) >= limit:
+                break
+        return grouped
+
     def _enrich_worker_logs(
         self, rows: list[PayflowWorkflowWorkerLogModel]
     ) -> list[dict[str, Any]]:
         if not rows:
             return []
-        client_ids = {r.client_id for r in rows if r.client_id}
-        portfolio_ids = {r.portfolio_id for r in rows if r.portfolio_id}
-        account_ids = {r.account_id for r in rows if r.account_id}
-        strategy_ids = {r.strategy_id for r in rows if r.strategy_id}
+
+        # Backfill missing client/portfolio/account from the run (older noisy rows).
+        run_ids = {
+            r.run_id
+            for r in rows
+            if r.run_id
+            and (r.client_id is None or r.portfolio_id is None or r.account_id is None)
+        }
+        runs: dict[int, PayflowWorkflowRunModel] = {}
+        if run_ids:
+            runs = {
+                run.id: run
+                for run in self.db.query(PayflowWorkflowRunModel)
+                .filter(PayflowWorkflowRunModel.id.in_(run_ids))
+                .all()
+            }
+        account_ids_for_fill = {
+            r.account_id
+            for r in rows
+            if r.account_id and (r.client_id is None or r.portfolio_id is None)
+        }
+        accounts_for_fill: dict[int, PayflowAccountModel] = {}
+        if account_ids_for_fill:
+            accounts_for_fill = {
+                a.id: a
+                for a in self.db.query(PayflowAccountModel)
+                .filter(PayflowAccountModel.id.in_(account_ids_for_fill))
+                .all()
+            }
+
+        resolved: list[tuple[PayflowWorkflowWorkerLogModel, int | None, int | None, int | None, int | None]] = []
+        client_ids: set[int] = set()
+        portfolio_ids: set[int] = set()
+        account_ids: set[int] = set()
+        strategy_ids: set[int] = set()
+        for r in rows:
+            cid, pid, aid, sid = r.client_id, r.portfolio_id, r.account_id, r.strategy_id
+            run = runs.get(r.run_id) if r.run_id else None
+            if run:
+                cid = cid if cid is not None else run.client_id
+                pid = pid if pid is not None else run.portfolio_id
+                aid = aid if aid is not None else run.account_id
+                sid = sid if sid is not None else run.strategy_id
+            if aid is not None and (cid is None or pid is None):
+                acct = accounts_for_fill.get(aid)
+                if acct:
+                    cid = cid if cid is not None else acct.client_id
+                    pid = pid if pid is not None else acct.portfolio_id
+            if cid is not None:
+                client_ids.add(cid)
+            if pid is not None:
+                portfolio_ids.add(pid)
+            if aid is not None:
+                account_ids.add(aid)
+            if sid is not None:
+                strategy_ids.add(sid)
+            resolved.append((r, cid, pid, aid, sid))
 
         clients = {
             c.id: c
@@ -1027,11 +1260,11 @@ class WorkflowExecutionService:
         }
 
         out: list[dict[str, Any]] = []
-        for r in rows:
-            client = clients.get(r.client_id) if r.client_id else None
-            portfolio = portfolios.get(r.portfolio_id) if r.portfolio_id else None
-            account = accounts.get(r.account_id) if r.account_id else None
-            strategy = strategies.get(r.strategy_id) if r.strategy_id else None
+        for r, cid, pid, aid, sid in resolved:
+            client = clients.get(cid) if cid else None
+            portfolio = portfolios.get(pid) if pid else None
+            account = accounts.get(aid) if aid else None
+            strategy = strategies.get(sid) if sid else None
             out.append(
                 {
                     "id": r.id,
@@ -1039,22 +1272,25 @@ class WorkflowExecutionService:
                     "level": r.level,
                     "message": r.message,
                     "detail": r.detail,
-                    "client_id": r.client_id,
+                    "client_id": cid,
                     "client_name": client.name if client else None,
                     "client_code": client.code if client else None,
-                    "portfolio_id": r.portfolio_id,
+                    "portfolio_id": pid,
                     "portfolio_name": portfolio.name if portfolio else None,
                     "portfolio_code": portfolio.code if portfolio else None,
-                    "account_id": r.account_id,
+                    "account_id": aid,
                     "account_reference": account.account_reference if account else None,
                     "customer_name": account.customer_name if account else None,
-                    "strategy_id": r.strategy_id,
+                    "strategy_id": sid,
                     "strategy_name": strategy.name if strategy else None,
                     "strategy_code": strategy.code if strategy else None,
                     "run_id": r.run_id,
                     "job_id": r.job_id,
                     "step_id": r.step_id,
                     "created_at": r.created_at,
+                    "event_count": 1,
+                    "group_key": None,
+                    "step_summary": None,
                 }
             )
         return out
@@ -1070,6 +1306,7 @@ class WorkflowExecutionService:
         level: str | None = None,
         search: str | None = None,
         limit: int = 200,
+        group: bool = True,
     ) -> list[dict[str, Any]]:
         q = self.db.query(PayflowWorkflowWorkerLogModel)
         if client_id is not None:
@@ -1119,51 +1356,71 @@ class WorkflowExecutionService:
                 )
                 .distinct()
             )
+        fetch_limit = min(max(limit * 10, limit), 2000) if group else min(limit, 500)
         rows = (
             q.order_by(PayflowWorkflowWorkerLogModel.id.desc())
-            .limit(min(limit, 500))
+            .limit(fetch_limit)
             .all()
         )
-        return self._enrich_worker_logs(rows)
+        enriched = self._enrich_worker_logs(rows)
+        if not group:
+            return enriched[: min(limit, 500)]
+        return self._group_worker_logs(enriched, limit=min(limit, 500))
 
     def get_worker_log(self, log_id: int) -> dict[str, Any] | None:
         row = self.db.get(PayflowWorkflowWorkerLogModel, log_id)
         if not row:
             return None
         item = self._enrich_worker_logs([row])[0]
-        related: list[PayflowWorkflowWorkerLogModel] = []
-        related_q = self.db.query(PayflowWorkflowWorkerLogModel).filter(
-            PayflowWorkflowWorkerLogModel.id != log_id
-        )
+
+        timeline_q = self.db.query(PayflowWorkflowWorkerLogModel)
         if row.run_id is not None:
-            related = (
-                related_q.filter(PayflowWorkflowWorkerLogModel.run_id == row.run_id)
-                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
-                .limit(40)
-                .all()
+            timeline_q = timeline_q.filter(PayflowWorkflowWorkerLogModel.run_id == row.run_id)
+        elif row.account_id is not None and row.job_id is not None:
+            timeline_q = timeline_q.filter(
+                PayflowWorkflowWorkerLogModel.account_id == row.account_id,
+                PayflowWorkflowWorkerLogModel.job_id == row.job_id,
             )
         elif row.account_id is not None:
-            related = (
-                related_q.filter(PayflowWorkflowWorkerLogModel.account_id == row.account_id)
-                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
-                .limit(40)
-                .all()
+            timeline_q = timeline_q.filter(
+                PayflowWorkflowWorkerLogModel.account_id == row.account_id
             )
         elif row.job_id is not None:
-            related = (
-                related_q.filter(PayflowWorkflowWorkerLogModel.job_id == row.job_id)
-                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
-                .limit(40)
-                .all()
-            )
+            timeline_q = timeline_q.filter(PayflowWorkflowWorkerLogModel.job_id == row.job_id)
         elif row.strategy_id is not None:
-            related = (
-                related_q.filter(PayflowWorkflowWorkerLogModel.strategy_id == row.strategy_id)
-                .order_by(PayflowWorkflowWorkerLogModel.id.desc())
-                .limit(40)
-                .all()
+            timeline_q = timeline_q.filter(
+                PayflowWorkflowWorkerLogModel.strategy_id == row.strategy_id
             )
-        item["related_events"] = self._enrich_worker_logs(related)
+        else:
+            timeline_q = timeline_q.filter(PayflowWorkflowWorkerLogModel.id == log_id)
+
+        timeline_rows = (
+            timeline_q.order_by(PayflowWorkflowWorkerLogModel.id.asc()).limit(80).all()
+        )
+        timeline = self._enrich_worker_logs(timeline_rows)
+        # Prefer the richest context row for the header.
+        for ev in reversed(timeline):
+            for field in (
+                "client_id",
+                "client_name",
+                "client_code",
+                "portfolio_id",
+                "portfolio_name",
+                "portfolio_code",
+                "account_id",
+                "account_reference",
+                "customer_name",
+                "strategy_id",
+                "strategy_name",
+                "strategy_code",
+                "run_id",
+                "job_id",
+            ):
+                if item.get(field) in (None, "") and ev.get(field) not in (None, ""):
+                    item[field] = ev[field]
+        item["event_count"] = len(timeline)
+        item["group_key"] = self._worker_log_group_key(item)
+        item["related_events"] = timeline
         return item
 
     def list_runs(

@@ -194,6 +194,7 @@ class PayflowNotificationType(str, Enum):
     HUMAN_REVIEW_AWAITING = "human_review_awaiting"
     WORKFLOW_AWAITING_APPROVAL = "workflow_awaiting_approval"
     COMM_AWAITING_GOVERNANCE = "comm_awaiting_governance"
+    COMM_SENT = "comm_sent"
     INTEGRATION_CONNECTION_FAILED = "integration_connection_failed"
     SUPERVISOR_ASSIGNMENT = "supervisor_assignment"
     CLIENT_ACTIVATED = "client_activated"
