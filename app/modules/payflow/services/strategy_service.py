@@ -1271,7 +1271,9 @@ class PayflowStrategyService:
             self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
 
-    def activate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
+    def activate(
+        self, user: UserModel, strategy_id: int, *, note: str | None = None
+    ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
         if row.status in {
@@ -1292,17 +1294,18 @@ class PayflowStrategyService:
             raise ValidationAppError("Only an Approved workflow can become Active")
 
         row.status = PayflowStrategyStatus.ACTIVE.value
-        self._prepend_version(
-            row,
-            {
-                "version": int(row.version or 1),
-                "date": _stamp(),
-                "note": f"Activated by {user.full_name}",
-                "changes": [],
-                "status": row.status,
-                "origin": row.origin,
-            },
-        )
+        entry = {
+            "version": int(row.version or 1),
+            "date": _stamp(),
+            "note": f"Activated by {user.full_name}",
+            "changes": [],
+            "status": row.status,
+            "origin": row.origin,
+        }
+        reviewer_note = _clean_note(note)
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
         # Enqueue account enrollment for the workflow worker (PostgreSQL due-queue).

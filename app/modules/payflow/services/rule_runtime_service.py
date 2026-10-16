@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.infrastructure.database.models import (
     PayflowAccountModel,
+    PayflowClientModel,
     PayflowCommunicationModel,
     PayflowRuleModel,
 )
@@ -33,6 +34,10 @@ class RuleRuntimeService:
         self.db = db
 
     def active_rules_for_account(self, account: PayflowAccountModel) -> list[PayflowRuleModel]:
+        client = self.db.get(PayflowClientModel, account.client_id)
+        assigned_system = {
+            str(name) for name in ((client.governance_rules if client else None) or []) if name
+        }
         rows = (
             self.db.query(PayflowRuleModel)
             .filter(PayflowRuleModel.status == PayflowRuleStatus.ACTIVE.value)
@@ -46,7 +51,13 @@ class RuleRuntimeService:
             .order_by(PayflowRuleModel.id.asc())
             .all()
         )
-        return rows
+        # System rules apply only when selected on the client's governance settings.
+        return [
+            r
+            for r in rows
+            if r.rule_type == PayflowRuleType.CLIENT.value
+            or (r.name or "") in assigned_system
+        ]
 
     def messages_sent_7d(self, account_id: int) -> int:
         cutoff = datetime.now(timezone.utc).timestamp() - 7 * 86400

@@ -45,7 +45,6 @@ from app.modules.payflow.crm_catalog import (
     CRM_FILE_BEHAVIOUR,
     CRM_INBOUND_FIELDS,
     CRM_OUTBOUND_FIELDS,
-    GOVERNANCE_RULE_LIBRARY,
     PAYFLOW_TARGET_FIELDS,
 )
 from app.shared.enums import (
@@ -61,6 +60,8 @@ from app.shared.enums import (
     PayflowPortfolioStatus,
     PayflowRoleCode,
     PayflowRoleScope,
+    PayflowRuleStatus,
+    PayflowRuleType,
 )
 
 
@@ -276,12 +277,29 @@ class PayflowClientService:
             "client_fields": client_fields,
             "outbound_fields": CRM_OUTBOUND_FIELDS,
             "payflow_fields": PAYFLOW_TARGET_FIELDS,
-            "governance_rules": GOVERNANCE_RULE_LIBRARY,
+            "governance_rules": self._governance_rule_names(),
             "catalog_version": CRM_FILE_BEHAVIOUR.get("catalog_version", "0.3"),
             "file_behaviour": CRM_FILE_BEHAVIOUR,
             "baseline_status": CRM_FILE_BEHAVIOUR.get("baseline_status"),
             "baseline_note": CRM_FILE_BEHAVIOUR.get("baseline_note"),
         }
+
+    def _governance_rule_names(self) -> list[str]:
+        """Active system rules available for client governance selection."""
+        rows = (
+            self.db.query(PayflowRuleModel.name)
+            .filter(
+                PayflowRuleModel.status == PayflowRuleStatus.ACTIVE.value,
+                PayflowRuleModel.rule_type == PayflowRuleType.SYSTEM.value,
+            )
+            .order_by(PayflowRuleModel.name.asc())
+            .all()
+        )
+        return [name for (name,) in rows if name]
+
+    def _known_rule_names(self) -> set[str]:
+        rows = self.db.query(PayflowRuleModel.name).all()
+        return {name for (name,) in rows if name}
 
     # ------------------------------------------------------------------
     # List / get
@@ -539,7 +557,10 @@ class PayflowClientService:
             rules = payload["governance_rules"]
             if not isinstance(rules, list):
                 raise ValidationAppError("governance_rules must be a list")
-            unknown = [r for r in rules if r not in GOVERNANCE_RULE_LIBRARY]
+            known = self._known_rule_names()
+            # Keep previously saved names even if the rule was later deactivated/renamed away.
+            previously = set(client.governance_rules or [])
+            unknown = [r for r in rules if r not in known and r not in previously]
             if unknown:
                 raise ValidationAppError(f"Unknown governance rule(s): {', '.join(map(str, unknown))}")
             client.governance_rules = list(rules)

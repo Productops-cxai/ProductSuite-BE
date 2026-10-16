@@ -964,6 +964,14 @@ class ApproveStrategyRequest(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why it was approved")
 
 
+class ActivateStrategyRequest(BaseModel):
+    note: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+        description="Optional: why this workflow is being activated",
+    )
+
+
 class RejectStrategyRequest(BaseModel):
     note: Optional[str] = None
 

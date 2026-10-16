@@ -171,7 +171,43 @@ class PayflowRuleService:
         if not self.access.can(user, "view_rules", rule.client_id):
             raise ForbiddenError("Rule access denied")
 
-    def _serialize(self, row: PayflowRuleModel, user: UserModel | None = None) -> dict[str, Any]:
+    def _governance_usage_by_rule_name(self) -> dict[str, list[str]]:
+        """Map rule name → client names that selected it under governance_rules."""
+        usage: dict[str, list[str]] = {}
+        clients = self.db.query(PayflowClientModel).all()
+        for client in clients:
+            for rule_name in client.governance_rules or []:
+                if not rule_name or not client.name:
+                    continue
+                bucket = usage.setdefault(str(rule_name), [])
+                if client.name not in bucket:
+                    bucket.append(client.name)
+        for names in usage.values():
+            names.sort()
+        return usage
+
+    def _applied_to_names(
+        self,
+        row: PayflowRuleModel,
+        *,
+        governance_usage: dict[str, list[str]] | None = None,
+    ) -> list[str]:
+        """Client display names where this rule applies."""
+        if row.rule_type == PayflowRuleType.CLIENT.value or row.client_id is not None:
+            client = row.client
+            if client and client.name:
+                return [client.name]
+            return []
+        usage = governance_usage if governance_usage is not None else self._governance_usage_by_rule_name()
+        return list(usage.get(row.name or "", []))
+
+    def _serialize(
+        self,
+        row: PayflowRuleModel,
+        user: UserModel | None = None,
+        *,
+        governance_usage: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
         client = row.client
         conditions = list(row.conditions or [])
         data = {
@@ -191,7 +227,7 @@ class PayflowRuleService:
             "status": row.status,
             "created_by": row.created_by,
             "triggers_7d": row.triggers_7d or 0,
-            "applied_to": list(row.applied_to or []),
+            "applied_to": self._applied_to_names(row, governance_usage=governance_usage),
             "history": list(row.history or []),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
@@ -223,6 +259,8 @@ class PayflowRuleService:
                 | (PayflowRuleModel.client_id.in_(allowed))
             )
         if client_id is not None:
+            # This client's own rules + system rules assigned on the client (governance_rules).
+            # Do not return every system rule — only those selected for this client.
             q = q.filter(
                 (PayflowRuleModel.client_id == client_id)
                 | (PayflowRuleModel.client_id.is_(None))
@@ -237,6 +275,26 @@ class PayflowRuleService:
             q = q.filter(PayflowRuleModel.rule_type == rule_type)
 
         rows = q.order_by(PayflowRuleModel.name.asc()).all()
+        if client_id is not None:
+            client = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id == int(client_id))
+                .first()
+            )
+            assigned = {
+                str(name)
+                for name in (client.governance_rules or [])
+                if name
+            } if client is not None else set()
+            rows = [
+                r
+                for r in rows
+                if r.client_id == int(client_id)
+                or (
+                    (r.rule_type == PayflowRuleType.SYSTEM.value or r.client_id is None)
+                    and (r.name or "") in assigned
+                )
+            ]
         if not self.access.is_operations_admin(user):
             filtered = []
             for r in rows:
@@ -267,8 +325,11 @@ class PayflowRuleService:
             "client": sum(1 for r in rows if r.rule_type == PayflowRuleType.CLIENT.value),
             "triggers_7d": sum(r.triggers_7d or 0 for r in rows),
         }
+        governance_usage = self._governance_usage_by_rule_name()
         return {
-            "rules": [self._serialize(r, user) for r in rows],
+            "rules": [
+                self._serialize(r, user, governance_usage=governance_usage) for r in rows
+            ],
             "summary": summary,
             "can_create": can_create,
             **self.catalog(),
@@ -372,8 +433,8 @@ class PayflowRuleService:
                 .filter(PayflowClientModel.id == int(client_id))
                 .first()
             )
-            if client:
-                applied_to = [client.code]
+            if client and client.name:
+                applied_to = [client.name]
 
         row = PayflowRuleModel(
             code=code,
@@ -431,7 +492,7 @@ class PayflowRuleService:
                 .filter(PayflowClientModel.id == row.client_id)
                 .first()
             )
-            row.applied_to = [client.code] if client else list(row.applied_to or [])
+            row.applied_to = [client.name] if client and client.name else list(row.applied_to or [])
 
         history = list(row.history or [])
         if prev_status != fields["status"]:

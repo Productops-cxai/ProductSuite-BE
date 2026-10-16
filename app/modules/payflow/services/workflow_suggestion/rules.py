@@ -31,6 +31,7 @@ def design_limits(client: dict[str, Any], rules: dict[str, list[dict]]) -> dict[
 def governing_rules(client: dict[str, Any], rules: dict[str, list[dict]]) -> list[str]:
     """Plain-text list of the rules a workflow is governed by (shown to reviewers)."""
     lines = []
+    listed: set[str] = set()
     for kind in ("system", "client"):
         for rule in rules[kind]:
             joiner = " AND " if rule["logic"] == "ALL" else " OR "
@@ -39,7 +40,12 @@ def governing_rules(client: dict[str, Any], rules: dict[str, list[dict]]) -> lis
                 for c in rule["conditions"]
             )
             lines.append(f"{rule['name']} ({kind} rule): IF {conditions} THEN {rule['action']}")
-    lines += [f"{name} (client governance setting)" for name in client["governance_rules"]]
+            if rule.get("name"):
+                listed.add(str(rule["name"]))
+    # Names still on the client but no longer matching an Active rule row.
+    for name in client.get("governance_rules") or []:
+        if name and str(name) not in listed:
+            lines.append(f"{name} (client governance setting)")
     return lines
 
 
