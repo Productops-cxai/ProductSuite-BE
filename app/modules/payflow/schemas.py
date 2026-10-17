@@ -112,6 +112,9 @@ class PayflowClientItem(BaseModel):
     setup_incomplete: List[str] = Field(default_factory=list)
     setup_steps_remaining: int = 0
     onboarding: Optional[PayflowOnboardingProgressItem] = None
+    # How the client was first created: add_client | file_upload
+    added_through: Optional[str] = None
+    added_through_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -313,7 +313,10 @@ def list_clients(
 @router.post("/clients")
 def create_client(payload: CreatePayflowClientRequest, _: PayflowCreateClient, db: DbSession):
     try:
-        return PayflowClientService(db).create_client(payload.model_dump())
+        data = payload.model_dump()
+        # Wizard creates are always "Add Client" (bulk import sets file_upload itself).
+        data["added_through"] = "add_client"
+        return PayflowClientService(db).create_client(data)
     except AppError as exc:
         raise _map_error(exc) from exc
 
