@@ -203,8 +203,12 @@ class SmsLogResponse(BaseModel):
     provider_id: Optional[str] = None
     error: Optional[str] = None
     account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
     run_id: Optional[int] = None
     client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
     created_at: datetime
 
 

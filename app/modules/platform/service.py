@@ -618,36 +618,94 @@ class PlatformService:
         if (actor_email or "").lower() != settings.SEED_SUPER_ADMIN_EMAIL.lower():
             raise ForbiddenError("SMS Logs are only available to the suite admin")
 
-        from app.infrastructure.database.models import SmsLogModel
+        from app.infrastructure.database.models import (
+            PayflowAccountModel,
+            PayflowClientModel,
+            SmsLogModel,
+        )
 
         query = self.db.query(SmsLogModel)
         if sms_type:
             query = query.filter(SmsLogModel.sms_type == sms_type)
         if search:
-            like = f"%{search.lower()}%"
+            like = f"%{search.strip()}%"
+            account_match = (
+                self.db.query(PayflowAccountModel.id)
+                .filter(
+                    or_(
+                        PayflowAccountModel.customer_name.ilike(like),
+                        PayflowAccountModel.account_reference.ilike(like),
+                    )
+                )
+                .subquery()
+            )
+            client_match = (
+                self.db.query(PayflowClientModel.id)
+                .filter(
+                    or_(
+                        PayflowClientModel.name.ilike(like),
+                        PayflowClientModel.code.ilike(like),
+                    )
+                )
+                .subquery()
+            )
             query = query.filter(
                 or_(
                     SmsLogModel.to_phone.ilike(like),
                     SmsLogModel.body.ilike(like),
+                    SmsLogModel.account_id.in_(account_match),
+                    SmsLogModel.client_id.in_(client_match),
                 )
             )
         rows = query.order_by(SmsLogModel.id.desc()).limit(min(limit, 500)).all()
-        return [
-            {
-                "id": r.id,
-                "to_phone": r.to_phone,
-                "body": r.body,
-                "sms_type": r.sms_type,
-                "status": r.status,
-                "provider_id": r.provider_id,
-                "error": r.error,
-                "account_id": r.account_id,
-                "run_id": r.run_id,
-                "client_id": r.client_id,
-                "created_at": r.created_at,
-            }
-            for r in rows
-        ]
+
+        account_ids = {r.account_id for r in rows if r.account_id}
+        client_ids = {r.client_id for r in rows if r.client_id}
+        accounts = {
+            a.id: a
+            for a in (
+                self.db.query(PayflowAccountModel)
+                .filter(PayflowAccountModel.id.in_(account_ids))
+                .all()
+                if account_ids
+                else []
+            )
+        }
+        clients = {
+            c.id: c
+            for c in (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id.in_(client_ids))
+                .all()
+                if client_ids
+                else []
+            )
+        }
+
+        out: List[dict] = []
+        for r in rows:
+            account = accounts.get(r.account_id) if r.account_id else None
+            client = clients.get(r.client_id) if r.client_id else None
+            out.append(
+                {
+                    "id": r.id,
+                    "to_phone": r.to_phone,
+                    "body": r.body,
+                    "sms_type": r.sms_type,
+                    "status": r.status,
+                    "provider_id": r.provider_id,
+                    "error": r.error,
+                    "account_id": r.account_id,
+                    "account_reference": account.account_reference if account else None,
+                    "customer_name": account.customer_name if account else None,
+                    "run_id": r.run_id,
+                    "client_id": r.client_id,
+                    "client_name": client.name if client else None,
+                    "client_code": client.code if client else None,
+                    "created_at": r.created_at,
+                }
+            )
+        return out
 
     def list_ai_suggest_jobs(
         self,
