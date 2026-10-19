@@ -1627,8 +1627,9 @@ class PayflowClientService:
             if date_field in row:
                 _validate_optional_import_date(row.get(date_field) or "", date_field)
 
-        # Optional boolean columns — reject garbage when present
-        for bool_field in ("restricted_access_client", "sliding_scale"):
+        # Optional boolean columns — reject garbage when present.
+        # Note: CRM "sliding_scale" is NOT a boolean (tier JSON/list); do not validate it here.
+        for bool_field in ("restricted_access_client",):
             raw = row.get(bool_field)
             if raw is None or str(raw).strip() == "":
                 continue
