@@ -528,17 +528,50 @@ class ReviewPaymentContext(BaseModel):
     paid_amount: Optional[float] = None
 
 
+class ReviewExceptionStep(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    kind: Optional[str] = None
+    available: bool = True
+    message: Optional[str] = None
+
+
+class ReviewExecutionSummary(BaseModel):
+    run_id: Optional[int] = None
+    status: Optional[str] = None
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_version: Optional[int] = None
+    current_step_id: Optional[str] = None
+    current_step_title: Optional[str] = None
+    current_step_kind: Optional[str] = None
+    next_step_id: Optional[str] = None
+    next_step_title: Optional[str] = None
+    next_scheduled_at: Optional[datetime] = None
+    block_reason: Optional[str] = None
+    workflow_definition_path: Optional[str] = None
+
+
+class ReviewMissingRef(BaseModel):
+    ref: str
+    message: str
+
+
 class ReviewWorkflowContext(BaseModel):
     strategy_id: Optional[int] = None
     strategy_name: Optional[str] = None
     strategy_code: Optional[str] = None
+    strategy_available: Optional[bool] = None
     workflow_version: Optional[int] = None
     exception_step_id: Optional[str] = None
+    exception_step: Optional[ReviewExceptionStep] = None
     current_workflow: Optional[str] = None
     collection_status: Optional[str] = None
     last_action: Optional[str] = None
     next_action: Optional[str] = None
     action_blocked: bool = False
+    execution: Optional[ReviewExecutionSummary] = None
+    workflow_definition_path: Optional[str] = None
 
 
 class ReviewAuditItem(BaseModel):
@@ -597,10 +630,12 @@ class PayflowReviewItem(BaseModel):
     payment_context: Optional[ReviewPaymentContext] = None
     workflow_context: Optional[ReviewWorkflowContext] = None
     available_actions: List[str] = Field(default_factory=list)
+    missing_refs: List[ReviewMissingRef] = Field(default_factory=list)
     decision_version: Optional[int] = None
     strategy_id: Optional[int] = None
     workflow_version: Optional[int] = None
     exception_step_id: Optional[str] = None
+    exception_step: Optional[ReviewExceptionStep] = None
     can_decide: Optional[bool] = None
     can_modify: Optional[bool] = None
     can_release: Optional[bool] = None
@@ -1300,13 +1335,36 @@ class PayflowWorkflowStepRunItem(BaseModel):
     id: int
     step_id: str
     kind: str
+    title: Optional[str] = None
     attempt: int
     status: str
+    ui_status: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     error: Optional[str] = None
+    block_reason: Optional[str] = None
     result_json: Optional[dict[str, Any]] = None
+    communication_id: Optional[int] = None
+
+
+class PayflowWorkflowActivityItem(BaseModel):
+    at: Optional[datetime] = None
+    label: str
+    kind: Optional[str] = None
+    detail: Optional[str] = None
+    ui_status: Optional[str] = None
+    step_id: Optional[str] = None
+    step_run_id: Optional[int] = None
+    communication_id: Optional[int] = None
+    block_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+class PayflowWorkflowCurrentStep(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    kind: Optional[str] = None
 
 
 class PayflowWorkflowRunItem(BaseModel):
@@ -1314,16 +1372,33 @@ class PayflowWorkflowRunItem(BaseModel):
     account_id: int
     strategy_id: int
     strategy_version: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    workflow_definition_path: Optional[str] = None
     client_id: Optional[int] = None
     portfolio_id: Optional[int] = None
     status: str
     current_step_id: Optional[str] = None
+    current_step: Optional[PayflowWorkflowCurrentStep] = None
+    next_step_id: Optional[str] = None
+    next_step_title: Optional[str] = None
+    next_scheduled_at: Optional[datetime] = None
     human_review_id: Optional[int] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    block_reason: Optional[str] = None
+    deactivate_policy: Optional[str] = None
     step_runs: List[PayflowWorkflowStepRunItem] = Field(default_factory=list)
+    activity: List[PayflowWorkflowActivityItem] = Field(default_factory=list)
 
 
 class PayflowWorkflowRunsResponse(BaseModel):
     items: List[PayflowWorkflowRunItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowPaymentEventRequest(BaseModel):
+    amount: Optional[float] = None
+    payment_date: Optional[str] = None
+    is_ptp: Optional[bool] = None
+    note: Optional[str] = None

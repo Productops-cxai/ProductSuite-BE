@@ -153,12 +153,13 @@ def test_under_review_can_be_regenerated(db_session, admin, ai_workflow):
     assert new["status"] == "AI Proposed"
 
 
-def test_approved_cannot_be_regenerated(db_session, admin, ai_workflow):
+def test_approved_can_be_regenerated(db_session, admin, ai_workflow):
     strategies = PayflowStrategyService(db_session)
     strategies.begin_review(admin, ai_workflow["id"])
     strategies.approve(admin, ai_workflow["id"])
-    with pytest.raises(ValidationAppError, match="Only AI Proposed or Under Review"):
-        regenerate(db_session, admin, ai_workflow["id"])
+    new, _ = regenerate(db_session, admin, ai_workflow["id"])
+    assert new["status"] == "AI Proposed"
+    assert new["id"] != ai_workflow["id"]
 
 
 def test_human_workflow_cannot_be_regenerated(db_session, admin, portfolio):  # noqa: F811
@@ -236,13 +237,17 @@ def test_api_remarks_required(client, admin_token, ai_workflow):
     assert _post(client, admin_token, ai_workflow["id"], remarks="   ").status_code == 422
 
 
-def test_api_approved_workflow_is_refused(client, admin_token, admin, db_session, ai_workflow):
+def test_api_approved_workflow_can_be_regenerated(client, admin_token, admin, db_session, ai_workflow):
     strategies = PayflowStrategyService(db_session)
     strategies.begin_review(admin, ai_workflow["id"])
     strategies.approve(admin, ai_workflow["id"])
-    response = _post(client, admin_token, ai_workflow["id"])
-    assert response.status_code == 400
-    assert response.json()["detail"] == "Only AI Proposed or Under Review workflows can be regenerated"
+    call, _ = fake_llm()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        response = _post(client, admin_token, ai_workflow["id"])
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["status"] == "AI Proposed"
+    assert body["id"] != ai_workflow["id"]
 
 
 def test_api_workflow_without_portfolio_is_refused(client, admin_token, db_session, portfolio):  # noqa: F811

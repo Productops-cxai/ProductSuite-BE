@@ -421,24 +421,142 @@ class PayflowReviewService:
             "paid_amount": float(account.paid_amount) if account.paid_amount is not None else None,
         }
 
+    def _resolve_exception_step(
+        self, strategy: PayflowStrategyModel | None, step_id: str | None
+    ) -> dict[str, Any] | None:
+        if not step_id:
+            return None
+        step_def: dict[str, Any] | None = None
+        if strategy and isinstance(strategy.steps, list):
+            for s in strategy.steps:
+                if isinstance(s, dict) and s.get("id") == step_id:
+                    step_def = s
+                    break
+        if step_def is None:
+            return {
+                "id": step_id,
+                "title": None,
+                "kind": None,
+                "available": False,
+                "message": "Exception step is unavailable in the current workflow definition",
+            }
+        return {
+            "id": step_id,
+            "title": step_def.get("title") or step_def.get("kind") or step_id,
+            "kind": step_def.get("kind"),
+            "available": True,
+            "message": None,
+        }
+
+    def _live_execution_summary(self, account_id: int | None) -> dict[str, Any] | None:
+        if not account_id:
+            return None
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            run = WorkflowExecutionService(self.db).get_account_workflow_execution(account_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if not run:
+            return None
+        current = run.get("current_step") or {}
+        return {
+            "run_id": run.get("id"),
+            "status": run.get("status"),
+            "strategy_id": run.get("strategy_id"),
+            "strategy_name": run.get("strategy_name"),
+            "strategy_version": run.get("strategy_version"),
+            "current_step_id": run.get("current_step_id"),
+            "current_step_title": current.get("title"),
+            "current_step_kind": current.get("kind"),
+            "next_step_id": run.get("next_step_id"),
+            "next_step_title": run.get("next_step_title"),
+            "next_scheduled_at": run.get("next_scheduled_at"),
+            "block_reason": run.get("block_reason") or run.get("last_error"),
+            "workflow_definition_path": run.get("workflow_definition_path"),
+        }
+
+    def _missing_refs(
+        self,
+        row: PayflowHumanReviewModel,
+        *,
+        client,
+        account,
+        rule,
+        strategy,
+        exception_step: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        missing: list[dict[str, str]] = []
+        if client is None:
+            missing.append(
+                {
+                    "ref": "client",
+                    "message": "Linked client is unavailable or was deleted",
+                }
+            )
+        if account is None:
+            missing.append(
+                {
+                    "ref": "account",
+                    "message": "Linked account / collection case is unavailable or was deleted",
+                }
+            )
+        if row.rule_id and rule is None:
+            missing.append(
+                {
+                    "ref": "rule",
+                    "message": "Triggering rule is unavailable or was deleted",
+                }
+            )
+        if row.strategy_id and strategy is None:
+            missing.append(
+                {
+                    "ref": "strategy",
+                    "message": "Linked workflow definition is unavailable or was deleted",
+                }
+            )
+        if row.exception_step_id and (
+            exception_step is None or not exception_step.get("available")
+        ):
+            missing.append(
+                {
+                    "ref": "exception_step",
+                    "message": "Exception step is missing from the workflow definition",
+                }
+            )
+        return missing
+
     def _workflow_context(self, row: PayflowHumanReviewModel) -> dict[str, Any]:
         account = row.account
         strategy = row.strategy
         if strategy is None and row.strategy_id:
             strategy = self.db.get(PayflowStrategyModel, row.strategy_id)
+        exception_step = self._resolve_exception_step(strategy, row.exception_step_id)
         return {
             "strategy_id": strategy.id if strategy else row.strategy_id,
-            "strategy_name": strategy.name if strategy else None,
+            "strategy_name": strategy.name
+            if strategy
+            else ("Workflow unavailable" if row.strategy_id else None),
             "strategy_code": strategy.code if strategy else None,
+            "strategy_available": strategy is not None,
             "workflow_version": row.workflow_version
             if row.workflow_version is not None
             else (strategy.version if strategy else None),
             "exception_step_id": row.exception_step_id,
-            "current_workflow": account.current_workflow if account else None,
+            "exception_step": exception_step,
+            "current_workflow": account.current_workflow
+            if account
+            else ("Case unavailable" if row.account_id else None),
             "collection_status": account.collection_status if account else None,
             "last_action": account.last_action if account else None,
             "next_action": account.next_action if account else None,
             "action_blocked": bool(account.human_review) if account else False,
+            "execution": self._live_execution_summary(row.account_id),
+            "workflow_definition_path": (
+                f"/payflow/workflows/{strategy.id}" if strategy else None
+            ),
         }
 
     def _serialize(
@@ -451,16 +569,26 @@ class PayflowReviewService:
         account = row.account
         client = row.client
         rule = row.rule
+        strategy = row.strategy
+        if strategy is None and row.strategy_id:
+            strategy = self.db.get(PayflowStrategyModel, row.strategy_id)
         waiting = self._waiting_minutes(row)
+        exception_step = self._resolve_exception_step(strategy, row.exception_step_id)
         data: dict[str, Any] = {
             "id": row.id,
             "code": row.code,
             "client_id": row.client_id,
             "client_code": client.code if client else None,
-            "client_name": client.name if client else None,
+            "client_name": client.name
+            if client
+            else ("Client unavailable" if row.client_id else None),
             "account_id": row.account_id,
-            "customer_name": account.customer_name if account else None,
-            "account_reference": account.account_reference if account else None,
+            "customer_name": account.customer_name
+            if account
+            else ("Customer unavailable" if row.account_id else None),
+            "account_reference": account.account_reference
+            if account
+            else ("Account unavailable" if row.account_id else None),
             "case_reference": account.case_reference if account else None,
             "original_balance": float(account.original_balance) if account else 0,
             "outstanding_balance": float(account.outstanding_balance) if account else 0,
@@ -475,7 +603,9 @@ class PayflowReviewService:
             "reason": row.reason,
             "rule_id": row.rule_id,
             "rule_code": rule.code if rule else None,
-            "rule_name": rule.name if rule else None,
+            "rule_name": rule.name
+            if rule
+            else ("Rule unavailable" if row.rule_id else None),
             "condition_text": row.condition_text,
             "observed_value": row.observed_value,
             "proposed_action": row.proposed_action,
@@ -497,8 +627,11 @@ class PayflowReviewService:
             "history": list(row.history or []),
             "decision_version": row.decision_version or 1,
             "strategy_id": row.strategy_id,
-            "workflow_version": row.workflow_version,
+            "workflow_version": row.workflow_version
+            if row.workflow_version is not None
+            else (strategy.version if strategy else None),
             "exception_step_id": row.exception_step_id,
+            "exception_step": exception_step,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "audit_trail": [],
@@ -506,6 +639,7 @@ class PayflowReviewService:
             "payment_context": None,
             "workflow_context": None,
             "available_actions": [],
+            "missing_refs": [],
         }
         if user is not None:
             data["can_decide"] = self.can_decide(user, row.client_id)
@@ -515,7 +649,20 @@ class PayflowReviewService:
         if include_detail:
             data["payment_context"] = self._payment_context(account)
             data["workflow_context"] = self._workflow_context(row)
-            data["communications"] = self._load_communications(row.account_id)
+            # Prefer enriched exception_step from workflow_context
+            if data["workflow_context"].get("exception_step"):
+                data["exception_step"] = data["workflow_context"]["exception_step"]
+            data["communications"] = (
+                self._load_communications(row.account_id) if account else []
+            )
+            data["missing_refs"] = self._missing_refs(
+                row,
+                client=client,
+                account=account,
+                rule=rule,
+                strategy=strategy,
+                exception_step=data.get("exception_step"),
+            )
             audits = (
                 self.db.query(PayflowHumanReviewAuditModel)
                 .filter(PayflowHumanReviewAuditModel.review_id == row.id)

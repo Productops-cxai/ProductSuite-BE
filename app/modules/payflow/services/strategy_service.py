@@ -1194,10 +1194,14 @@ class PayflowStrategyService:
     def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
-        if row.status != PayflowStrategyStatus.UNDER_REVIEW.value:
+        # Reviewer can approve from AI Proposed or Under Review; Active still requires a separate activate.
+        if row.status not in {
+            PayflowStrategyStatus.AI_PROPOSED.value,
+            PayflowStrategyStatus.UNDER_REVIEW.value,
+        }:
             raise ValidationAppError(
-                "Only workflows Under Review can be approved "
-                "(AI Proposed workflows cannot bypass human review into Active)"
+                "Only AI Proposed or Under Review workflows can be approved "
+                "(approval does not activate — use Activate when ready)"
             )
 
         # Keep Human Modified if already modified; do not revert to AI Proposed

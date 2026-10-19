@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ForbiddenError, NotFoundError
-from app.infrastructure.database.models import PayflowCommunicationModel, UserModel
+from app.infrastructure.database.models import (
+    PayflowAccountModel,
+    PayflowCommunicationModel,
+    PayflowStrategyModel,
+    UserModel,
+)
+from app.infrastructure.email.sendgrid_service import send_collection_email
+from app.infrastructure.sms.twilio_service import send_collection_sms
 from app.modules.payflow.services.access_context_service import AccessContextService
 from app.shared.enums import PayflowCommChannel, PayflowCommPurpose, PayflowCommStatus
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 DROP_OFF_SEGMENTS = [
     "Delivered but Not Opened / Read",
@@ -197,6 +210,158 @@ class PayflowCommunicationService:
             raise NotFoundError("Communication not found")
         self._assert_view(user, row.client_id)
         return self._serialize(row)
+
+    def send_workflow_step(
+        self,
+        *,
+        account: PayflowAccountModel,
+        strategy: PayflowStrategyModel,
+        channel: str,
+        purpose: str,
+        subject: str,
+        body: str,
+        payment_link: str | None = None,
+        run_id: int | None = None,
+        client_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Send a workflow communication via providers and persist the comm record.
+
+        Workflow engine must call this instead of provider APIs directly.
+        """
+        channel_norm = (channel or "Email").strip()
+        purpose_norm = purpose or "Payment Reminder"
+        send_status = "logged"
+        recipient = ""
+        skip_reason: str | None = None
+        provider_error: str | None = None
+
+        if channel_norm == "SMS":
+            phone = (account.phone_mobile or account.phone_work or "").strip()
+            if not phone:
+                skip_reason = "no_phone"
+            else:
+                recipient = phone
+                sms = send_collection_sms(
+                    self.db,
+                    to_phone=phone,
+                    body=body,
+                    sms_type="collection_workflow",
+                    account_id=account.id,
+                    run_id=run_id,
+                    client_id=client_id or account.client_id,
+                    commit=False,
+                )
+                send_status = sms.status
+                account.last_sms_sent_date = _utcnow().date()
+                if sms.status == "failed":
+                    provider_error = sms.error or "failed"
+        else:
+            email = (account.email or "").strip()
+            if not email:
+                skip_reason = "no_email"
+            else:
+                recipient = email
+                log = send_collection_email(
+                    self.db,
+                    to_email=email,
+                    subject=subject,
+                    body=body,
+                    email_type="collection_workflow",
+                    action_link=payment_link,
+                    commit=False,
+                )
+                send_status = log.status
+                account.last_email_sent_date = _utcnow().date()
+                if log.status == "failed":
+                    provider_error = "sendgrid_failed"
+
+        if skip_reason:
+            return {
+                "skipped": skip_reason,
+                "channel": channel_norm,
+                "status": "skipped",
+                "communication_id": None,
+            }
+
+        account.last_contact_date = _utcnow().date()
+        code = f"COM-{uuid4().hex[:10].upper()}"
+        comm_status = (
+            PayflowCommStatus.SENT.value
+            if send_status in {"sent", "logged"}
+            else PayflowCommStatus.FAILED.value
+        )
+        comm = PayflowCommunicationModel(
+            code=code,
+            client_id=client_id or account.client_id,
+            account_id=account.id,
+            channel=channel_norm,
+            purpose=purpose_norm,
+            status=comm_status,
+            workflow_name=strategy.name,
+            subject=subject if channel_norm != "SMS" else None,
+            body_lines=body.splitlines()[:40],
+            payment_link=bool(payment_link),
+            why_message="Workflow communication step",
+            why_channel=channel_norm,
+            why_timing="Scheduled by workflow worker",
+            events=[{"at": _utcnow().isoformat(), "label": f"{channel_norm} {send_status}"}],
+            balance=float(account.outstanding_balance or 0),
+        )
+        self.db.add(comm)
+        self.db.flush()
+        return {
+            "skipped": None,
+            "channel": channel_norm,
+            "status": send_status,
+            "comm_status": comm_status,
+            "recipient": recipient,
+            "communication_id": comm.id,
+            "provider_error": provider_error,
+            "code": code,
+        }
+
+    def update_status(
+        self,
+        communication_id: int,
+        status: str,
+        *,
+        event_label: str | None = None,
+        commit: bool = True,
+    ) -> PayflowCommunicationModel:
+        row = self.db.get(PayflowCommunicationModel, communication_id)
+        if not row:
+            raise NotFoundError("Communication not found")
+        previous = row.status
+        row.status = status
+        events = list(row.events or [])
+        events.append(
+            {
+                "at": _utcnow().isoformat(),
+                "label": event_label or f"Status → {status}",
+                "detail": f"{previous} → {status}",
+            }
+        )
+        row.events = events[-40:]
+        if commit:
+            self.db.commit()
+            self.db.refresh(row)
+        else:
+            self.db.flush()
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_communication_event(
+                communication_id, status, commit=commit
+            )
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.comms").exception(
+                "workflow advance failed for communication_id=%s", communication_id
+            )
+        return row
 
     def _empty(self) -> dict[str, Any]:
         return {

@@ -278,7 +278,7 @@ class PayflowNotificationService:
         return total
 
     # ------------------------------------------------------------------ inbox API
-    def list_for_user(self, user: UserModel, *, limit: int = 30) -> dict[str, Any]:
+    def list_for_user(self, user: UserModel, *, limit: int = 100) -> dict[str, Any]:
         self.access.require_membership(user)
         # Keep demo / existing awaiting items visible without reseed.
         self.sync_awaiting_review_notifications()
@@ -289,8 +289,12 @@ class PayflowNotificationService:
             PayflowNotificationModel.user_id == user.id
         )
         unread = q.filter(PayflowNotificationModel.read_at.is_(None)).count()
+        # Prefer unread first so the inbox badge matches what the dropdown shows.
         rows = (
-            q.order_by(PayflowNotificationModel.created_at.desc())
+            q.order_by(
+                PayflowNotificationModel.read_at.isnot(None).asc(),
+                PayflowNotificationModel.created_at.desc(),
+            )
             .limit(limit)
             .all()
         )

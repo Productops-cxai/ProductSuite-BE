@@ -36,7 +36,11 @@ from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 MAX_FIX_ATTEMPTS = 2
 
 # Approved / Active / Inactive workflows are never regenerated.
-REGENERATE_STATUSES = {PayflowStrategyStatus.AI_PROPOSED.value, PayflowStrategyStatus.UNDER_REVIEW.value}
+REGENERATE_STATUSES = {
+    PayflowStrategyStatus.AI_PROPOSED.value,
+    PayflowStrategyStatus.UNDER_REVIEW.value,
+    PayflowStrategyStatus.APPROVED.value,
+}
 # ai_context lines rewritten on every revision (the rest is kept from the original).
 _REWRITTEN_CONTEXT = {
     "AI rationale",  # older workflows (before the structured reasoning)
@@ -138,7 +142,9 @@ class WorkflowSuggestionService:
         if original["source"] != PayflowStrategySource.AI_GENERATED.value:
             raise ValidationAppError("Only AI-generated workflows can be regenerated")
         if original["status"] not in REGENERATE_STATUSES:
-            raise ValidationAppError("Only AI Proposed or Under Review workflows can be regenerated")
+            raise ValidationAppError(
+                "Only AI Proposed, Under Review or Approved workflows can be regenerated"
+            )
         # Old workflows (before the rework) may have no portfolio; saving would fail after the AI call.
         if original["portfolio_id"] is None:
             raise ValidationAppError("This workflow has no portfolio, so it cannot be regenerated")

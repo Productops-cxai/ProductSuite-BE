@@ -168,6 +168,9 @@ _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 def _guess_client_import_field(message: str) -> str:
     text = (message or "").lower()
     checks = (
+        ("parent is locked", "master_client__client_number"),
+        ("already used as a master", "client_number"),
+        ("already used as a sub", "client_number"),
         ("client_number", "client_number"),
         ("client_code", "client_code"),
         ("company_name", "company_name"),
@@ -216,7 +219,6 @@ def _cell_to_str(val: Any) -> str:
 
 
 _PRIMARY_CONTACT_FIELDS = (
-    "crm_client_number",
     "contact_name",
     "contact_title",
     "contact_email",
@@ -376,7 +378,12 @@ class PayflowClientService:
         commit: bool = True,
         soft_client_type: bool = False,
     ) -> tuple[PayflowClientModel, str]:
-        """Create or update a client. Match by crm_client_number, then code."""
+        """Create or update a client.
+
+        Identity is ``crm_client_number`` (client_number). A new number creates a
+        new client; an existing number updates other fields. client_number itself
+        is locked once set — matching by code must never rewrite it.
+        """
         name = (payload.get("name") or "").strip()
         code = _normalize_code(payload.get("code") or "")
         crm_number = (payload.get("crm_client_number") or "").strip() or None
@@ -385,7 +392,7 @@ class PayflowClientService:
         if not code:
             raise ValidationAppError("Client code / reference is required")
 
-        client = self._find_client(crm_number=crm_number, code=code)
+        client = self._resolve_client_for_upsert(crm_number=crm_number, code=code)
         type_parser = _parse_client_type_soft if soft_client_type else _parse_client_type
         ds = self._normalize_data_source(payload.get("data_source_type"), allow_none=True)
 
@@ -393,6 +400,7 @@ class PayflowClientService:
             self._assert_unique_code(code)
             if crm_number:
                 self._assert_unique_crm_number(crm_number)
+                self._assert_master_number_not_used_as_sub(crm_number)
             added_raw = (payload.get("added_through") or "").strip().lower()
             if added_raw in {
                 PayflowClientAddedThrough.ADD_CLIENT.value,
@@ -404,6 +412,7 @@ class PayflowClientService:
             client = PayflowClientModel(
                 name=name,
                 code=code,
+                crm_client_number=crm_number,
                 category=(payload.get("industry") or payload.get("category") or "").strip()
                 or None,
                 status=PayflowClientStatus.DRAFT.value,
@@ -439,11 +448,19 @@ class PayflowClientService:
                 self._seed_default_mappings(client)
             action = "created"
         else:
+            self._assert_crm_number_immutable(
+                existing=client.crm_client_number,
+                incoming=crm_number,
+                code=code,
+                entity="client",
+            )
+            if not (client.crm_client_number or "").strip() and crm_number:
+                self._assert_unique_crm_number(crm_number, exclude_id=client.id)
+                self._assert_master_number_not_used_as_sub(crm_number)
+                client.crm_client_number = crm_number
             if code.lower() != (client.code or "").lower():
                 self._assert_unique_code(code, exclude_id=client.id)
                 client.code = code
-            if crm_number and crm_number != (client.crm_client_number or ""):
-                self._assert_unique_crm_number(crm_number, exclude_id=client.id)
             client.name = name
             if "industry" in payload or "category" in payload:
                 industry = payload.get("industry", payload.get("category"))
@@ -484,6 +501,23 @@ class PayflowClientService:
             # Allow config updates after activation for non-identity fields;
             # identity uniqueness still enforced.
             pass
+
+        if "crm_client_number" in payload:
+            incoming = (
+                str(payload["crm_client_number"]).strip()
+                if payload.get("crm_client_number")
+                else None
+            ) or None
+            self._assert_crm_number_immutable(
+                existing=client.crm_client_number,
+                incoming=incoming,
+                code=client.code,
+                entity="client",
+            )
+            if not (client.crm_client_number or "").strip() and incoming:
+                self._assert_unique_crm_number(incoming, exclude_id=client.id)
+                self._assert_master_number_not_used_as_sub(incoming)
+                client.crm_client_number = incoming
 
         if "name" in payload and payload["name"] is not None:
             name = str(payload["name"]).strip()
@@ -732,7 +766,9 @@ class PayflowClientService:
         if not code:
             raise ValidationAppError("Portfolio code / reference is required")
 
-        row = self._find_portfolio(client.id, crm_number=crm_number, code=code)
+        row = self._resolve_portfolio_for_upsert(
+            client.id, crm_number=crm_number, code=code
+        )
         status = (payload.get("status") or PayflowPortfolioStatus.ONBOARDING.value).strip().lower()
         if status not in {s.value for s in PayflowPortfolioStatus}:
             raise ValidationAppError("Invalid portfolio status")
@@ -759,6 +795,20 @@ class PayflowClientService:
             self.db.add(row)
             action = "created"
         else:
+            self._assert_crm_number_immutable(
+                existing=row.crm_client_number,
+                incoming=crm_number,
+                code=code,
+                entity="sub-client",
+            )
+            if not (row.crm_client_number or "").strip() and crm_number:
+                self._assert_sub_import_identity(
+                    number=crm_number,
+                    master_number=(client.crm_client_number or "").strip()
+                    or f"client_id:{client.id}",
+                    parent=client,
+                )
+                row.crm_client_number = crm_number
             if code.lower() != (row.code or "").lower():
                 clash = (
                     self.db.query(PayflowPortfolioModel)
@@ -779,8 +829,6 @@ class PayflowClientService:
                 row.description = (
                     str(payload["description"]).strip() if payload.get("description") else None
                 )
-            if crm_number is not None:
-                row.crm_client_number = crm_number
             action = "updated"
 
         client.updated_at = _utcnow()
@@ -847,9 +895,25 @@ class PayflowClientService:
                 str(payload["description"]).strip() if payload["description"] else None
             )
         if "crm_client_number" in payload:
-            row.crm_client_number = (
-                str(payload["crm_client_number"]).strip() if payload.get("crm_client_number") else None
+            incoming = (
+                str(payload["crm_client_number"]).strip()
+                if payload.get("crm_client_number")
+                else None
+            ) or None
+            self._assert_crm_number_immutable(
+                existing=row.crm_client_number,
+                incoming=incoming,
+                code=row.code,
+                entity="sub-client",
             )
+            if not (row.crm_client_number or "").strip() and incoming:
+                self._assert_sub_import_identity(
+                    number=incoming,
+                    master_number=(client.crm_client_number or "").strip()
+                    or f"client_id:{client.id}",
+                    parent=client,
+                )
+                row.crm_client_number = incoming
 
         client.updated_at = _utcnow()
         self.db.commit()
@@ -1467,12 +1531,10 @@ class PayflowClientService:
                     raise ConflictError(f"Duplicate client_number in file: {number}")
                 if code.lower() in seen_codes:
                     raise ConflictError(f"Duplicate client_code in file: {code}")
-                seen_numbers.add(number.lower())
-                seen_codes.add(code.lower())
-                masters_in_file[number.lower()] = row
+                self._assert_master_number_not_used_as_sub(number)
 
                 payload = self._crm_row_to_client_payload(row, data_source="crm")
-                existing = self._find_client(crm_number=number, code=code)
+                existing = self._resolve_client_for_upsert(crm_number=number, code=code)
                 entity_id = existing.id if existing else None
                 if existing and self._client_crm_unchanged(existing, payload):
                     action = "No Change"
@@ -1508,6 +1570,10 @@ class PayflowClientService:
                         entity_id = client.id
                     created += 1
                     new_clients += 1
+                # Only accept identity after validation/create path succeeds
+                seen_numbers.add(number.lower())
+                seen_codes.add(code.lower())
+                masters_in_file[number.lower()] = row
                 preview_masters.append(
                     {
                         "id": f"master-{row_num}",
@@ -1586,9 +1652,6 @@ class PayflowClientService:
                     raise ConflictError(f"Duplicate client_number in file: {number}")
                 if code.lower() in seen_codes:
                     raise ConflictError(f"Duplicate client_code in file: {code}")
-                if number:
-                    seen_numbers.add(number.lower())
-                seen_codes.add(code.lower())
 
                 parent = self._find_client(crm_number=master_number, code=None)
                 if parent is None:
@@ -1598,6 +1661,12 @@ class PayflowClientService:
                     raise ValidationAppError(
                         f"Unknown master client_number: {master_number}"
                     )
+
+                self._assert_sub_import_identity(
+                    number=number or None,
+                    master_number=master_number,
+                    parent=parent,
+                )
 
                 parent_name = (
                     parent.name
@@ -1615,7 +1684,9 @@ class PayflowClientService:
                 )
 
                 existing = (
-                    self._find_portfolio(parent.id, crm_number=number or None, code=code)
+                    self._resolve_portfolio_for_upsert(
+                        parent.id, crm_number=number or None, code=code
+                    )
                     if parent
                     else None
                 )
@@ -1679,6 +1750,9 @@ class PayflowClientService:
                         parent_code = parent.code
                     created += 1
                     new_sub_clients += 1
+                if number:
+                    seen_numbers.add(number.lower())
+                seen_codes.add(code.lower())
                 preview_subs.append(
                     {
                         "id": f"sub-{row_num}",
@@ -2263,6 +2337,149 @@ class PayflowClientService:
         if q.first():
             raise ConflictError("CRM client number already linked to another client")
 
+    @staticmethod
+    def _assert_crm_number_immutable(
+        *,
+        existing: str | None,
+        incoming: str | None,
+        code: str | None = None,
+        entity: str = "client",
+    ) -> None:
+        """Reject attempts to rewrite a locked client_number / sub-client number."""
+        current = (existing or "").strip()
+        new = (incoming or "").strip()
+        if not current:
+            return
+        if not new:
+            raise ValidationAppError(
+                f"client_number is locked and cannot be removed "
+                f"(existing: {current}"
+                + (f", client_code: {code}" if code else "")
+                + ")"
+            )
+        if new.lower() != current.lower():
+            label = "client_number" if entity == "client" else "sub-client client_number"
+            raise ValidationAppError(
+                f"{label} is locked and cannot be changed "
+                f"(existing: {current}, uploaded: {new}"
+                + (f", client_code: {code}" if code else "")
+                + "). Upload the original client_number, or use a new "
+                "client_number with a new client_code to create a new record."
+            )
+
+    def _find_portfolio_by_crm_number_global(
+        self, crm_number: str
+    ) -> PayflowPortfolioModel | None:
+        number = (crm_number or "").strip()
+        if not number:
+            return None
+        return (
+            self.db.query(PayflowPortfolioModel)
+            .filter(PayflowPortfolioModel.crm_client_number == number)
+            .first()
+        )
+
+    def _assert_master_number_not_used_as_sub(self, crm_number: str) -> None:
+        """Reject master rows whose client_number already belongs to a sub-client."""
+        number = (crm_number or "").strip()
+        if not number:
+            return
+        port = self._find_portfolio_by_crm_number_global(number)
+        if port is None:
+            return
+        raise ValidationAppError(
+            f"client_number already used as a sub-client "
+            f"(client_number: {number}, client_code: {port.code}). "
+            f"A master client cannot reuse a sub-client client_number."
+        )
+
+    def _assert_sub_import_identity(
+        self,
+        *,
+        number: str | None,
+        master_number: str,
+        parent: PayflowClientModel | None,
+    ) -> None:
+        """Lock sub parent relationship and block master/sub role flips."""
+        num = (number or "").strip() or None
+        if not num:
+            return
+
+        as_master = self._find_client(crm_number=num, code=None)
+        if as_master is not None:
+            raise ValidationAppError(
+                f"client_number already used as a master client "
+                f"(client_number: {num}, client_code: {as_master.code}). "
+                f"A sub-client cannot reuse a master client_number."
+            )
+
+        global_port = self._find_portfolio_by_crm_number_global(num)
+        if global_port is None:
+            return
+
+        existing_parent = (
+            self.db.query(PayflowClientModel)
+            .filter(PayflowClientModel.id == global_port.client_id)
+            .first()
+        )
+        existing_master = (
+            (existing_parent.crm_client_number or "").strip()
+            if existing_parent
+            else ""
+        ) or f"client_id:{global_port.client_id}"
+
+        if parent is not None:
+            if global_port.client_id != parent.id:
+                raise ValidationAppError(
+                    f"Sub-client parent is locked "
+                    f"(existing master: {existing_master}, "
+                    f"uploaded master: {master_number}, client_number: {num})"
+                )
+            return
+
+        # Parent only present in this file (not flushed yet) — still block reparent
+        # when the sub already exists under a different master in DB.
+        if existing_master.lower() != (master_number or "").strip().lower():
+            raise ValidationAppError(
+                f"Sub-client parent is locked "
+                f"(existing master: {existing_master}, "
+                f"uploaded master: {master_number}, client_number: {num})"
+            )
+
+    def _resolve_client_for_upsert(
+        self, *, crm_number: str | None, code: str | None
+    ) -> PayflowClientModel | None:
+        """Match by client_number first. Code fallback never rewrites identity."""
+        number = (crm_number or "").strip() or None
+        code_norm = _normalize_code(code or "") if code else ""
+        if number:
+            by_number = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.crm_client_number == number)
+                .first()
+            )
+            if by_number:
+                return by_number
+        if code_norm:
+            by_code = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.code == code_norm)
+                .first()
+            )
+            if by_code is None:
+                return None
+            existing_number = (by_code.crm_client_number or "").strip()
+            if number and existing_number and existing_number.lower() != number.lower():
+                raise ValidationAppError(
+                    f"client_number is locked and cannot be changed "
+                    f"(existing: {existing_number}, uploaded: {number}, "
+                    f"client_code: {code_norm}). Upload the original "
+                    "client_number, or use a new client_number with a new "
+                    "client_code to create a new record."
+                )
+            return by_code
+        return None
+
     def _find_client(
         self, *, crm_number: str | None, code: str | None
     ) -> PayflowClientModel | None:
@@ -2280,6 +2497,76 @@ class PayflowClientService:
                 .filter(PayflowClientModel.code == code)
                 .first()
             )
+        return None
+
+    def _resolve_portfolio_for_upsert(
+        self,
+        client_id: int,
+        *,
+        crm_number: str | None,
+        code: str | None,
+    ) -> PayflowPortfolioModel | None:
+        """Match sub-client by client_number first; never rewrite via code."""
+        number = (crm_number or "").strip() or None
+        code_norm = _normalize_code(code or "") if code else ""
+        if number:
+            as_master = self._find_client(crm_number=number, code=None)
+            if as_master is not None:
+                raise ValidationAppError(
+                    f"client_number already used as a master client "
+                    f"(client_number: {number}, client_code: {as_master.code}). "
+                    f"A sub-client cannot reuse a master client_number."
+                )
+            global_row = self._find_portfolio_by_crm_number_global(number)
+            if global_row is not None and global_row.client_id != client_id:
+                existing_parent = (
+                    self.db.query(PayflowClientModel)
+                    .filter(PayflowClientModel.id == global_row.client_id)
+                    .first()
+                )
+                existing_master = (
+                    (existing_parent.crm_client_number or "").strip()
+                    if existing_parent
+                    else ""
+                ) or f"client_id:{global_row.client_id}"
+                uploaded_parent = (
+                    self.db.query(PayflowClientModel)
+                    .filter(PayflowClientModel.id == client_id)
+                    .first()
+                )
+                uploaded_master = (
+                    (uploaded_parent.crm_client_number or "").strip()
+                    if uploaded_parent
+                    else ""
+                ) or f"client_id:{client_id}"
+                raise ValidationAppError(
+                    f"Sub-client parent is locked "
+                    f"(existing master: {existing_master}, "
+                    f"uploaded master: {uploaded_master}, client_number: {number})"
+                )
+            if global_row is not None:
+                return global_row
+        if code_norm:
+            by_code = (
+                self.db.query(PayflowPortfolioModel)
+                .filter(
+                    PayflowPortfolioModel.client_id == client_id,
+                    PayflowPortfolioModel.code == code_norm,
+                )
+                .first()
+            )
+            if by_code is None:
+                return None
+            existing_number = (by_code.crm_client_number or "").strip()
+            if number and existing_number and existing_number.lower() != number.lower():
+                raise ValidationAppError(
+                    f"sub-client client_number is locked and cannot be changed "
+                    f"(existing: {existing_number}, uploaded: {number}, "
+                    f"client_code: {code_norm}). Upload the original "
+                    "client_number, or use a new client_number with a new "
+                    "client_code to create a new record."
+                )
+            return by_code
         return None
 
     def _find_portfolio(

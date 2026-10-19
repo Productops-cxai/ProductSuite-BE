@@ -1548,6 +1548,10 @@ class PayflowImportService:
             existing.last_crm_refresh_at = now
             return "unchanged"
 
+        previous_status = existing.collection_status
+        previous_payment_date = existing.last_payment_date
+        previous_hold = bool(existing.provincial_hold)
+
         original = float(existing.original_balance or 0)
         existing.portfolio_id = portfolio.id
         existing.customer_name = parsed["customer_name"]
@@ -1568,6 +1572,24 @@ class PayflowImportService:
         self._apply_crm_fields(existing, parsed, original_locked=True)
         existing.last_crm_refresh_at = now
         self._ensure_human_review_request(existing)
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_account_import_changed(
+                existing,
+                previous_status=previous_status,
+                previous_payment_date=previous_payment_date,
+                previous_hold=previous_hold,
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.import").exception(
+                "workflow event hook failed for account_id=%s", existing.id
+            )
         return "updated"
 
     def _ensure_human_review_request(self, account: PayflowAccountModel) -> None:

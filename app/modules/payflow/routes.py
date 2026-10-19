@@ -73,6 +73,7 @@ from app.modules.payflow.schemas import (
     SuggestWorkflowsRequest,
     SuggestWorkflowsResponse,
     RegenerateWorkflowRequest,
+    PayflowWorkflowPaymentEventRequest,
     PayflowWorkflowRunItem,
     PayflowWorkflowRunsResponse,
     PayflowWorkflowWorkerLogsResponse,
@@ -538,6 +539,43 @@ def get_account(account_id: int, user: RequirePayflowProduct, db: DbSession):
         return PayflowAccountService(db).get_account(user, account_id)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+@router.get("/accounts/{account_id}/workflow-execution")
+def get_account_workflow_execution(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    """Active (or latest) workflow run for a Collection Case, enriched for the Case UI."""
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    # Enforce account access via existing account service.
+    try:
+        PayflowAccountService(db).get_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    item = WorkflowExecutionService(db).get_account_workflow_execution(account_id)
+    return {"execution": item}
+
+
+@router.post("/accounts/{account_id}/workflow-events/payment")
+def post_account_payment_workflow_event(
+    account_id: int,
+    body: PayflowWorkflowPaymentEventRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    try:
+        PayflowAccountService(db).get_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    result = WorkflowExecutionService(db).on_payment_event(
+        account_id,
+        body.model_dump(exclude_none=True),
+        commit=True,
+    )
+    return {"ok": True, **result}
 
 
 # ---------------------------------------------------------------------------
