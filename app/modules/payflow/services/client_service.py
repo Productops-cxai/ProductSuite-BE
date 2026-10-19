@@ -37,6 +37,7 @@ from app.infrastructure.database.models import (
 )
 from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
+    ACCOUNT_IMPORT_CURRENCIES,
     BULK_UPLOAD_HEADERS,
     CLIENT_IMPORT_MASTER_PROFILE_HEADERS,
     CLIENT_IMPORT_MASTER_REQUIRED,
@@ -148,10 +149,84 @@ def _parse_client_type_soft(value: str | None) -> str:
         return PayflowClientType.THIRD_PARTY.value
 
 
+_TRUE_BOOLS = frozenset({"true", "1", "yes", "y"})
+_FALSE_BOOLS = frozenset({"false", "0", "no", "n"})
+_CLIENT_IMPORT_DATE_FIELDS = (
+    "start_date",
+    "last_placement",
+    "created_at",
+    "updated_at",
+)
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    return str(value or "").strip().lower() in ("true", "1", "yes", "y")
+    return str(value or "").strip().lower() in _TRUE_BOOLS
+
+
+def _parse_import_bool(value: Any, *, field: str) -> bool:
+    """Strict True/False for import flags (rejects garbage values)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value if value is not None else "").strip().lower()
+    if text in _TRUE_BOOLS:
+        return True
+    if text in _FALSE_BOOLS:
+        return False
+    if not text:
+        raise ValidationAppError(f"{field} is required. Use True or False.")
+    raise ValidationAppError(
+        f'{field} must be True or False. "{_cell_to_str(value)}" is not valid.'
+    )
+
+
+def _normalize_import_currency(raw: str) -> str:
+    """Map CRM currency labels to CAD/USD; reject unsupported values."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValidationAppError("Currency is required")
+    upper = text.upper()
+    if upper in ACCOUNT_IMPORT_CURRENCIES:
+        return upper
+    if upper in {"CDN", "C$", "CA$"} or "CANADIAN" in upper or upper == "CAD":
+        return "CAD"
+    if upper in {"US", "US$", "$"} or "US DOLLAR" in upper or "USD" in upper:
+        return "USD"
+    raise ValidationAppError(
+        f'Currency "{text}" is not supported. Use CAD or USD.'
+    )
+
+
+def _validate_optional_import_date(raw: str, field: str) -> None:
+    """Reject non-empty date cells that are not parseable."""
+    text = (raw or "").strip()
+    if not text:
+        return
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        # Excel serial date as plain number string — accept as numeric date token
+        try:
+            serial = float(text)
+            if serial < 1 or serial > 60000:
+                raise ValidationAppError(
+                    f"{field} must be a valid date (YYYY-MM-DD)."
+                )
+            return
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            datetime.strptime(text[:10], fmt)
+            return
+        except ValueError:
+            continue
+    # ISO datetime prefix
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00")[:19])
+        return
+    except ValueError:
+        pass
+    raise ValidationAppError(f"{field} must be a valid date (YYYY-MM-DD).")
 
 
 def _row_first(row: dict[str, str], *keys: str) -> str:
@@ -163,14 +238,58 @@ def _row_first(row: dict[str, str], *keys: str) -> str:
 
 
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+# Canadian postal: A1A 1A1 (aligned with FE CLIENT_POSTAL_CODE_PATTERN)
+_POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
+
+
+def _normalize_postal_code(raw: str | None) -> str:
+    text = (raw or "").strip().upper()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) == 6:
+        return f"{compact[:3]} {compact[3:]}"
+    return text
+
+
+def _is_valid_postal_code(raw: str | None) -> bool:
+    cleaned = _normalize_postal_code(raw)
+    if not cleaned:
+        return True
+    return bool(_POSTAL_CODE_RE.match(cleaned))
 
 
 def _guess_client_import_field(message: str) -> str:
     text = (message or "").lower()
     checks = (
-        ("parent is locked", "master_client__client_number"),
+        ("does not belong to master", "client_number"),
+        ("was not found", "master_client__client_number"),
+        ("cannot have master_client__client_number", "master_client__client_number"),
+        ("master clients cannot", "master_client__client_number"),
+        ("is_master_client", "is_master_client"),
+        ("true or false", "is_master_client"),
+        ("master client", "master_client__client_number"),
+        ("already belongs to another master", "master_client__client_number"),
+        ("already belongs to master", "master_client__client_number"),
         ("already used as a master", "client_number"),
         ("already used as a sub", "client_number"),
+        ("already used by a master", "client_number"),
+        ("already used by a sub", "client_number"),
+        ("cannot be changed", "client_number"),
+        ("cannot be removed", "client_number"),
+        ("start_date", "start_date"),
+        ("last_placement", "last_placement"),
+        ("created_at", "created_at"),
+        ("updated_at", "updated_at"),
+        ("must be a valid date", "start_date"),
+        ("currency", "currency__name"),
+        ("restricted_access_client", "restricted_access_client"),
+        ("sliding_scale", "sliding_scale"),
+        ("setup incomplete", "setup"),
+        ("branding & channels", "setup"),
+        ("supervisor assignment", "setup"),
+        ("postal code", "zip_code"),
+        ("a1a 1a1", "zip_code"),
         ("client_number", "client_number"),
         ("client_code", "client_code"),
         ("company_name", "company_name"),
@@ -183,7 +302,6 @@ def _guess_client_import_field(message: str) -> str:
         ("phone", "phone_number"),
         ("country", "country__name"),
         ("language", "correspondence_language__name"),
-        ("currency", "currency__name"),
         ("client type", "client_type__name"),
         ("client_type", "client_type__name"),
         ("duplicate", "client_code"),
@@ -200,6 +318,13 @@ def _cell_to_str(val: Any) -> str:
         return ""
     if isinstance(val, bool):
         return "True" if val else "False"
+    if isinstance(val, datetime):
+        return val.date().isoformat()
+    if hasattr(val, "isoformat") and not isinstance(val, (str, bytes)):
+        try:
+            return val.isoformat()  # date objects
+        except Exception:
+            pass
     if isinstance(val, int):
         return str(val)
     if isinstance(val, float):
@@ -1489,9 +1614,25 @@ class PayflowClientService:
         if not language:
             raise ValidationAppError("Language is required")
 
-        currency = _row_first(row, "currency__name")
-        if not currency:
-            raise ValidationAppError("Currency is required")
+        _normalize_import_currency(_row_first(row, "currency__name"))
+
+        postal = _row_first(row, "zip_code", "postal_code")
+        if postal and not _is_valid_postal_code(postal):
+            raise ValidationAppError(
+                "Postal code must match format A1A 1A1 "
+                "(letter-number-letter space number-letter-number)"
+            )
+
+        for date_field in _CLIENT_IMPORT_DATE_FIELDS:
+            if date_field in row:
+                _validate_optional_import_date(row.get(date_field) or "", date_field)
+
+        # Optional boolean columns — reject garbage when present
+        for bool_field in ("restricted_access_client", "sliding_scale"):
+            raw = row.get(bool_field)
+            if raw is None or str(raw).strip() == "":
+                continue
+            _parse_import_bool(raw, field=bool_field)
 
     def _process_crm_hierarchy(
         self,
@@ -1508,18 +1649,61 @@ class PayflowClientService:
         created = updated = unchanged = failed = 0
         new_clients = existing_clients = new_sub_clients = existing_sub_clients = 0
         masters_in_file: dict[str, dict[str, str]] = {}
-        seen_codes: set[str] = set()
+        seen_master_codes: set[str] = set()
+        seen_sub_codes: set[tuple[str, str]] = set()
         seen_numbers: set[str] = set()
+        flag_error_rows: set[int] = set()
 
         # Pass 1 — masters
         for row_num, row in enumerate(data_rows, start=2):
-            if not _truthy(row.get("is_master_client")):
-                continue
             record_id = row.get("client_number") or f"Row {row_num}"
             code = _normalize_code(row.get("client_code") or "")
             number = (row.get("client_number") or "").strip()
             name = (row.get("company_name") or row.get("short_name") or "").strip()
             try:
+                is_master = _parse_import_bool(
+                    row.get("is_master_client"), field="is_master_client"
+                )
+            except ValidationAppError as exc:
+                failed += 1
+                flag_error_rows.add(row_num)
+                field = _guess_client_import_field(exc.message)
+                errors.append(
+                    {
+                        "record_id": record_id or f"Row {row_num}",
+                        "client": name or code or "—",
+                        "sub_client": "—",
+                        "field": field,
+                        "error": exc.message,
+                        "status": "Rejected",
+                    }
+                )
+                preview_masters.append(
+                    {
+                        "id": f"master-err-{row_num}",
+                        "record_id": record_id or f"Row {row_num}",
+                        "client": code or "—",
+                        "client_name": name or code or f"Row {row_num}",
+                        "client_code": code or "—",
+                        "sub_client": "—",
+                        "sub_client_name": "—",
+                        "action": "Error",
+                        "note": exc.message,
+                        "is_sub": False,
+                        "entity_id": None,
+                    }
+                )
+                continue
+            if not is_master:
+                continue
+            try:
+                parent_ref = (row.get("master_client__client_number") or "").strip()
+                if parent_ref:
+                    raise ValidationAppError(
+                        "Master clients cannot have master_client__client_number set. "
+                        "Clear that column for master rows, or set is_master_client to "
+                        "False for sub-clients."
+                    )
                 if not number:
                     raise ValidationAppError("client_number is required for master clients")
                 if not code:
@@ -1528,9 +1712,15 @@ class PayflowClientService:
                     raise ValidationAppError("company_name or short_name is required")
                 self._validate_master_profile_row(row)
                 if number.lower() in seen_numbers:
-                    raise ConflictError(f"Duplicate client_number in file: {number}")
-                if code.lower() in seen_codes:
-                    raise ConflictError(f"Duplicate client_code in file: {code}")
+                    raise ConflictError(
+                        f'Duplicate client_number "{number}" in this file. '
+                        "Each client_number must be unique."
+                    )
+                if code.lower() in seen_master_codes:
+                    raise ConflictError(
+                        f'Duplicate client_code "{code}" in this file. '
+                        "Each master client_code must be unique."
+                    )
                 self._assert_master_number_not_used_as_sub(number)
 
                 payload = self._crm_row_to_client_payload(row, data_source="crm")
@@ -1570,10 +1760,61 @@ class PayflowClientService:
                         entity_id = client.id
                     created += 1
                     new_clients += 1
+
+                has_subs_in_file = any(
+                    not _truthy(r.get("is_master_client"))
+                    and (r.get("master_client__client_number") or "").strip().lower()
+                    == number.lower()
+                    for r in data_rows
+                )
+                setup_issues: list[str] = []
+                if entity_id and not dry_run:
+                    live = (
+                        self.db.query(PayflowClientModel)
+                        .filter(PayflowClientModel.id == entity_id)
+                        .first()
+                    )
+                    if live is not None:
+                        setup_issues = self._setup_issue_messages(live)
+                        if has_subs_in_file:
+                            setup_issues = [
+                                i
+                                for i in setup_issues
+                                if "sub-clients / portfolios" not in i.lower()
+                            ]
+                elif existing is not None:
+                    setup_issues = self._setup_issue_messages(existing)
+                    if has_subs_in_file:
+                        setup_issues = [
+                            i
+                            for i in setup_issues
+                            if "sub-clients / portfolios" not in i.lower()
+                        ]
+                else:
+                    setup_issues = self._simulate_setup_issues_after_file_import(
+                        payload, has_subs_in_file=has_subs_in_file
+                    )
+
                 # Only accept identity after validation/create path succeeds
                 seen_numbers.add(number.lower())
-                seen_codes.add(code.lower())
+                seen_master_codes.add(code.lower())
                 masters_in_file[number.lower()] = row
+                note = number
+                if setup_issues:
+                    note = f"{number} · Setup incomplete: {'; '.join(setup_issues)}"
+                    errors.append(
+                        {
+                            "record_id": record_id,
+                            "client": name or code or "—",
+                            "sub_client": "—",
+                            "field": "setup",
+                            "error": (
+                                "Client will import as Draft with remaining setup: "
+                                + "; ".join(setup_issues)
+                            ),
+                            "status": "Attention",
+                        }
+                    )
                 preview_masters.append(
                     {
                         "id": f"master-{row_num}",
@@ -1584,9 +1825,10 @@ class PayflowClientService:
                         "sub_client": "—",
                         "sub_client_name": "—",
                         "action": action,
-                        "note": number,
+                        "note": note,
                         "is_sub": False,
                         "entity_id": entity_id,
+                        "setup_issues": setup_issues,
                     }
                 )
             except (ValidationAppError, ConflictError) as exc:
@@ -1627,7 +1869,7 @@ class PayflowClientService:
 
         # Pass 2 — sub-clients
         for row_num, row in enumerate(data_rows, start=2):
-            if _truthy(row.get("is_master_client")):
+            if row_num in flag_error_rows:
                 continue
             record_id = row.get("client_number") or f"Row {row_num}"
             code = _normalize_code(row.get("client_code") or "")
@@ -1640,18 +1882,31 @@ class PayflowClientService:
                 or ""
             ).strip()
             try:
+                if _parse_import_bool(
+                    row.get("is_master_client"), field="is_master_client"
+                ):
+                    continue
                 if not master_number:
                     raise ValidationAppError(
-                        "master_client__client_number is required for sub-clients"
+                        "Master client number is required for sub-clients. "
+                        "Set master_client__client_number to the parent client_number."
                     )
                 if not code:
                     raise ValidationAppError("client_code is required")
                 if not name:
                     raise ValidationAppError("short_name, product, or company_name is required")
                 if number and number.lower() in seen_numbers:
-                    raise ConflictError(f"Duplicate client_number in file: {number}")
-                if code.lower() in seen_codes:
-                    raise ConflictError(f"Duplicate client_code in file: {code}")
+                    raise ConflictError(
+                        f'Duplicate client_number "{number}" in this file. '
+                        "Each client_number must be unique."
+                    )
+                sub_code_key = (master_number.lower(), code.lower())
+                if sub_code_key in seen_sub_codes:
+                    raise ConflictError(
+                        f'Duplicate client_code "{code}" under master '
+                        f'"{master_number}" in this file. Sub-client codes must be '
+                        "unique within the same master."
+                    )
 
                 parent = self._find_client(crm_number=master_number, code=None)
                 if parent is None:
@@ -1659,7 +1914,8 @@ class PayflowClientService:
                 master_row = masters_in_file.get(master_number.lower())
                 if parent is None and master_row is None:
                     raise ValidationAppError(
-                        f"Unknown master client_number: {master_number}"
+                        f'Master client "{master_number}" was not found. '
+                        "Add the master row first, or fix master_client__client_number."
                     )
 
                 self._assert_sub_import_identity(
@@ -1681,6 +1937,13 @@ class PayflowClientService:
                     parent.code
                     if parent
                     else _normalize_code(master_row.get("client_code") or "")
+                )
+
+                self._assert_sub_belongs_to_master(
+                    number=number or None,
+                    code=code,
+                    master_number=master_number,
+                    master_code=parent_code,
                 )
 
                 existing = (
@@ -1705,7 +1968,8 @@ class PayflowClientService:
                             parent = self._find_client(crm_number=master_number, code=None)
                         if parent is None:
                             raise ValidationAppError(
-                                f"Unknown master client_number: {master_number}"
+                                f'Master client "{master_number}" was not found. '
+                                "Add the master row first, or fix master_client__client_number."
                             )
                         port, _act = self.upsert_portfolio(
                             parent.id,
@@ -1731,7 +1995,8 @@ class PayflowClientService:
                             parent = self._find_client(crm_number=master_number, code=None)
                         if parent is None:
                             raise ValidationAppError(
-                                f"Unknown master client_number: {master_number}"
+                                f'Master client "{master_number}" was not found. '
+                                "Add the master row first, or fix master_client__client_number."
                             )
                         port, _act = self.upsert_portfolio(
                             parent.id,
@@ -1752,7 +2017,7 @@ class PayflowClientService:
                     new_sub_clients += 1
                 if number:
                     seen_numbers.add(number.lower())
-                seen_codes.add(code.lower())
+                seen_sub_codes.add((master_number.lower(), code.lower()))
                 preview_subs.append(
                     {
                         "id": f"sub-{row_num}",
@@ -1813,6 +2078,13 @@ class PayflowClientService:
             "new_sub_clients": new_sub_clients,
             "existing_sub_clients": existing_sub_clients,
         }
+        setup_message = None
+        if new_clients > 0:
+            setup_message = (
+                f"{new_clients} new client(s) import as Draft. "
+                "Open each client and use Complete Setup to finish onboarding "
+                "(supervisors, branding, and remaining configuration)."
+            )
 
         if not dry_run:
             run = self._persist_client_import_run(
@@ -1831,7 +2103,7 @@ class PayflowClientService:
                 "file_name": filename,
                 "status": run.status if run else ("Completed with Errors" if failed else "Completed"),
                 "import_id": run.id if run else None,
-                "message": None,
+                "message": setup_message,
                 "summary": summary,
                 "preview": preview,
                 "errors": errors,
@@ -1867,7 +2139,7 @@ class PayflowClientService:
             "ok": True,
             "file_name": filename,
             "status": "Ready",
-            "message": None,
+            "message": setup_message,
             "summary": summary,
             "preview": preview,
             "errors": errors,
@@ -2138,12 +2410,16 @@ class PayflowClientService:
             "city": (row.get("city__name") or "").strip() or None,
             "province_state": (row.get("province__name") or "").strip() or None,
             "country": (row.get("country__name") or "").strip() or None,
-            "postal_code": (row.get("zip_code") or "").strip() or None,
+            "postal_code": _normalize_postal_code(row.get("zip_code") or "") or None,
             "correspondence_language": (
                 row.get("correspondence_language__name") or ""
             ).strip()
             or None,
-            "currency_code": (row.get("currency__name") or "").strip() or None,
+            "currency_code": _normalize_import_currency(
+                (row.get("currency__name") or "").strip()
+            )
+            if (row.get("currency__name") or "").strip()
+            else None,
             "crm_status": (row.get("client_status__name") or "").strip() or None,
         }
 
@@ -2350,22 +2626,48 @@ class PayflowClientService:
         new = (incoming or "").strip()
         if not current:
             return
+        who = "client" if entity == "client" else "sub-client"
         if not new:
             raise ValidationAppError(
-                f"client_number is locked and cannot be removed "
-                f"(existing: {current}"
-                + (f", client_code: {code}" if code else "")
-                + ")"
+                f"The {who} number \"{current}\" cannot be removed"
+                + (f' for client_code "{code}"' if code else "")
+                + ". Keep the original client_number."
             )
         if new.lower() != current.lower():
-            label = "client_number" if entity == "client" else "sub-client client_number"
             raise ValidationAppError(
-                f"{label} is locked and cannot be changed "
-                f"(existing: {current}, uploaded: {new}"
-                + (f", client_code: {code}" if code else "")
-                + "). Upload the original client_number, or use a new "
-                "client_number with a new client_code to create a new record."
+                f'The {who} number cannot be changed from "{current}" to "{new}"'
+                + (f' for client_code "{code}"' if code else "")
+                + ". Keep the original number, or use a new number and a new "
+                "code to create a new record."
             )
+
+    @staticmethod
+    def _assert_sub_belongs_to_master(
+        *,
+        number: str | None,
+        code: str,
+        master_number: str,
+        master_code: str,
+    ) -> None:
+        """Reject subs whose number/code do not follow the parent master pattern."""
+        master_number = (master_number or "").strip()
+        master_code = _normalize_code(master_code or "")
+        number = (number or "").strip()
+        code = _normalize_code(code or "")
+        if not master_number or not master_code:
+            return
+
+        num_ok = bool(number) and number.lower().startswith(
+            f"{master_number.lower()}-"
+        )
+        code_ok = bool(code) and code.lower().startswith(f"{master_code.lower()}-")
+        if num_ok and code_ok:
+            return
+        raise ValidationAppError(
+            f'This sub-client does not belong to master "{master_number}" / '
+            f'"{master_code}". Use a client_number starting with '
+            f'"{master_number}-" and a client_code starting with "{master_code}-".'
+        )
 
     def _find_portfolio_by_crm_number_global(
         self, crm_number: str
@@ -2388,9 +2690,9 @@ class PayflowClientService:
         if port is None:
             return
         raise ValidationAppError(
-            f"client_number already used as a sub-client "
-            f"(client_number: {number}, client_code: {port.code}). "
-            f"A master client cannot reuse a sub-client client_number."
+            f'Client number "{number}" is already used by a sub-client'
+            + (f' (client_code "{port.code}")' if port.code else "")
+            + ". A master client cannot reuse a sub-client number."
         )
 
     def _assert_sub_import_identity(
@@ -2408,9 +2710,9 @@ class PayflowClientService:
         as_master = self._find_client(crm_number=num, code=None)
         if as_master is not None:
             raise ValidationAppError(
-                f"client_number already used as a master client "
-                f"(client_number: {num}, client_code: {as_master.code}). "
-                f"A sub-client cannot reuse a master client_number."
+                f'Client number "{num}" is already used by a master client'
+                + (f' (client_code "{as_master.code}")' if as_master.code else "")
+                + ". A sub-client cannot reuse a master client number."
             )
 
         global_port = self._find_portfolio_by_crm_number_global(num)
@@ -2426,14 +2728,14 @@ class PayflowClientService:
             (existing_parent.crm_client_number or "").strip()
             if existing_parent
             else ""
-        ) or f"client_id:{global_port.client_id}"
+        ) or f"client #{global_port.client_id}"
 
         if parent is not None:
             if global_port.client_id != parent.id:
                 raise ValidationAppError(
-                    f"Sub-client parent is locked "
-                    f"(existing master: {existing_master}, "
-                    f"uploaded master: {master_number}, client_number: {num})"
+                    f'Sub-client "{num}" already belongs to master '
+                    f'"{existing_master}". It cannot be moved under '
+                    f'"{master_number}".'
                 )
             return
 
@@ -2441,15 +2743,19 @@ class PayflowClientService:
         # when the sub already exists under a different master in DB.
         if existing_master.lower() != (master_number or "").strip().lower():
             raise ValidationAppError(
-                f"Sub-client parent is locked "
-                f"(existing master: {existing_master}, "
-                f"uploaded master: {master_number}, client_number: {num})"
+                f'Sub-client "{num}" already belongs to master '
+                f'"{existing_master}". It cannot be moved under '
+                f'"{master_number}".'
             )
 
     def _resolve_client_for_upsert(
         self, *, crm_number: str | None, code: str | None
     ) -> PayflowClientModel | None:
-        """Match by client_number first. Code fallback never rewrites identity."""
+        """Match by client_number first. Code fallback never rewrites identity.
+
+        New client_number + new client_code → no match → caller creates.
+        Same client_code + different client_number → error.
+        """
         number = (crm_number or "").strip() or None
         code_norm = _normalize_code(code or "") if code else ""
         if number:
@@ -2471,11 +2777,9 @@ class PayflowClientService:
             existing_number = (by_code.crm_client_number or "").strip()
             if number and existing_number and existing_number.lower() != number.lower():
                 raise ValidationAppError(
-                    f"client_number is locked and cannot be changed "
-                    f"(existing: {existing_number}, uploaded: {number}, "
-                    f"client_code: {code_norm}). Upload the original "
-                    "client_number, or use a new client_number with a new "
-                    "client_code to create a new record."
+                    f'Client number cannot be changed for an existing client_code '
+                    f'"{code_norm}". Keep the original number "{existing_number}", '
+                    "or use a new number and a new code to create a new client."
                 )
             return by_code
         return None
@@ -2513,9 +2817,9 @@ class PayflowClientService:
             as_master = self._find_client(crm_number=number, code=None)
             if as_master is not None:
                 raise ValidationAppError(
-                    f"client_number already used as a master client "
-                    f"(client_number: {number}, client_code: {as_master.code}). "
-                    f"A sub-client cannot reuse a master client_number."
+                    f'Client number "{number}" is already used by a master client'
+                    + (f' (client_code "{as_master.code}")' if as_master.code else "")
+                    + ". A sub-client cannot reuse a master client number."
                 )
             global_row = self._find_portfolio_by_crm_number_global(number)
             if global_row is not None and global_row.client_id != client_id:
@@ -2528,7 +2832,7 @@ class PayflowClientService:
                     (existing_parent.crm_client_number or "").strip()
                     if existing_parent
                     else ""
-                ) or f"client_id:{global_row.client_id}"
+                ) or f"client #{global_row.client_id}"
                 uploaded_parent = (
                     self.db.query(PayflowClientModel)
                     .filter(PayflowClientModel.id == client_id)
@@ -2538,11 +2842,11 @@ class PayflowClientService:
                     (uploaded_parent.crm_client_number or "").strip()
                     if uploaded_parent
                     else ""
-                ) or f"client_id:{client_id}"
+                ) or f"client #{client_id}"
                 raise ValidationAppError(
-                    f"Sub-client parent is locked "
-                    f"(existing master: {existing_master}, "
-                    f"uploaded master: {uploaded_master}, client_number: {number})"
+                    f'Sub-client "{number}" already belongs to master '
+                    f'"{existing_master}". It cannot be moved under '
+                    f'"{uploaded_master}".'
                 )
             if global_row is not None:
                 return global_row
@@ -2560,11 +2864,10 @@ class PayflowClientService:
             existing_number = (by_code.crm_client_number or "").strip()
             if number and existing_number and existing_number.lower() != number.lower():
                 raise ValidationAppError(
-                    f"sub-client client_number is locked and cannot be changed "
-                    f"(existing: {existing_number}, uploaded: {number}, "
-                    f"client_code: {code_norm}). Upload the original "
-                    "client_number, or use a new client_number with a new "
-                    "client_code to create a new record."
+                    f'Sub-client number cannot be changed for an existing '
+                    f'client_code "{code_norm}". Keep the original number '
+                    f'"{existing_number}", or use a new number and a new code '
+                    "to create a new sub-client."
                 )
             return by_code
         return None
@@ -2886,11 +3189,45 @@ class PayflowClientService:
             "required_missing": required_missing,
         }
 
+    def _profile_issues(self, client: PayflowClientModel) -> list[str]:
+        """General / Client Profile field issues (same rules as FE General tab)."""
+        issues: list[str] = []
+        if not (client.name or "").strip():
+            issues.append("Client name is required")
+        if not (client.code or "").strip():
+            issues.append("Client code is required")
+        if not (client.client_type or "").strip():
+            issues.append("Client type is required")
+        if not (client.business_domain or "").strip():
+            issues.append("Business use case is required")
+        if not (client.contact_name or "").strip():
+            issues.append("Primary contact name is required")
+        email = (client.contact_email or "").strip()
+        if not email:
+            issues.append("Primary contact email is required")
+        elif not _EMAIL_RE.match(email):
+            issues.append("Enter a valid primary contact email")
+        if not (client.contact_phone or "").strip():
+            issues.append("Primary contact phone is required")
+        if not (client.country or "").strip():
+            issues.append("Country is required")
+        if not (client.correspondence_language or "").strip():
+            issues.append("Language is required")
+        if not (client.currency_code or "").strip():
+            issues.append("Currency is required")
+        postal = (client.postal_code or "").strip()
+        if postal and not _is_valid_postal_code(postal):
+            issues.append(
+                "Postal code must match format A1A 1A1 "
+                "(letter-number-letter space number-letter-number)"
+            )
+        return issues
+
     def _onboarding_progress(self, client: PayflowClientModel) -> dict:
         supervisors = self._supervisors(client)
         portfolio_count = len(client.portfolios or [])
 
-        profile_ok = bool(client.name and client.code and client.client_type and client.business_domain)
+        profile_ok = len(self._profile_issues(client)) == 0
         # Clients use daily file intake; CRM field mapping is global (System Mapping).
         is_file = client.data_source_type == PayflowDataSourceType.FILE.value
         is_crm = client.data_source_type == PayflowDataSourceType.CRM.value
@@ -2976,25 +3313,133 @@ class PayflowClientService:
         }
 
     def _branding_issues(self, client: PayflowClientModel) -> list[str]:
-        """Required branding/channel fields by client type (AC5)."""
+        """Required branding/channel fields — aligned with FE Branding & Channels save rules."""
         issues: list[str] = []
         if not client.channel_email and not client.channel_sms:
             issues.append("At least one communication channel must be enabled")
-        is_first = client.client_type == PayflowClientType.FIRST_PARTY.value
         brand = (client.brand_name or "").strip()
+        if not brand:
+            issues.append("Display / brand name is required (set in Branding & Channels)")
+        if not (client.sender_name or "").strip():
+            issues.append("Sender name is required (set in Branding & Channels)")
+        is_first = client.client_type == PayflowClientType.FIRST_PARTY.value
         if is_first:
-            if not brand:
-                issues.append("Display / brand name is required for First Party clients")
-            if not (client.sender_name or "").strip():
-                issues.append("Sender name is required for First Party clients")
             if client.channel_email and not (client.email_from or "").strip():
                 issues.append("Email from address is required when Email is enabled")
             if client.channel_sms and not (client.sms_sender_id or "").strip():
                 issues.append("SMS sender ID is required when SMS is enabled")
-        elif not brand and not (client.name or "").strip():
+        return issues
+
+    def _setup_issue_messages(
+        self, client: PayflowClientModel, *, include_informational: bool = True
+    ) -> list[str]:
+        """Concrete remaining setup issues across all config tabs (for grid / header)."""
+        issues: list[str] = []
+        progress = self._onboarding_progress(client)
+        by_key = {s["key"]: s for s in progress["steps"]}
+
+        for msg in self._profile_issues(client):
+            issues.append(f"Client Profile: {msg}")
+
+        if include_informational:
+            port_status = by_key.get("portfolios", {}).get("status")
+            if port_status != PayflowOnboardingStepStatus.COMPLETE.value:
+                issues.append(
+                    "Sub-Clients / Portfolios: add at least one sub-client (optional but recommended)"
+                )
+
+        if by_key.get("data_source", {}).get("status") != PayflowOnboardingStepStatus.COMPLETE.value:
+            issues.append("Data Source: select and connect a primary data source")
+
+        for msg in self._branding_issues(client):
+            issues.append(f"Branding & Channels: {msg}")
+
+        if by_key.get("ai_governance", {}).get("status") != PayflowOnboardingStepStatus.COMPLETE.value:
+            issues.append("AI & Governance: select an AI mode")
+
+        if by_key.get("supervisors", {}).get("status") != PayflowOnboardingStepStatus.COMPLETE.value:
+            issues.append("Supervisor Assignment: assign at least one supervisor")
+
+        act = by_key.get("activation", {})
+        if act.get("status") != PayflowOnboardingStepStatus.COMPLETE.value:
+            if act.get("status") == PayflowOnboardingStepStatus.BLOCKED.value:
+                for b in self._activation_blockers(client):
+                    label = f"Review & Activation: {b}"
+                    if label not in issues and not any(
+                        b.lower() in (i or "").lower() for i in issues
+                    ):
+                        issues.append(label)
+            else:
+                issues.append(
+                    "Review & Activation: finish required setup, then activate the client"
+                )
+
+        # De-dupe while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for item in issues:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
+
+    def _simulate_setup_issues_after_file_import(
+        self,
+        payload: dict[str, Any],
+        *,
+        has_subs_in_file: bool = False,
+    ) -> list[str]:
+        """Expected remaining issues for a master created/updated from CRM file (defaults)."""
+        client_type = _parse_client_type_soft(payload.get("client_type"))
+        brand = (
+            (payload.get("brand_name") or "").strip()
+            or (payload.get("short_name") or "").strip()
+            or (payload.get("name") or "").strip()
+        )
+        # File import always seeds empty sender_name and no supervisors.
+        stub = PayflowClientModel(
+            name=(payload.get("name") or "").strip() or "Client",
+            code=_normalize_code(payload.get("code") or "") or "TMP",
+            client_type=client_type,
+            business_domain=_parse_domain(payload.get("business_domain")),
+            ai_mode=_parse_ai_mode(payload.get("ai_mode")),
+            data_source_type=PayflowDataSourceType.CRM.value,
+            connection_status=PayflowConnectionStatus.CONNECTED.value,
+            contact_name=(payload.get("contact_name") or "").strip() or None,
+            contact_email=(payload.get("contact_email") or "").strip() or None,
+            contact_phone=(payload.get("contact_phone") or "").strip() or None,
+            country=(payload.get("country") or "").strip() or None,
+            correspondence_language=(
+                payload.get("correspondence_language") or ""
+            ).strip()
+            or None,
+            currency_code=(payload.get("currency_code") or "").strip() or None,
+            postal_code=(payload.get("postal_code") or "").strip() or None,
+            brand_name=brand,
+            sender_name="",
+            email_from="collections@payflow.io",
+            sms_sender_id="PAYFLOW",
+            channel_email=True,
+            channel_sms=True,
+            status=PayflowClientStatus.DRAFT.value,
+            portfolios=[],
+        )
+        # Avoid DB hits in _supervisors / portfolio count — stub has no id/assignments
+        issues: list[str] = []
+        for msg in self._profile_issues(stub):
+            issues.append(f"Client Profile: {msg}")
+        for msg in self._branding_issues(stub):
+            issues.append(f"Branding & Channels: {msg}")
+        issues.append("Supervisor Assignment: assign at least one supervisor")
+        if not has_subs_in_file:
             issues.append(
-                "Client display / reference name is required for Third Party clients"
+                "Sub-Clients / Portfolios: add at least one sub-client (optional but recommended)"
             )
+        issues.append(
+            "Review & Activation: finish required setup, then activate the client"
+        )
         return issues
 
     def _require_draft_for_branding(self, client: PayflowClientModel) -> None:
@@ -3005,10 +3450,7 @@ class PayflowClientService:
 
     def _activation_blockers(self, client: PayflowClientModel) -> list[str]:
         blockers: list[str] = []
-        if not (client.name or "").strip():
-            blockers.append("Client name is required")
-        if not (client.code or "").strip():
-            blockers.append("Client code is required")
+        blockers.extend(self._profile_issues(client))
         # Phase-1 client intake is daily file; CRM→PayFlow mapping is system-wide.
         if client.data_source_type not in (
             PayflowDataSourceType.FILE.value,
@@ -3049,20 +3491,13 @@ class PayflowClientService:
             )
 
         progress = self._onboarding_progress(client)
-        # Match FE banner / clients-grid chips (exclude AI, activation, Data Mapping).
-        _setup_chip_keys = {
-            "profile",
-            "portfolios",
-            "data_source",
-            "branding",
-            "supervisors",
-        }
+        # All journey steps still open (Data Mapping is not in steps).
         incomplete = [
             s["label"]
             for s in progress["steps"]
-            if s.get("key") in _setup_chip_keys
-            and s.get("status") != PayflowOnboardingStepStatus.COMPLETE.value
+            if s.get("status") != PayflowOnboardingStepStatus.COMPLETE.value
         ]
+        setup_issues = self._setup_issue_messages(client)
         return {
             "id": client.id,
             "code": client.code,
@@ -3086,7 +3521,8 @@ class PayflowClientService:
             ),
             "supervisors": supervisors,
             "setup_incomplete": incomplete,
-            "setup_steps_remaining": len(incomplete),
+            "setup_issues": setup_issues,
+            "setup_steps_remaining": max(len(incomplete), len(setup_issues)),
             "onboarding": progress,
             "added_through": client.added_through
             or PayflowClientAddedThrough.ADD_CLIENT.value,

@@ -110,6 +110,7 @@ class PayflowClientItem(BaseModel):
     connection_status_label: Optional[str] = None
     supervisors: List[dict] = Field(default_factory=list)
     setup_incomplete: List[str] = Field(default_factory=list)
+    setup_issues: List[str] = Field(default_factory=list)
     setup_steps_remaining: int = 0
     onboarding: Optional[PayflowOnboardingProgressItem] = None
     # How the client was first created: add_client | file_upload
@@ -1218,6 +1219,7 @@ class PayflowImportPreviewRecord(BaseModel):
     current_balance: Optional[float] = None
     incoming_balance: Optional[float] = None
     note: Optional[str] = None
+    setup_issues: List[str] = Field(default_factory=list)
 
 
 class PayflowImportPreviewSummary(BaseModel):
