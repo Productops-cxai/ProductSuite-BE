@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
@@ -20,7 +21,11 @@ from app.infrastructure.database.models import (
     UserModel,
 )
 from app.infrastructure.email.sendgrid_service import send_collection_email
-from app.infrastructure.sms.twilio_service import send_collection_sms
+from app.infrastructure.sms.twilio_service import (
+    normalize_e164,
+    send_collection_sms,
+    truncate_sms_body,
+)
 from app.modules.payflow.services.access_context_service import AccessContextService
 from app.shared.enums import PayflowCommChannel, PayflowCommPurpose, PayflowCommStatus
 
@@ -42,6 +47,7 @@ _STATUS_RANK = {
     PayflowCommStatus.AWAITING_GOVERNANCE.value: 15,
     PayflowCommStatus.APPROVED.value: 20,
     PayflowCommStatus.SCHEDULED.value: 25,
+    PayflowCommStatus.QUEUED.value: 28,
     PayflowCommStatus.SENT.value: 30,
     PayflowCommStatus.DELIVERED.value: 40,
     PayflowCommStatus.OPENED_READ.value: 50,
@@ -230,6 +236,7 @@ class PayflowCommunicationService:
             elif row.status == PayflowCommStatus.SCHEDULED.value:
                 eligibility_status = "Scheduled"
             elif row.status in {
+                PayflowCommStatus.QUEUED.value,
                 PayflowCommStatus.SENT.value,
                 PayflowCommStatus.DELIVERED.value,
                 PayflowCommStatus.OPENED_READ.value,
@@ -238,6 +245,23 @@ class PayflowCommunicationService:
                 eligibility_status = "Eligible"
             else:
                 eligibility_status = "Eligible"
+
+        recipient = row.recipient
+        if not recipient and account:
+            if (row.channel or "") == "SMS":
+                recipient = (account.phone_mobile or account.phone_work or None)
+            else:
+                recipient = account.email
+
+        provider_error = row.provider_error
+        if not provider_error and row.status == PayflowCommStatus.FAILED.value:
+            for ev in reversed(list(row.events or [])):
+                if isinstance(ev, dict) and (
+                    "fail" in (ev.get("label") or "").lower()
+                    or "bounce" in (ev.get("label") or "").lower()
+                ):
+                    provider_error = ev.get("detail")
+                    break
 
         return {
             "id": row.id,
@@ -253,6 +277,8 @@ class PayflowCommunicationService:
             "channel": row.channel,
             "purpose": row.purpose,
             "status": row.status,
+            "recipient": recipient,
+            "provider_error": provider_error,
             "workflow_name": row.workflow_name,
             "engagement": self._engagement_label(row),
             "engagement_tracking": tracking,
@@ -475,12 +501,26 @@ class PayflowCommunicationService:
                     "restriction_reason": "SMS channel is disabled for this client",
                     "next_eligible_at": None,
                 }
+            if getattr(account, "sms_opt_out", False):
+                return {
+                    "ok": False,
+                    "eligibility_status": "Blocked",
+                    "restriction_reason": "Customer opted out of SMS (STOP)",
+                    "next_eligible_at": None,
+                }
             phone = (account.phone_mobile or account.phone_work or "").strip()
             if not phone:
                 return {
                     "ok": False,
                     "eligibility_status": "Blocked",
                     "restriction_reason": "No valid mobile/work phone on file",
+                    "next_eligible_at": None,
+                }
+            if not normalize_e164(phone):
+                return {
+                    "ok": False,
+                    "eligibility_status": "Blocked",
+                    "restriction_reason": "Phone number is not a valid E.164 / NANP number",
                     "next_eligible_at": None,
                 }
         else:
@@ -512,7 +552,7 @@ class PayflowCommunicationService:
         self,
         *,
         account: PayflowAccountModel,
-        strategy: PayflowStrategyModel | None,
+        strategy: PayflowStrategyModel | Any | None,
         channel: str,
         purpose: str,
         subject: str | None = None,
@@ -575,7 +615,7 @@ class PayflowCommunicationService:
         self,
         *,
         account: PayflowAccountModel,
-        strategy: PayflowStrategyModel,
+        strategy: PayflowStrategyModel | Any,
         channel: str,
         purpose: str,
         subject: str,
@@ -654,12 +694,14 @@ class PayflowCommunicationService:
         }
 
         if channel_norm == "SMS":
-            phone = (account.phone_mobile or account.phone_work or "").strip()
+            phone = normalize_e164(account.phone_mobile or account.phone_work) or (
+                account.phone_mobile or account.phone_work or ""
+            ).strip()
             recipient = phone
             sms = send_collection_sms(
                 self.db,
                 to_phone=phone,
-                body=body,
+                body=truncate_sms_body(body),
                 sms_type="collection_workflow",
                 account_id=account.id,
                 run_id=run_id,
@@ -692,7 +734,18 @@ class PayflowCommunicationService:
 
         account.last_contact_date = now.date()
         comm.provider_message_id = provider_message_id
-        if send_status in {"sent", "logged"}:
+        comm.recipient = recipient
+        comm.provider_error = provider_error
+        if send_status == "queued":
+            comm.status = PayflowCommStatus.QUEUED.value
+            comm.sent_at = now
+            self._record_event_row(
+                comm,
+                event_type="queued",
+                label=f"{channel_norm} Queued",
+                detail=f"recipient={recipient}",
+            )
+        elif send_status in {"sent", "logged"}:
             comm.status = PayflowCommStatus.SENT.value
             comm.sent_at = now
             self._record_event_row(
@@ -709,6 +762,27 @@ class PayflowCommunicationService:
                 label=f"{channel_norm} Failed",
                 detail=provider_error,
             )
+            try:
+                from app.modules.payflow.services.operational_exception_service import (
+                    PayflowOperationalExceptionService,
+                )
+                from app.shared.enums import PayflowOperationalExceptionType
+
+                PayflowOperationalExceptionService(self.db).raise_exception(
+                    exception_type=PayflowOperationalExceptionType.COMMUNICATION_FAILURE.value,
+                    reason=provider_error or f"{channel_norm} send failed",
+                    client_id=comm.client_id,
+                    account_id=comm.account_id,
+                    source_entity_type="communication",
+                    source_entity_id=comm.id,
+                    severity="High",
+                    retriable=True,
+                    link=f"/payflow/comms/{comm.id}",
+                    notify=True,
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to raise communication exception on send")
 
         return {
             "skipped": None,
@@ -808,8 +882,23 @@ class PayflowCommunicationService:
         payment_base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
         is_payment_click = bool(url and payment_base and payment_base in url)
 
-        if et in {"processed"}:
+        fail_detail = None
+        if isinstance(payload, dict):
+            fail_detail = (
+                payload.get("ErrorMessage")
+                or payload.get("error_message")
+                or payload.get("reason")
+                or payload.get("ErrorCode")
+            )
+            if fail_detail is not None:
+                fail_detail = str(fail_detail)[:500]
+
+        if et in {"queued", "accepted"}:
+            self._advance_status(row, PayflowCommStatus.QUEUED.value)
+            row.sent_at = row.sent_at or when
+        elif et in {"processed", "sending", "sent"}:
             self._advance_status(row, PayflowCommStatus.SENT.value)
+            row.sent_at = row.sent_at or when
         elif et in {"delivered"}:
             self._advance_status(row, PayflowCommStatus.DELIVERED.value)
             row.delivered_at = row.delivered_at or when
@@ -828,9 +917,39 @@ class PayflowCommunicationService:
                 self._advance_status(row, PayflowCommStatus.PAYMENT_LINK_CLICKED.value)
             else:
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
-        elif et in {"bounce", "bounced", "dropped"}:
+        elif et in {
+            "bounce",
+            "bounced",
+            "dropped",
+            "failed",
+            "undelivered",
+            "canceled",
+            "cancelled",
+        }:
             self._advance_status(row, PayflowCommStatus.FAILED.value)
-            row.restriction_reason = row.restriction_reason or f"Provider {et}"
+            row.provider_error = fail_detail or row.provider_error or f"Provider {et}"
+            row.restriction_reason = row.restriction_reason or row.provider_error
+            try:
+                from app.modules.payflow.services.operational_exception_service import (
+                    PayflowOperationalExceptionService,
+                )
+                from app.shared.enums import PayflowOperationalExceptionType
+
+                PayflowOperationalExceptionService(self.db).raise_exception(
+                    exception_type=PayflowOperationalExceptionType.COMMUNICATION_FAILURE.value,
+                    reason=row.provider_error or f"Communication {et}",
+                    client_id=row.client_id,
+                    account_id=row.account_id,
+                    source_entity_type="communication",
+                    source_entity_id=row.id,
+                    severity="High",
+                    retriable=et in {"deferred", "undelivered"},
+                    link=f"/payflow/comms/{row.id}",
+                    notify=True,
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to raise communication exception")
         elif et in {"spamreport", "spam", "unsubscribe", "group_unsubscribe"}:
             self._advance_status(row, PayflowCommStatus.SUPPRESSED.value)
             row.eligibility_status = "Blocked"
@@ -884,6 +1003,131 @@ class PayflowCommunicationService:
             self.db.commit()
         else:
             self.db.flush()
+
+    def mark_sms_opt_out_by_phone(self, from_phone: str, *, commit: bool = True) -> int:
+        """Set sms_opt_out on accounts matching inbound From number. Returns count updated."""
+        normalized = normalize_e164(from_phone)
+        if not normalized:
+            return 0
+        digits = re.sub(r"\D+", "", normalized)
+        candidates = (
+            self.db.query(PayflowAccountModel)
+            .filter(
+                (PayflowAccountModel.phone_mobile.isnot(None))
+                | (PayflowAccountModel.phone_work.isnot(None))
+            )
+            .all()
+        )
+        updated = 0
+        for account in candidates:
+            for raw in (account.phone_mobile, account.phone_work):
+                other = normalize_e164(raw)
+                other_digits = re.sub(r"\D+", "", other or "") if other else ""
+                if other == normalized or (other_digits and other_digits == digits):
+                    if not account.sms_opt_out:
+                        account.sms_opt_out = True
+                        updated += 1
+                    break
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
+        return updated
+
+    def send_manual_sms(
+        self,
+        user: UserModel,
+        account: PayflowAccountModel,
+        *,
+        body: str,
+        purpose: str = "Payment Reminder",
+        include_payment_link: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Authorized manual SMS — same eligibility gates as workflow send."""
+        if not self.access.is_operations_admin(user) and not self.access.can(
+            user, "send_communications", account.client_id
+        ):
+            raise ForbiddenError("Send Communications permission required")
+        self._assert_view(user, account.client_id)
+
+        purpose_norm = (purpose or "Payment Reminder").strip()
+        if idempotency_key:
+            existing = (
+                self.db.query(PayflowCommunicationModel)
+                .filter(
+                    PayflowCommunicationModel.account_id == account.id,
+                    PayflowCommunicationModel.channel == "SMS",
+                    PayflowCommunicationModel.why_timing == f"manual:{idempotency_key}",
+                )
+                .first()
+            )
+            if existing:
+                return {
+                    "skipped": "idempotent",
+                    "communication_id": existing.id,
+                    "code": existing.code,
+                    "comm_status": existing.status,
+                }
+
+        recent = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(
+                PayflowCommunicationModel.account_id == account.id,
+                PayflowCommunicationModel.channel == "SMS",
+                PayflowCommunicationModel.purpose == purpose_norm,
+                PayflowCommunicationModel.status.in_(
+                    [
+                        PayflowCommStatus.QUEUED.value,
+                        PayflowCommStatus.SENT.value,
+                        PayflowCommStatus.PREPARED.value,
+                    ]
+                ),
+                PayflowCommunicationModel.created_at >= _utcnow() - timedelta(minutes=5),
+            )
+            .order_by(PayflowCommunicationModel.id.desc())
+            .first()
+        )
+        if recent and not idempotency_key:
+            return {
+                "skipped": "duplicate_window",
+                "communication_id": recent.id,
+                "code": recent.code,
+                "comm_status": recent.status,
+                "restriction_reason": "An SMS for this purpose was already sent in the last 5 minutes",
+            }
+
+        payment_url = None
+        if include_payment_link:
+            payment_url = _payment_link_url(account, True)
+
+        strategy = SimpleNamespace(name="Manual SMS")
+
+        result = self.send_workflow_step(
+            account=account,
+            strategy=strategy,  # type: ignore[arg-type]
+            channel="SMS",
+            purpose=purpose_norm,
+            subject="",
+            body=body,
+            payment_link=payment_url,
+            run_id=None,
+            client_id=account.client_id,
+        )
+        if result.get("communication_id"):
+            row = self.db.get(PayflowCommunicationModel, result["communication_id"])
+            if row:
+                row.why_message = "Authorized manual SMS"
+                row.why_timing = (
+                    f"manual:{idempotency_key}" if idempotency_key else "Manual send by authorized user"
+                )
+                row.workflow_name = "Manual SMS"
+                if result.get("skipped") == "eligibility":
+                    pass
+                else:
+                    self.db.flush()
+        self.db.commit()
+        return result
 
     def case_eligibility_snapshot(self, user: UserModel, account: PayflowAccountModel) -> dict[str, Any]:
         self._assert_view(user, account.client_id)

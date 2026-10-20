@@ -853,7 +853,7 @@ class WorkflowExecutionService:
                 step,
                 step_run,
                 rule_id=None,
-                reason="Escalated by governance rule",
+                reason="Payment arrangement exception",
             )
             return True
 
@@ -981,6 +981,18 @@ class WorkflowExecutionService:
             return yes_id if matched else no_id
 
         if kind == "Human Review":
+            # Lovable: Review Reason comes from the catalog, not the step title ("Human review").
+            from app.modules.payflow.services.review_service import (
+                REVIEW_REASONS,
+                normalize_review_reason,
+            )
+
+            configured = (cfg.get("review_reason") or "").strip()
+            reason = (
+                configured
+                if configured in REVIEW_REASONS
+                else normalize_review_reason(configured or cfg.get("note"))
+            )
             self._pause_for_human_review(
                 run,
                 account,
@@ -988,7 +1000,7 @@ class WorkflowExecutionService:
                 step,
                 step_run,
                 rule_id=None,
-                reason=step.get("title") or cfg.get("note") or "Workflow human review step",
+                reason=reason,
             )
             return None
 
@@ -1304,7 +1316,7 @@ class WorkflowExecutionService:
             self._notify_provider_failed(
                 run, channel, str(result.get("provider_error"))
             )
-        elif result.get("status") in {"sent", "logged"}:
+        elif result.get("status") in {"sent", "logged", "queued"}:
             self._notify_comm_sent(
                 run,
                 account,
@@ -1374,7 +1386,24 @@ class WorkflowExecutionService:
     def _notify_step_failed(self, run: PayflowWorkflowRunModel, message: str) -> None:
         try:
             from app.modules.payflow.services.notification_service import PayflowNotificationService
+            from app.modules.payflow.services.operational_exception_service import (
+                PayflowOperationalExceptionService,
+            )
+            from app.shared.enums import PayflowOperationalExceptionType
 
+            PayflowOperationalExceptionService(self.db).raise_exception(
+                exception_type=PayflowOperationalExceptionType.WORKFLOW_EXECUTION_FAILURE.value,
+                reason=message or "Workflow step failed",
+                client_id=run.client_id,
+                account_id=run.account_id,
+                source_entity_type="workflow_run",
+                source_entity_id=run.id,
+                severity="High",
+                retriable=True,
+                link=f"/payflow/cases/{run.account_id}",
+                notify=False,
+                commit=False,
+            )
             svc = PayflowNotificationService(self.db)
             svc.notify(
                 users=svc.recipients_for_client(run.client_id),
@@ -1393,7 +1422,24 @@ class WorkflowExecutionService:
     def _notify_provider_failed(self, run: PayflowWorkflowRunModel, channel: str, detail: str) -> None:
         try:
             from app.modules.payflow.services.notification_service import PayflowNotificationService
+            from app.modules.payflow.services.operational_exception_service import (
+                PayflowOperationalExceptionService,
+            )
+            from app.shared.enums import PayflowOperationalExceptionType
 
+            PayflowOperationalExceptionService(self.db).raise_exception(
+                exception_type=PayflowOperationalExceptionType.COMMUNICATION_FAILURE.value,
+                reason=f"{channel} send failed: {(detail or '')[:300]}",
+                client_id=run.client_id,
+                account_id=run.account_id,
+                source_entity_type="workflow_run",
+                source_entity_id=run.id,
+                severity="High",
+                retriable=True,
+                link=f"/payflow/cases/{run.account_id}",
+                notify=False,
+                commit=False,
+            )
             svc = PayflowNotificationService(self.db)
             svc.notify(
                 users=svc.recipients_for_client(run.client_id),
@@ -2015,6 +2061,33 @@ class WorkflowExecutionService:
         if not account:
             return {"advanced": 0}
         payload = payload or {}
+        status_raw = str(payload.get("status") or payload.get("result") or "").lower()
+        if status_raw in {"failed", "failure", "error", "declined"}:
+            try:
+                from app.modules.payflow.services.operational_exception_service import (
+                    PayflowOperationalExceptionService,
+                )
+                from app.shared.enums import PayflowOperationalExceptionType
+
+                PayflowOperationalExceptionService(self.db).raise_exception(
+                    exception_type=PayflowOperationalExceptionType.PAYMENT_PROCESSING_ISSUE.value,
+                    reason=str(
+                        payload.get("reason")
+                        or payload.get("error")
+                        or "Payment processing failed"
+                    )[:500],
+                    client_id=account.client_id,
+                    account_id=account_id,
+                    source_entity_type="payment",
+                    source_entity_id=str(payload.get("payment_id") or account_id),
+                    severity="High",
+                    retriable=True,
+                    link=f"/payflow/cases/{account_id}",
+                    commit=commit,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("payment failure exception raise failed")
+            return {"advanced": 0, "exception": "payment_processing_issue"}
         if payload.get("amount") is not None:
             try:
                 account.last_payment_amount = float(payload["amount"])

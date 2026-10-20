@@ -56,6 +56,9 @@ _PERMISSION_SEED: list[tuple[str, str, str, int]] = [
     ("create_edit_workflows", "Create / Edit Workflows", "collection_operations", 11),
     ("delete_workflows", "Delete Workflows", "collection_operations", 12),
     ("view_communications", "View Communications", "collection_operations", 13),
+    ("send_communications", "Send Communications", "collection_operations", 14),
+    ("view_operational_exceptions", "View Operational Exceptions", "collection_operations", 15),
+    ("manage_operational_exceptions", "Acknowledge / Resolve Exceptions", "collection_operations", 16),
     # Human review
     ("view_human_reviews", "View Human Reviews", "human_review", 20),
     ("approve_human_reviews", "Approve Human Reviews", "human_review", 21),
@@ -82,6 +85,9 @@ _SUPERVISOR_PERMISSION_CODES = [
     "view_collection_cases",
     "view_workflows",
     "view_communications",
+    "send_communications",
+    "view_operational_exceptions",
+    "manage_operational_exceptions",
     "view_human_reviews",
     "approve_human_reviews",
     "view_rules",
@@ -618,6 +624,16 @@ class DatabaseSeeder:
         # Supervisor defaults only on first create — later Edit access must stick.
         if supervisor_created:
             ensure_role_perms(supervisor, _SUPERVISOR_PERMISSION_CODES)
+        else:
+            # Additive only for newly introduced permission codes (does not reset custom grants).
+            ensure_role_perms(
+                supervisor,
+                [
+                    "send_communications",
+                    "view_operational_exceptions",
+                    "manage_operational_exceptions",
+                ],
+            )
         db.flush()
 
     def _seed_payflow_menus(self, db: Session) -> None:

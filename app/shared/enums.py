@@ -174,12 +174,33 @@ class PayflowCommStatus(str, Enum):
     AWAITING_GOVERNANCE = "Awaiting Governance"
     APPROVED = "Approved"
     SCHEDULED = "Scheduled"
+    QUEUED = "Queued"
     SENT = "Sent"
     DELIVERED = "Delivered"
     OPENED_READ = "Opened / Read"
     PAYMENT_LINK_CLICKED = "Payment Link Clicked"
     FAILED = "Failed"
     SUPPRESSED = "Suppressed"
+
+
+class PayflowOperationalExceptionType(str, Enum):
+    COMMUNICATION_FAILURE = "communication_failure"
+    WORKFLOW_EXECUTION_FAILURE = "workflow_execution_failure"
+    PAYMENT_PROCESSING_ISSUE = "payment_processing_issue"
+    PROCESSING_DISCREPANCY = "processing_discrepancy"
+
+
+class PayflowOperationalExceptionStatus(str, Enum):
+    OPEN = "Open"
+    ACKNOWLEDGED = "Acknowledged"
+    RESOLVED = "Resolved"
+
+
+class PayflowOperationalExceptionSeverity(str, Enum):
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+    CRITICAL = "Critical"
 
 
 class PayflowCommPurpose(str, Enum):
@@ -204,6 +225,7 @@ class PayflowNotificationType(str, Enum):
     WORKFLOW_RULE_BLOCKED = "workflow_rule_blocked"
     WORKFLOW_RUN_SUPERSEDED = "workflow_run_superseded"
     PROVIDER_SEND_FAILED = "provider_send_failed"
+    OPERATIONAL_EXCEPTION = "operational_exception"
 
 
 class PayflowWorkflowRunStatus(str, Enum):

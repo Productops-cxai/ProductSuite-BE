@@ -18,6 +18,7 @@ from app.infrastructure.database.seeder import run_seeder
 from app.modules.identity.routes import router as identity_router
 from app.modules.payflow.routes import router as payflow_router
 from app.modules.payflow.sendgrid_webhook import router as sendgrid_webhook_router
+from app.modules.payflow.twilio_webhook import router as twilio_webhook_router
 from app.modules.platform.routes import router as platform_router
 
 logger = logging.getLogger("uvicorn.error")
@@ -84,6 +85,7 @@ app.include_router(identity_router)
 app.include_router(platform_router)
 app.include_router(payflow_router)
 app.include_router(sendgrid_webhook_router)
+app.include_router(twilio_webhook_router)
 
 
 @app.get("/health", tags=["Health"])

@@ -463,6 +463,7 @@ class PayflowAccountModel(Base):
     provincial_hold: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     hold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     email_consent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    sms_opt_out: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
     source_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -697,6 +698,8 @@ class PayflowCommunicationModel(Base):
     )
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    recipient: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     opens_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -755,6 +758,46 @@ class PayflowCommunicationEventModel(Base):
     )
 
     communication = relationship("PayflowCommunicationModel", back_populates="event_rows")
+
+
+class PayflowOperationalExceptionModel(Base):
+    """Operational failure requiring attention (separate from Human Review governance)."""
+
+    __tablename__ = "payflow_operational_exceptions"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_payflow_ops_exception_dedupe"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exception_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False, default="Medium")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Open", index=True)
+    retriable: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    account_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=True, index=True
+    )
+    source_entity_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_entity_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    diagnostic_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    link: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    acknowledged_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel")
+    account = relationship("PayflowAccountModel")
 
 
 class PayflowRuleModel(Base):

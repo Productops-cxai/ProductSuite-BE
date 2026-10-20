@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_FROM_NUMBER: str = ""
+    # Public API base for Twilio StatusCallback / inbound webhooks (e.g. https://api.example.com).
+    # Empty = omit StatusCallback on send (local/dev).
+    PUBLIC_API_BASE: str = ""
 
     # Workflow worker (PostgreSQL due-queue).
     WORKFLOW_WORKER_ID: str = ""

@@ -321,6 +321,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         "action",
         "outcome",
         "note",
+        "review_reason",
         "template_id",
     ):
         if key in raw and raw[key] is not None and key not in cfg:

@@ -11,6 +11,7 @@ from app.infrastructure.database.models import (
     PayflowCommunicationModel,
     PayflowHumanReviewModel,
     PayflowNotificationModel,
+    PayflowOperationalExceptionModel,
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
@@ -20,6 +21,7 @@ from app.shared.enums import (
     PayflowCollectionStatus,
     PayflowCommChannel,
     PayflowCommStatus,
+    PayflowOperationalExceptionStatus,
     PayflowReviewPriority,
     PayflowReviewStatus,
 )
@@ -200,6 +202,24 @@ class PayflowDashboardService:
             1 for r in awaiting if r.priority == PayflowReviewPriority.HIGH.value
         )
         failed_comms = sum(1 for c in comms if c.status == PayflowCommStatus.FAILED.value)
+        open_exceptions_q = self.db.query(PayflowOperationalExceptionModel).filter(
+            PayflowOperationalExceptionModel.status
+            == PayflowOperationalExceptionStatus.OPEN.value
+        )
+        if client_id is not None:
+            open_exceptions_q = open_exceptions_q.filter(
+                PayflowOperationalExceptionModel.client_id == client_id
+            )
+        elif allowed is not None:
+            if allowed:
+                open_exceptions_q = open_exceptions_q.filter(
+                    PayflowOperationalExceptionModel.client_id.in_(allowed)
+                )
+            else:
+                open_exceptions_q = open_exceptions_q.filter(
+                    PayflowOperationalExceptionModel.id == -1
+                )
+        open_exceptions_count = open_exceptions_q.count()
         # Partial payments: recovered something but still outstanding
         partial_payments = sum(
             1
@@ -275,6 +295,13 @@ class PayflowDashboardService:
                 "count": len(awaiting),
                 "tone": "peach",
                 "href": "/payflow/review?status=Awaiting%20Review",
+            },
+            {
+                "id": "open_exceptions",
+                "label": f"Open Exceptions · {open_exceptions_count}",
+                "count": open_exceptions_count,
+                "tone": "coral",
+                "href": "/payflow/exceptions?status=Open",
             },
             {
                 "id": "failed_comms",

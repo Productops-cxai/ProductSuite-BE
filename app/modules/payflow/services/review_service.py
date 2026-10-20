@@ -43,6 +43,74 @@ REVIEW_REASONS = [
     "Hardship signal detected",
 ]
 
+# Lovable: Review Reason is a fixed business catalog; Triggered Rule is separate.
+# Map governance rule category → catalog reason when a rule creates a review.
+_CATEGORY_TO_REVIEW_REASON = {
+    "Amount": "High balance treatment",
+    "Collection Attempts": "Repeated unsuccessful attempts",
+    "AI Confidence": "Low decision confidence",
+    "Promise-to-Pay": "Payment arrangement exception",
+    "Payment Plan": "Payment arrangement exception",
+    "Payment Status": "Payment arrangement exception",
+    "Payment Activity": "Payment arrangement exception",
+    "Customer Risk": "Customer dispute raised",
+    "Communication": "Repeated unsuccessful attempts",
+    "Workflow": "Payment arrangement exception",
+}
+
+_DEFAULT_REVIEW_REASON = "Payment arrangement exception"
+
+
+def reason_from_rule(rule: PayflowRuleModel | None) -> str:
+    """Resolve the Lovable catalog reason for a governance rule (not the rule name)."""
+    if rule is None:
+        return _DEFAULT_REVIEW_REASON
+    name = (rule.name or "").lower()
+    if "hardship" in name:
+        return "Hardship signal detected"
+    if "dispute" in name:
+        return "Customer dispute raised"
+    if "confidence" in name:
+        return "Low decision confidence"
+    if "balance" in name or "amount" in name or "high value" in name:
+        return "High balance treatment"
+    if "promise" in name or "arrangement" in name or "plan" in name:
+        return "Payment arrangement exception"
+    if "attempt" in name:
+        return "Repeated unsuccessful attempts"
+    cat = (rule.category or "").strip()
+    if cat in _CATEGORY_TO_REVIEW_REASON:
+        return _CATEGORY_TO_REVIEW_REASON[cat]
+    return _DEFAULT_REVIEW_REASON
+
+
+def normalize_review_reason(
+    reason: str | None, *, rule: PayflowRuleModel | None = None
+) -> str:
+    """
+    Coerce free-text / legacy reasons onto the Lovable REVIEW_REASONS catalog.
+    Rule name and workflow step titles (e.g. 'Human review') must not appear as reasons.
+    """
+    text = (reason or "").strip()
+    if text in REVIEW_REASONS:
+        return text
+    if rule is not None:
+        return reason_from_rule(rule)
+    low = text.lower()
+    if "hardship" in low:
+        return "Hardship signal detected"
+    if "dispute" in low:
+        return "Customer dispute raised"
+    if "confidence" in low:
+        return "Low decision confidence"
+    if "balance" in low or "amount" in low:
+        return "High balance treatment"
+    if "promise" in low or "arrangement" in low or "plan" in low:
+        return "Payment arrangement exception"
+    if "attempt" in low:
+        return "Repeated unsuccessful attempts"
+    return _DEFAULT_REVIEW_REASON
+
 REJECTION_REASONS = [
     "Not appropriate for customer context",
     "Insufficient information",
@@ -601,7 +669,8 @@ class PayflowReviewService:
             ),
             "current_workflow": account.current_workflow if account else None,
             "priority": row.priority,
-            "reason": row.reason,
+            # Display catalog reason even for legacy rows that stored rule/step titles.
+            "reason": normalize_review_reason(row.reason, rule=rule),
             "rule_id": row.rule_id,
             "rule_code": rule.code if rule else None,
             "rule_name": rule.name
@@ -892,10 +961,7 @@ class PayflowReviewService:
         notify: bool = True,
         commit: bool = True,
     ) -> PayflowHumanReviewModel:
-        reason = (reason or "").strip()
         proposed_action = (proposed_action or "").strip()
-        if not reason:
-            raise ValidationAppError("Review reason is required")
         if not proposed_action:
             raise ValidationAppError("Proposed action is required")
         if priority not in {p.value for p in PayflowReviewPriority}:
@@ -934,6 +1000,11 @@ class PayflowReviewService:
                 raise ValidationAppError(
                     "Only rules with action 'Require Human Review' can create reviews"
                 )
+
+        # Catalog reason only — never store rule name or workflow step title as reason.
+        reason = normalize_review_reason(reason, rule=rule)
+        if not reason:
+            raise ValidationAppError("Review reason is required")
 
         strategy = self._resolve_strategy(account, strategy_id)
         assignee_id = _as_uuid(assigned_user_id)
@@ -1151,7 +1222,7 @@ class PayflowReviewService:
         return self.create_review(
             account_id=account_id,
             rule_id=rule.id,
-            reason=rule.name,
+            reason=reason_from_rule(rule),
             proposed_action=proposed_action
             or "Continue current treatment with adjusted communication",
             priority=priority,
@@ -1274,14 +1345,22 @@ class PayflowReviewService:
             q = q.filter(PayflowHumanReviewModel.status == status)
         if priority:
             q = q.filter(PayflowHumanReviewModel.priority == priority)
-        if reason:
-            q = q.filter(PayflowHumanReviewModel.reason == reason)
         if rule_id is not None:
             q = q.filter(PayflowHumanReviewModel.rule_id == rule_id)
         if proposed_action:
             q = q.filter(PayflowHumanReviewModel.proposed_action == proposed_action)
 
         rows = self._filter_permission_rows(user, q.all())
+
+        # Reason filter uses the Lovable catalog (including remapped legacy values).
+        if reason:
+            if reason not in REVIEW_REASONS:
+                raise ValidationAppError("Invalid reason filter")
+            rows = [
+                r
+                for r in rows
+                if normalize_review_reason(r.reason, rule=r.rule) == reason
+            ]
 
         if search:
             term = search.strip().lower()

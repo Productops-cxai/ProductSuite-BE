@@ -1060,6 +1060,8 @@ class PayflowCommunicationItem(BaseModel):
     sms_sender_id: Optional[str] = None
     provider: Optional[str] = None
     provider_message_id: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
     sent_at: Optional[datetime] = None
     delivered_at: Optional[datetime] = None
     opens_count: int = 0
@@ -1117,6 +1119,62 @@ class CommunicationEligibilitySnapshot(BaseModel):
     rule_code: Optional[str] = None
     can_view_rule: bool = False
     communication_id: Optional[int] = None
+
+
+class ManualSmsSendRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=1600)
+    purpose: str = "Payment Reminder"
+    include_payment_link: bool = False
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class ManualSmsSendResponse(BaseModel):
+    skipped: Optional[str] = None
+    communication_id: Optional[int] = None
+    code: Optional[str] = None
+    status: Optional[str] = None
+    comm_status: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
+    restriction_reason: Optional[str] = None
+
+
+class PayflowOperationalExceptionItem(BaseModel):
+    id: int
+    exception_type: str
+    severity: str
+    status: str
+    retriable: bool = True
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    case_reference: Optional[str] = None
+    source_entity_type: Optional[str] = None
+    source_entity_id: Optional[str] = None
+    reason: str
+    diagnostic_ref: Optional[str] = None
+    link: Optional[str] = None
+    dedupe_key: str
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class PayflowOperationalExceptionsListResponse(BaseModel):
+    exceptions: List[PayflowOperationalExceptionItem]
+    total: int = 0
+    open_count: int = 0
+    acknowledged_count: int = 0
+    resolved_count: int = 0
+
+
+class ResolveOperationalExceptionRequest(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=1000)
 
 
 class PayflowNotificationItem(BaseModel):

@@ -43,8 +43,13 @@ from app.modules.payflow.schemas import (
     PayflowAccountsListResponse,
     PayflowClientsListResponse,
     CommunicationEligibilitySnapshot,
+    ManualSmsSendRequest,
+    ManualSmsSendResponse,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
+    PayflowOperationalExceptionItem,
+    PayflowOperationalExceptionsListResponse,
+    ResolveOperationalExceptionRequest,
     PayflowIntegrationItem,
     PayflowIntegrationsListResponse,
     PayflowNotificationItem,
@@ -90,6 +95,9 @@ from app.modules.payflow.services.dashboard_service import PayflowDashboardServi
 from app.modules.payflow.services.import_service import PayflowImportService
 from app.modules.payflow.services.integration_service import PayflowIntegrationService
 from app.modules.payflow.services.notification_service import PayflowNotificationService
+from app.modules.payflow.services.operational_exception_service import (
+    PayflowOperationalExceptionService,
+)
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
@@ -1215,6 +1223,113 @@ def get_account_communication_eligibility(
         if not row:
             raise NotFoundError("Account not found")
         return PayflowCommunicationService(db).case_eligibility_snapshot(user, row)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/accounts/{account_id}/communications/sms/send",
+    response_model=ManualSmsSendResponse,
+)
+def send_manual_sms(
+    account_id: int,
+    payload: ManualSmsSendRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        result = PayflowCommunicationService(db).send_manual_sms(
+            user,
+            row,
+            body=payload.body,
+            purpose=payload.purpose,
+            include_payment_link=payload.include_payment_link,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualSmsSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Operational exceptions
+# ---------------------------------------------------------------------------
+
+
+@router.get("/exceptions", response_model=PayflowOperationalExceptionsListResponse)
+def list_operational_exceptions(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    status_filter: str | None = Query(default=None, alias="status"),
+    exception_type: str | None = Query(default=None),
+    client_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return PayflowOperationalExceptionService(db).list_exceptions(
+            user,
+            status=status_filter,
+            exception_type=exception_type,
+            client_id=client_id,
+            limit=limit,
+            offset=offset,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/exceptions/{exception_id}", response_model=PayflowOperationalExceptionItem)
+def get_operational_exception(
+    exception_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowOperationalExceptionService(db).get_exception(user, exception_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/exceptions/{exception_id}/acknowledge", response_model=PayflowOperationalExceptionItem)
+def acknowledge_operational_exception(
+    exception_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowOperationalExceptionService(db).acknowledge(user, exception_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/exceptions/{exception_id}/resolve", response_model=PayflowOperationalExceptionItem)
+def resolve_operational_exception(
+    exception_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    payload: ResolveOperationalExceptionRequest = ResolveOperationalExceptionRequest(),
+):
+    try:
+        return PayflowOperationalExceptionService(db).resolve(
+            user, exception_id, note=payload.note
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
