@@ -50,9 +50,12 @@ from app.modules.payflow.schemas import (
     ResendCommunicationRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
+    PayflowPaymentAttemptItem,
+    PayflowPaymentInitiateRequest,
     PayflowPaymentLinkItem,
     PayflowPaymentLinkPublicResolve,
     PayflowPaymentLinksListResponse,
+    PayflowPaymentMockOutcomeRequest,
     PayflowOperationalExceptionItem,
     PayflowOperationalExceptionsListResponse,
     ResolveOperationalExceptionRequest,
@@ -105,6 +108,7 @@ from app.modules.payflow.services.operational_exception_service import (
     PayflowOperationalExceptionService,
 )
 from app.modules.payflow.services.payment_link_service import PayflowPaymentLinkService
+from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
@@ -1392,9 +1396,70 @@ def revoke_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession
     response_model=PayflowPaymentLinkPublicResolve,
 )
 def resolve_public_payment_link(token: str, db: DbSession):
-    """Customer payment portal resolve — no JWT. Access audit only; never marks paid."""
+    """Customer payment portal resolve — no JWT. Branding, balance, options."""
     try:
-        return PayflowPaymentLinkService(db).resolve_public(token)
+        return PayflowPaymentPortalService(db).resolve_portal(token)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/initiate",
+    response_model=PayflowPaymentAttemptItem,
+)
+def initiate_public_payment(
+    token: str, payload: PayflowPaymentInitiateRequest, db: DbSession
+):
+    """Validate option/amount and create Stripe (or mock) Checkout session."""
+    try:
+        return PayflowPaymentPortalService(db).initiate(
+            token,
+            option_id=payload.option_id,
+            amount=payload.amount,
+            idempotency_key=payload.idempotency_key,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/public/payment-links/{token}/attempts/{attempt_id}",
+    response_model=PayflowPaymentAttemptItem,
+)
+def get_public_payment_attempt(token: str, attempt_id: str, db: DbSession):
+    """Poll backend-confirmed payment outcome (never trust browser redirect alone)."""
+    try:
+        return PayflowPaymentPortalService(db).get_attempt_public(token, attempt_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/attempts/{attempt_id}/cancel",
+    response_model=PayflowPaymentAttemptItem,
+)
+def cancel_public_payment_attempt(token: str, attempt_id: str, db: DbSession):
+    try:
+        return PayflowPaymentPortalService(db).cancel_attempt(token, attempt_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/attempts/{attempt_id}/mock-outcome",
+    response_model=PayflowPaymentAttemptItem,
+)
+def mock_public_payment_outcome(
+    token: str,
+    attempt_id: str,
+    payload: PayflowPaymentMockOutcomeRequest,
+    db: DbSession,
+):
+    """Dev-only when Stripe keys are unset — never collects card details."""
+    try:
+        return PayflowPaymentPortalService(db).simulate_mock_outcome(
+            token, attempt_id, outcome=payload.outcome
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 

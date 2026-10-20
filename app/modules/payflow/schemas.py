@@ -193,6 +193,8 @@ class UpdatePayflowClientRequest(BaseModel):
     sms_sender_id: Optional[str] = None
     channels: Optional[dict] = None
     governance_rules: Optional[List[str]] = None
+    # Portal options: allow_pay_in_full, allow_partial, allow_payment_plan, min amounts, plans.
+    payment_settings: Optional[dict] = None
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
@@ -1205,10 +1207,42 @@ class PayflowPaymentLinkPublicResolve(BaseModel):
     status: str
     block_reason: Optional[str] = None
     expires_at: Optional[datetime] = None
+    token: Optional[str] = None
     customer: dict = Field(default_factory=dict)
     case: dict = Field(default_factory=dict)
     brand: dict = Field(default_factory=dict)
     link_ref: Optional[str] = None
+    payment_options: List[dict] = Field(default_factory=list)
+    provider: dict = Field(default_factory=dict)
+
+
+class PayflowPaymentInitiateRequest(BaseModel):
+    option_id: str = Field(min_length=1, max_length=64)
+    amount: Optional[float] = Field(default=None, gt=0)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class PayflowPaymentAttemptItem(BaseModel):
+    id: str
+    status: str
+    option_type: str
+    plan_id: Optional[str] = None
+    amount: float
+    currency_code: str
+    provider: str
+    checkout_url: Optional[str] = None
+    error_message: Optional[str] = None
+    balance_at_initiation: Optional[float] = None
+    stripe_session_id: Optional[str] = None
+    reference: Optional[str] = None
+    confirmed: bool = False
+    events: List[dict] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class PayflowPaymentMockOutcomeRequest(BaseModel):
+    outcome: str = Field(min_length=1, max_length=32)
 
 
 class PayflowOperationalExceptionItem(BaseModel):

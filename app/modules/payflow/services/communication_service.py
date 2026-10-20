@@ -1070,9 +1070,23 @@ class PayflowCommunicationService:
         if not row:
             return
         if event == "initiated":
+            if row.payment_initiated:
+                # Idempotent — do not append a second "Payment Initiated" timeline row.
+                if commit:
+                    self.db.commit()
+                else:
+                    self.db.flush()
+                return
             row.payment_initiated = True
             self._record_event_row(row, event_type="payment_initiated", label="Payment Initiated")
         elif event == "completed":
+            if row.payment_completed:
+                # Idempotent — prevents duplicate "Payment Completed" from Stripe + workflow paths.
+                if commit:
+                    self.db.commit()
+                else:
+                    self.db.flush()
+                return
             row.payment_initiated = True
             row.payment_completed = True
             self._record_event_row(row, event_type="payment_completed", label="Payment Completed")
@@ -1213,6 +1227,7 @@ class PayflowCommunicationService:
                 else:
                     self.db.flush()
         self.db.commit()
+        self._notify_manual_comm_sent(account, result, channel="SMS")
         return result
 
     def send_manual_email(
@@ -1304,7 +1319,33 @@ class PayflowCommunicationService:
                 row.workflow_name = "Manual Email"
                 self.db.flush()
         self.db.commit()
+        self._notify_manual_comm_sent(account, result, channel="Email")
         return result
+
+    def _notify_manual_comm_sent(
+        self, account: PayflowAccountModel, result: dict[str, Any], *, channel: str
+    ) -> None:
+        if result.get("skipped") or result.get("status") in {"blocked", "failed"}:
+            return
+        if not result.get("communication_id"):
+            return
+        try:
+            from app.modules.payflow.services.notification_service import (
+                PayflowNotificationService,
+            )
+
+            PayflowNotificationService(self.db).notify_comm_sent(
+                client_id=account.client_id,
+                account_id=account.id,
+                customer_name=account.customer_name or "Customer",
+                account_reference=account.account_reference or str(account.id),
+                channel=channel,
+                recipient=result.get("recipient"),
+                communication_id=result.get("communication_id"),
+                communication_code=result.get("code"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("manual %s sent notify failed account_id=%s", channel, account.id)
 
     def resend_failed_communication(
         self,

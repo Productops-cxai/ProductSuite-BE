@@ -210,6 +210,21 @@ class PayflowPaymentLinkStatus(str, Enum):
     COMPLETED = "Completed"
 
 
+class PayflowPaymentOptionType(str, Enum):
+    PAY_IN_FULL = "pay_in_full"
+    PARTIAL = "partial"
+    PAYMENT_PLAN = "payment_plan"
+
+
+class PayflowPaymentAttemptStatus(str, Enum):
+    INITIATED = "Initiated"
+    PROCESSING = "Processing"
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+    EXPIRED = "Expired"
+
+
 class PayflowCommPurpose(str, Enum):
     PAYMENT_REMINDER = "Payment Reminder"
     PROMISE_FOLLOW_UP = "Promise-to-Pay Follow-Up"
@@ -233,6 +248,9 @@ class PayflowNotificationType(str, Enum):
     WORKFLOW_RUN_SUPERSEDED = "workflow_run_superseded"
     PROVIDER_SEND_FAILED = "provider_send_failed"
     OPERATIONAL_EXCEPTION = "operational_exception"
+    # Customer payment portal / Stripe (or mock) outcomes
+    PAYMENT_RECEIVED = "payment_received"
+    PAYMENT_FAILED = "payment_failed"
 
 
 class PayflowWorkflowRunStatus(str, Enum):

@@ -311,6 +311,8 @@ class PayflowClientModel(Base):
     channel_sms: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     channel_whatsapp: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     governance_rules: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Customer portal payment options (pay in full / partial / plans, min amounts).
+    payment_settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # How the client was first created: add_client | file_upload
     added_through: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -800,6 +802,59 @@ class PayflowPaymentLinkModel(Base):
     client = relationship("PayflowClientModel")
     account = relationship("PayflowAccountModel")
     communication = relationship("PayflowCommunicationModel")
+    attempts = relationship(
+        "PayflowPaymentAttemptModel",
+        back_populates="payment_link",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowPaymentAttemptModel(Base):
+    """Customer payment initiation via Stripe Checkout (or local mock when unset)."""
+
+    __tablename__ = "payflow_payment_attempts"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_payflow_payment_attempt_public_id"),
+        Index("ix_payflow_payment_attempts_stripe_session", "stripe_session_id"),
+        Index("ix_payflow_payment_attempts_link_status", "payment_link_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payment_link_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_payment_links.id"), nullable=False, index=True
+    )
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    option_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    plan_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Initiated", index=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="stripe")
+    stripe_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    checkout_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    balance_at_initiation: Mapped[float | None] = mapped_column(Float, nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    provider_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    payment_link = relationship("PayflowPaymentLinkModel", back_populates="attempts")
+    client = relationship("PayflowClientModel")
+    account = relationship("PayflowAccountModel")
 
 
 class PayflowOperationalExceptionModel(Base):

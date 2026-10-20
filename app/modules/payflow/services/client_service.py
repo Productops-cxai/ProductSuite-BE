@@ -724,6 +724,12 @@ class PayflowClientService:
                 raise ValidationAppError(f"Unknown governance rule(s): {', '.join(map(str, unknown))}")
             client.governance_rules = list(rules)
 
+        if "payment_settings" in payload and payload["payment_settings"] is not None:
+            settings_payload = payload["payment_settings"]
+            if not isinstance(settings_payload, dict):
+                raise ValidationAppError("payment_settings must be an object")
+            client.payment_settings = dict(settings_payload)
+
         if "mappings" in payload and payload["mappings"] is not None:
             self._replace_mappings(client, payload["mappings"])
 
@@ -841,6 +847,19 @@ class PayflowClientService:
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(client)
+
+        try:
+            from app.modules.payflow.services.notification_service import (
+                PayflowNotificationService,
+            )
+
+            PayflowNotificationService(self.db).notify_client_activated(
+                client_id=client.id,
+                client_name=client.name,
+                actor_user_id=user.id if user else None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
 
@@ -3577,6 +3596,7 @@ class PayflowClientService:
                 "whatsapp": bool(client.channel_whatsapp),
             },
             "governance_rules": list(client.governance_rules or []),
+            "payment_settings": dict(client.payment_settings or {}),
             "mappings": [
                 {
                     "id": m.id,

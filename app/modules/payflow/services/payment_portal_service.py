@@ -1,0 +1,846 @@
+"""Customer payment portal — resolve, eligibility, initiate, attempt status, Stripe outcomes."""
+
+from __future__ import annotations
+
+import logging
+import math
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy.orm import Session, joinedload
+
+from app.core.config import settings
+from app.core.exceptions import NotFoundError, ValidationAppError
+from app.infrastructure.database.models import (
+    PayflowAccountModel,
+    PayflowClientModel,
+    PayflowPaymentAttemptModel,
+    PayflowPaymentLinkModel,
+)
+from app.modules.payflow.services.payment_link_service import (
+    PayflowPaymentLinkService,
+    public_url_for_token,
+)
+from app.modules.payflow.services.stripe_checkout_service import (
+    create_checkout_session,
+    stripe_configured,
+)
+from app.shared.enums import (
+    PayflowClientType,
+    PayflowPaymentAttemptStatus,
+    PayflowPaymentLinkStatus,
+    PayflowPaymentOptionType,
+)
+
+logger = logging.getLogger("app.payflow.payment_portal")
+
+_DEFAULT_PAYMENT_SETTINGS: dict[str, Any] = {
+    "allow_pay_in_full": True,
+    "allow_partial": True,
+    "allow_payment_plan": True,
+    "min_partial_amount": 10.0,
+    "min_partial_percent": 5.0,
+    "payment_plan_options": [
+        {"id": "plan_3", "label": "3 monthly instalments", "installments": 3},
+        {"id": "plan_6", "label": "6 monthly instalments", "installments": 6},
+    ],
+}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _money(value: float) -> float:
+    return round(float(value or 0), 2)
+
+
+class PayflowPaymentPortalService:
+    def __init__(self, db: Session):
+        self.db = db
+        self.links = PayflowPaymentLinkService(db)
+
+    def _append_attempt_event(
+        self, row: PayflowPaymentAttemptModel, label: str, detail: str | None = None
+    ) -> None:
+        events = list(row.events or [])
+        events.append({"at": _utcnow().isoformat(), "label": label, "detail": detail})
+        row.events = events[-80:]
+
+    def _client_settings(self, client: PayflowClientModel | None) -> dict[str, Any]:
+        raw = dict(_DEFAULT_PAYMENT_SETTINGS)
+        if client and isinstance(client.payment_settings, dict):
+            raw.update({k: v for k, v in client.payment_settings.items() if v is not None})
+        return raw
+
+    def _is_third_party(self, client: PayflowClientModel | None) -> bool:
+        if not client or not client.client_type:
+            return True
+        key = str(client.client_type).strip().lower().replace(" ", "_").replace("-", "_")
+        return key in {
+            PayflowClientType.THIRD_PARTY.value,
+            "thirdparty",
+            "third_party",
+        }
+
+    def _brand_payload(self, client: PayflowClientModel | None) -> dict[str, Any]:
+        third = self._is_third_party(client)
+        client_label = (client.brand_name or client.name) if client else "Client"
+        if third:
+            return {
+                "mode": "third_party",
+                "name": settings.PAYFLOW_OPERATOR_BRAND_NAME or "PayFlow Collections",
+                "logo_url": (settings.PAYFLOW_OPERATOR_LOGO_URL or None) or None,
+                "on_behalf_of": client_label,
+            }
+        return {
+            "mode": "first_party",
+            "name": client_label or "PayFlow",
+            "logo_url": client.logo_url if client else None,
+            "on_behalf_of": None,
+        }
+
+    def _case_payment_eligible(self, account: PayflowAccountModel) -> tuple[bool, str | None]:
+        ok, reason = self.links._case_eligible(account)
+        if not ok:
+            return ok, reason
+        balance = _money(account.outstanding_balance)
+        if balance <= 0:
+            return False, "This account has no outstanding balance"
+        return True, None
+
+    def _build_options(
+        self, account: PayflowAccountModel, client: PayflowClientModel | None
+    ) -> list[dict[str, Any]]:
+        settings_map = self._client_settings(client)
+        balance = _money(account.outstanding_balance)
+        currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        options: list[dict[str, Any]] = []
+
+        if settings_map.get("allow_pay_in_full", True) and balance > 0:
+            options.append(
+                {
+                    "id": PayflowPaymentOptionType.PAY_IN_FULL.value,
+                    "type": PayflowPaymentOptionType.PAY_IN_FULL.value,
+                    "label": "Pay in full",
+                    "description": "Settle the full outstanding balance in one payment.",
+                    "amount": balance,
+                    "currency_code": currency,
+                    "amount_editable": False,
+                    "min_amount": balance,
+                    "max_amount": balance,
+                }
+            )
+
+        if settings_map.get("allow_partial", True) and balance > 0:
+            min_amt = float(settings_map.get("min_partial_amount") or 10.0)
+            pct = float(settings_map.get("min_partial_percent") or 0)
+            if pct > 0:
+                min_amt = max(min_amt, _money(balance * (pct / 100.0)))
+            min_amt = min(min_amt, balance)
+            if min_amt < balance:
+                options.append(
+                    {
+                        "id": PayflowPaymentOptionType.PARTIAL.value,
+                        "type": PayflowPaymentOptionType.PARTIAL.value,
+                        "label": "Pay a partial amount",
+                        "description": f"Pay any amount between {min_amt:.2f} and {balance:.2f} {currency}.",
+                        "amount": None,
+                        "currency_code": currency,
+                        "amount_editable": True,
+                        "min_amount": min_amt,
+                        "max_amount": balance,
+                    }
+                )
+
+        if settings_map.get("allow_payment_plan", True) and balance > 0:
+            plans = settings_map.get("payment_plan_options") or []
+            for plan in plans:
+                if not isinstance(plan, dict):
+                    continue
+                installments = int(plan.get("installments") or 0)
+                if installments < 2:
+                    continue
+                first = _money(math.ceil((balance / installments) * 100) / 100)
+                first = min(first, balance)
+                plan_id = str(plan.get("id") or f"plan_{installments}")
+                options.append(
+                    {
+                        "id": plan_id,
+                        "type": PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                        "label": str(plan.get("label") or f"{installments} instalments"),
+                        "description": (
+                            f"Start a {installments}-payment plan. Today's charge is the first "
+                            f"instalment ({first:.2f} {currency})."
+                        ),
+                        "amount": first,
+                        "currency_code": currency,
+                        "amount_editable": False,
+                        "min_amount": first,
+                        "max_amount": first,
+                        "installments": installments,
+                        "plan_id": plan_id,
+                    }
+                )
+
+        return options
+
+    def resolve_portal(self, token: str) -> dict[str, Any]:
+        """Public portal payload — branding, balance, options, block reasons."""
+        row = (
+            self.db.query(PayflowPaymentLinkModel)
+            .options(
+                joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
+                joinedload(PayflowPaymentLinkModel.client),
+            )
+            .filter(PayflowPaymentLinkModel.token == token)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment link not found")
+
+        self.links._refresh_expiry(row)
+        account = row.account
+        if not account:
+            raise NotFoundError("Account not found")
+        client = account.client or row.client
+
+        usable = row.status == PayflowPaymentLinkStatus.ACTIVE.value
+        block_reason: str | None = None
+        if row.status == PayflowPaymentLinkStatus.EXPIRED.value:
+            block_reason = "This payment link has expired"
+            usable = False
+        elif row.status == PayflowPaymentLinkStatus.REVOKED.value:
+            block_reason = "This payment link has been revoked"
+            usable = False
+        elif row.status == PayflowPaymentLinkStatus.COMPLETED.value:
+            block_reason = "Payment for this link was already completed"
+            usable = False
+        else:
+            ok, reason = self._case_payment_eligible(account)
+            if not ok:
+                usable = False
+                block_reason = reason
+
+        row.access_count = int(row.access_count or 0) + 1
+        row.last_accessed_at = _utcnow()
+        self.links._append_event(
+            row, "Accessed", "usable" if usable else (block_reason or "blocked")
+        )
+        self.db.commit()
+
+        balance = _money(account.outstanding_balance)
+        currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        options = self._build_options(account, client) if usable else []
+        provider_ready = stripe_configured() or (settings.APP_ENV or "").lower() in {
+            "development",
+            "dev",
+            "local",
+            "test",
+        }
+
+        return {
+            "usable": usable,
+            "status": row.status,
+            "block_reason": block_reason,
+            "expires_at": row.expires_at,
+            "token": token,
+            "link_ref": row.token[:8],
+            "customer": {
+                "display_name": account.customer_first_name
+                or (account.customer_name or "").split(" ")[0]
+                or "Customer",
+            },
+            "case": {
+                "account_reference": account.account_reference,
+                "outstanding_balance": balance,
+                "currency_code": currency,
+                "collection_status": account.collection_status,
+            },
+            "brand": self._brand_payload(client),
+            "payment_options": options,
+            "provider": {
+                "name": "stripe" if stripe_configured() else "mock",
+                "ready": bool(provider_ready and usable and options),
+                "message": None
+                if provider_ready
+                else "Online payments are not configured for this environment",
+            },
+        }
+
+    def _resolve_amount(
+        self,
+        *,
+        option: dict[str, Any],
+        requested_amount: float | None,
+        balance: float,
+    ) -> float:
+        opt_type = option["type"]
+        if opt_type == PayflowPaymentOptionType.PAY_IN_FULL.value:
+            return balance
+        if opt_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            return _money(option["amount"])
+        # partial
+        if requested_amount is None:
+            raise ValidationAppError("Partial payment amount is required")
+        amount = _money(requested_amount)
+        min_a = _money(option["min_amount"])
+        max_a = _money(option["max_amount"])
+        if amount < min_a:
+            raise ValidationAppError(f"Amount must be at least {min_a:.2f}")
+        if amount > max_a:
+            raise ValidationAppError(f"Amount cannot exceed {max_a:.2f}")
+        return amount
+
+    def initiate(
+        self,
+        token: str,
+        *,
+        option_id: str,
+        amount: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        row = (
+            self.db.query(PayflowPaymentLinkModel)
+            .options(
+                joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
+                joinedload(PayflowPaymentLinkModel.client),
+            )
+            .filter(PayflowPaymentLinkModel.token == token)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment link not found")
+        self.links._refresh_expiry(row)
+        if row.status != PayflowPaymentLinkStatus.ACTIVE.value:
+            raise ValidationAppError(
+                "This payment link is no longer available"
+                if row.status != PayflowPaymentLinkStatus.COMPLETED.value
+                else "Payment for this link was already completed"
+            )
+
+        account = row.account
+        if not account:
+            raise NotFoundError("Account not found")
+        ok, reason = self._case_payment_eligible(account)
+        if not ok:
+            raise ValidationAppError(reason or "Case is not eligible for payment")
+
+        # Recheck live balance — prevent stale / overpayment.
+        balance = _money(account.outstanding_balance)
+        if balance <= 0:
+            raise ValidationAppError("This account has no outstanding balance")
+
+        client = account.client or row.client
+        options = self._build_options(account, client)
+        option = next((o for o in options if o["id"] == option_id), None)
+        if not option:
+            raise ValidationAppError("Selected payment option is not available")
+
+        # Recompute option amounts against current balance.
+        if option["type"] == PayflowPaymentOptionType.PAY_IN_FULL.value:
+            option = {**option, "amount": balance, "min_amount": balance, "max_amount": balance}
+        elif option["type"] == PayflowPaymentOptionType.PARTIAL.value:
+            option = {**option, "max_amount": balance}
+            if option["min_amount"] > balance:
+                raise ValidationAppError("Partial payment is not available for this balance")
+
+        charge_amount = self._resolve_amount(
+            option=option, requested_amount=amount, balance=balance
+        )
+        if charge_amount > balance:
+            raise ValidationAppError("Payment amount exceeds current outstanding balance")
+
+        if idempotency_key:
+            existing = (
+                self.db.query(PayflowPaymentAttemptModel)
+                .filter(PayflowPaymentAttemptModel.idempotency_key == idempotency_key)
+                .first()
+            )
+            if existing:
+                return self.serialize_attempt(existing)
+
+        # Avoid duplicate open attempts for same link+option+amount in a short window.
+        open_statuses = {
+            PayflowPaymentAttemptStatus.INITIATED.value,
+            PayflowPaymentAttemptStatus.PROCESSING.value,
+        }
+        recent = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.payment_link_id == row.id,
+                PayflowPaymentAttemptModel.option_type == option["type"],
+                PayflowPaymentAttemptModel.amount == charge_amount,
+                PayflowPaymentAttemptModel.status.in_(list(open_statuses)),
+            )
+            .order_by(PayflowPaymentAttemptModel.id.desc())
+            .first()
+        )
+        if recent and recent.checkout_url:
+            return self.serialize_attempt(recent)
+
+        currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        public_id = uuid.uuid4().hex
+        use_stripe = stripe_configured()
+        attempt = PayflowPaymentAttemptModel(
+            public_id=public_id,
+            payment_link_id=row.id,
+            client_id=row.client_id,
+            account_id=account.id,
+            option_type=option["type"],
+            plan_id=option.get("plan_id"),
+            amount=charge_amount,
+            currency_code=currency,
+            status=PayflowPaymentAttemptStatus.INITIATED.value,
+            provider="stripe" if use_stripe else "mock",
+            idempotency_key=idempotency_key,
+            balance_at_initiation=balance,
+            events=[],
+        )
+        self.db.add(attempt)
+        self.db.flush()
+        self._append_attempt_event(
+            attempt,
+            "Initiated",
+            f"{option['type']} {charge_amount:.2f} {currency}",
+        )
+
+        fe = (settings.FRONTEND_URL or "").rstrip("/")
+        success_url = (
+            f"{fe}/pay/{token}/result?attempt={public_id}&outcome=success"
+            if fe
+            else f"/pay/{token}/result?attempt={public_id}&outcome=success"
+        )
+        cancel_url = (
+            f"{fe}/pay/{token}/result?attempt={public_id}&outcome=cancel"
+            if fe
+            else f"/pay/{token}/result?attempt={public_id}&outcome=cancel"
+        )
+        brand = self._brand_payload(client)
+
+        try:
+            if use_stripe:
+                session = create_checkout_session(
+                    amount=charge_amount,
+                    currency=currency,
+                    success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
+                    cancel_url=cancel_url,
+                    client_reference_id=public_id,
+                    metadata={
+                        "attempt_public_id": public_id,
+                        "payment_link_token": token[:48],
+                        "account_id": str(account.id),
+                        "client_id": str(row.client_id),
+                        "option_type": option["type"],
+                    },
+                    brand_name=brand.get("name"),
+                    customer_email=(account.email or None),
+                )
+                attempt.stripe_session_id = session.get("id")
+                attempt.checkout_url = session.get("url")
+                pi = session.get("payment_intent")
+                if isinstance(pi, str):
+                    attempt.stripe_payment_intent_id = pi
+                attempt.provider_payload = {"session_id": session.get("id")}
+                attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
+                self._append_attempt_event(attempt, "Checkout Created", attempt.stripe_session_id)
+            else:
+                # Dev mock — no card data; customer confirms on our page.
+                mock_url = (
+                    f"{fe}/pay/{token}/checkout?attempt={public_id}"
+                    if fe
+                    else f"/pay/{token}/checkout?attempt={public_id}"
+                )
+                attempt.checkout_url = mock_url
+                attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
+                self._append_attempt_event(attempt, "Mock Checkout Ready", None)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("checkout create failed attempt=%s", public_id)
+            attempt.status = PayflowPaymentAttemptStatus.FAILED.value
+            attempt.error_message = str(exc)[:500]
+            self._append_attempt_event(attempt, "Checkout Failed", attempt.error_message)
+            self._raise_ops_exception(attempt, attempt.error_message or "Checkout failed")
+            self.db.commit()
+            try:
+                from app.modules.payflow.services.notification_service import (
+                    PayflowNotificationService,
+                )
+
+                PayflowNotificationService(self.db).notify_payment_failed(
+                    client_id=attempt.client_id,
+                    account_id=attempt.account_id,
+                    customer_name=account.customer_name or "Customer",
+                    account_reference=account.account_reference or str(account.id),
+                    attempt_public_id=attempt.public_id,
+                    detail=attempt.error_message,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("checkout failed notify failed attempt=%s", public_id)
+            raise ValidationAppError(
+                "Unable to start payment. Please try again or contact support."
+            ) from exc
+
+        try:
+            from app.modules.payflow.services.communication_service import (
+                PayflowCommunicationService,
+            )
+
+            PayflowCommunicationService(self.db).mark_payment_event(
+                account.id, event="initiated", commit=False
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("mark payment initiated failed account_id=%s", account.id)
+
+        self.db.commit()
+        self.db.refresh(attempt)
+        return self.serialize_attempt(attempt)
+
+    def serialize_attempt(self, row: PayflowPaymentAttemptModel) -> dict[str, Any]:
+        return {
+            "id": row.public_id,
+            "status": row.status,
+            "option_type": row.option_type,
+            "plan_id": row.plan_id,
+            "amount": _money(row.amount),
+            "currency_code": row.currency_code,
+            "provider": row.provider,
+            "checkout_url": row.checkout_url,
+            "error_message": row.error_message,
+            "balance_at_initiation": row.balance_at_initiation,
+            "stripe_session_id": row.stripe_session_id,
+            "reference": row.stripe_payment_intent_id or row.stripe_session_id or row.public_id[:12],
+            "confirmed": row.status == PayflowPaymentAttemptStatus.SUCCEEDED.value,
+            "events": list(row.events or []),
+            "created_at": row.created_at,
+            "completed_at": row.completed_at,
+        }
+
+    def get_attempt_public(self, token: str, attempt_public_id: str) -> dict[str, Any]:
+        link = (
+            self.db.query(PayflowPaymentLinkModel)
+            .filter(PayflowPaymentLinkModel.token == token)
+            .first()
+        )
+        if not link:
+            raise NotFoundError("Payment link not found")
+        row = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.public_id == attempt_public_id,
+                PayflowPaymentAttemptModel.payment_link_id == link.id,
+            )
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment attempt not found")
+        return self.serialize_attempt(row)
+
+    def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
+        link = (
+            self.db.query(PayflowPaymentLinkModel)
+            .filter(PayflowPaymentLinkModel.token == token)
+            .first()
+        )
+        if not link:
+            raise NotFoundError("Payment link not found")
+        row = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.public_id == attempt_public_id,
+                PayflowPaymentAttemptModel.payment_link_id == link.id,
+            )
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment attempt not found")
+        if row.status in {
+            PayflowPaymentAttemptStatus.SUCCEEDED.value,
+            PayflowPaymentAttemptStatus.FAILED.value,
+            PayflowPaymentAttemptStatus.CANCELLED.value,
+            PayflowPaymentAttemptStatus.EXPIRED.value,
+        }:
+            return self.serialize_attempt(row)
+        row.status = PayflowPaymentAttemptStatus.CANCELLED.value
+        self._append_attempt_event(row, "Cancelled", "Customer returned without paying")
+        self.db.commit()
+        self.db.refresh(row)
+        return self.serialize_attempt(row)
+
+    def simulate_mock_outcome(
+        self, token: str, attempt_public_id: str, *, outcome: str
+    ) -> dict[str, Any]:
+        """Dev-only path when Stripe keys are unset. Never stores card details."""
+        if stripe_configured():
+            raise ValidationAppError("Mock outcomes are disabled when Stripe is configured")
+        if (settings.APP_ENV or "").lower() not in {"development", "dev", "local", "test"}:
+            raise ValidationAppError("Mock payment outcomes are only available in development")
+
+        link = (
+            self.db.query(PayflowPaymentLinkModel)
+            .filter(PayflowPaymentLinkModel.token == token)
+            .first()
+        )
+        if not link:
+            raise NotFoundError("Payment link not found")
+        row = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.public_id == attempt_public_id,
+                PayflowPaymentAttemptModel.payment_link_id == link.id,
+            )
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment attempt not found")
+        if row.provider != "mock":
+            raise ValidationAppError("Attempt is not a mock checkout")
+
+        outcome_norm = (outcome or "").strip().lower()
+        if outcome_norm == "success":
+            self.apply_succeeded(row, provider_ref=f"mock_{row.public_id[:12]}", commit=True)
+        elif outcome_norm in {"fail", "failed", "failure"}:
+            self.apply_failed(row, error="Mock payment failed", commit=True)
+        elif outcome_norm in {"cancel", "cancelled", "canceled"}:
+            row.status = PayflowPaymentAttemptStatus.CANCELLED.value
+            self._append_attempt_event(row, "Cancelled", "Mock cancel")
+            self.db.commit()
+        else:
+            raise ValidationAppError("outcome must be success, failed, or cancel")
+        self.db.refresh(row)
+        return self.serialize_attempt(row)
+
+    def _raise_ops_exception(self, attempt: PayflowPaymentAttemptModel, reason: str) -> None:
+        try:
+            from app.modules.payflow.services.operational_exception_service import (
+                PayflowOperationalExceptionService,
+            )
+            from app.shared.enums import PayflowOperationalExceptionType
+
+            PayflowOperationalExceptionService(self.db).raise_exception(
+                exception_type=PayflowOperationalExceptionType.PAYMENT_PROCESSING_ISSUE.value,
+                reason=reason[:500],
+                client_id=attempt.client_id,
+                account_id=attempt.account_id,
+                source_entity_type="payment_attempt",
+                source_entity_id=attempt.public_id,
+                severity="High",
+                retriable=True,
+                link=f"/payflow/cases/{attempt.account_id}",
+                notify=True,
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to raise payment ops exception")
+
+    def apply_succeeded(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        *,
+        provider_ref: str | None = None,
+        commit: bool = True,
+    ) -> None:
+        if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
+            return  # idempotent
+        if attempt.status in {
+            PayflowPaymentAttemptStatus.CANCELLED.value,
+            PayflowPaymentAttemptStatus.EXPIRED.value,
+        }:
+            # Late success after cancel — still accept provider truth.
+            pass
+
+        account = self.db.get(PayflowAccountModel, attempt.account_id)
+        amount = _money(attempt.amount)
+        if account:
+            # Adjust balance only once on first success.
+            prev = _money(account.outstanding_balance)
+            new_bal = max(0.0, _money(prev - amount))
+            account.outstanding_balance = new_bal
+            account.recovered_balance = _money((account.recovered_balance or 0) + amount)
+            account.last_payment_amount = amount
+            account.last_payment_date = _utcnow().date()
+            account.paid_amount = _money((account.paid_amount or 0) + amount)
+            if new_bal <= 0:
+                account.collection_status = "Resolved"
+
+        attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
+        attempt.completed_at = _utcnow()
+        if provider_ref:
+            attempt.stripe_payment_intent_id = (
+                attempt.stripe_payment_intent_id or provider_ref
+            )
+        self._append_attempt_event(attempt, "Succeeded", provider_ref)
+
+        # Complete payment links when balance cleared or pay-in-full.
+        if account and (
+            _money(account.outstanding_balance) <= 0
+            or attempt.option_type == PayflowPaymentOptionType.PAY_IN_FULL.value
+        ):
+            self.links.mark_completed_for_account(attempt.account_id, commit=False)
+
+        # Single path: workflow advance + one communication "Payment Completed" event.
+        # Do NOT also call mark_payment_event here — on_payment_event already does that.
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_payment_event(
+                attempt.account_id,
+                {
+                    "amount": amount,
+                    "completed": True,
+                    "status": "succeeded",
+                    "source": "stripe" if attempt.provider == "stripe" else "mock",
+                    "attempt_id": attempt.public_id,
+                    "payment_date": _utcnow().date().isoformat(),
+                },
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("workflow payment event failed")
+
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
+
+        # In-app after durable success (ops + client supervisors).
+        try:
+            from app.modules.payflow.services.notification_service import (
+                PayflowNotificationService,
+            )
+
+            customer = account.customer_name if account else "Customer"
+            ref = account.account_reference if account else str(attempt.account_id)
+            resolved = bool(account and _money(account.outstanding_balance) <= 0)
+            PayflowNotificationService(self.db).notify_payment_received(
+                client_id=attempt.client_id,
+                account_id=attempt.account_id,
+                customer_name=customer,
+                account_reference=ref,
+                amount=amount,
+                currency_code=attempt.currency_code or "USD",
+                attempt_public_id=attempt.public_id,
+                option_type=attempt.option_type,
+                resolved=resolved,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("payment received notify failed attempt=%s", attempt.public_id)
+
+    def apply_failed(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        *,
+        error: str | None = None,
+        commit: bool = True,
+    ) -> None:
+        if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
+            return
+        if attempt.status == PayflowPaymentAttemptStatus.FAILED.value:
+            return
+        attempt.status = PayflowPaymentAttemptStatus.FAILED.value
+        attempt.error_message = (error or attempt.error_message or "Payment failed")[:500]
+        attempt.completed_at = _utcnow()
+        self._append_attempt_event(attempt, "Failed", attempt.error_message)
+        self._raise_ops_exception(attempt, attempt.error_message or "Payment failed")
+        if commit:
+            self.db.commit()
+        else:
+            self.db.flush()
+
+        try:
+            from app.modules.payflow.services.notification_service import (
+                PayflowNotificationService,
+            )
+
+            account = self.db.get(PayflowAccountModel, attempt.account_id)
+            customer = account.customer_name if account else "Customer"
+            ref = account.account_reference if account else str(attempt.account_id)
+            PayflowNotificationService(self.db).notify_payment_failed(
+                client_id=attempt.client_id,
+                account_id=attempt.account_id,
+                customer_name=customer,
+                account_reference=ref,
+                attempt_public_id=attempt.public_id,
+                detail=attempt.error_message,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("payment failed notify failed attempt=%s", attempt.public_id)
+
+    def handle_stripe_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        et = str(event.get("type") or "")
+        data_object = (event.get("data") or {}).get("object") or {}
+        session_id = data_object.get("id") if data_object.get("object") == "checkout.session" else None
+        if not session_id and "checkout.session" in et:
+            session_id = data_object.get("id")
+
+        attempt: PayflowPaymentAttemptModel | None = None
+        if session_id:
+            attempt = (
+                self.db.query(PayflowPaymentAttemptModel)
+                .filter(PayflowPaymentAttemptModel.stripe_session_id == session_id)
+                .first()
+            )
+        if not attempt:
+            meta = data_object.get("metadata") or {}
+            public_id = meta.get("attempt_public_id") or data_object.get("client_reference_id")
+            if public_id:
+                attempt = (
+                    self.db.query(PayflowPaymentAttemptModel)
+                    .filter(PayflowPaymentAttemptModel.public_id == str(public_id))
+                    .first()
+                )
+        if not attempt:
+            return {"matched": False, "reason": "attempt_not_found", "type": et}
+
+        pi = data_object.get("payment_intent")
+        if isinstance(pi, str) and pi:
+            attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi
+
+        if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+            # Only treat as paid when Stripe reports paid / complete.
+            payment_status = (data_object.get("payment_status") or "").lower()
+            status = (data_object.get("status") or "").lower()
+            if payment_status in {"paid", "no_payment_required"} or status == "complete":
+                self.apply_succeeded(
+                    attempt,
+                    provider_ref=attempt.stripe_payment_intent_id or session_id,
+                    commit=True,
+                )
+                return {"matched": True, "status": attempt.status, "type": et}
+            attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
+            self._append_attempt_event(attempt, "Processing", et)
+            self.db.commit()
+            return {"matched": True, "status": attempt.status, "type": et}
+
+        if et in {
+            "checkout.session.expired",
+            "checkout.session.async_payment_failed",
+        }:
+            if et.endswith("expired"):
+                if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
+                    attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
+                    self._append_attempt_event(attempt, "Expired", et)
+                    self.db.commit()
+            else:
+                self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
+            return {"matched": True, "status": attempt.status, "type": et}
+
+        if et in {"payment_intent.payment_failed", "payment_intent.canceled"}:
+            self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
+            return {"matched": True, "status": attempt.status, "type": et}
+
+        if et == "payment_intent.succeeded":
+            self.apply_succeeded(
+                attempt, provider_ref=data_object.get("id") or session_id, commit=True
+            )
+            return {"matched": True, "status": attempt.status, "type": et}
+
+        self._append_attempt_event(attempt, "Stripe Event", et)
+        self.db.commit()
+        return {"matched": True, "ignored": True, "type": et, "status": attempt.status}
+
+
+# Keep public_url helper importable for callers that only need URL composition.
+__all__ = ["PayflowPaymentPortalService", "public_url_for_token"]

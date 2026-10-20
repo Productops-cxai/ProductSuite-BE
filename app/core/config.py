@@ -66,9 +66,18 @@ class Settings(BaseSettings):
     # Reclaim RUNNING jobs whose lock is older than this (crash / dead worker).
     WORKFLOW_WORKER_STALE_SECONDS: int = 300
     WORKFLOW_JOB_NOTIFY_CHANNEL: str = "workflow_jobs"
-    WORKFLOW_PAYMENT_LINK_BASE: str = "https://pay.payflow.local/pay"
+    # Customer portal base (token appended). Empty → {FRONTEND_URL}/pay
+    WORKFLOW_PAYMENT_LINK_BASE: str = ""
     # Opaque payment-link token TTL (hours). Default 14 days.
     PAYMENT_LINK_TTL_HOURS: int = 336
+
+    # Stripe Checkout (empty secret → local mock checkout for development).
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PUBLISHABLE_KEY: str = ""
+    # Operator brand shown for Third Party clients on the customer portal.
+    PAYFLOW_OPERATOR_BRAND_NAME: str = "PayFlow Collections"
+    PAYFLOW_OPERATOR_LOGO_URL: str = ""
 
 
 settings = Settings()

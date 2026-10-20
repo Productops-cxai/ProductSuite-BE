@@ -32,7 +32,8 @@ def _ttl() -> timedelta:
 def public_url_for_token(token: str) -> str:
     base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
     if not base:
-        return f"/pay/{token}"
+        fe = (settings.FRONTEND_URL or "").rstrip("/")
+        base = f"{fe}/pay" if fe else "/pay"
     return f"{base}/{token}"
 
 
@@ -287,76 +288,12 @@ class PayflowPaymentLinkService:
             self.db.flush()
 
     def resolve_public(self, token: str) -> dict[str, Any]:
-        """Portal resolve — no JWT. Validates status, expiry, and case eligibility.
-
-        Does not alter outstanding balance or mark payment completed.
-        """
-        row = (
-            self.db.query(PayflowPaymentLinkModel)
-            .options(
-                joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
-                joinedload(PayflowPaymentLinkModel.client),
-            )
-            .filter(PayflowPaymentLinkModel.token == token)
-            .first()
+        """Delegate to portal service (branding, options, eligibility, access audit)."""
+        from app.modules.payflow.services.payment_portal_service import (
+            PayflowPaymentPortalService,
         )
-        if not row:
-            raise NotFoundError("Payment link not found")
 
-        self._refresh_expiry(row)
-        account = row.account
-        if not account:
-            raise NotFoundError("Account not found")
-
-        usable = row.status == PayflowPaymentLinkStatus.ACTIVE.value
-        block_reason: str | None = None
-        if row.status == PayflowPaymentLinkStatus.EXPIRED.value:
-            block_reason = "This payment link has expired"
-            usable = False
-        elif row.status == PayflowPaymentLinkStatus.REVOKED.value:
-            block_reason = "This payment link has been revoked"
-            usable = False
-        elif row.status == PayflowPaymentLinkStatus.COMPLETED.value:
-            block_reason = "Payment for this link was already completed"
-            usable = False
-        else:
-            ok, reason = self._case_eligible(account)
-            if not ok:
-                usable = False
-                block_reason = reason
-
-        # Access audit — never marks payment completed / never changes balance.
-        row.access_count = int(row.access_count or 0) + 1
-        row.last_accessed_at = _utcnow()
-        self._append_event(
-            row,
-            "Accessed",
-            "usable" if usable else (block_reason or "blocked"),
-        )
-        self.db.commit()
-
-        client = account.client or row.client
-        return {
-            "usable": usable,
-            "status": row.status,
-            "block_reason": block_reason,
-            "expires_at": row.expires_at,
-            "customer": {
-                "display_name": account.customer_first_name
-                or (account.customer_name or "").split(" ")[0]
-                or "Customer",
-            },
-            "case": {
-                "outstanding_balance": float(account.outstanding_balance or 0),
-                "currency_code": account.currency_code or "USD",
-            },
-            "brand": {
-                "name": (client.brand_name or client.name) if client else "PayFlow",
-                "logo_url": client.logo_url if client else None,
-            },
-            # Opaque reference only — never CRM account_reference / debtor ids.
-            "link_ref": row.token[:8],
-        }
+        return PayflowPaymentPortalService(self.db).resolve_portal(token)
 
     def url_for_communication(
         self, communication: PayflowCommunicationModel, account: PayflowAccountModel | None

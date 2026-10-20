@@ -1480,17 +1480,15 @@ class WorkflowExecutionService:
         try:
             from app.modules.payflow.services.notification_service import PayflowNotificationService
 
-            svc = PayflowNotificationService(self.db)
-            svc.notify(
-                users=svc.recipients_for_client(run.client_id),
-                notification_type=PayflowNotificationType.COMM_SENT.value,
-                title=f"{channel} sent · {account.customer_name}",
-                body=f"To {recipient} · {account.account_reference} · {comm_code}",
-                link=f"/payflow/cases/{account.id}",
+            PayflowNotificationService(self.db).notify_comm_sent(
                 client_id=run.client_id,
-                entity_type="communication",
-                entity_id=comm_code,
-                send_mail=False,
+                account_id=account.id,
+                customer_name=account.customer_name or "Customer",
+                account_reference=account.account_reference or str(account.id),
+                channel=channel,
+                recipient=recipient,
+                communication_id=None,
+                communication_code=comm_code,
             )
         except Exception:  # noqa: BLE001
             logger.exception("comm sent notify failed run=%s", run.id)
