@@ -41,6 +41,9 @@ def process_job(job_id: int) -> None:
     except Exception as exc:  # noqa: BLE001
         logger.exception("job %s failed", job_id)
         try:
+            # Flush/UniqueViolation leaves the session needing rollback before
+            # any further work (including mark_job_failed).
+            db.rollback()
             mark_job_failed(db, job_id, str(exc))
         except Exception:  # noqa: BLE001
             logger.exception("mark_job_failed also failed for %s", job_id)

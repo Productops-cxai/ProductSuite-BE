@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
@@ -196,13 +196,8 @@ class PayflowReviewService:
         }
 
     def _next_code(self) -> str:
-        latest = (
-            self.db.query(PayflowHumanReviewModel)
-            .order_by(PayflowHumanReviewModel.id.desc())
-            .first()
-        )
-        n = (latest.id + 1) if latest else 1001
-        return f"rev-{n}"
+        """Temporary unique placeholder; replaced with rev-{id} after flush."""
+        return f"tmp-{uuid4().hex}"
 
     def _snapshot(self, row: PayflowHumanReviewModel) -> dict[str, Any]:
         return {
@@ -1004,6 +999,8 @@ class PayflowReviewService:
         )
         self.db.add(row)
         self.db.flush()
+        # Stable unique code from PK — avoids rev-{id+1} colliding with older codes.
+        row.code = f"rev-{row.id}"
 
         self._block_account_for_review(account, proposed_action=proposed_action, stamp=stamp)
         if rule:
