@@ -1162,6 +1162,55 @@ class ResendCommunicationRequest(BaseModel):
     idempotency_key: Optional[str] = Field(default=None, max_length=64)
 
 
+class PayflowPaymentLinkEventItem(BaseModel):
+    at: Optional[str] = None
+    label: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class PayflowPaymentLinkItem(BaseModel):
+    id: int
+    token: str
+    url: str
+    status: str
+    client_id: int
+    account_id: int
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    communication_id: Optional[int] = None
+    communication_code: Optional[str] = None
+    communication_channel: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
+    completed_at: Optional[datetime] = None
+    access_count: int = 0
+    clicks_count: int = 0
+    last_accessed_at: Optional[datetime] = None
+    last_clicked_at: Optional[datetime] = None
+    events: List[PayflowPaymentLinkEventItem] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    is_usable: bool = False
+
+
+class PayflowPaymentLinksListResponse(BaseModel):
+    payment_links: List[PayflowPaymentLinkItem]
+    total: int = 0
+    active_count: int = 0
+
+
+class PayflowPaymentLinkPublicResolve(BaseModel):
+    usable: bool
+    status: str
+    block_reason: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    customer: dict = Field(default_factory=dict)
+    case: dict = Field(default_factory=dict)
+    brand: dict = Field(default_factory=dict)
+    link_ref: Optional[str] = None
+
+
 class PayflowOperationalExceptionItem(BaseModel):
     id: int
     exception_type: str

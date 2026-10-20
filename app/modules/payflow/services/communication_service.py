@@ -95,15 +95,6 @@ def _date_meta(when: datetime | None = None) -> tuple[str, str, str]:
     return bucket, local.strftime("%d %b %Y"), local.strftime("%H:%M")
 
 
-def _payment_link_url(account: PayflowAccountModel | None, has_link: bool) -> str | None:
-    if not has_link or not account or not account.account_reference:
-        return None
-    base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
-    if not base:
-        return None
-    return f"{base}/{account.account_reference}"
-
-
 def _redact_url(url: str | None) -> str | None:
     if not url:
         return None
@@ -141,6 +132,34 @@ class PayflowCommunicationService:
             raise ForbiddenError("Communication access denied")
         if not self.access.can(user, "view_communications", client_id):
             raise ForbiddenError("View Communications permission required")
+
+    def _resolve_payment_link_url(
+        self, row: PayflowCommunicationModel, account: PayflowAccountModel | None
+    ) -> str | None:
+        try:
+            from app.modules.payflow.services.payment_link_service import (
+                PayflowPaymentLinkService,
+            )
+
+            return PayflowPaymentLinkService(self.db).url_for_communication(row, account)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ensure_payment_url(
+        self, account: PayflowAccountModel, *, communication_id: int | None = None
+    ) -> str | None:
+        try:
+            from app.modules.payflow.services.payment_link_service import (
+                PayflowPaymentLinkService,
+            )
+
+            link = PayflowPaymentLinkService(self.db).ensure_active_link(
+                account, communication_id=communication_id, commit=False
+            )
+            return PayflowPaymentLinkService(self.db).public_url(link)
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to ensure payment link for account_id=%s", account.id)
+            return None
 
     def _append_json_event(self, row: PayflowCommunicationModel, label: str, detail: str | None = None) -> None:
         events = list(row.events or [])
@@ -298,7 +317,7 @@ class PayflowCommunicationService:
             "subject": row.subject,
             "body_lines": list(row.body_lines or []),
             "payment_link": has_link,
-            "payment_link_url": _payment_link_url(account, has_link),
+            "payment_link_url": self._resolve_payment_link_url(row, account) if has_link else None,
             "why_message": row.why_message,
             "why_channel": row.why_channel,
             "why_timing": row.why_timing,
@@ -716,6 +735,14 @@ class PayflowCommunicationService:
         self.db.flush()
         self._record_event_row(comm, event_type="prepared", label="Communication Prepared")
 
+        # Opaque tokenized payment URL (reuse Active link; never account_reference).
+        action_url: str | None = None
+        if payment_link:
+            action_url = self._ensure_payment_url(account, communication_id=comm.id)
+            if action_url and channel_norm == "SMS" and action_url not in body:
+                body = f"{body.rstrip()}\nPay: {action_url}"
+                comm.body_lines = body.splitlines()[:40]
+
         send_status = "logged"
         recipient = ""
         provider_error: str | None = None
@@ -760,7 +787,7 @@ class PayflowCommunicationService:
                 subject=subject,
                 body=rendered_body,
                 email_type="collection_workflow",
-                action_link=payment_link,
+                action_link=action_url,
                 custom_args=custom_args if email_provider == "sendgrid" else None,
                 from_email=brand_from,
                 from_name=brand_name,
@@ -957,6 +984,14 @@ class PayflowCommunicationService:
                 row.last_clicked_url = url[:1024]
             if is_payment_click or row.payment_link:
                 self._advance_status(row, PayflowCommStatus.PAYMENT_LINK_CLICKED.value)
+                try:
+                    from app.modules.payflow.services.payment_link_service import (
+                        PayflowPaymentLinkService,
+                    )
+
+                    PayflowPaymentLinkService(self.db).record_click_by_url(url, commit=False)
+                except Exception:  # noqa: BLE001
+                    logger.exception("payment link click record failed")
             else:
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {
@@ -1041,6 +1076,16 @@ class PayflowCommunicationService:
             row.payment_initiated = True
             row.payment_completed = True
             self._record_event_row(row, event_type="payment_completed", label="Payment Completed")
+            try:
+                from app.modules.payflow.services.payment_link_service import (
+                    PayflowPaymentLinkService,
+                )
+
+                PayflowPaymentLinkService(self.db).mark_completed_for_account(
+                    account_id, commit=False
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("payment link complete mark failed account_id=%s", account_id)
         if commit:
             self.db.commit()
         else:
@@ -1139,9 +1184,8 @@ class PayflowCommunicationService:
                 "restriction_reason": "An SMS for this purpose was already sent in the last 5 minutes",
             }
 
-        payment_url = None
-        if include_payment_link:
-            payment_url = _payment_link_url(account, True)
+        # Truthy flag → send_workflow_step ensures a secure Active tokenized link.
+        payment_url = "1" if include_payment_link else None
 
         strategy = SimpleNamespace(name="Manual SMS")
 
@@ -1237,7 +1281,7 @@ class PayflowCommunicationService:
                 "restriction_reason": "An email for this purpose was already sent in the last 5 minutes",
             }
 
-        payment_url = _payment_link_url(account, True) if include_payment_link else None
+        payment_url = "1" if include_payment_link else None
         strategy = SimpleNamespace(name="Manual Email")
         result = self.send_workflow_step(
             account=account,

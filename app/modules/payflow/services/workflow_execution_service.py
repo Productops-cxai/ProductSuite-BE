@@ -1346,8 +1346,20 @@ class WorkflowExecutionService:
         return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", repl, text)
 
     def _payment_link(self, account: PayflowAccountModel) -> str:
-        base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
-        return f"{base}/{account.account_reference}"
+        """Opaque tokenized URL — never exposes CRM account_reference in the path."""
+        try:
+            from app.modules.payflow.services.payment_link_service import (
+                PayflowPaymentLinkService,
+            )
+
+            svc = PayflowPaymentLinkService(self.db)
+            link = svc.ensure_active_link(account, commit=False)
+            return svc.public_url(link)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to ensure payment link for account_id=%s", getattr(account, "id", None)
+            )
+            return ""
 
     def _fail_run(self, run: PayflowWorkflowRunModel, error: str, *, job_id: int | None) -> None:
         run.status = PayflowWorkflowRunStatus.FAILED.value

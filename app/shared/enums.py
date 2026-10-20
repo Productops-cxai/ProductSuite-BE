@@ -203,6 +203,13 @@ class PayflowOperationalExceptionSeverity(str, Enum):
     CRITICAL = "Critical"
 
 
+class PayflowPaymentLinkStatus(str, Enum):
+    ACTIVE = "Active"
+    EXPIRED = "Expired"
+    REVOKED = "Revoked"
+    COMPLETED = "Completed"
+
+
 class PayflowCommPurpose(str, Enum):
     PAYMENT_REMINDER = "Payment Reminder"
     PROMISE_FOLLOW_UP = "Promise-to-Pay Follow-Up"

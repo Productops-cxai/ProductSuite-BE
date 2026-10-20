@@ -50,6 +50,9 @@ from app.modules.payflow.schemas import (
     ResendCommunicationRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
+    PayflowPaymentLinkItem,
+    PayflowPaymentLinkPublicResolve,
+    PayflowPaymentLinksListResponse,
     PayflowOperationalExceptionItem,
     PayflowOperationalExceptionsListResponse,
     ResolveOperationalExceptionRequest,
@@ -101,6 +104,7 @@ from app.modules.payflow.services.notification_service import PayflowNotificatio
 from app.modules.payflow.services.operational_exception_service import (
     PayflowOperationalExceptionService,
 )
+from app.modules.payflow.services.payment_link_service import PayflowPaymentLinkService
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
@@ -1345,6 +1349,52 @@ def resend_failed_communication(
             provider_error=result.get("provider_error"),
             restriction_reason=result.get("restriction_reason"),
         )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Payment links (secure opaque tokens)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/accounts/{account_id}/payment-links",
+    response_model=PayflowPaymentLinksListResponse,
+)
+def list_account_payment_links(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowPaymentLinkService(db).list_for_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/payment-links/{link_id}", response_model=PayflowPaymentLinkItem)
+def get_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowPaymentLinkService(db).get_link(user, link_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/payment-links/{link_id}/revoke", response_model=PayflowPaymentLinkItem)
+def revoke_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowPaymentLinkService(db).revoke(user, link_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/public/payment-links/{token}",
+    response_model=PayflowPaymentLinkPublicResolve,
+)
+def resolve_public_payment_link(token: str, db: DbSession):
+    """Customer payment portal resolve — no JWT. Access audit only; never marks paid."""
+    try:
+        return PayflowPaymentLinkService(db).resolve_public(token)
     except AppError as exc:
         raise _map_error(exc) from exc
 

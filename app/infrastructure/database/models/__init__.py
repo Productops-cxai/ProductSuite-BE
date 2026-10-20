@@ -760,6 +760,48 @@ class PayflowCommunicationEventModel(Base):
     communication = relationship("PayflowCommunicationModel", back_populates="event_rows")
 
 
+class PayflowPaymentLinkModel(Base):
+    """Secure, trackable payment link for a collection case (opaque token, not CRM ids)."""
+
+    __tablename__ = "payflow_payment_links"
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_payflow_payment_link_token"),
+        Index("ix_payflow_payment_links_account_status", "account_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    communication_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_communications.id"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Active", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    access_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicks_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_clicked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel")
+    account = relationship("PayflowAccountModel")
+    communication = relationship("PayflowCommunicationModel")
+
+
 class PayflowOperationalExceptionModel(Base):
     """Operational failure requiring attention (separate from Human Review governance)."""
 

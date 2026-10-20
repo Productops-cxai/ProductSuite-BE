@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     WORKFLOW_WORKER_STALE_SECONDS: int = 300
     WORKFLOW_JOB_NOTIFY_CHANNEL: str = "workflow_jobs"
     WORKFLOW_PAYMENT_LINK_BASE: str = "https://pay.payflow.local/pay"
+    # Opaque payment-link token TTL (hours). Default 14 days.
+    PAYMENT_LINK_TTL_HOURS: int = 336
 
 
 settings = Settings()
