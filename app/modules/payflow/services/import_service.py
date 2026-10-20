@@ -64,6 +64,36 @@ _COMPARE_FLOATS = (
     "ptp_amount",
 )
 
+# Word-boundary CRM → PayFlow status hints. Substring checks are unsafe:
+# e.g. "paid" in "unpaid" / "closed" in "disclosure" incorrectly became Resolved.
+_CRM_STATUS_RESOLVED_RE = re.compile(
+    r"\b(paid\s+in\s+full|pif|resolved|settled|closed|paid)\b",
+    re.IGNORECASE,
+)
+_CRM_STATUS_UNPAID_RE = re.compile(r"\b(un[- ]?paid|not\s+paid)\b", re.IGNORECASE)
+_CRM_STATUS_PTP_RE = re.compile(r"\b(promise(?:\s+to\s+pay)?|ptp)\b", re.IGNORECASE)
+_CRM_STATUS_PLAN_RE = re.compile(r"\b(payment\s+plan|arrangement)\b", re.IGNORECASE)
+_CRM_STATUS_REVIEW_RE = re.compile(r"\breview\b", re.IGNORECASE)
+
+
+def _fuzzy_collection_status(raw: str) -> str | None:
+    """Map free-text CRM status labels to PayFlow enums. None = unknown."""
+    low = re.sub(r"[_\-]+", " ", (raw or "").strip().lower())
+    if not low:
+        return None
+    # Unpaid / not-paid must never resolve via the "paid" token.
+    if _CRM_STATUS_UNPAID_RE.search(low):
+        return PayflowCollectionStatus.ACTIVE.value
+    if _CRM_STATUS_PTP_RE.search(low):
+        return PayflowCollectionStatus.PROMISE_TO_PAY.value
+    if _CRM_STATUS_PLAN_RE.search(low):
+        return PayflowCollectionStatus.PAYMENT_PLAN.value
+    if _CRM_STATUS_REVIEW_RE.search(low):
+        return PayflowCollectionStatus.HUMAN_REVIEW.value
+    if _CRM_STATUS_RESOLVED_RE.search(low):
+        return PayflowCollectionStatus.RESOLVED.value
+    return None
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -1405,19 +1435,14 @@ class PayflowImportService:
             collection_status = _COLLECTION_BY_LOWER.get(collection_raw.lower())
             if not collection_status:
                 # Light CRM → PayFlow status mapping for common closed/paid labels.
-                low = collection_raw.lower()
-                if any(tok in low for tok in ("paid", "pif", "resolved", "settled", "closed")):
-                    collection_status = PayflowCollectionStatus.RESOLVED.value
-                elif "promise" in low or "ptp" in low:
-                    collection_status = PayflowCollectionStatus.PROMISE_TO_PAY.value
-                elif "payment plan" in low or "arrangement" in low:
-                    collection_status = PayflowCollectionStatus.PAYMENT_PLAN.value
-                elif "review" in low:
-                    collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
-                elif crm_number:
-                    collection_status = PayflowCollectionStatus.ACTIVE.value
-                else:
-                    raise ValidationAppError("collection_status is not a recognised PayFlow status")
+                collection_status = _fuzzy_collection_status(collection_raw)
+                if not collection_status:
+                    if crm_number:
+                        collection_status = PayflowCollectionStatus.ACTIVE.value
+                    else:
+                        raise ValidationAppError(
+                            "collection_status is not a recognised PayFlow status"
+                        )
         else:
             collection_status = PayflowCollectionStatus.ACTIVE.value
 
@@ -1589,7 +1614,10 @@ class PayflowImportService:
                 timeline=[
                     {
                         "label": "Created from file upload",
-                        "detail": f"Account {parsed['account_id']} imported from uploaded file",
+                        "detail": (
+                            f"Account {parsed['account_id']} imported from uploaded file "
+                            f"(collection_status={parsed['collection_status']})"
+                        ),
                         "at": stamp,
                         "source": "file_upload",
                     }
@@ -1622,7 +1650,10 @@ class PayflowImportService:
         events.append(
             {
                 "label": "Updated from file upload",
-                "detail": f"Outstanding {parsed['outstanding_balance']}",
+                "detail": (
+                    f"Outstanding {parsed['outstanding_balance']}; "
+                    f"collection_status={parsed['collection_status']}"
+                ),
                 "at": stamp,
                 "source": "file_upload",
             }

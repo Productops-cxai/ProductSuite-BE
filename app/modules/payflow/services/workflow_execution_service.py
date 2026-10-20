@@ -782,6 +782,28 @@ class WorkflowExecutionService:
                 "rule_name": matched.get("name"),
             }
             step_run.finished_at = _utcnow()
+            cfg = _cfg(step)
+            channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
+            purpose = cfg.get("purpose") or step.get("purpose") or "Payment Reminder"
+            try:
+                from app.modules.payflow.services.communication_service import (
+                    PayflowCommunicationService,
+                )
+
+                PayflowCommunicationService(self.db).record_blocked_communication(
+                    account=account,
+                    strategy=strategy,
+                    channel=channel,
+                    purpose=purpose,
+                    payment_link=bool(cfg.get("template_id") or cfg.get("payment_link")),
+                    restriction_reason=f"Prevent Communication — {matched.get('name') or 'governance rule'}",
+                    eligibility_status="Blocked",
+                    rule_id=matched.get("rule_id"),
+                    rule_name=matched.get("name"),
+                    client_id=run.client_id,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to persist blocked communication")
             next_id = step.get("next") or _cfg(step).get("next")
             self._notify_rule_blocked(run, matched)
             if next_id:
@@ -2027,6 +2049,19 @@ class WorkflowExecutionService:
                 account_id=account_id,
                 strategy_id=run.strategy_id,
             )
+        try:
+            from app.modules.payflow.services.communication_service import (
+                PayflowCommunicationService,
+            )
+
+            # Payment events are verified by PayFlow — never from email click alone.
+            PayflowCommunicationService(self.db).mark_payment_event(
+                account_id,
+                event="completed" if payload.get("completed") else "initiated",
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to attribute payment to communication")
         if commit:
             self.db.commit()
         return {"advanced": advanced}

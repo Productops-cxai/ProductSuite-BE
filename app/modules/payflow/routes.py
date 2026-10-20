@@ -1,10 +1,11 @@
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
 from app.core.deps import DbSession
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, NotFoundError
 from app.modules.payflow.deps import (
     PayflowAccessContext,
     PayflowCreateClient,
@@ -41,6 +42,7 @@ from app.modules.payflow.schemas import (
     ModifyReviewRequest,
     PayflowAccountsListResponse,
     PayflowClientsListResponse,
+    CommunicationEligibilitySnapshot,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
     PayflowIntegrationItem,
@@ -1164,6 +1166,10 @@ def list_comms(
     purpose: str | None = Query(default=None),
     workflow: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     try:
         return PayflowCommunicationService(db).list_communications(
@@ -1175,6 +1181,10 @@ def list_comms(
             purpose=purpose,
             workflow=workflow,
             search=search,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -1184,6 +1194,27 @@ def list_comms(
 def get_comm(communication_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         return PayflowCommunicationService(db).get_communication(user, communication_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/accounts/{account_id}/communication-eligibility", response_model=CommunicationEligibilitySnapshot)
+def get_account_communication_eligibility(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        return PayflowCommunicationService(db).case_eligibility_snapshot(user, row)
     except AppError as exc:
         raise _map_error(exc) from exc
 

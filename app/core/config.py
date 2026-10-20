@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     SENDGRID_API_KEY: str = ""
     SENDGRID_FROM_EMAIL: str = ""
     SENDGRID_FROM_NAME: str = "PayFlow"
+    # Signed Event Webhook verification key from SendGrid.
+    # Empty = accept events without signature check (local/dev only).
+    SENDGRID_WEBHOOK_VERIFICATION_KEY: str = ""
 
     # Collection SMS — Twilio (empty credentials = log-only).
     TWILIO_ACCOUNT_SID: str = ""

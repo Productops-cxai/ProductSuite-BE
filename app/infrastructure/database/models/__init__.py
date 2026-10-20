@@ -695,6 +695,26 @@ class PayflowCommunicationModel(Base):
     review_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("payflow_human_reviews.id"), nullable=True, index=True
     )
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opens_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    clicks_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_clicked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_clicked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_clicked_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    engagement_tracking: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payment_initiated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    payment_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    eligibility_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    restriction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rule_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rule_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    rule_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -705,6 +725,36 @@ class PayflowCommunicationModel(Base):
     client = relationship("PayflowClientModel", back_populates="communications")
     account = relationship("PayflowAccountModel", back_populates="communications")
     review = relationship("PayflowHumanReviewModel")
+    event_rows = relationship(
+        "PayflowCommunicationEventModel",
+        back_populates="communication",
+        cascade="all, delete-orphan",
+        order_by="PayflowCommunicationEventModel.id",
+    )
+
+
+class PayflowCommunicationEventModel(Base):
+    """Provider/internal communication delivery & engagement events (dedupeable)."""
+
+    __tablename__ = "payflow_communication_events"
+    __table_args__ = (
+        UniqueConstraint("provider_event_id", name="uq_payflow_comm_provider_event_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    communication_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_communications.id"), nullable=False, index=True
+    )
+    provider_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    communication = relationship("PayflowCommunicationModel", back_populates="event_rows")
 
 
 class PayflowRuleModel(Base):

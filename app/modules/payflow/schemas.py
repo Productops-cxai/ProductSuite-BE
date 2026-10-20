@@ -1037,6 +1037,7 @@ class PayflowCommunicationItem(BaseModel):
     status: str
     workflow_name: Optional[str] = None
     engagement: Optional[str] = None
+    engagement_tracking: Optional[str] = None
     date_bucket: Optional[str] = None
     date_label: Optional[str] = None
     time_label: Optional[str] = None
@@ -1055,6 +1056,28 @@ class PayflowCommunicationItem(BaseModel):
     sender_name: Optional[str] = None
     email_from: Optional[str] = None
     sms_sender_id: Optional[str] = None
+    provider: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
+    opens_count: int = 0
+    clicks_count: int = 0
+    first_opened_at: Optional[datetime] = None
+    last_opened_at: Optional[datetime] = None
+    first_clicked_at: Optional[datetime] = None
+    last_clicked_at: Optional[datetime] = None
+    last_clicked_url: Optional[str] = None
+    days_since_delivery_without_open: Optional[int] = None
+    days_since_delivery_without_click: Optional[int] = None
+    payment_initiated: bool = False
+    payment_completed: bool = False
+    eligibility_status: Optional[str] = None
+    restriction_reason: Optional[str] = None
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    rule_code: Optional[str] = None
+    next_eligible_at: Optional[datetime] = None
+    can_view_rule: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -1076,6 +1099,22 @@ class PayflowCommunicationsListResponse(BaseModel):
     purposes: List[str] = Field(default_factory=list)
     workflows: List[str] = Field(default_factory=list)
     drop_off_segments: List[str] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+
+
+class CommunicationEligibilitySnapshot(BaseModel):
+    email: dict = Field(default_factory=dict)
+    sms: dict = Field(default_factory=dict)
+    latest_restriction_reason: Optional[str] = None
+    latest_eligibility_status: Optional[str] = None
+    next_eligible_at: Optional[datetime] = None
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    rule_code: Optional[str] = None
+    can_view_rule: bool = False
+    communication_id: Optional[int] = None
 
 
 class PayflowNotificationItem(BaseModel):
