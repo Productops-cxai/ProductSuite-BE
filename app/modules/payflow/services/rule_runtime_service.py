@@ -199,22 +199,33 @@ class RuleRuntimeService:
 
 
 def _compare(actual: Any, operator: str, expected: Any) -> bool:
-    op = operator.replace("_", " ").strip()
+    # UI labels (RuleNewPage NUMERIC_OPS / TEXT_OPS / ENUM_OPS) are stored as-is and
+    # lowercased by callers — keep aliases for both "… or equal" and "… or equal to".
+    op = operator.replace("_", " ").strip().lower()
     try:
         if op in ("=", "==", "equals", "is", "equal to"):
             return _coerce_eq(actual, expected)
-        if op in ("!=", "<>", "not equals", "is not", "not equal to"):
+        if op in (
+            "!=",
+            "<>",
+            "not equals",
+            "does not equal",
+            "is not",
+            "not equal to",
+        ):
             return not _coerce_eq(actual, expected)
         if op in (">", "greater than"):
             return float(actual) > float(expected)
-        if op in (">=", "greater than or equal"):
+        if op in (">=", "greater than or equal", "greater than or equal to"):
             return float(actual) >= float(expected)
         if op in ("<", "less than"):
             return float(actual) < float(expected)
-        if op in ("<=", "less than or equal"):
+        if op in ("<=", "less than or equal", "less than or equal to"):
             return float(actual) <= float(expected)
         if op in ("contains",):
             return str(expected).lower() in str(actual).lower()
+        if op in ("does not contain", "not contains"):
+            return str(expected).lower() not in str(actual).lower()
         if op in ("in",):
             options = [x.strip() for x in str(expected).split(",")]
             return str(actual) in options

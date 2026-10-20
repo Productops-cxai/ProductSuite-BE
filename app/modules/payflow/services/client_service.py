@@ -108,8 +108,8 @@ _STATUS_LABELS = {
 }
 
 _ADDED_THROUGH_LABELS = {
-    PayflowClientAddedThrough.ADD_CLIENT.value: "Add Client",
-    PayflowClientAddedThrough.FILE_UPLOAD.value: "File Upload",
+    PayflowClientAddedThrough.ADD_CLIENT.value: "Created",
+    PayflowClientAddedThrough.FILE_UPLOAD.value: "Created from file upload",
 }
 
 
@@ -3529,7 +3529,7 @@ class PayflowClientService:
             or PayflowClientAddedThrough.ADD_CLIENT.value,
             "added_through_label": _ADDED_THROUGH_LABELS.get(
                 client.added_through or PayflowClientAddedThrough.ADD_CLIENT.value,
-                "Add Client",
+                "Created",
             ),
             "created_at": client.created_at,
             "updated_at": client.updated_at or client.created_at,

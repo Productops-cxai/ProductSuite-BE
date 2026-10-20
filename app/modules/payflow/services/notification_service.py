@@ -93,6 +93,8 @@ class PayflowNotificationService:
         for user in users:
             if actor_user_id and user.id == actor_user_id:
                 continue
+            # Dedupe across read + unread. Inbox list syncs awaiting entities on
+            # every poll; requiring unread-only caused mark-read → recreate spam.
             if dedupe and entity_type and entity_id:
                 exists = (
                     self.db.query(PayflowNotificationModel)
@@ -101,7 +103,6 @@ class PayflowNotificationService:
                         PayflowNotificationModel.notification_type == notification_type,
                         PayflowNotificationModel.entity_type == entity_type,
                         PayflowNotificationModel.entity_id == str(entity_id),
-                        PayflowNotificationModel.read_at.is_(None),
                     )
                     .first()
                 )
@@ -146,6 +147,7 @@ class PayflowNotificationService:
         *,
         actor_user_id: UUID | None = None,
         send_mail: bool = False,
+        dedupe: bool = True,
     ) -> list[PayflowNotificationModel]:
         if review.status != PayflowReviewStatus.AWAITING_REVIEW.value:
             return []
@@ -167,6 +169,7 @@ class PayflowNotificationService:
             send_mail=send_mail,
             email_type="human_review_awaiting",
             actor_user_id=actor_user_id,
+            dedupe=dedupe,
         )
 
     def notify_workflow_awaiting(

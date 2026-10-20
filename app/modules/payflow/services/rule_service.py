@@ -511,11 +511,9 @@ class PayflowRuleService:
 
         self.db.commit()
         self.db.refresh(row)
-        became_active = (
-            prev_status != PayflowRuleStatus.ACTIVE.value
-            and row.status == PayflowRuleStatus.ACTIVE.value
-        )
-        if became_active:
+        # Re-scan on save while Active so condition edits (and prior failed
+        # matches) pick up existing accounts. No-op unless action is RHR.
+        if row.status == PayflowRuleStatus.ACTIVE.value:
             self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
@@ -524,6 +522,8 @@ class PayflowRuleService:
         if not self.can_edit_rule(user, row):
             raise ForbiddenError("Create / Edit Client Rules permission required")
         if row.status == PayflowRuleStatus.ACTIVE.value:
+            # Idempotent re-scan: recovers accounts that should already have been queued.
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
             return self._serialize(row, user)
         row.status = PayflowRuleStatus.ACTIVE.value
         history = list(row.history or [])

@@ -782,13 +782,18 @@ class PayflowReviewService:
         except Exception:
             pass
 
-    def _notify_awaiting(self, row: PayflowHumanReviewModel) -> None:
+    def _notify_awaiting(
+        self, row: PayflowHumanReviewModel, *, force: bool = False
+    ) -> None:
         try:
             from app.modules.payflow.services.notification_service import (
                 PayflowNotificationService,
             )
 
-            PayflowNotificationService(self.db).notify_review_awaiting(row, send_mail=False)
+            # force=True for hold-release re-await; default dedupe stops inbox-poll spam.
+            PayflowNotificationService(self.db).notify_review_awaiting(
+                row, send_mail=False, dedupe=not force
+            )
         except Exception:
             pass
 
@@ -1072,7 +1077,7 @@ class PayflowReviewService:
         reason: str = "High balance treatment",
         proposed_action: str = "Move to stronger collection treatment",
         priority: str = PayflowReviewPriority.NORMAL.value,
-        actor_name: str = "CRM import",
+        actor_name: str = "File upload",
         commit: bool = False,
     ) -> PayflowHumanReviewModel | None:
         """Create an open review when an account enters Human Review status."""
@@ -1644,7 +1649,7 @@ class PayflowReviewService:
         )
         self.db.commit()
         self.db.refresh(row)
-        self._notify_awaiting(self._get_row(row.id))
+        self._notify_awaiting(self._get_row(row.id), force=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def is_action_blocked(self, account_id: int) -> bool:

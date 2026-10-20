@@ -1031,6 +1031,7 @@ class PayflowCommunicationItem(BaseModel):
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None
     case_reference: Optional[str] = None
+    case_status: Optional[str] = None
     channel: str
     purpose: str
     status: str
@@ -1042,6 +1043,7 @@ class PayflowCommunicationItem(BaseModel):
     subject: Optional[str] = None
     body_lines: List[str] = Field(default_factory=list)
     payment_link: bool = False
+    payment_link_url: Optional[str] = None
     why_message: Optional[str] = None
     why_channel: Optional[str] = None
     why_timing: Optional[str] = None
@@ -1122,6 +1124,7 @@ class DashboardFunnelStep(BaseModel):
     drop: Optional[str] = None
     bar: float = 0
     paid: bool = False
+    href: Optional[str] = None
 
 
 class DashboardOutcomeItem(BaseModel):

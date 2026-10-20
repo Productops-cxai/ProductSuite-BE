@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.core.config import settings
 from app.core.exceptions import ForbiddenError, NotFoundError
 from app.infrastructure.database.models import (
     PayflowAccountModel,
@@ -22,12 +23,12 @@ from app.shared.enums import PayflowCommChannel, PayflowCommPurpose, PayflowComm
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
 DROP_OFF_SEGMENTS = [
     "Delivered but Not Opened / Read",
     "Opened / Read but Did Not Click",
     "Clicked but Did Not Initiate Payment",
 ]
-
 
 def _drop_off_segment(status: str, payment_link: bool) -> str | None:
     if status == PayflowCommStatus.DELIVERED.value:
@@ -37,6 +38,36 @@ def _drop_off_segment(status: str, payment_link: bool) -> str | None:
     if status == PayflowCommStatus.PAYMENT_LINK_CLICKED.value:
         return DROP_OFF_SEGMENTS[2]
     return None
+
+
+def _date_meta(when: datetime | None = None) -> tuple[str, str, str]:
+    """Return (date_bucket, date_label, time_label) for list KPIs and filters."""
+    now = when or _utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    local = now.astimezone()
+    today = datetime.now(local.tzinfo).date()
+    d = local.date()
+    if d == today:
+        bucket = "Today"
+    elif d == today - timedelta(days=1):
+        bucket = "Yesterday"
+    elif d >= today - timedelta(days=6):
+        bucket = "Last 7 Days"
+    else:
+        bucket = "This Month"
+    date_label = local.strftime("%d %b %Y")
+    time_label = local.strftime("%H:%M")
+    return bucket, date_label, time_label
+
+
+def _payment_link_url(account: PayflowAccountModel | None, has_link: bool) -> str | None:
+    if not has_link or not account or not account.account_reference:
+        return None
+    base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/{account.account_reference}"
 
 
 class PayflowCommunicationService:
@@ -61,6 +92,15 @@ class PayflowCommunicationService:
     def _serialize(self, row: PayflowCommunicationModel) -> dict[str, Any]:
         account = row.account
         client = row.client
+        has_link = bool(row.payment_link)
+        date_bucket = row.date_bucket
+        date_label = row.date_label
+        time_label = row.time_label
+        if not date_bucket or not date_label or not time_label:
+            fallback_bucket, fallback_date, fallback_time = _date_meta(row.created_at)
+            date_bucket = date_bucket or fallback_bucket
+            date_label = date_label or fallback_date
+            time_label = time_label or fallback_time
         return {
             "id": row.id,
             "code": row.code,
@@ -71,24 +111,26 @@ class PayflowCommunicationService:
             "customer_name": account.customer_name if account else None,
             "account_reference": account.account_reference if account else None,
             "case_reference": account.case_reference if account else None,
+            "case_status": (account.collection_status if account else None),
             "channel": row.channel,
             "purpose": row.purpose,
             "status": row.status,
             "workflow_name": row.workflow_name,
             "engagement": row.engagement,
-            "date_bucket": row.date_bucket,
-            "date_label": row.date_label,
-            "time_label": row.time_label,
+            "date_bucket": date_bucket,
+            "date_label": date_label,
+            "time_label": time_label,
             "subject": row.subject,
             "body_lines": list(row.body_lines or []),
-            "payment_link": bool(row.payment_link),
+            "payment_link": has_link,
+            "payment_link_url": _payment_link_url(account, has_link),
             "why_message": row.why_message,
             "why_channel": row.why_channel,
             "why_timing": row.why_timing,
             "events": list(row.events or []),
             "balance": float(row.balance or 0),
             "review_id": row.review_id,
-            "drop_off_segment": _drop_off_segment(row.status, bool(row.payment_link)),
+            "drop_off_segment": _drop_off_segment(row.status, has_link),
             "brand_name": client.brand_name or (client.name if client else None),
             "sender_name": client.sender_name,
             "email_from": client.email_from,
@@ -145,11 +187,15 @@ class PayflowCommunicationService:
                 if term
                 in " ".join(
                     [
+                        r.code or "",
+                        str(r.id),
                         (r.account.customer_name if r.account else ""),
                         (r.account.account_reference if r.account else ""),
+                        (r.account.case_reference if r.account else ""),
                         r.purpose or "",
                         r.channel or "",
                         r.workflow_name or "",
+                        r.status or "",
                     ]
                 ).lower()
             ]
@@ -283,13 +329,17 @@ class PayflowCommunicationService:
                 "communication_id": None,
             }
 
-        account.last_contact_date = _utcnow().date()
+        now = _utcnow()
+        account.last_contact_date = now.date()
         code = f"COM-{uuid4().hex[:10].upper()}"
         comm_status = (
             PayflowCommStatus.SENT.value
             if send_status in {"sent", "logged"}
             else PayflowCommStatus.FAILED.value
         )
+        date_bucket, date_label, time_label = _date_meta(now)
+        # Open/read tracking starts empty; SMS stays not-trackable in the UI when null.
+        engagement = None
         comm = PayflowCommunicationModel(
             code=code,
             client_id=client_id or account.client_id,
@@ -298,13 +348,17 @@ class PayflowCommunicationService:
             purpose=purpose_norm,
             status=comm_status,
             workflow_name=strategy.name,
+            engagement=engagement,
+            date_bucket=date_bucket,
+            date_label=date_label,
+            time_label=time_label,
             subject=subject if channel_norm != "SMS" else None,
             body_lines=body.splitlines()[:40],
             payment_link=bool(payment_link),
             why_message="Workflow communication step",
             why_channel=channel_norm,
             why_timing="Scheduled by workflow worker",
-            events=[{"at": _utcnow().isoformat(), "label": f"{channel_norm} {send_status}"}],
+            events=[{"at": now.isoformat(), "label": f"{channel_norm} {send_status}"}],
             balance=float(account.outstanding_balance or 0),
         )
         self.db.add(comm)

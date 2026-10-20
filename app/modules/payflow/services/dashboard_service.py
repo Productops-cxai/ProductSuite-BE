@@ -384,6 +384,16 @@ class PayflowDashboardService:
             rate = None if i == 0 else (f"{(value / prev * 100):.1f}%" if prev else "0%")
             drop = None if i == 0 else f"−{max(0, prev - value):,}"
             bar = min(100.0, (value / base) * 100) if base else 0
+            # Map funnel stage → communications log status filter (Lovable parity).
+            status_href = {
+                "Sent": "Sent",
+                "Delivered": "Delivered",
+                "Opened / Read": "Opened / Read",
+                "Clicked": "Payment Link Clicked",
+                "Payment Initiated": "Payment Link Clicked",
+                "Paid": "Payment Link Clicked",
+            }.get(label)
+            href = f"/payflow/comms?status={status_href}" if status_href else None
             out.append(
                 {
                     "step": step,
@@ -394,6 +404,7 @@ class PayflowDashboardService:
                     "drop": drop,
                     "bar": round(bar, 1),
                     "paid": paid,
+                    "href": href,
                 }
             )
             prev = value if i < 4 else prev  # keep drop relative within comms then to payment

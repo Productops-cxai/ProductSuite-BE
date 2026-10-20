@@ -54,7 +54,19 @@ _TERMINAL = {
     PayflowWorkflowRunStatus.SUPERSEDED.value,
 }
 
-_STEP_DONE_STATUSES = frozenset({"done", "skipped", "blocked", "held", "cancelled"})
+# Include terminal step outcomes so duplicate worker jobs cannot re-run the same
+# step (and re-notify / re-send) after it already finished or paused.
+_STEP_DONE_STATUSES = frozenset(
+    {
+        "done",
+        "skipped",
+        "blocked",
+        "held",
+        "cancelled",
+        "paused_human_review",
+        "reassessment_requested",
+    }
+)
 
 _UI_STEP_STATUS = {
     "pending": "Pending",
@@ -67,6 +79,7 @@ _UI_STEP_STATUS = {
     "failed": "Failed",
     "cancelled": "Cancelled",
     "reassessment_requested": "Scheduled",
+    "paused_human_review": "Awaiting Review",
 }
 
 
@@ -1860,6 +1873,7 @@ class WorkflowExecutionService:
         activity: list[dict[str, Any]] = []
         for s in step_rows:
             item = self._serialize_step_run(s, steps_by_id=steps_by_id)
+            result = s.result_json if isinstance(s.result_json, dict) else {}
             activity.append(
                 {
                     "at": (s.finished_at or s.started_at or s.scheduled_at or s.created_at),
@@ -1870,6 +1884,7 @@ class WorkflowExecutionService:
                     "step_id": s.step_id,
                     "step_run_id": s.id,
                     "communication_id": item.get("communication_id"),
+                    "human_review_id": result.get("human_review_id"),
                     "block_reason": item.get("block_reason"),
                     "error": s.error,
                 }
@@ -2142,7 +2157,7 @@ class WorkflowExecutionService:
         previous_hold: bool | None,
         commit: bool = False,
     ) -> None:
-        """Hook from CRM import when payment/status/hold fields change."""
+        """Hook from file upload when payment/status/hold fields change."""
         if account.last_payment_date and account.last_payment_date != previous_payment_date:
             self.on_payment_event(
                 account.id,

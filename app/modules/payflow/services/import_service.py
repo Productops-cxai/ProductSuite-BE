@@ -1583,14 +1583,15 @@ class PayflowImportService:
                 outstanding_balance=float(parsed["outstanding_balance"]),
                 recovered_balance=recovered,
                 collection_status=parsed["collection_status"],
-                last_action="Created from CRM daily file",
+                last_action="Created from file upload",
                 next_action="Assign workflow",
                 human_review=parsed["collection_status"] == PayflowCollectionStatus.HUMAN_REVIEW.value,
                 timeline=[
                     {
-                        "label": "CRM import",
-                        "detail": f"Account created from {parsed['account_id']}",
+                        "label": "Created from file upload",
+                        "detail": f"Account {parsed['account_id']} imported from uploaded file",
                         "at": stamp,
+                        "source": "file_upload",
                     }
                 ],
             )
@@ -1615,14 +1616,15 @@ class PayflowImportService:
         existing.outstanding_balance = float(parsed["outstanding_balance"])
         existing.recovered_balance = max(0.0, original - existing.outstanding_balance)
         existing.collection_status = parsed["collection_status"]
-        existing.last_action = "Refreshed from CRM daily file"
+        existing.last_action = "Updated from file upload"
         existing.human_review = parsed["collection_status"] == PayflowCollectionStatus.HUMAN_REVIEW.value
         events = list(existing.timeline or [])
         events.append(
             {
-                "label": "CRM refresh",
+                "label": "Updated from file upload",
                 "detail": f"Outstanding {parsed['outstanding_balance']}",
                 "at": stamp,
+                "source": "file_upload",
             }
         )
         existing.timeline = events[-40:]
@@ -1661,7 +1663,7 @@ class PayflowImportService:
             account,
             reason="High balance treatment",
             proposed_action="Move to stronger collection treatment",
-            actor_name="CRM import",
+            actor_name="File upload",
             commit=False,
         )
 

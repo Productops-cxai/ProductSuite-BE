@@ -1167,7 +1167,7 @@ CRM_FILE_BEHAVIOUR: dict = {
         },
         "historical_preservation": [
             "original_balance is set only on create and is not overwritten on refresh",
-            "account timeline appends CRM import/refresh events",
+            "account timeline appends Created from file upload / Updated from file upload events",
         ],
         "negative_balance": "coerce_to_absolute_value",
     },
