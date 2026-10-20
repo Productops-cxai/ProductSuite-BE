@@ -35,8 +35,10 @@ from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 # After the first AI answer, failing workflows are sent back to the AI this many times.
 MAX_FIX_ATTEMPTS = 2
 
-# Approved / Active / Inactive workflows are never regenerated.
+# Active / Inactive are rejected first (→ AI Proposed or Draft), then regenerated.
+# Draft is included so Human Created workflows can regenerate after reject.
 REGENERATE_STATUSES = {
+    PayflowStrategyStatus.DRAFT.value,
     PayflowStrategyStatus.AI_PROPOSED.value,
     PayflowStrategyStatus.UNDER_REVIEW.value,
     PayflowStrategyStatus.APPROVED.value,
@@ -133,17 +135,21 @@ class WorkflowSuggestionService:
         }
 
     def regenerate_workflow(self, user: UserModel, strategy_id: int, remarks: str) -> dict[str, Any]:
-        """New "AI Proposed" version of an AI workflow, guided by reviewer remarks.
+        """New "AI Proposed" version of a workflow, guided by reviewer remarks.
 
-        The original workflow is not changed; the new one records revision_of_id
-        (plus a "Revision of #id" line for reviewers).
+        Works for AI Generated and Human Created sources. The original workflow is
+        not replaced; the new one records revision_of_id (plus a "Revision of #id"
+        line for reviewers).
         """
         original = self.strategies.get_strategy(user, strategy_id)
-        if original["source"] != PayflowStrategySource.AI_GENERATED.value:
-            raise ValidationAppError("Only AI-generated workflows can be regenerated")
+        if original["source"] not in {
+            PayflowStrategySource.AI_GENERATED.value,
+            PayflowStrategySource.HUMAN_CREATED.value,
+        }:
+            raise ValidationAppError("Only AI-generated or human-created workflows can be regenerated")
         if original["status"] not in REGENERATE_STATUSES:
             raise ValidationAppError(
-                "Only AI Proposed, Under Review or Approved workflows can be regenerated"
+                "Only Draft, AI Proposed, Under Review or Approved workflows can be regenerated"
             )
         # Old workflows (before the rework) may have no portfolio; saving would fail after the AI call.
         if original["portfolio_id"] is None:
@@ -153,8 +159,12 @@ class WorkflowSuggestionService:
         rules = load_rules(self.db, original["client_id"])
         limits = design_limits(client, rules)
 
-        # The workflow already stores its segment and stats — reuse them as the AI's context.
-        kept = [item for item in original["ai_context"] if item["label"] not in _REWRITTEN_CONTEXT]
+        # AI workflows store segment/stats in ai_context; human-created may have none.
+        kept = [
+            item
+            for item in (original.get("ai_context") or [])
+            if item.get("label") not in _REWRITTEN_CONTEXT
+        ]
         segment = {
             "segment_id": "A",
             "label": next((i["value"] for i in kept if i["label"] == "Segment"), "Current segment"),

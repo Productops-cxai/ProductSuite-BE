@@ -1235,13 +1235,19 @@ class PayflowStrategyService:
     def reject(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        # Lovable: Reject / Request Regeneration is available for AI workflows in any
+        # reviewable state including Active (returns to AI Proposed for regeneration).
         if row.status not in {
+            PayflowStrategyStatus.DRAFT.value,
             PayflowStrategyStatus.UNDER_REVIEW.value,
             PayflowStrategyStatus.AI_PROPOSED.value,
             PayflowStrategyStatus.APPROVED.value,
+            PayflowStrategyStatus.ACTIVE.value,
+            PayflowStrategyStatus.INACTIVE.value,
         }:
             raise ValidationAppError("This workflow cannot be rejected in its current status")
 
+        was_active = row.status == PayflowStrategyStatus.ACTIVE.value
         source = _row_source(row)
         if source == PayflowStrategySource.AI_GENERATED.value:
             row.status = PayflowStrategyStatus.AI_PROPOSED.value
@@ -1271,6 +1277,20 @@ class PayflowStrategyService:
         self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
+        # Rejecting an Active workflow must stop collection execution (AC1).
+        if was_active:
+            try:
+                from app.modules.payflow.services.workflow_execution_service import (
+                    WorkflowExecutionService,
+                )
+
+                WorkflowExecutionService(self.db).on_strategy_deactivated(row.id)
+            except Exception:  # noqa: BLE001
+                import logging
+
+                logging.getLogger("app.strategy").exception(
+                    "Failed to cancel runs after reject of active strategy_id=%s", row.id
+                )
         if row.status in AWAITING_STATUSES:
             self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))

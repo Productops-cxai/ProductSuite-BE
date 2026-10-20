@@ -13,7 +13,12 @@ from app.infrastructure.database.models import (
     PayflowCommunicationModel,
     PayflowRuleModel,
 )
-from app.shared.enums import PayflowRuleLogic, PayflowRuleStatus, PayflowRuleType
+from app.shared.enums import (
+    PayflowCollectionStatus,
+    PayflowRuleLogic,
+    PayflowRuleStatus,
+    PayflowRuleType,
+)
 
 
 FIELD_GETTERS: dict[str, Any] = {
@@ -130,6 +135,46 @@ class RuleRuntimeService:
                 if m["action"] == action:
                     return m
         return matched[0]
+
+    def matches_rule(
+        self,
+        rule: PayflowRuleModel,
+        account: PayflowAccountModel,
+        *,
+        channel: str | None = None,
+    ) -> bool:
+        """Whether a single rule's conditions match the account (current snapshot)."""
+        ctx = {
+            "channel": channel or "",
+            "messages_7d": self.messages_sent_7d(account.id),
+        }
+        return self._rule_matches(rule, account, ctx)
+
+    def candidate_accounts_for_rule(self, rule: PayflowRuleModel) -> list[PayflowAccountModel]:
+        """
+        Accounts that could be evaluated for this rule on activation/create.
+        Client rules → that client's accounts; system rules → clients that assigned the rule.
+        Resolved accounts are skipped (no retroactive exception queue for closed cases).
+        """
+        q = self.db.query(PayflowAccountModel).filter(
+            PayflowAccountModel.collection_status != PayflowCollectionStatus.RESOLVED.value
+        )
+        if rule.rule_type == PayflowRuleType.CLIENT.value:
+            if rule.client_id is None:
+                return []
+            q = q.filter(PayflowAccountModel.client_id == rule.client_id)
+        else:
+            clients = self.db.query(PayflowClientModel).all()
+            client_ids = [
+                c.id
+                for c in clients
+                if (rule.name or "")
+                in {str(name) for name in (c.governance_rules or []) if name}
+            ]
+            if not client_ids:
+                return []
+            q = q.filter(PayflowAccountModel.client_id.in_(client_ids))
+        return q.order_by(PayflowAccountModel.id.asc()).all()
 
     def _rule_matches(self, rule: PayflowRuleModel, account: PayflowAccountModel, ctx: dict) -> bool:
         conditions = list(rule.conditions or [])

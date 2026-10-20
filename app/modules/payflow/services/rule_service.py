@@ -465,6 +465,8 @@ class PayflowRuleService:
         self.db.add(row)
         self.db.commit()
         self.db.refresh(row)
+        if row.status == PayflowRuleStatus.ACTIVE.value:
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
     def update_rule(
@@ -509,6 +511,12 @@ class PayflowRuleService:
 
         self.db.commit()
         self.db.refresh(row)
+        became_active = (
+            prev_status != PayflowRuleStatus.ACTIVE.value
+            and row.status == PayflowRuleStatus.ACTIVE.value
+        )
+        if became_active:
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
     def activate(self, user: UserModel, rule_id: int) -> dict[str, Any]:
@@ -523,6 +531,7 @@ class PayflowRuleService:
         row.history = history
         self.db.commit()
         self.db.refresh(row)
+        self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
     def deactivate(self, user: UserModel, rule_id: int) -> dict[str, Any]:
@@ -567,6 +576,55 @@ class PayflowRuleService:
         self.db.delete(row)
         self.db.commit()
         return {"message": "Rule deleted"}
+
+    def _enqueue_retroactive_human_reviews(
+        self, rule: PayflowRuleModel, *, actor_name: str
+    ) -> int:
+        """
+        When a Require Human Review rule becomes Active, scan existing accounts now
+        (not only on the next workflow step). Same rule+account open reviews are skipped.
+        Does not change the worker step-time path.
+        """
+        if rule.status != PayflowRuleStatus.ACTIVE.value:
+            return 0
+        if rule.action != "Require Human Review":
+            return 0
+
+        from app.modules.payflow.services.review_service import (
+            OPEN_STATUSES,
+            PayflowReviewService,
+        )
+        from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
+
+        runtime = RuleRuntimeService(self.db)
+        review_svc = PayflowReviewService(self.db)
+        created = 0
+        for account in runtime.candidate_accounts_for_rule(rule):
+            if not runtime.matches_rule(rule, account):
+                continue
+            already_open = (
+                self.db.query(PayflowHumanReviewModel)
+                .filter(
+                    PayflowHumanReviewModel.account_id == account.id,
+                    PayflowHumanReviewModel.rule_id == rule.id,
+                    PayflowHumanReviewModel.status.in_(list(OPEN_STATUSES)),
+                )
+                .first()
+            )
+            if already_open:
+                continue
+            review_svc.enqueue_from_rule(
+                account_id=account.id,
+                rule_id=rule.id,
+                observed_value=f"${float(account.outstanding_balance or 0):,.2f} outstanding",
+                actor_name=actor_name or "Rule activation scan",
+                commit=False,
+                notify=False,
+            )
+            created += 1
+        if created:
+            self.db.commit()
+        return created
 
     def _get_row(self, rule_id: int) -> PayflowRuleModel:
         row = (
