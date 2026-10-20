@@ -585,6 +585,12 @@ class PayflowReviewService:
             if account
             else ("Account unavailable" if row.account_id else None),
             "case_reference": account.case_reference if account else None,
+            "portfolio_id": account.portfolio_id if account else None,
+            "portfolio_name": (
+                account.portfolio.name
+                if account and getattr(account, "portfolio", None) is not None
+                else None
+            ),
             "original_balance": float(account.original_balance) if account else 0,
             "outstanding_balance": float(account.outstanding_balance) if account else 0,
             "recovered_balance": float(account.recovered_balance) if account else 0,
@@ -683,7 +689,7 @@ class PayflowReviewService:
     def _base_query(self):
         return self.db.query(PayflowHumanReviewModel).options(
             joinedload(PayflowHumanReviewModel.client),
-            joinedload(PayflowHumanReviewModel.account),
+            joinedload(PayflowHumanReviewModel.account).joinedload(PayflowAccountModel.portfolio),
             joinedload(PayflowHumanReviewModel.rule),
             joinedload(PayflowHumanReviewModel.strategy),
         )

@@ -597,6 +597,8 @@ class PayflowReviewItem(BaseModel):
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None
     case_reference: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
     original_balance: float = 0
     outstanding_balance: float = 0
     recovered_balance: float = 0
