@@ -857,6 +857,137 @@ class PayflowPaymentAttemptModel(Base):
     account = relationship("PayflowAccountModel")
 
 
+class PayflowPaymentPlanModel(Base):
+    """Customer payment plan — schedule stored; future charges are NOT auto-initiated."""
+
+    __tablename__ = "payflow_payment_plans"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_payflow_payment_plan_public_id"),
+        Index("ix_payflow_payment_plans_account_status", "account_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    payment_link_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_payment_links.id"), nullable=True, index=True
+    )
+    plan_option_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Active", index=True)
+    installments_total: Mapped[int] = mapped_column(Integer, nullable=False)
+    installment_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    frequency: Mapped[str] = mapped_column(String(32), nullable=False, default="monthly")
+    currency_code: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    total_payable: Mapped[float] = mapped_column(Float, nullable=False)
+    amount_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    next_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel")
+    account = relationship("PayflowAccountModel")
+    payment_link = relationship("PayflowPaymentLinkModel")
+    installments = relationship(
+        "PayflowPaymentPlanInstallmentModel",
+        back_populates="plan",
+        cascade="all, delete-orphan",
+        order_by="PayflowPaymentPlanInstallmentModel.sequence",
+    )
+
+
+class PayflowPaymentPlanInstallmentModel(Base):
+    __tablename__ = "payflow_payment_plan_installments"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "sequence", name="uq_payflow_plan_installment_seq"),
+        Index("ix_payflow_plan_installments_due", "due_date", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_payment_plans.id"), nullable=False, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Pending", index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_attempt_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_payment_attempts.id"), nullable=True
+    )
+    # Set after ledger row exists (no FK to avoid create_all cycles).
+    payment_transaction_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    plan = relationship("PayflowPaymentPlanModel", back_populates="installments")
+
+
+class PayflowPaymentTransactionModel(Base):
+    """Durable payment ledger — never delete; refunds/reversals are new rows."""
+
+    __tablename__ = "payflow_payment_transactions"
+    __table_args__ = (
+        UniqueConstraint("public_id", name="uq_payflow_payment_txn_public_id"),
+        Index("ix_payflow_payment_txns_provider_ref", "provider_ref"),
+        Index("ix_payflow_payment_txns_account", "account_id", "created_at"),
+        Index("ix_payflow_payment_txns_attempt", "payment_attempt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    payment_attempt_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    payment_plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    installment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False, default="payment")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Succeeded", index=True)
+    option_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    currency_code: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    method_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    balance_before: Mapped[float | None] = mapped_column(Float, nullable=True)
+    balance_after: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recovered_delta: Mapped[float | None] = mapped_column(Float, nullable=True)
+    related_transaction_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel")
+    account = relationship("PayflowAccountModel")
+
+
 class PayflowOperationalExceptionModel(Base):
     """Operational failure requiring attention (separate from Human Review governance)."""
 

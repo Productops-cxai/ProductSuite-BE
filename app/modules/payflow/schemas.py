@@ -1245,6 +1245,15 @@ class PayflowPaymentMockOutcomeRequest(BaseModel):
     outcome: str = Field(min_length=1, max_length=32)
 
 
+class PayflowAccountPaymentsResponse(BaseModel):
+    account_id: int
+    balances: dict = Field(default_factory=dict)
+    transactions: List[dict] = Field(default_factory=list)
+    attempts: List[dict] = Field(default_factory=list)
+    payment_plans: List[dict] = Field(default_factory=list)
+    total_transactions: int = 0
+
+
 class PayflowOperationalExceptionItem(BaseModel):
     id: int
     exception_type: str

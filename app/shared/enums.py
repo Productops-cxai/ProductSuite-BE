@@ -225,6 +225,37 @@ class PayflowPaymentAttemptStatus(str, Enum):
     EXPIRED = "Expired"
 
 
+class PayflowPaymentTxnStatus(str, Enum):
+    PENDING = "Pending"
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+    REFUNDED = "Refunded"
+    REVERSED = "Reversed"
+
+
+class PayflowPaymentTxnDirection(str, Enum):
+    PAYMENT = "payment"
+    REFUND = "refund"
+    REVERSAL = "reversal"
+
+
+class PayflowPaymentPlanStatus(str, Enum):
+    ACTIVE = "Active"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    OVERDUE = "Overdue"
+    DEFAULTED = "Defaulted"
+
+
+class PayflowPaymentInstallmentStatus(str, Enum):
+    PENDING = "Pending"
+    PAID = "Paid"
+    FAILED = "Failed"
+    OVERDUE = "Overdue"
+    WAIVED = "Waived"
+
+
 class PayflowCommPurpose(str, Enum):
     PAYMENT_REMINDER = "Payment Reminder"
     PROMISE_FOLLOW_UP = "Promise-to-Pay Follow-Up"

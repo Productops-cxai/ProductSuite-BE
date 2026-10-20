@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import math
 import uuid
-from datetime import datetime, timezone
+from calendar import monthrange
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -17,6 +18,7 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowPaymentAttemptModel,
     PayflowPaymentLinkModel,
+    PayflowPaymentPlanModel,
 )
 from app.modules.payflow.services.payment_link_service import (
     PayflowPaymentLinkService,
@@ -165,14 +167,36 @@ class PayflowPaymentPortalService:
                 first = _money(math.ceil((balance / installments) * 100) / 100)
                 first = min(first, balance)
                 plan_id = str(plan.get("id") or f"plan_{installments}")
+                frequency = str(plan.get("frequency") or "monthly")
+                start = _utcnow().date()
+                schedule = []
+                remaining = balance
+                for i in range(1, installments + 1):
+                    if i == 1:
+                        amt = first
+                    elif i == installments:
+                        amt = _money(remaining)
+                    else:
+                        amt = _money(remaining / (installments - i + 1))
+                    remaining = _money(remaining - amt)
+                    due = self._add_months(start, i - 1)
+                    schedule.append(
+                        {
+                            "sequence": i,
+                            "amount": amt,
+                            "due_date": due.isoformat(),
+                            "frequency": frequency,
+                        }
+                    )
                 options.append(
                     {
                         "id": plan_id,
                         "type": PayflowPaymentOptionType.PAYMENT_PLAN.value,
                         "label": str(plan.get("label") or f"{installments} instalments"),
                         "description": (
-                            f"Start a {installments}-payment plan. Today's charge is the first "
-                            f"instalment ({first:.2f} {currency})."
+                            f"{installments} {frequency} payments totalling {balance:.2f} {currency}. "
+                            f"Today’s charge: {first:.2f} {currency}. Future instalments are not "
+                            "auto-charged."
                         ),
                         "amount": first,
                         "currency_code": currency,
@@ -181,10 +205,22 @@ class PayflowPaymentPortalService:
                         "max_amount": first,
                         "installments": installments,
                         "plan_id": plan_id,
+                        "frequency": frequency,
+                        "total_payable": balance,
+                        "installment_amount": first,
+                        "schedule": schedule,
                     }
                 )
 
         return options
+
+    @staticmethod
+    def _add_months(d: date, months: int) -> date:
+        month = d.month - 1 + months
+        year = d.year + month // 12
+        month = month % 12 + 1
+        day = min(d.day, monthrange(year, month)[1])
+        return date(year, month, day)
 
     def resolve_portal(self, token: str) -> dict[str, Any]:
         """Public portal payload — branding, balance, options, block reasons."""
@@ -240,6 +276,27 @@ class PayflowPaymentPortalService:
             "test",
         }
 
+        active_plans: list[dict[str, Any]] = []
+        try:
+            from app.modules.payflow.services.payment_outcome_service import (
+                PayflowPaymentOutcomeService,
+            )
+
+            outcome = PayflowPaymentOutcomeService(self.db)
+            outcome.refresh_overdue_plans(account.id)
+            for plan in (
+                self.db.query(PayflowPaymentPlanModel)
+                .filter(
+                    PayflowPaymentPlanModel.account_id == account.id,
+                    PayflowPaymentPlanModel.status.in_(["Active", "Overdue"]),
+                )
+                .order_by(PayflowPaymentPlanModel.id.desc())
+                .all()
+            ):
+                active_plans.append(outcome.serialize_plan(plan))
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to load payment plans for portal")
+
         return {
             "usable": usable,
             "status": row.status,
@@ -254,12 +311,15 @@ class PayflowPaymentPortalService:
             },
             "case": {
                 "account_reference": account.account_reference,
+                "original_balance": float(account.original_balance or 0),
                 "outstanding_balance": balance,
+                "recovered_balance": float(account.recovered_balance or 0),
                 "currency_code": currency,
                 "collection_status": account.collection_status,
             },
             "brand": self._brand_payload(client),
             "payment_options": options,
+            "active_payment_plans": active_plans,
             "provider": {
                 "name": "stripe" if stripe_configured() else "mock",
                 "ready": bool(provider_ready and usable and options),
@@ -640,28 +700,33 @@ class PayflowPaymentPortalService:
         provider_ref: str | None = None,
         commit: bool = True,
     ) -> None:
+        from app.modules.payflow.services.payment_outcome_service import (
+            PayflowPaymentOutcomeService,
+        )
+
+        outcome = PayflowPaymentOutcomeService(self.db)
+        # Already succeeded + ledgered → no second balance hit.
         if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
-            return  # idempotent
-        if attempt.status in {
-            PayflowPaymentAttemptStatus.CANCELLED.value,
-            PayflowPaymentAttemptStatus.EXPIRED.value,
-        }:
-            # Late success after cancel — still accept provider truth.
-            pass
+            existing = outcome._txn_by_attempt(attempt.id)
+            if existing:
+                return
 
         account = self.db.get(PayflowAccountModel, attempt.account_id)
         amount = _money(attempt.amount)
+        prev = _money(account.outstanding_balance) if account else 0.0
+        new_bal = prev
         if account:
-            # Adjust balance only once on first success.
-            prev = _money(account.outstanding_balance)
             new_bal = max(0.0, _money(prev - amount))
             account.outstanding_balance = new_bal
             account.recovered_balance = _money((account.recovered_balance or 0) + amount)
             account.last_payment_amount = amount
             account.last_payment_date = _utcnow().date()
             account.paid_amount = _money((account.paid_amount or 0) + amount)
-            if new_bal <= 0:
+            if new_bal <= 0 or attempt.option_type == PayflowPaymentOptionType.PAY_IN_FULL.value:
                 account.collection_status = "Resolved"
+            elif attempt.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+                account.collection_status = "Payment Plan"
+            # Partial keeps Active / existing status unless settled.
 
         attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
         attempt.completed_at = _utcnow()
@@ -671,15 +736,34 @@ class PayflowPaymentPortalService:
             )
         self._append_attempt_event(attempt, "Succeeded", provider_ref)
 
-        # Complete payment links when balance cleared or pay-in-full.
-        if account and (
-            _money(account.outstanding_balance) <= 0
-            or attempt.option_type == PayflowPaymentOptionType.PAY_IN_FULL.value
-        ):
+        txn = None
+        plan = None
+        if account:
+            txn = outcome.record_confirmed_payment(
+                attempt,
+                account,
+                amount=amount,
+                balance_before=prev,
+                balance_after=new_bal,
+                provider_ref=provider_ref or attempt.stripe_payment_intent_id,
+            )
+            if attempt.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+                plan = outcome.ensure_payment_plan_for_attempt(
+                    attempt,
+                    account,
+                    first_txn=txn,
+                    balance_at_plan_start=prev,
+                )
+            outcome._append_account_timeline(
+                account,
+                "Payment Confirmed",
+                f"{amount:.2f} {attempt.currency_code} · {attempt.option_type} · {txn.public_id}",
+            )
+
+        # Stop collection links only on full settlement — not on partial/plan first instalment.
+        if account and new_bal <= 0:
             self.links.mark_completed_for_account(attempt.account_id, commit=False)
 
-        # Single path: workflow advance + one communication "Payment Completed" event.
-        # Do NOT also call mark_payment_event here — on_payment_event already does that.
         try:
             from app.modules.payflow.services.workflow_execution_service import (
                 WorkflowExecutionService,
@@ -689,10 +773,17 @@ class PayflowPaymentPortalService:
                 attempt.account_id,
                 {
                     "amount": amount,
+                    # verified money received (comm payment_completed) — not only full settlement
                     "completed": True,
+                    "case_settled": new_bal <= 0,
+                    "partial": attempt.option_type == PayflowPaymentOptionType.PARTIAL.value,
+                    "payment_plan": attempt.option_type
+                    == PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                    "plan_id": plan.public_id if plan else None,
                     "status": "succeeded",
                     "source": "stripe" if attempt.provider == "stripe" else "mock",
                     "attempt_id": attempt.public_id,
+                    "transaction_id": txn.public_id if txn else None,
                     "payment_date": _utcnow().date().isoformat(),
                 },
                 commit=False,
@@ -705,7 +796,6 @@ class PayflowPaymentPortalService:
         else:
             self.db.flush()
 
-        # In-app after durable success (ops + client supervisors).
         try:
             from app.modules.payflow.services.notification_service import (
                 PayflowNotificationService,
@@ -713,7 +803,6 @@ class PayflowPaymentPortalService:
 
             customer = account.customer_name if account else "Customer"
             ref = account.account_reference if account else str(attempt.account_id)
-            resolved = bool(account and _money(account.outstanding_balance) <= 0)
             PayflowNotificationService(self.db).notify_payment_received(
                 client_id=attempt.client_id,
                 account_id=attempt.account_id,
@@ -723,7 +812,7 @@ class PayflowPaymentPortalService:
                 currency_code=attempt.currency_code or "USD",
                 attempt_public_id=attempt.public_id,
                 option_type=attempt.option_type,
-                resolved=resolved,
+                resolved=new_bal <= 0,
             )
         except Exception:  # noqa: BLE001
             logger.exception("payment received notify failed attempt=%s", attempt.public_id)
@@ -771,6 +860,46 @@ class PayflowPaymentPortalService:
     def handle_stripe_event(self, event: dict[str, Any]) -> dict[str, Any]:
         et = str(event.get("type") or "")
         data_object = (event.get("data") or {}).get("object") or {}
+
+        # Refunds / chargebacks — adjust ledger without deleting originals.
+        if et in {"charge.refunded", "refund.created", "charge.dispute.funds_withdrawn"}:
+            try:
+                from app.modules.payflow.services.payment_outcome_service import (
+                    PayflowPaymentOutcomeService,
+                )
+
+                pi = data_object.get("payment_intent")
+                charge_id = data_object.get("id")
+                amount_refunded = data_object.get("amount_refunded") or data_object.get("amount")
+                amt = None
+                if amount_refunded is not None:
+                    amt = float(amount_refunded) / 100.0
+                ref = None
+                if isinstance(pi, str) and pi:
+                    ref = pi
+                elif charge_id:
+                    # Find txn by provider_ref containing charge or use charge id.
+                    ref = str(charge_id)
+                direction = "reversal" if "dispute" in et else "refund"
+                if ref:
+                    adj = PayflowPaymentOutcomeService(self.db).apply_refund_or_reversal(
+                        original_provider_ref=ref,
+                        amount=amt,
+                        direction=direction,
+                        provider_ref=f"{et}:{data_object.get('id')}",
+                        notes=f"Stripe {et}",
+                        commit=True,
+                    )
+                    return {
+                        "matched": True,
+                        "type": et,
+                        "adjustment": adj.public_id,
+                        "status": adj.status,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("stripe refund/reversal handling failed")
+                return {"matched": False, "reason": str(exc)[:200], "type": et}
+
         session_id = data_object.get("id") if data_object.get("object") == "checkout.session" else None
         if not session_id and "checkout.session" in et:
             session_id = data_object.get("id")

@@ -1090,16 +1090,9 @@ class PayflowCommunicationService:
             row.payment_initiated = True
             row.payment_completed = True
             self._record_event_row(row, event_type="payment_completed", label="Payment Completed")
-            try:
-                from app.modules.payflow.services.payment_link_service import (
-                    PayflowPaymentLinkService,
-                )
-
-                PayflowPaymentLinkService(self.db).mark_completed_for_account(
-                    account_id, commit=False
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("payment link complete mark failed account_id=%s", account_id)
+            # Do NOT auto-complete all payment links here — partial / plan first
+            # instalments must keep Active links. Full settlement completes links
+            # in payment_portal_service.apply_succeeded when balance hits zero.
         if commit:
             self.db.commit()
         else:

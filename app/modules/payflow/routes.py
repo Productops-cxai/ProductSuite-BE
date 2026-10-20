@@ -50,6 +50,7 @@ from app.modules.payflow.schemas import (
     ResendCommunicationRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
+    PayflowAccountPaymentsResponse,
     PayflowPaymentAttemptItem,
     PayflowPaymentInitiateRequest,
     PayflowPaymentLinkItem,
@@ -108,6 +109,7 @@ from app.modules.payflow.services.operational_exception_service import (
     PayflowOperationalExceptionService,
 )
 from app.modules.payflow.services.payment_link_service import PayflowPaymentLinkService
+from app.modules.payflow.services.payment_outcome_service import PayflowPaymentOutcomeService
 from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
@@ -1371,6 +1373,18 @@ def list_account_payment_links(
 ):
     try:
         return PayflowPaymentLinkService(db).list_for_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/accounts/{account_id}/payments",
+    response_model=PayflowAccountPaymentsResponse,
+)
+def list_account_payments(account_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Confirmed payment ledger + attempts + plans for Case detail (backend-verified only)."""
+    try:
+        return PayflowPaymentOutcomeService(db).list_account_payments(user, account_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 
