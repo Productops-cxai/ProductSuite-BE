@@ -43,8 +43,11 @@ from app.modules.payflow.schemas import (
     PayflowAccountsListResponse,
     PayflowClientsListResponse,
     CommunicationEligibilitySnapshot,
+    ManualEmailSendRequest,
+    ManualEmailSendResponse,
     ManualSmsSendRequest,
     ManualSmsSendResponse,
+    ResendCommunicationRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
     PayflowOperationalExceptionItem,
@@ -1258,6 +1261,81 @@ def send_manual_sms(
             idempotency_key=payload.idempotency_key,
         )
         return ManualSmsSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/accounts/{account_id}/communications/email/send",
+    response_model=ManualEmailSendResponse,
+)
+def send_manual_email(
+    account_id: int,
+    payload: ManualEmailSendRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        result = PayflowCommunicationService(db).send_manual_email(
+            user,
+            row,
+            subject=payload.subject,
+            body=payload.body,
+            purpose=payload.purpose,
+            include_payment_link=payload.include_payment_link,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualEmailSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/comms/{communication_id}/resend",
+    response_model=ManualEmailSendResponse,
+)
+def resend_failed_communication(
+    communication_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    payload: ResendCommunicationRequest = ResendCommunicationRequest(),
+):
+    try:
+        result = PayflowCommunicationService(db).resend_failed_communication(
+            user,
+            communication_id,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualEmailSendResponse(
             skipped=result.get("skipped"),
             communication_id=result.get("communication_id"),
             code=result.get("code"),

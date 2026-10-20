@@ -1139,6 +1139,29 @@ class ManualSmsSendResponse(BaseModel):
     restriction_reason: Optional[str] = None
 
 
+class ManualEmailSendRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=20000)
+    purpose: str = "Payment Reminder"
+    include_payment_link: bool = False
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class ManualEmailSendResponse(BaseModel):
+    skipped: Optional[str] = None
+    communication_id: Optional[int] = None
+    code: Optional[str] = None
+    status: Optional[str] = None
+    comm_status: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
+    restriction_reason: Optional[str] = None
+
+
+class ResendCommunicationRequest(BaseModel):
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
 class PayflowOperationalExceptionItem(BaseModel):
     id: int
     exception_type: str

@@ -11,7 +11,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import ForbiddenError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowClientModel,
@@ -20,7 +20,10 @@ from app.infrastructure.database.models import (
     PayflowStrategyModel,
     UserModel,
 )
-from app.infrastructure.email.sendgrid_service import send_collection_email
+from app.infrastructure.email.collection_provider import (
+    active_collection_provider,
+    send_collection_email,
+)
 from app.infrastructure.sms.twilio_service import (
     normalize_e164,
     send_collection_sms,
@@ -30,6 +33,13 @@ from app.modules.payflow.services.access_context_service import AccessContextSer
 from app.shared.enums import PayflowCommChannel, PayflowCommPurpose, PayflowCommStatus
 
 logger = logging.getLogger("app.comms")
+
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def _valid_email(value: str | None) -> bool:
+    text = (value or "").strip()
+    return bool(text and _EMAIL_RE.match(text) and len(text) <= 255)
 
 
 def _utcnow() -> datetime:
@@ -539,6 +549,13 @@ class PayflowCommunicationService:
                     "restriction_reason": "No valid email on file",
                     "next_eligible_at": None,
                 }
+            if not _valid_email(email):
+                return {
+                    "ok": False,
+                    "eligibility_status": "Blocked",
+                    "restriction_reason": "Email address format is invalid",
+                    "next_eligible_at": None,
+                }
             if account.email_consent is False:
                 return {
                     "ok": False,
@@ -654,7 +671,19 @@ class PayflowCommunicationService:
         now = _utcnow()
         date_bucket, date_label, time_label = _date_meta(now)
         code = f"COM-{uuid4().hex[:10].upper()}"
-        tracking = "not_available" if channel_norm == "SMS" else "available"
+        email_provider = active_collection_provider()
+        tracking = (
+            "not_available"
+            if channel_norm == "SMS" or email_provider in {"smtp", "log"}
+            else "available"
+        )
+        client = account.client
+        if client is None and account.client_id:
+            client = self.db.get(PayflowClientModel, account.client_id)
+        brand_from = (client.email_from if client else None) or None
+        brand_name = None
+        if client:
+            brand_name = client.sender_name or client.brand_name or client.name
         comm = PayflowCommunicationModel(
             code=code,
             client_id=client_id or account.client_id,
@@ -677,7 +706,11 @@ class PayflowCommunicationService:
             events=[],
             balance=float(account.outstanding_balance or 0),
             eligibility_status="Eligible",
-            provider="twilio" if channel_norm == "SMS" else "sendgrid",
+            provider=(
+                "twilio"
+                if channel_norm == "SMS"
+                else email_provider
+            ),
         )
         self.db.add(comm)
         self.db.flush()
@@ -716,21 +749,30 @@ class PayflowCommunicationService:
         else:
             email = (account.email or "").strip()
             recipient = email
+            # Prefer client branding on the wire; fall back to global SENDGRID_/SMTP_FROM.
+            rendered_body = body
+            if brand_name and "{{brand_name}}" not in body:
+                # Already rendered templates may include brand; leave body as-is.
+                pass
             log = send_collection_email(
                 self.db,
                 to_email=email,
                 subject=subject,
-                body=body,
+                body=rendered_body,
                 email_type="collection_workflow",
                 action_link=payment_link,
-                custom_args=custom_args,
+                custom_args=custom_args if email_provider == "sendgrid" else None,
+                from_email=brand_from,
+                from_name=brand_name,
                 commit=False,
             )
             send_status = log.status
             provider_message_id = getattr(log, "provider_message_id", None)
+            provider_name = getattr(log, "provider_name", None) or email_provider
+            comm.provider = provider_name
             account.last_email_sent_date = now.date()
             if log.status == "failed":
-                provider_error = "sendgrid_failed"
+                provider_error = getattr(log, "error", None) or f"{provider_name}_failed"
 
         account.last_contact_date = now.date()
         comm.provider_message_id = provider_message_id
@@ -1128,6 +1170,148 @@ class PayflowCommunicationService:
                     self.db.flush()
         self.db.commit()
         return result
+
+    def send_manual_email(
+        self,
+        user: UserModel,
+        account: PayflowAccountModel,
+        *,
+        subject: str,
+        body: str,
+        purpose: str = "Payment Reminder",
+        include_payment_link: bool = False,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Authorized manual email — same eligibility gates as workflow send."""
+        if not self.access.is_operations_admin(user) and not self.access.can(
+            user, "send_communications", account.client_id
+        ):
+            raise ForbiddenError("Send Communications permission required")
+        self._assert_view(user, account.client_id)
+
+        purpose_norm = (purpose or "Payment Reminder").strip()
+        subject_norm = (subject or "Payment reminder").strip()[:500]
+        if idempotency_key:
+            existing = (
+                self.db.query(PayflowCommunicationModel)
+                .filter(
+                    PayflowCommunicationModel.account_id == account.id,
+                    PayflowCommunicationModel.channel == "Email",
+                    PayflowCommunicationModel.why_timing == f"manual:{idempotency_key}",
+                )
+                .first()
+            )
+            if existing:
+                return {
+                    "skipped": "idempotent",
+                    "communication_id": existing.id,
+                    "code": existing.code,
+                    "comm_status": existing.status,
+                }
+
+        recent = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(
+                PayflowCommunicationModel.account_id == account.id,
+                PayflowCommunicationModel.channel == "Email",
+                PayflowCommunicationModel.purpose == purpose_norm,
+                PayflowCommunicationModel.status.in_(
+                    [
+                        PayflowCommStatus.QUEUED.value,
+                        PayflowCommStatus.SENT.value,
+                        PayflowCommStatus.PREPARED.value,
+                        PayflowCommStatus.DELIVERED.value,
+                    ]
+                ),
+                PayflowCommunicationModel.created_at >= _utcnow() - timedelta(minutes=5),
+            )
+            .order_by(PayflowCommunicationModel.id.desc())
+            .first()
+        )
+        if recent and not idempotency_key:
+            return {
+                "skipped": "duplicate_window",
+                "communication_id": recent.id,
+                "code": recent.code,
+                "comm_status": recent.status,
+                "restriction_reason": "An email for this purpose was already sent in the last 5 minutes",
+            }
+
+        payment_url = _payment_link_url(account, True) if include_payment_link else None
+        strategy = SimpleNamespace(name="Manual Email")
+        result = self.send_workflow_step(
+            account=account,
+            strategy=strategy,  # type: ignore[arg-type]
+            channel="Email",
+            purpose=purpose_norm,
+            subject=subject_norm,
+            body=body,
+            payment_link=payment_url,
+            run_id=None,
+            client_id=account.client_id,
+        )
+        if result.get("communication_id"):
+            row = self.db.get(PayflowCommunicationModel, result["communication_id"])
+            if row:
+                row.why_message = "Authorized manual email"
+                row.why_timing = (
+                    f"manual:{idempotency_key}" if idempotency_key else "Manual send by authorized user"
+                )
+                row.workflow_name = "Manual Email"
+                self.db.flush()
+        self.db.commit()
+        return result
+
+    def resend_failed_communication(
+        self,
+        user: UserModel,
+        communication_id: int,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Safe retry for a Failed email/SMS — creates a new send; never duplicates a non-failed row."""
+        row = (
+            self.db.query(PayflowCommunicationModel)
+            .options(
+                joinedload(PayflowCommunicationModel.account).joinedload(PayflowAccountModel.client),
+                joinedload(PayflowCommunicationModel.client),
+            )
+            .filter(PayflowCommunicationModel.id == communication_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Communication not found")
+        self._assert_view(user, row.client_id)
+        if not self.access.is_operations_admin(user) and not self.access.can(
+            user, "send_communications", row.client_id
+        ):
+            raise ForbiddenError("Send Communications permission required")
+        if row.status != PayflowCommStatus.FAILED.value:
+            raise ValidationAppError("Only failed communications can be resent")
+        account = row.account
+        if not account:
+            raise NotFoundError("Account not found for communication")
+
+        body = "\n".join(row.body_lines or []) or "Payment reminder"
+        key = idempotency_key or f"resend-{row.id}"
+        if row.channel == "SMS":
+            return self.send_manual_sms(
+                user,
+                account,
+                body=body,
+                purpose=row.purpose or "Payment Reminder",
+                include_payment_link=bool(row.payment_link),
+                idempotency_key=key,
+            )
+        return self.send_manual_email(
+            user,
+            account,
+            subject=row.subject or "Payment reminder",
+            body=body,
+            purpose=row.purpose or "Payment Reminder",
+            include_payment_link=bool(row.payment_link),
+            idempotency_key=key,
+        )
 
     def case_eligibility_snapshot(self, user: UserModel, account: PayflowAccountModel) -> dict[str, Any]:
         self._assert_view(user, account.client_id)
