@@ -1093,6 +1093,7 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "phone_work_number": "phone_work",
     "work_phone": "phone_work",
     "principle_amount": "original_balance",
+    "principal_amount": "original_balance",
     "id": "crm_case_id",
     "date_last_email_sent": "last_email_sent_date",
     "date_of_last_sms_sent": "last_sms_sent_date",
@@ -1106,7 +1107,9 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "dn_debtorcaseaddress_city_name": "city",
     "dn_debtorcaseaddress_province_name": "province_state",
     "dn_debtorcaseaddress_postal_code": "postal_code",
+    # First header wins; "Canada" / ISO-2 alias both normalize to CA in import_service.
     "dn_debtorcaseaddress_country_name": "country_code",
+    "dn_debtorcaseaddress_country_alias_1": "country_code",
     "dn_client_demographic_product": "product_code",
     "account_product": "product_code",
     "updated_at": "source_updated_at",

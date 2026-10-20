@@ -39,6 +39,18 @@ from app.shared.enums import PayflowCollectionStatus, PayflowPortfolioStatus
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_DIGITS_RE = re.compile(r"\D+")
+# CRM Debtor dumps put a broken JSON array in bucket_values (quotes/commas unescaped).
+# That splits one logical cell into dozens of CSV fields and shifts address/contact columns.
+_BUCKET_VALUES_BROKEN_RE = re.compile(r',(?:"\[\{|\[\{).*?\}\]"{0,3},', re.DOTALL)
+_COUNTRY_NAME_TO_ISO = {
+    "CA": "CA",
+    "CAN": "CA",
+    "CANADA": "CA",
+    "US": "US",
+    "USA": "US",
+    "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US",
+}
 _BE_ROOT = Path(__file__).resolve().parents[4]
 _UPLOADS = _BE_ROOT / "uploads" / "imports"
 _SAMPLE_PATH = _BE_ROOT / "docs" / "samples" / "payflow_daily_accounts_sample.xlsx"
@@ -73,6 +85,56 @@ def _cell(row: tuple, idx: dict[str, int], key: str) -> str:
     if isinstance(val, date):
         return val.isoformat()
     return str(val).strip()
+
+
+def _repair_debtor_csv_text(text: str) -> str:
+    """Neutralize malformed bucket_values so later columns keep their header alignment."""
+    if "bucket_values" not in text.lower() or "[{bucket_name" not in text.lower():
+        return text
+    return _BUCKET_VALUES_BROKEN_RE.sub(',"",', text)
+
+
+def _is_shifted_crm_junk(val: str | None) -> bool:
+    """True when a cell looks like a fragment from a broken bucket_values JSON blob."""
+    if not val:
+        return False
+    text = str(val).strip()
+    if not text:
+        return False
+    low = text.lower()
+    if "{" in text or "}" in text:
+        return True
+    if any(
+        tok in low
+        for tok in (
+            "bucket_name",
+            "paid_amt",
+            "adjustment",
+            "\"amount\"",
+            "initial",
+        )
+    ):
+        return True
+    # e.g. `"adjustment": 0.0` after quote stripping left a key:value fragment
+    if ":" in text and any(ch.isdigit() for ch in text) and (
+        '"' in text or low.endswith(".0") or low in {"0", "0.0", "null"}
+    ):
+        # Only treat as junk when it also looks like a JSON key fragment
+        if any(tok in low for tok in ("paid", "adjust", "amount", "initial", "bucket")):
+            return True
+    return False
+
+
+def _normalize_country_code(raw: str, *, crm_number: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else ""
+    upper = text.upper()
+    if upper in _COUNTRY_NAME_TO_ISO:
+        return _COUNTRY_NAME_TO_ISO[upper]
+    if len(upper) == 2 and upper.isalpha():
+        return upper
+    return ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else upper
 
 
 def _normalize_phone(raw: str | None) -> str | None:
@@ -1113,6 +1175,7 @@ class PayflowImportService:
             raise ValidationAppError(
                 "The CSV file could not be read. Save it as UTF-8 and try again."
             ) from exc
+        text = _repair_debtor_csv_text(text)
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
         if not rows:
@@ -1242,9 +1305,7 @@ class PayflowImportService:
 
         crm_number = c("client_number")
         # CRM debtor dump defaults when columns are missing or corrupted after bucket_values.
-        country = c("country_code").upper()
-        if len(country) != 2:
-            country = ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else country
+        country = _normalize_country_code(c("country_code"), crm_number=crm_number)
         currency = c("currency_code").upper()
         if currency not in ACCOUNT_IMPORT_CURRENCIES:
             # Accept CRM labels: CDN, Canadian Dollars, US Dollar, …
@@ -1337,11 +1398,7 @@ class PayflowImportService:
 
         # Prefer dn_collection_status_name (aliased to collection_status); fall back to case_life_status.
         collection_raw = c("collection_status") or c("case_life_status")
-        if collection_raw and (
-            "{" in collection_raw
-            or "amount" in collection_raw.lower()
-            or "bucket_name" in collection_raw.lower()
-        ):
+        if _is_shifted_crm_junk(collection_raw):
             # Shifted/corrupt debtor-dump cell after broken bucket_values quoting.
             collection_raw = ""
         if collection_raw:
@@ -1365,18 +1422,18 @@ class PayflowImportService:
             collection_status = PayflowCollectionStatus.ACTIVE.value
 
         province = c("province_state")
-        # Skip clearly corrupted geo values from broken CSV quoting.
-        if province and ("{" in province or "amount" in province.lower()):
+        if _is_shifted_crm_junk(province):
             province = ""
-        region = c("region") or province
+        region_raw = c("region")
+        if _is_shifted_crm_junk(region_raw):
+            region_raw = ""
+        region = region_raw or province
         first = values["customer_first_name"]
         last = values["customer_last_name"]
 
         def safe_text(key: str) -> str | None:
             val = c(key)
-            if not val:
-                return None
-            if "{" in val or "amount" in val.lower() or "bucket_name" in val.lower():
+            if not val or _is_shifted_crm_junk(val):
                 return None
             return val
 
