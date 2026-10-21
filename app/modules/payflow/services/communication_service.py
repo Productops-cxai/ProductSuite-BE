@@ -393,8 +393,8 @@ class PayflowCommunicationService:
             q = q.filter(PayflowCommunicationModel.channel == channel)
         if purpose:
             q = q.filter(PayflowCommunicationModel.purpose == purpose)
-        if workflow:
-            q = q.filter(PayflowCommunicationModel.workflow_name == workflow)
+        # Apply workflow after facet options are built so the Workflow dropdown
+        # still lists every workflow available under the other filters.
         if date_from is not None:
             q = q.filter(PayflowCommunicationModel.created_at >= date_from)
         if date_to is not None:
@@ -425,6 +425,10 @@ class PayflowCommunicationService:
                     ]
                 ).lower()
             ]
+
+        workflows = sorted({r.workflow_name for r in rows if r.workflow_name})
+        if workflow:
+            rows = [r for r in rows if r.workflow_name == workflow]
 
         total = len(rows)
         page = rows[offset : offset + max(1, min(limit, 500))]
@@ -468,7 +472,6 @@ class PayflowCommunicationService:
             )
             for seg in DROP_OFF_SEGMENTS
         }
-        workflows = sorted({r.workflow_name for r in rows if r.workflow_name})
         return {
             "communications": [self._serialize(r, user=user) for r in page],
             "summary": summary,
