@@ -1,8 +1,36 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.secrets_crypto import SecretsCryptoError, decrypt_settings_values
+
+
+def resolve_env_file() -> str:
+    """Pick which dotenv file to load.
+
+    Priority:
+    1. ``DOTENV_FILE`` process env (explicit path)
+    2. ``.env.production`` when process ``APP_ENV=production``
+    3. ``.env`` (local / default)
+    """
+    explicit = (os.environ.get("DOTENV_FILE") or "").strip()
+    if explicit:
+        return explicit
+    app_env = (os.environ.get("APP_ENV") or "").strip().lower()
+    if app_env == "production":
+        return ".env.production"
+    return ".env"
+
+
+_ENV_FILE = resolve_env_file()
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore")
 
     DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/PayFlowDB"
     APP_NAME: str = "Platform Suite API"
@@ -78,6 +106,39 @@ class Settings(BaseSettings):
     # Operator brand shown for Third Party clients on the customer portal.
     PAYFLOW_OPERATOR_BRAND_NAME: str = "PayFlow Collections"
     PAYFLOW_OPERATOR_LOGO_URL: str = ""
+
+    # Uploads — empty S3_BUCKET = local disk under ./uploads (dev).
+    # Prod: set S3_BUCKET + rely on EC2 IAM role (no AWS keys in .env).
+    S3_BUCKET: str = ""
+    AWS_REGION: str = "ca-central-1"
+
+    # Comma-separated browser origins for CORS. Empty + production → FRONTEND_URL only.
+    # Dev default remains allow-all when empty and APP_ENV != production.
+    CORS_ORIGINS: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _decrypt_enc_values(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        try:
+            return decrypt_settings_values(data)
+        except SecretsCryptoError:
+            raise
+
+    def cors_allow_origins(self) -> list[str]:
+        raw = (self.CORS_ORIGINS or "").strip()
+        if raw:
+            return [o.strip() for o in raw.split(",") if o.strip()]
+        if (self.APP_ENV or "").strip().lower() == "production":
+            fe = (self.FRONTEND_URL or "").rstrip("/")
+            origins = [fe] if fe else []
+            if fe.startswith("https://") and "://www." not in fe:
+                # Also allow www twin when FRONTEND_URL is apex.
+                host = fe.removeprefix("https://")
+                origins.append(f"https://www.{host}")
+            return origins or ["https://testatncri.com"]
+        return ["*"]
 
 
 settings = Settings()

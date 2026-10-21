@@ -1,5 +1,7 @@
 # Keep secrets and local env out of git
 .env
+.env.production
+.env.*.local
 .venv/
 venv/
 __pycache__/
