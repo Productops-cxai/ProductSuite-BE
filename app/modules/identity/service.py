@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, UnauthorizedError, ValidationAppError
+from app.core.request_context import get_frontend_url
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -343,24 +344,28 @@ class IdentityService:
                 )
             raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
 
+        # Refresh already used/expired. Do NOT treat "user still has an active session"
+        # as another login — that false-positive fires on concurrent refresh races
+        # (same browser, access expired, two API calls rotate the refresh once).
         if not row or row.revoked_at is not None or row.expires_at < now:
-            # Login elsewhere revoked this refresh — surface a clear reason when we can.
-            if row is not None:
-                newer = (
-                    self.db.query(UserSessionModel)
-                    .filter(
-                        UserSessionModel.user_id == row.user_id,
-                        UserSessionModel.revoked_at.is_(None),
-                    )
-                    .first()
-                )
-                if newer is not None:
+            if session is not None and session.revoked_at is not None:
+                if session.revoke_reason == "replaced":
                     raise UnauthorizedError(
                         SESSION_REPLACED_MESSAGE, code="session_replaced"
                     )
-            raise UnauthorizedError("Refresh token expired or revoked")
+                raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
+            raise UnauthorizedError(
+                "Refresh token expired or already used",
+                code="refresh_reused",
+            )
 
-        if session is None or session.revoked_at is not None:
+        if session is None:
+            raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
+        if session.revoked_at is not None:
+            if session.revoke_reason == "replaced":
+                raise UnauthorizedError(
+                    SESSION_REPLACED_MESSAGE, code="session_replaced"
+                )
             raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
 
         user = (
@@ -577,7 +582,7 @@ class IdentityService:
             AuthTokenType.PASSWORD_RESET,
             minutes=minutes,
         )
-        link = f"{settings.FRONTEND_URL}/reset-password?token={raw}"
+        link = f"{get_frontend_url()}/reset-password?token={raw}"
         expiry_label = (
             f"{minutes} minute{'s' if minutes != 1 else ''}"
             if minutes < 60
@@ -618,7 +623,7 @@ class IdentityService:
         raw = self.create_auth_token(
             user.id, AuthTokenType.ACTIVATION, minutes=minutes
         )
-        link = f"{settings.FRONTEND_URL}/activate?token={raw}"
+        link = f"{get_frontend_url()}/activate?token={raw}"
         expiry_label = (
             f"{minutes} minute{'s' if minutes != 1 else ''}"
             if minutes < 60

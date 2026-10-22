@@ -1,13 +1,18 @@
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 from app.core.deps import CurrentPerson, DbSession, SuperAdmin
 from app.core.exceptions import AppError
+from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.platform.schemas import (
+    AiSuggestJobResponse,
+    AiSuggestRequeueResponse,
     AssignProductRequest,
     EmailLogResponse,
+    SmsLogResponse,
+    WorkflowWorkerLogResponse,
     EnterProductResponse,
     GrantAccessRequest,
     InviteResendResponse,
@@ -206,6 +211,21 @@ def list_email_logs(
         raise _map_error(exc) from exc
 
 
+@router.get("/sms-logs", response_model=List[SmsLogResponse])
+def list_sms_logs(
+    admin: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    sms_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Outbound SMS archive (Twilio / log-only). Suite admin only."""
+    try:
+        return PlatformService(db).list_sms_logs(admin.email, search, sms_type, limit)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.get("/deletion-logs", response_model=List[DeletionLogResponse])
 def list_deletion_logs(
     _: SuperAdmin,
@@ -215,6 +235,79 @@ def list_deletion_logs(
     limit: int = Query(default=200, ge=1, le=500),
 ):
     return PlatformService(db).list_deletion_logs(search, entity_type, limit)
+
+
+@router.get("/ai-suggest-jobs", response_model=List[AiSuggestJobResponse])
+def list_ai_suggest_jobs(
+    _: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    client_id: Optional[int] = Query(default=None),
+    portfolio_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Platform ops view of auto AI workflow suggestion jobs (not exposed in PayFlow)."""
+    return PlatformService(db).list_ai_suggest_jobs(
+        search=search,
+        status=status_filter,
+        client_id=client_id,
+        portfolio_id=portfolio_id,
+        limit=limit,
+    )
+
+
+@router.post("/ai-suggest-jobs/requeue-missing", response_model=AiSuggestRequeueResponse)
+def requeue_missing_ai_suggest_jobs(
+    admin: SuperAdmin,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    client_id: Optional[int] = Query(default=None),
+):
+    """Re-enqueue AI suggest for active clients/portfolios that have no AI workflows.
+
+    Use after wiping strategies/jobs while leaving clients active — activate alone
+    does not re-fire because status already is active.
+    """
+    result = PlatformService(db).requeue_missing_ai_suggest_jobs(
+        requested_by_user_id=admin.id,
+        client_id=client_id,
+    )
+    schedule_ai_suggest_jobs(background_tasks, result.get("job_ids") or [])
+    return result
+
+
+@router.get("/workflow-worker-logs", response_model=List[WorkflowWorkerLogResponse])
+def list_workflow_worker_logs(
+    _: SuperAdmin,
+    db: DbSession,
+    search: Optional[str] = Query(default=None),
+    event_type: Optional[str] = Query(default=None),
+    level: Optional[str] = Query(default=None),
+    client_id: Optional[int] = Query(default=None),
+    account_id: Optional[int] = Query(default=None),
+    strategy_id: Optional[int] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    """Platform ops view of workflow worker enrollment / step / send events."""
+    return PlatformService(db).list_workflow_worker_logs(
+        search=search,
+        event_type=event_type,
+        level=level,
+        client_id=client_id,
+        account_id=account_id,
+        strategy_id=strategy_id,
+        limit=limit,
+    )
+
+
+@router.get("/workflow-worker-logs/{log_id}", response_model=WorkflowWorkerLogResponse)
+def get_workflow_worker_log(log_id: int, _: SuperAdmin, db: DbSession):
+    """Single worker event with related run/account timeline."""
+    try:
+        return PlatformService(db).get_workflow_worker_log(log_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
 
 
 @router.get("/me/products", response_model=List[ProductResponse])

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -11,6 +11,10 @@ from app.infrastructure.database.models import (
     PayflowCommunicationModel,
     PayflowHumanReviewModel,
     PayflowNotificationModel,
+    PayflowOperationalExceptionModel,
+    PayflowPaymentAttemptModel,
+    PayflowPaymentPlanModel,
+    PayflowPaymentTransactionModel,
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
@@ -20,6 +24,12 @@ from app.shared.enums import (
     PayflowCollectionStatus,
     PayflowCommChannel,
     PayflowCommStatus,
+    PayflowOperationalExceptionStatus,
+    PayflowPaymentAttemptStatus,
+    PayflowPaymentOptionType,
+    PayflowPaymentPlanStatus,
+    PayflowPaymentTxnDirection,
+    PayflowPaymentTxnStatus,
     PayflowReviewPriority,
     PayflowReviewStatus,
 )
@@ -66,6 +76,23 @@ FUNNEL_STAGES: list[tuple[str, str, set[str]]] = [
         {PayflowCommStatus.PAYMENT_LINK_CLICKED.value},
     ),
 ]
+
+
+def _range_start(date_range: str) -> datetime | None:
+    """Lower bound for payment ledger / attempt filters (UTC)."""
+    now = datetime.now(timezone.utc)
+    key = (date_range or "today").lower()
+    if key == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if key == "7d":
+        return now - timedelta(days=7)
+    if key == "30d":
+        return now - timedelta(days=30)
+    if key == "qtd":
+        # Calendar quarter start
+        q_month = ((now.month - 1) // 3) * 3 + 1
+        return now.replace(month=q_month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return None
 
 
 def _rel_time(dt: datetime | None) -> str:
@@ -194,31 +221,133 @@ class PayflowDashboardService:
         active_cases = [
             a for a in accounts if a.collection_status == PayflowCollectionStatus.ACTIVE.value
         ]
-        recovered_total = sum(float(a.recovered_balance or 0) for a in accounts)
         awaiting = [r for r in reviews if r.status == PayflowReviewStatus.AWAITING_REVIEW.value]
         high_priority = sum(
             1 for r in awaiting if r.priority == PayflowReviewPriority.HIGH.value
         )
         failed_comms = sum(1 for c in comms if c.status == PayflowCommStatus.FAILED.value)
-        # Partial payments: recovered something but still outstanding
+        open_exceptions_q = self.db.query(PayflowOperationalExceptionModel).filter(
+            PayflowOperationalExceptionModel.status
+            == PayflowOperationalExceptionStatus.OPEN.value
+        )
+        if client_id is not None:
+            open_exceptions_q = open_exceptions_q.filter(
+                PayflowOperationalExceptionModel.client_id == client_id
+            )
+        elif allowed is not None:
+            if allowed:
+                open_exceptions_q = open_exceptions_q.filter(
+                    PayflowOperationalExceptionModel.client_id.in_(allowed)
+                )
+            else:
+                open_exceptions_q = open_exceptions_q.filter(
+                    PayflowOperationalExceptionModel.id == -1
+                )
+        open_exceptions_count = open_exceptions_q.count()
+
+        # ---- Payment ledger / attempts / plans (backend-confirmed wire-up) ----
+        since = _range_start(date_range)
+        account_ids = [a.id for a in accounts]
+        client_ids_scope = [c.id for c in clients]
+
+        attempts_q = self.db.query(PayflowPaymentAttemptModel)
+        txns_q = self.db.query(PayflowPaymentTransactionModel)
+        plans_q = self.db.query(PayflowPaymentPlanModel)
+        if account_ids:
+            attempts_q = attempts_q.filter(PayflowPaymentAttemptModel.account_id.in_(account_ids))
+            txns_q = txns_q.filter(PayflowPaymentTransactionModel.account_id.in_(account_ids))
+            plans_q = plans_q.filter(PayflowPaymentPlanModel.account_id.in_(account_ids))
+        elif client_ids_scope:
+            attempts_q = attempts_q.filter(PayflowPaymentAttemptModel.client_id.in_(client_ids_scope))
+            txns_q = txns_q.filter(PayflowPaymentTransactionModel.client_id.in_(client_ids_scope))
+            plans_q = plans_q.filter(PayflowPaymentPlanModel.client_id.in_(client_ids_scope))
+        else:
+            attempts_q = attempts_q.filter(PayflowPaymentAttemptModel.id == -1)
+            txns_q = txns_q.filter(PayflowPaymentTransactionModel.id == -1)
+            plans_q = plans_q.filter(PayflowPaymentPlanModel.id == -1)
+
+        if since is not None:
+            attempts_q = attempts_q.filter(PayflowPaymentAttemptModel.created_at >= since)
+            txns_q = txns_q.filter(
+                (PayflowPaymentTransactionModel.completed_at >= since)
+                | (
+                    PayflowPaymentTransactionModel.completed_at.is_(None)
+                    & (PayflowPaymentTransactionModel.created_at >= since)
+                )
+            )
+
+        attempts = attempts_q.all()
+        txns = txns_q.all()
+        plans = plans_q.all()
+
+        succeeded_payments = [
+            t
+            for t in txns
+            if t.direction == PayflowPaymentTxnDirection.PAYMENT.value
+            and t.status == PayflowPaymentTxnStatus.SUCCEEDED.value
+        ]
+        # Period recovered from confirmed ledger (not initiation).
+        recovered_period = sum(float(t.amount or 0) for t in succeeded_payments)
+        # Lifetime recovered still from accounts (KPI parity with case balances).
+        recovered_total = sum(float(a.recovered_balance or 0) for a in accounts)
+
         partial_payments = sum(
             1
-            for a in accounts
-            if float(a.recovered_balance or 0) > 0 and float(a.outstanding_balance or 0) > 0
+            for t in succeeded_payments
+            if t.option_type == PayflowPaymentOptionType.PARTIAL.value
         )
+        if partial_payments == 0 and since is None:
+            # Lifetime fallback only: accounts with recovery but still outstanding
+            partial_payments = sum(
+                1
+                for a in accounts
+                if float(a.recovered_balance or 0) > 0 and float(a.outstanding_balance or 0) > 0
+            )
+
         paid_in_full = sum(
             1 for a in accounts if a.collection_status == PayflowCollectionStatus.RESOLVED.value
         )
-        payment_plans = sum(
-            1 for a in accounts if a.collection_status == PayflowCollectionStatus.PAYMENT_PLAN.value
-        )
-        # Failed payments — no dedicated entity; surface failed payment-purpose comms
-        failed_payments = sum(
+        paid_in_full_txns = sum(
             1
-            for c in comms
-            if c.status == PayflowCommStatus.FAILED.value
-            and "payment" in (c.purpose or "").lower()
+            for t in succeeded_payments
+            if t.option_type == PayflowPaymentOptionType.PAY_IN_FULL.value
+            or (t.balance_after is not None and float(t.balance_after) <= 0)
         )
+
+        active_plan_rows = [
+            p
+            for p in plans
+            if p.status
+            in {
+                PayflowPaymentPlanStatus.ACTIVE.value,
+                PayflowPaymentPlanStatus.OVERDUE.value,
+            }
+        ]
+        # Prefer live plan rows; fall back to case status when plans table empty for older data.
+        payment_plans = len(active_plan_rows) or sum(
+            1
+            for a in accounts
+            if a.collection_status == PayflowCollectionStatus.PAYMENT_PLAN.value
+        )
+
+        failed_payments = sum(
+            1 for a in attempts if a.status == PayflowPaymentAttemptStatus.FAILED.value
+        )
+        payment_initiated = sum(
+            1
+            for a in attempts
+            if a.status
+            in {
+                PayflowPaymentAttemptStatus.INITIATED.value,
+                PayflowPaymentAttemptStatus.PROCESSING.value,
+                PayflowPaymentAttemptStatus.SUCCEEDED.value,
+            }
+        )
+        # Also count comms that marked payment initiated (legacy / CRM path).
+        if payment_initiated == 0:
+            payment_initiated = sum(1 for c in comms if getattr(c, "payment_initiated", False))
+
+        paid_funnel = max(paid_in_full, paid_in_full_txns)
 
         kpis = [
             {
@@ -253,7 +382,10 @@ class PayflowDashboardService:
                 "label": "Amount Recovered",
                 "value": recovered_total,
                 "display": _money(recovered_total),
-                "hint": f"{paid_in_full} paid in full",
+                "hint": (
+                    f"{paid_in_full} paid in full"
+                    + (f" · {_money(recovered_period)} in range" if since else "")
+                ),
                 "tone": "primary",
                 "href": "/payflow/cases?status=Resolved",
             },
@@ -277,6 +409,13 @@ class PayflowDashboardService:
                 "href": "/payflow/review?status=Awaiting%20Review",
             },
             {
+                "id": "open_exceptions",
+                "label": f"Open Exceptions · {open_exceptions_count}",
+                "count": open_exceptions_count,
+                "tone": "coral",
+                "href": "/payflow/exceptions?status=Open",
+            },
+            {
                 "id": "failed_comms",
                 "label": f"Failed Communications · {failed_comms}",
                 "count": failed_comms,
@@ -288,7 +427,7 @@ class PayflowDashboardService:
                 "label": f"Failed Payments · {failed_payments}",
                 "count": failed_payments,
                 "tone": "coral",
-                "href": "/payflow/comms?status=Failed",
+                "href": "/payflow/exceptions?type=payment_processing_issue",
             },
             {
                 "id": "integrations",
@@ -299,14 +438,14 @@ class PayflowDashboardService:
             },
         ]
 
-        funnel = self._build_funnel(comms, paid_in_full, payment_plans)
+        funnel = self._build_funnel(comms, paid_funnel, payment_initiated)
 
         outcomes = [
             {
                 "id": "amount_recovered",
                 "label": "Amount Recovered",
-                "value": recovered_total,
-                "display": _money(recovered_total),
+                "value": recovered_period if since else recovered_total,
+                "display": _money(recovered_period if since else recovered_total),
                 "href": "/payflow/cases?status=Resolved",
             },
             {
@@ -335,7 +474,7 @@ class PayflowDashboardService:
                 "label": "Failed Payments",
                 "value": failed_payments,
                 "display": str(failed_payments),
-                "href": "/payflow/comms?status=Failed",
+                "href": "/payflow/exceptions?type=payment_processing_issue",
             },
         ]
 
@@ -368,14 +507,15 @@ class PayflowDashboardService:
     def _build_funnel(
         self,
         comms: list[PayflowCommunicationModel],
-        paid_in_full: int,
-        payment_plans: int,
+        paid_count: int,
+        payment_initiated: int,
     ) -> list[dict[str, Any]]:
         counts = []
         for step, label, statuses in FUNNEL_STAGES:
             counts.append((step, label, sum(1 for c in comms if c.status in statuses), False))
-        counts.append(("05", "Payment Initiated", payment_plans, False))
-        counts.append(("06", "Paid", paid_in_full, True))
+        # Payment stages from attempts / confirmed outcomes — not plan-status misuse.
+        counts.append(("05", "Payment Initiated", payment_initiated, False))
+        counts.append(("06", "Paid", paid_count, True))
 
         base = counts[0][2] or 1
         prev = counts[0][2]
@@ -384,6 +524,16 @@ class PayflowDashboardService:
             rate = None if i == 0 else (f"{(value / prev * 100):.1f}%" if prev else "0%")
             drop = None if i == 0 else f"−{max(0, prev - value):,}"
             bar = min(100.0, (value / base) * 100) if base else 0
+            # Comm stages → comms filter; payment stages → cases (confirmed outcomes).
+            href_map = {
+                "Sent": "/payflow/comms?status=Sent",
+                "Delivered": "/payflow/comms?status=Delivered",
+                "Opened / Read": "/payflow/comms?status=Opened%20%2F%20Read",
+                "Clicked": "/payflow/comms?status=Payment%20Link%20Clicked",
+                "Payment Initiated": "/payflow/cases",
+                "Paid": "/payflow/cases?status=Resolved",
+            }
+            href = href_map.get(label)
             out.append(
                 {
                     "step": step,
@@ -394,6 +544,7 @@ class PayflowDashboardService:
                     "drop": drop,
                     "bar": round(bar, 1),
                     "paid": paid,
+                    "href": href,
                 }
             )
             prev = value if i < 4 else prev  # keep drop relative within comms then to payment

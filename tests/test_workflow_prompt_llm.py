@@ -236,3 +236,38 @@ def test_prompt_explains_reasoning_and_revision_asks_for_changes():
     system = build_messages(CLIENT, "Residential", SEGMENTS, limits)[0]["content"]
     assert "reasoning (each field" in system and "segment_fit" in system
     assert "reasoning.changes_made" in build_revision("A", {"steps": []}, "fewer SMS")
+
+
+# --------------------------------------------------------------------------- review history (regenerate)
+
+
+def test_review_history_lists_edits_rejects_and_notes_oldest_first():
+    from app.modules.payflow.services.workflow_suggestion.prompt import build_review_history
+
+    versions = [  # stored newest first
+        {"note": "Too aggressive", "changes": [], "reviewer_note": "Too aggressive"},  # reject with a note
+        {"note": "Review started by Sara", "changes": []},  # no feedback → skipped
+        {"note": "Updated by Sara", "changes": ["Wait 3 days: timing changed"], "reviewer_note": "SMS too early"},
+        {"note": "Proposed by PayFlow AI", "changes": []},  # no feedback → skipped
+    ]
+    assert build_review_history(versions).splitlines() == [
+        "Review history (oldest first). Keep what reviewers changed unless the remarks say otherwise:",
+        "- Updated by Sara. Changed: Wait 3 days: timing changed. Reason: SMS too early",
+        "- Rejected. Reason: Too aggressive",
+    ]
+
+
+def test_review_history_is_empty_without_feedback_and_capped():
+    from app.modules.payflow.services.workflow_suggestion.prompt import (
+        MAX_HISTORY_ENTRIES,
+        build_review_history,
+        build_revision,
+    )
+
+    assert build_review_history([{"note": "Proposed by PayFlow AI", "changes": []}]) == ""
+    assert "Review history" not in build_revision("A", {"steps": [], "versions": []}, "fewer SMS")
+
+    edits = [{"note": f"Updated by Sara ({i})", "changes": ["x"]} for i in range(MAX_HISTORY_ENTRIES + 5)]
+    lines = build_review_history(edits).splitlines()[1:]
+    assert len(lines) == MAX_HISTORY_ENTRIES
+    assert lines[-1].startswith("- Updated by Sara (0)")  # the newest entry is kept

@@ -34,9 +34,23 @@ from app.modules.payflow.crm_catalog import (
     ACCOUNT_IMPORT_REQUIRED,
     AGE_GROUPS,
 )
+from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
 from app.shared.enums import PayflowCollectionStatus, PayflowPortfolioStatus
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PHONE_DIGITS_RE = re.compile(r"\D+")
+# CRM Debtor dumps put a broken JSON array in bucket_values (quotes/commas unescaped).
+# That splits one logical cell into dozens of CSV fields and shifts address/contact columns.
+_BUCKET_VALUES_BROKEN_RE = re.compile(r',(?:"\[\{|\[\{).*?\}\]"{0,3},', re.DOTALL)
+_COUNTRY_NAME_TO_ISO = {
+    "CA": "CA",
+    "CAN": "CA",
+    "CANADA": "CA",
+    "US": "US",
+    "USA": "US",
+    "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US",
+}
 _BE_ROOT = Path(__file__).resolve().parents[4]
 _UPLOADS = _BE_ROOT / "uploads" / "imports"
 _SAMPLE_PATH = _BE_ROOT / "docs" / "samples" / "payflow_daily_accounts_sample.xlsx"
@@ -49,6 +63,36 @@ _COMPARE_FLOATS = (
     "last_payment_amount",
     "ptp_amount",
 )
+
+# Word-boundary CRM → PayFlow status hints. Substring checks are unsafe:
+# e.g. "paid" in "unpaid" / "closed" in "disclosure" incorrectly became Resolved.
+_CRM_STATUS_RESOLVED_RE = re.compile(
+    r"\b(paid\s+in\s+full|pif|resolved|settled|closed|paid)\b",
+    re.IGNORECASE,
+)
+_CRM_STATUS_UNPAID_RE = re.compile(r"\b(un[- ]?paid|not\s+paid)\b", re.IGNORECASE)
+_CRM_STATUS_PTP_RE = re.compile(r"\b(promise(?:\s+to\s+pay)?|ptp)\b", re.IGNORECASE)
+_CRM_STATUS_PLAN_RE = re.compile(r"\b(payment\s+plan|arrangement)\b", re.IGNORECASE)
+_CRM_STATUS_REVIEW_RE = re.compile(r"\breview\b", re.IGNORECASE)
+
+
+def _fuzzy_collection_status(raw: str) -> str | None:
+    """Map free-text CRM status labels to PayFlow enums. None = unknown."""
+    low = re.sub(r"[_\-]+", " ", (raw or "").strip().lower())
+    if not low:
+        return None
+    # Unpaid / not-paid must never resolve via the "paid" token.
+    if _CRM_STATUS_UNPAID_RE.search(low):
+        return PayflowCollectionStatus.ACTIVE.value
+    if _CRM_STATUS_PTP_RE.search(low):
+        return PayflowCollectionStatus.PROMISE_TO_PAY.value
+    if _CRM_STATUS_PLAN_RE.search(low):
+        return PayflowCollectionStatus.PAYMENT_PLAN.value
+    if _CRM_STATUS_REVIEW_RE.search(low):
+        return PayflowCollectionStatus.HUMAN_REVIEW.value
+    if _CRM_STATUS_RESOLVED_RE.search(low):
+        return PayflowCollectionStatus.RESOLVED.value
+    return None
 
 
 def _now() -> datetime:
@@ -71,6 +115,70 @@ def _cell(row: tuple, idx: dict[str, int], key: str) -> str:
     if isinstance(val, date):
         return val.isoformat()
     return str(val).strip()
+
+
+def _repair_debtor_csv_text(text: str) -> str:
+    """Neutralize malformed bucket_values so later columns keep their header alignment."""
+    if "bucket_values" not in text.lower() or "[{bucket_name" not in text.lower():
+        return text
+    return _BUCKET_VALUES_BROKEN_RE.sub(',"",', text)
+
+
+def _is_shifted_crm_junk(val: str | None) -> bool:
+    """True when a cell looks like a fragment from a broken bucket_values JSON blob."""
+    if not val:
+        return False
+    text = str(val).strip()
+    if not text:
+        return False
+    low = text.lower()
+    if "{" in text or "}" in text:
+        return True
+    if any(
+        tok in low
+        for tok in (
+            "bucket_name",
+            "paid_amt",
+            "adjustment",
+            "\"amount\"",
+            "initial",
+        )
+    ):
+        return True
+    # e.g. `"adjustment": 0.0` after quote stripping left a key:value fragment
+    if ":" in text and any(ch.isdigit() for ch in text) and (
+        '"' in text or low.endswith(".0") or low in {"0", "0.0", "null"}
+    ):
+        # Only treat as junk when it also looks like a JSON key fragment
+        if any(tok in low for tok in ("paid", "adjust", "amount", "initial", "bucket")):
+            return True
+    return False
+
+
+def _normalize_country_code(raw: str, *, crm_number: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else ""
+    upper = text.upper()
+    if upper in _COUNTRY_NAME_TO_ISO:
+        return _COUNTRY_NAME_TO_ISO[upper]
+    if len(upper) == 2 and upper.isalpha():
+        return upper
+    return ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else upper
+
+
+def _normalize_phone(raw: str | None) -> str | None:
+    """Keep digits only; NANP 10-digit numbers get a leading 1 for SMS readiness."""
+    if not raw:
+        return None
+    digits = _PHONE_DIGITS_RE.sub("", raw)
+    if not digits:
+        return None
+    if len(digits) == 10:
+        digits = f"1{digits}"
+    if len(digits) < 10 or len(digits) > 15:
+        return None
+    return digits
 
 
 def _parse_date(raw: str, field: str) -> date | None:
@@ -816,7 +924,9 @@ class PayflowImportService:
             "errors": errors,
         }
 
-    def process_account_file(self, user: UserModel, file_bytes: bytes, filename: str) -> dict[str, Any]:
+    def process_account_file(
+        self, user: UserModel, file_bytes: bytes, filename: str
+    ) -> tuple[dict[str, Any], list[int]]:
         _UPLOADS.mkdir(parents=True, exist_ok=True)
         safe_name = Path(filename or "upload.xlsx").name
         stored = _UPLOADS / f"{int(_now().timestamp())}-{safe_name}"
@@ -839,10 +949,13 @@ class PayflowImportService:
         try:
             idx, data_rows = self._load_account_rows(file_bytes, safe_name)
         except ValidationAppError as exc:
-            return self._fail_run(run, self._guess_field(str(exc.message)), str(exc.message))
+            return self._fail_run(run, self._guess_field(str(exc.message)), str(exc.message)), []
         except Exception as exc:
-            return self._fail_run(
-                run, "File structure", "The file is not a valid CSV or Excel workbook.", exc
+            return (
+                self._fail_run(
+                    run, "File structure", "The file is not a valid CSV or Excel workbook.", exc
+                ),
+                [],
             )
 
         run.status = "Processing"
@@ -855,6 +968,7 @@ class PayflowImportService:
 
         seen_keys: set[tuple[str, str]] = set()
         created = updated = unchanged = failed = 0
+        touched_portfolios: set[tuple[int, int]] = set()
 
         for row in data_rows:
             record_id = _cell(row, idx, "account_id") or "Row"
@@ -894,6 +1008,7 @@ class PayflowImportService:
                     updated += 1
                 else:
                     unchanged += 1
+                touched_portfolios.add((client.id, portfolio.id))
             except ValidationAppError as exc:
                 failed += 1
                 self.db.add(
@@ -917,9 +1032,19 @@ class PayflowImportService:
         run.unchanged_count = unchanged
         run.failed_count = failed
         run.completed_at = _now()
+
+        ai_job_ids: list[int] = []
+        if run.status in ("Completed", "Completed with Errors") and touched_portfolios:
+            ai_job_ids = AiSuggestJobService(self.db).enqueue_many(
+                touched_portfolios,
+                trigger="import",
+                requested_by_user_id=user.id,
+                import_run_id=run.id,
+            )
+
         self.db.commit()
         self.db.refresh(run)
-        return self._serialize_run(run)
+        return self._serialize_run(run), ai_job_ids
 
     def list_imports(self, kind: str | None = None) -> dict[str, Any]:
         q = self.db.query(PayflowImportRunModel).options(joinedload(PayflowImportRunModel.errors))
@@ -1080,6 +1205,7 @@ class PayflowImportService:
             raise ValidationAppError(
                 "The CSV file could not be read. Save it as UTF-8 and try again."
             ) from exc
+        text = _repair_debtor_csv_text(text)
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
         if not rows:
@@ -1209,9 +1335,7 @@ class PayflowImportService:
 
         crm_number = c("client_number")
         # CRM debtor dump defaults when columns are missing or corrupted after bucket_values.
-        country = c("country_code").upper()
-        if len(country) != 2:
-            country = ACCOUNT_CRM_DEFAULT_COUNTRY if crm_number else country
+        country = _normalize_country_code(c("country_code"), crm_number=crm_number)
         currency = c("currency_code").upper()
         if currency not in ACCOUNT_IMPORT_CURRENCIES:
             # Accept CRM labels: CDN, Canadian Dollars, US Dollar, …
@@ -1237,6 +1361,8 @@ class PayflowImportService:
                 account_status = "CLOSED"
         account_status = account_status or "OPEN"
 
+        # Account debtor contact — collection email/SMS targets. Not client.contact_email.
+        email_raw = (c("email") or "").strip().lower()
         # Soft-fill so required check works for CRM dumps.
         values = {
             "client_code": c("client_code"),
@@ -1248,17 +1374,26 @@ class PayflowImportService:
             "country_code": country,
             "currency_code": currency,
             "outstanding_balance": c("outstanding_balance"),
-            "email": c("email"),
+            "email": email_raw,
         }
         for key in ACCOUNT_IMPORT_REQUIRED:
             if key in ("client_code", "sub_client_code") and crm_number:
                 continue
             if not values.get(key):
-                raise ValidationAppError(f"{key} is required")
+                raise ValidationAppError(
+                    f"{key} is required"
+                    + (
+                        " (account customer email — used for collection alerts)"
+                        if key == "email"
+                        else ""
+                    )
+                )
 
         email = values["email"]
         if not _EMAIL_RE.match(email):
-            raise ValidationAppError("email is not a valid address")
+            raise ValidationAppError(
+                "email is not a valid address (account customer email for alerts)"
+            )
 
         outstanding = _parse_float(
             values["outstanding_balance"], "outstanding_balance", required=True
@@ -1293,46 +1428,37 @@ class PayflowImportService:
 
         # Prefer dn_collection_status_name (aliased to collection_status); fall back to case_life_status.
         collection_raw = c("collection_status") or c("case_life_status")
-        if collection_raw and (
-            "{" in collection_raw
-            or "amount" in collection_raw.lower()
-            or "bucket_name" in collection_raw.lower()
-        ):
+        if _is_shifted_crm_junk(collection_raw):
             # Shifted/corrupt debtor-dump cell after broken bucket_values quoting.
             collection_raw = ""
         if collection_raw:
             collection_status = _COLLECTION_BY_LOWER.get(collection_raw.lower())
             if not collection_status:
                 # Light CRM → PayFlow status mapping for common closed/paid labels.
-                low = collection_raw.lower()
-                if any(tok in low for tok in ("paid", "pif", "resolved", "settled", "closed")):
-                    collection_status = PayflowCollectionStatus.RESOLVED.value
-                elif "promise" in low or "ptp" in low:
-                    collection_status = PayflowCollectionStatus.PROMISE_TO_PAY.value
-                elif "payment plan" in low or "arrangement" in low:
-                    collection_status = PayflowCollectionStatus.PAYMENT_PLAN.value
-                elif "review" in low:
-                    collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
-                elif crm_number:
-                    collection_status = PayflowCollectionStatus.ACTIVE.value
-                else:
-                    raise ValidationAppError("collection_status is not a recognised PayFlow status")
+                collection_status = _fuzzy_collection_status(collection_raw)
+                if not collection_status:
+                    if crm_number:
+                        collection_status = PayflowCollectionStatus.ACTIVE.value
+                    else:
+                        raise ValidationAppError(
+                            "collection_status is not a recognised PayFlow status"
+                        )
         else:
             collection_status = PayflowCollectionStatus.ACTIVE.value
 
         province = c("province_state")
-        # Skip clearly corrupted geo values from broken CSV quoting.
-        if province and ("{" in province or "amount" in province.lower()):
+        if _is_shifted_crm_junk(province):
             province = ""
-        region = c("region") or province
+        region_raw = c("region")
+        if _is_shifted_crm_junk(region_raw):
+            region_raw = ""
+        region = region_raw or province
         first = values["customer_first_name"]
         last = values["customer_last_name"]
 
         def safe_text(key: str) -> str | None:
             val = c(key)
-            if not val:
-                return None
-            if "{" in val or "amount" in val.lower() or "bucket_name" in val.lower():
+            if not val or _is_shifted_crm_junk(val):
                 return None
             return val
 
@@ -1367,8 +1493,8 @@ class PayflowImportService:
             "original_balance": _parse_float(c("original_balance"), "original_balance", required=False),
             "fee_amount": _parse_float(c("fee_amount"), "fee_amount", required=False),
             "email": email,
-            "phone_mobile": safe_text("phone_mobile"),
-            "phone_work": safe_text("phone_work"),
+            "phone_mobile": _normalize_phone(safe_text("phone_mobile")),
+            "phone_work": _normalize_phone(safe_text("phone_work")),
             "language": language,
             "date_listed": _parse_date(c("date_listed") or c("placement_date"), "date_listed"),
             "date_incurred": self._soft_date(
@@ -1482,14 +1608,18 @@ class PayflowImportService:
                 outstanding_balance=float(parsed["outstanding_balance"]),
                 recovered_balance=recovered,
                 collection_status=parsed["collection_status"],
-                last_action="Created from CRM daily file",
+                last_action="Created from file upload",
                 next_action="Assign workflow",
                 human_review=parsed["collection_status"] == PayflowCollectionStatus.HUMAN_REVIEW.value,
                 timeline=[
                     {
-                        "label": "CRM import",
-                        "detail": f"Account created from {parsed['account_id']}",
+                        "label": "Created from file upload",
+                        "detail": (
+                            f"Account {parsed['account_id']} imported from uploaded file "
+                            f"(collection_status={parsed['collection_status']})"
+                        ),
                         "at": stamp,
+                        "source": "file_upload",
                     }
                 ],
             )
@@ -1504,26 +1634,52 @@ class PayflowImportService:
             existing.last_crm_refresh_at = now
             return "unchanged"
 
+        previous_status = existing.collection_status
+        previous_payment_date = existing.last_payment_date
+        previous_hold = bool(existing.provincial_hold)
+
         original = float(existing.original_balance or 0)
         existing.portfolio_id = portfolio.id
         existing.customer_name = parsed["customer_name"]
         existing.outstanding_balance = float(parsed["outstanding_balance"])
         existing.recovered_balance = max(0.0, original - existing.outstanding_balance)
         existing.collection_status = parsed["collection_status"]
-        existing.last_action = "Refreshed from CRM daily file"
+        existing.last_action = "Updated from file upload"
         existing.human_review = parsed["collection_status"] == PayflowCollectionStatus.HUMAN_REVIEW.value
         events = list(existing.timeline or [])
         events.append(
             {
-                "label": "CRM refresh",
-                "detail": f"Outstanding {parsed['outstanding_balance']}",
+                "label": "Updated from file upload",
+                "detail": (
+                    f"Outstanding {parsed['outstanding_balance']}; "
+                    f"collection_status={parsed['collection_status']}"
+                ),
                 "at": stamp,
+                "source": "file_upload",
             }
         )
         existing.timeline = events[-40:]
         self._apply_crm_fields(existing, parsed, original_locked=True)
         existing.last_crm_refresh_at = now
         self._ensure_human_review_request(existing)
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_account_import_changed(
+                existing,
+                previous_status=previous_status,
+                previous_payment_date=previous_payment_date,
+                previous_hold=previous_hold,
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.import").exception(
+                "workflow event hook failed for account_id=%s", existing.id
+            )
         return "updated"
 
     def _ensure_human_review_request(self, account: PayflowAccountModel) -> None:
@@ -1538,7 +1694,7 @@ class PayflowImportService:
             account,
             reason="High balance treatment",
             proposed_action="Move to stronger collection treatment",
-            actor_name="CRM import",
+            actor_name="File upload",
             commit=False,
         )
 

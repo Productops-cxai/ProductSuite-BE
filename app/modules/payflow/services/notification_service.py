@@ -93,6 +93,8 @@ class PayflowNotificationService:
         for user in users:
             if actor_user_id and user.id == actor_user_id:
                 continue
+            # Dedupe across read + unread. Inbox list syncs awaiting entities on
+            # every poll; requiring unread-only caused mark-read → recreate spam.
             if dedupe and entity_type and entity_id:
                 exists = (
                     self.db.query(PayflowNotificationModel)
@@ -101,7 +103,6 @@ class PayflowNotificationService:
                         PayflowNotificationModel.notification_type == notification_type,
                         PayflowNotificationModel.entity_type == entity_type,
                         PayflowNotificationModel.entity_id == str(entity_id),
-                        PayflowNotificationModel.read_at.is_(None),
                     )
                     .first()
                 )
@@ -145,7 +146,8 @@ class PayflowNotificationService:
         review: PayflowHumanReviewModel,
         *,
         actor_user_id: UUID | None = None,
-        send_mail: bool = True,
+        send_mail: bool = False,
+        dedupe: bool = True,
     ) -> list[PayflowNotificationModel]:
         if review.status != PayflowReviewStatus.AWAITING_REVIEW.value:
             return []
@@ -167,6 +169,7 @@ class PayflowNotificationService:
             send_mail=send_mail,
             email_type="human_review_awaiting",
             actor_user_id=actor_user_id,
+            dedupe=dedupe,
         )
 
     def notify_workflow_awaiting(
@@ -176,7 +179,7 @@ class PayflowNotificationService:
         strategy_name: str,
         client_id: int,
         actor_user_id: UUID | None = None,
-        send_mail: bool = True,
+        send_mail: bool = False,
     ) -> list[PayflowNotificationModel]:
         users = self.recipients_for_client(client_id)
         return self.notify(
@@ -201,7 +204,7 @@ class PayflowNotificationService:
         client_id: int,
         channel: str,
         purpose: str,
-        send_mail: bool = True,
+        send_mail: bool = False,
     ) -> list[PayflowNotificationModel]:
         users = self.recipients_for_client(client_id)
         return self.notify(
@@ -260,6 +263,124 @@ class PayflowNotificationService:
             email_type="supervisor_assignment",
         )
 
+    def notify_client_activated(
+        self,
+        *,
+        client_id: int,
+        client_name: str,
+        actor_user_id: UUID | None = None,
+        send_mail: bool = False,
+    ) -> list[PayflowNotificationModel]:
+        users = self.recipients_for_client(client_id)
+        return self.notify(
+            users=users,
+            notification_type=PayflowNotificationType.CLIENT_ACTIVATED.value,
+            title=f"Client activated · {client_name}",
+            body="Client is live. Workflow suggestion jobs may be running.",
+            link=f"/payflow/clients/{client_id}",
+            client_id=client_id,
+            entity_type="client",
+            entity_id=str(client_id),
+            send_mail=send_mail,
+            email_type="client_activated",
+            actor_user_id=actor_user_id,
+        )
+
+    def notify_comm_sent(
+        self,
+        *,
+        client_id: int,
+        account_id: int,
+        customer_name: str,
+        account_reference: str,
+        channel: str,
+        recipient: str | None,
+        communication_id: int | None,
+        communication_code: str | None,
+        send_mail: bool = False,
+    ) -> list[PayflowNotificationModel]:
+        """In-app: collection email/SMS reached (or was logged for) the customer."""
+        users = self.recipients_for_client(client_id)
+        code = communication_code or (str(communication_id) if communication_id else "comm")
+        return self.notify(
+            users=users,
+            notification_type=PayflowNotificationType.COMM_SENT.value,
+            title=f"{channel} sent · {customer_name}",
+            body=f"To {recipient or '—'} · {account_reference} · {code}",
+            link=(
+                f"/payflow/comms/{communication_id}"
+                if communication_id
+                else f"/payflow/cases/{account_id}"
+            ),
+            client_id=client_id,
+            entity_type="communication",
+            entity_id=code,
+            send_mail=send_mail,
+            email_type="comm_sent",
+        )
+
+    def notify_payment_received(
+        self,
+        *,
+        client_id: int,
+        account_id: int,
+        customer_name: str,
+        account_reference: str,
+        amount: float,
+        currency_code: str,
+        attempt_public_id: str,
+        option_type: str | None = None,
+        resolved: bool = False,
+        send_mail: bool = False,
+    ) -> list[PayflowNotificationModel]:
+        """In-app when Stripe/mock confirms a customer payment (backend-verified only)."""
+        users = self.recipients_for_client(client_id)
+        money = f"{float(amount):,.2f} {currency_code or 'USD'}"
+        option = (option_type or "payment").replace("_", " ")
+        body = f"{money} · {option}"
+        if resolved:
+            body = f"{body} · case resolved"
+        return self.notify(
+            users=users,
+            notification_type=PayflowNotificationType.PAYMENT_RECEIVED.value,
+            title=f"Payment received · {customer_name}",
+            body=f"{account_reference} · {body}",
+            link=f"/payflow/cases/{account_id}",
+            client_id=client_id,
+            entity_type="payment_attempt",
+            entity_id=attempt_public_id,
+            send_mail=send_mail,
+            email_type="payment_received",
+            dedupe=True,
+        )
+
+    def notify_payment_failed(
+        self,
+        *,
+        client_id: int,
+        account_id: int,
+        customer_name: str,
+        account_reference: str,
+        attempt_public_id: str,
+        detail: str | None = None,
+        send_mail: bool = False,
+    ) -> list[PayflowNotificationModel]:
+        """In-app payment failure (alongside operational exception when raised)."""
+        users = self.recipients_for_client(client_id)
+        return self.notify(
+            users=users,
+            notification_type=PayflowNotificationType.PAYMENT_FAILED.value,
+            title=f"Payment failed · {customer_name}",
+            body=f"{account_reference} · {(detail or 'Checkout or provider failure')[:200]}",
+            link=f"/payflow/cases/{account_id}",
+            client_id=client_id,
+            entity_type="payment_attempt",
+            entity_id=f"fail:{attempt_public_id}",
+            send_mail=send_mail,
+            email_type="payment_failed",
+            dedupe=True,
+        )
+
     def sync_awaiting_review_notifications(self) -> int:
         """Idempotent: ensure inbox rows exist for every awaiting review."""
         rows = (
@@ -278,7 +399,7 @@ class PayflowNotificationService:
         return total
 
     # ------------------------------------------------------------------ inbox API
-    def list_for_user(self, user: UserModel, *, limit: int = 30) -> dict[str, Any]:
+    def list_for_user(self, user: UserModel, *, limit: int = 100) -> dict[str, Any]:
         self.access.require_membership(user)
         # Keep demo / existing awaiting items visible without reseed.
         self.sync_awaiting_review_notifications()
@@ -289,8 +410,12 @@ class PayflowNotificationService:
             PayflowNotificationModel.user_id == user.id
         )
         unread = q.filter(PayflowNotificationModel.read_at.is_(None)).count()
+        # Prefer unread first so the inbox badge matches what the dropdown shows.
         rows = (
-            q.order_by(PayflowNotificationModel.created_at.desc())
+            q.order_by(
+                PayflowNotificationModel.read_at.isnot(None).asc(),
+                PayflowNotificationModel.created_at.desc(),
+            )
             .limit(limit)
             .all()
         )

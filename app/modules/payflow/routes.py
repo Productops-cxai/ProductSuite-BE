@@ -1,10 +1,11 @@
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
 from app.core.deps import DbSession
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, NotFoundError
 from app.modules.payflow.deps import (
     PayflowAccessContext,
     PayflowCreateClient,
@@ -24,6 +25,8 @@ from app.modules.payflow.deps import (
 from app.modules.payflow.schemas import (
     AccessContextResponse,
     ApproveReviewRequest,
+    ActivateStrategyRequest,
+    ApproveStrategyRequest,
     AssignReviewRequest,
     CreateHumanReviewRequest,
     CreatePayflowClientRequest,
@@ -39,8 +42,24 @@ from app.modules.payflow.schemas import (
     ModifyReviewRequest,
     PayflowAccountsListResponse,
     PayflowClientsListResponse,
+    CommunicationEligibilitySnapshot,
+    ManualEmailSendRequest,
+    ManualEmailSendResponse,
+    ManualSmsSendRequest,
+    ManualSmsSendResponse,
+    ResendCommunicationRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
+    PayflowAccountPaymentsResponse,
+    PayflowPaymentAttemptItem,
+    PayflowPaymentInitiateRequest,
+    PayflowPaymentLinkItem,
+    PayflowPaymentLinkPublicResolve,
+    PayflowPaymentLinksListResponse,
+    PayflowPaymentMockOutcomeRequest,
+    PayflowOperationalExceptionItem,
+    PayflowOperationalExceptionsListResponse,
+    ResolveOperationalExceptionRequest,
     PayflowIntegrationItem,
     PayflowIntegrationsListResponse,
     PayflowNotificationItem,
@@ -71,6 +90,10 @@ from app.modules.payflow.schemas import (
     SuggestWorkflowsRequest,
     SuggestWorkflowsResponse,
     RegenerateWorkflowRequest,
+    PayflowWorkflowPaymentEventRequest,
+    PayflowWorkflowRunItem,
+    PayflowWorkflowRunsResponse,
+    PayflowWorkflowWorkerLogsResponse,
 )
 from app.modules.platform.schemas import DeletionLogResponse
 from app.modules.payflow.service import PayflowUserService
@@ -82,10 +105,17 @@ from app.modules.payflow.services.dashboard_service import PayflowDashboardServi
 from app.modules.payflow.services.import_service import PayflowImportService
 from app.modules.payflow.services.integration_service import PayflowIntegrationService
 from app.modules.payflow.services.notification_service import PayflowNotificationService
+from app.modules.payflow.services.operational_exception_service import (
+    PayflowOperationalExceptionService,
+)
+from app.modules.payflow.services.payment_link_service import PayflowPaymentLinkService
+from app.modules.payflow.services.payment_outcome_service import PayflowPaymentOutcomeService
+from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
 
 # Default tag is overridden in app.core.openapi_tags for Swagger sections.
@@ -307,7 +337,10 @@ def list_clients(
 @router.post("/clients")
 def create_client(payload: CreatePayflowClientRequest, _: PayflowCreateClient, db: DbSession):
     try:
-        return PayflowClientService(db).create_client(payload.model_dump())
+        data = payload.model_dump()
+        # Wizard creates are always "Add Client" (bulk import sets file_upload itself).
+        data["added_through"] = "add_client"
+        return PayflowClientService(db).create_client(data)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -367,9 +400,16 @@ def delete_client_logo(client_id: int, _: PayflowEditClient, db: DbSession):
 
 
 @router.post("/clients/{client_id}/activate")
-def activate_client(client_id: int, _: PayflowEditClient, db: DbSession):
+def activate_client(
+    client_id: int,
+    admin: PayflowEditClient,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+):
     try:
-        return PayflowClientService(db).activate_client(client_id)
+        detail, job_ids = PayflowClientService(db).activate_client(client_id, user=admin)
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return detail
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -414,13 +454,19 @@ def update_portfolio(
     client_id: int,
     portfolio_id: int,
     payload: UpdatePortfolioRequest,
-    _: PayflowEditClient,
+    admin: PayflowEditClient,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ):
     try:
-        return PayflowClientService(db).update_portfolio(
-            client_id, portfolio_id, payload.model_dump(exclude_unset=True)
+        detail, job_ids = PayflowClientService(db).update_portfolio(
+            client_id,
+            portfolio_id,
+            payload.model_dump(exclude_unset=True),
+            user=admin,
         )
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return detail
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -518,6 +564,43 @@ def get_account(account_id: int, user: RequirePayflowProduct, db: DbSession):
         raise _map_error(exc) from exc
 
 
+@router.get("/accounts/{account_id}/workflow-execution")
+def get_account_workflow_execution(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    """Active (or latest) workflow run for a Collection Case, enriched for the Case UI."""
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    # Enforce account access via existing account service.
+    try:
+        PayflowAccountService(db).get_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    item = WorkflowExecutionService(db).get_account_workflow_execution(account_id)
+    return {"execution": item}
+
+
+@router.post("/accounts/{account_id}/workflow-events/payment")
+def post_account_payment_workflow_event(
+    account_id: int,
+    body: PayflowWorkflowPaymentEventRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    try:
+        PayflowAccountService(db).get_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    result = WorkflowExecutionService(db).on_payment_event(
+        account_id,
+        body.model_dump(exclude_none=True),
+        commit=True,
+    )
+    return {"ok": True, **result}
+
+
 # ---------------------------------------------------------------------------
 # Daily CRM account import
 # ---------------------------------------------------------------------------
@@ -551,6 +634,7 @@ async def validate_account_import(
 async def upload_account_import(
     admin: PayflowImportAccounts,
     db: DbSession,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
     name = (file.filename or "").lower()
@@ -558,7 +642,11 @@ async def upload_account_import(
         raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
     data = await file.read()
     try:
-        return PayflowImportService(db).process_account_file(admin, data, file.filename or "upload.xlsx")
+        result, job_ids = PayflowImportService(db).process_account_file(
+            admin, data, file.filename or "upload.xlsx"
+        )
+        schedule_ai_suggest_jobs(background_tasks, job_ids)
+        return result
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -832,19 +920,18 @@ def list_rules(
 
 
 @router.post("/rules", response_model=PayflowRuleItem)
-def create_rule(
+def create_or_update_rule(
     payload: CreatePayflowRuleRequest,
     user: RequirePayflowProduct,
     db: DbSession,
 ):
+    """Create a rule, or update when ``id`` is present in the body (same POST)."""
     try:
-        return PayflowRuleService(db).create_rule(
-            user,
-            {
-                **payload.model_dump(),
-                "conditions": [c.model_dump() for c in payload.conditions],
-            },
-        )
+        body = {
+            **payload.model_dump(),
+            "conditions": [c.model_dump() for c in payload.conditions],
+        }
+        return PayflowRuleService(db).create_rule(user, body)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -980,9 +1067,15 @@ def submit_workflow_review(strategy_id: int, user: PayflowManageWorkflows, db: D
 
 
 @router.post("/workflows/{strategy_id}/approve", response_model=PayflowStrategyItem)
-def approve_workflow(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+def approve_workflow(
+    strategy_id: int,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+    payload: ApproveStrategyRequest | None = None,  # body is optional
+):
     try:
-        return PayflowStrategyService(db).approve(user, strategy_id)
+        note = payload.note if payload else None
+        return PayflowStrategyService(db).approve(user, strategy_id, note=note)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1001,9 +1094,15 @@ def reject_workflow(
 
 
 @router.post("/workflows/{strategy_id}/activate", response_model=PayflowStrategyItem)
-def activate_workflow(strategy_id: int, user: PayflowManageWorkflows, db: DbSession):
+def activate_workflow(
+    strategy_id: int,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+    payload: ActivateStrategyRequest | None = None,
+):
     try:
-        return PayflowStrategyService(db).activate(user, strategy_id)
+        note = payload.note if payload else None
+        return PayflowStrategyService(db).activate(user, strategy_id, note=note)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1088,6 +1187,10 @@ def list_comms(
     purpose: str | None = Query(default=None),
     workflow: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     try:
         return PayflowCommunicationService(db).list_communications(
@@ -1099,6 +1202,10 @@ def list_comms(
             purpose=purpose,
             workflow=workflow,
             search=search,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -1110,6 +1217,394 @@ def get_comm(communication_id: int, user: RequirePayflowProduct, db: DbSession):
         return PayflowCommunicationService(db).get_communication(user, communication_id)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+@router.get("/accounts/{account_id}/communication-eligibility", response_model=CommunicationEligibilitySnapshot)
+def get_account_communication_eligibility(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        return PayflowCommunicationService(db).case_eligibility_snapshot(user, row)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/accounts/{account_id}/communications/sms/send",
+    response_model=ManualSmsSendResponse,
+)
+def send_manual_sms(
+    account_id: int,
+    payload: ManualSmsSendRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        result = PayflowCommunicationService(db).send_manual_sms(
+            user,
+            row,
+            body=payload.body,
+            purpose=payload.purpose,
+            include_payment_link=payload.include_payment_link,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualSmsSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/accounts/{account_id}/communications/email/send",
+    response_model=ManualEmailSendResponse,
+)
+def send_manual_email(
+    account_id: int,
+    payload: ManualEmailSendRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from sqlalchemy.orm import joinedload
+
+        row = (
+            db.query(PayflowAccountModel)
+            .options(joinedload(PayflowAccountModel.client))
+            .filter(PayflowAccountModel.id == account_id)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Account not found")
+        result = PayflowCommunicationService(db).send_manual_email(
+            user,
+            row,
+            subject=payload.subject,
+            body=payload.body,
+            purpose=payload.purpose,
+            include_payment_link=payload.include_payment_link,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualEmailSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/comms/{communication_id}/resend",
+    response_model=ManualEmailSendResponse,
+)
+def resend_failed_communication(
+    communication_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    payload: ResendCommunicationRequest = ResendCommunicationRequest(),
+):
+    try:
+        result = PayflowCommunicationService(db).resend_failed_communication(
+            user,
+            communication_id,
+            idempotency_key=payload.idempotency_key,
+        )
+        return ManualEmailSendResponse(
+            skipped=result.get("skipped"),
+            communication_id=result.get("communication_id"),
+            code=result.get("code"),
+            status=result.get("status"),
+            comm_status=result.get("comm_status"),
+            recipient=result.get("recipient"),
+            provider_error=result.get("provider_error"),
+            restriction_reason=result.get("restriction_reason"),
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Payment links (secure opaque tokens)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/accounts/{account_id}/payment-links",
+    response_model=PayflowPaymentLinksListResponse,
+)
+def list_account_payment_links(
+    account_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowPaymentLinkService(db).list_for_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/accounts/{account_id}/payments",
+    response_model=PayflowAccountPaymentsResponse,
+)
+def list_account_payments(account_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Confirmed payment ledger + attempts + plans for Case detail (backend-verified only)."""
+    try:
+        return PayflowPaymentOutcomeService(db).list_account_payments(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/payment-links/{link_id}", response_model=PayflowPaymentLinkItem)
+def get_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowPaymentLinkService(db).get_link(user, link_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/payment-links/{link_id}/revoke", response_model=PayflowPaymentLinkItem)
+def revoke_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
+    try:
+        return PayflowPaymentLinkService(db).revoke(user, link_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/public/payment-links/{token}",
+    response_model=PayflowPaymentLinkPublicResolve,
+)
+def resolve_public_payment_link(token: str, db: DbSession):
+    """Customer payment portal resolve — no JWT. Branding, balance, options."""
+    try:
+        return PayflowPaymentPortalService(db).resolve_portal(token)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/initiate",
+    response_model=PayflowPaymentAttemptItem,
+)
+def initiate_public_payment(
+    token: str, payload: PayflowPaymentInitiateRequest, db: DbSession
+):
+    """Validate option/amount and create Stripe (or mock) Checkout session."""
+    try:
+        return PayflowPaymentPortalService(db).initiate(
+            token,
+            option_id=payload.option_id,
+            amount=payload.amount,
+            idempotency_key=payload.idempotency_key,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/public/payment-links/{token}/attempts/{attempt_id}",
+    response_model=PayflowPaymentAttemptItem,
+)
+def get_public_payment_attempt(token: str, attempt_id: str, db: DbSession):
+    """Poll backend-confirmed payment outcome (never trust browser redirect alone)."""
+    try:
+        return PayflowPaymentPortalService(db).get_attempt_public(token, attempt_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/attempts/{attempt_id}/cancel",
+    response_model=PayflowPaymentAttemptItem,
+)
+def cancel_public_payment_attempt(token: str, attempt_id: str, db: DbSession):
+    try:
+        return PayflowPaymentPortalService(db).cancel_attempt(token, attempt_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/payment-links/{token}/attempts/{attempt_id}/mock-outcome",
+    response_model=PayflowPaymentAttemptItem,
+)
+def mock_public_payment_outcome(
+    token: str,
+    attempt_id: str,
+    payload: PayflowPaymentMockOutcomeRequest,
+    db: DbSession,
+):
+    """Dev-only when Stripe keys are unset — never collects card details."""
+    try:
+        return PayflowPaymentPortalService(db).simulate_mock_outcome(
+            token, attempt_id, outcome=payload.outcome
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Operational exceptions
+# ---------------------------------------------------------------------------
+
+
+@router.get("/exceptions", response_model=PayflowOperationalExceptionsListResponse)
+def list_operational_exceptions(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    status_filter: str | None = Query(default=None, alias="status"),
+    exception_type: str | None = Query(default=None),
+    client_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        return PayflowOperationalExceptionService(db).list_exceptions(
+            user,
+            status=status_filter,
+            exception_type=exception_type,
+            client_id=client_id,
+            limit=limit,
+            offset=offset,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/exceptions/{exception_id}", response_model=PayflowOperationalExceptionItem)
+def get_operational_exception(
+    exception_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowOperationalExceptionService(db).get_exception(user, exception_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/exceptions/{exception_id}/acknowledge", response_model=PayflowOperationalExceptionItem)
+def acknowledge_operational_exception(
+    exception_id: int, user: RequirePayflowProduct, db: DbSession
+):
+    try:
+        return PayflowOperationalExceptionService(db).acknowledge(user, exception_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/exceptions/{exception_id}/resolve", response_model=PayflowOperationalExceptionItem)
+def resolve_operational_exception(
+    exception_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    payload: ResolveOperationalExceptionRequest = ResolveOperationalExceptionRequest(),
+):
+    try:
+        return PayflowOperationalExceptionService(db).resolve(
+            user, exception_id, note=payload.note
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# Workflow worker / runs
+# ---------------------------------------------------------------------------
+
+
+@router.get("/workflow-worker-logs", response_model=PayflowWorkflowWorkerLogsResponse)
+def list_workflow_worker_logs(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    strategy_id: int | None = Query(default=None),
+    event_type: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    items = WorkflowExecutionService(db).list_worker_logs(
+        client_id=client_id,
+        portfolio_id=portfolio_id,
+        account_id=account_id,
+        strategy_id=strategy_id,
+        event_type=event_type,
+        level=level,
+        search=search,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@router.get("/workflow-runs", response_model=PayflowWorkflowRunsResponse)
+def list_workflow_runs(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    strategy_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    items = WorkflowExecutionService(db).list_runs(
+        client_id=client_id,
+        strategy_id=strategy_id,
+        account_id=account_id,
+        status=status_filter,
+        limit=limit,
+    )
+    return {"items": items}
+
+
+@router.get("/workflow-runs/{run_id}", response_model=PayflowWorkflowRunItem)
+def get_workflow_run(run_id: int, user: RequirePayflowProduct, db: DbSession):
+    from app.core.exceptions import NotFoundError
+    from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
+
+    item = WorkflowExecutionService(db).get_run(run_id)
+    if not item:
+        raise _map_error(NotFoundError("Workflow run not found"))
+    return item
 
 
 # ---------------------------------------------------------------------------

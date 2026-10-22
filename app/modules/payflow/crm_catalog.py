@@ -711,7 +711,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "client_type__name",
         "payflow_field": "client_type",
         "meaning": "First Party / Third Party (or Commercial labels mapped softly).",
-        "required": False,
+        "required": True,
         "sample_value": "Commercial",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -728,10 +728,20 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "feed": "client_hierarchy",
     },
     {
+        "source_field": "clientdemographiccontactinformation__full_name",
+        "payflow_field": "contact_name",
+        "meaning": "Primary contact name on the Client record.",
+        "required": True,
+        "sample_value": "Jane Contact",
+        "group": "Client hierarchy",
+        "available": "Yes",
+        "feed": "client_hierarchy",
+    },
+    {
         "source_field": "email_address / clientdemographiccontactinformation__email_address",
         "payflow_field": "contact_email",
         "meaning": "Primary contact email on the Client record.",
-        "required": False,
+        "required": True,
         "sample_value": "ops@client.com",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -741,7 +751,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "phone_number / clientdemographiccontactinformation__phone_number",
         "payflow_field": "contact_phone",
         "meaning": "Primary contact phone on the Client record.",
-        "required": False,
+        "required": True,
         "sample_value": "4165550100",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -750,8 +760,8 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
     {
         "source_field": "address_line_1 / city__name / province__name / country__name / zip_code",
         "payflow_field": "client_address",
-        "meaning": "Client mailing address fields from the clients file.",
-        "required": False,
+        "meaning": "Client mailing address fields from the clients file. Country is required for master clients.",
+        "required": True,
         "sample_value": "5060 Address, Mississauga, ON, Canada",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -761,7 +771,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "currency__name",
         "payflow_field": "currency_code",
         "meaning": "Default currency for the Client (e.g. Canadian Dollars → CAD).",
-        "required": False,
+        "required": True,
         "sample_value": "Canadian Dollars",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -771,7 +781,7 @@ CRM_CLIENT_HIERARCHY_FIELDS: list[CrmFieldDef] = [
         "source_field": "correspondence_language__name",
         "payflow_field": "correspondence_language",
         "meaning": "Default correspondence language for the Client.",
-        "required": False,
+        "required": True,
         "sample_value": "English",
         "group": "Client hierarchy",
         "available": "Yes",
@@ -956,6 +966,31 @@ CLIENT_IMPORT_MASTER_REQUIRED: tuple[str, ...] = (
     "is_master_client",
 )
 
+# At least one name column must be present for master / sub display names.
+CLIENT_IMPORT_NAME_COLUMNS: tuple[str, ...] = (
+    "company_name",
+    "short_name",
+)
+
+# Master-client profile columns (parity with Add Client mandatory fields).
+# For each logical field, at least one alias header must exist in the file.
+CLIENT_IMPORT_MASTER_PROFILE_HEADERS: dict[str, tuple[str, ...]] = {
+    "client_type": ("client_type__name",),
+    "contact_name": ("clientdemographiccontactinformation__full_name",),
+    "email": (
+        "email_address",
+        "clientdemographiccontactinformation__email_address",
+    ),
+    "phone": (
+        "phone_number",
+        "cell_number",
+        "clientdemographiccontactinformation__phone_number",
+    ),
+    "country": ("country__name",),
+    "language": ("correspondence_language__name",),
+    "currency": ("currency__name",),
+}
+
 # Daily CRM account file — one sheet "Accounts". Clients/portfolios must already exist.
 ACCOUNT_IMPORT_HEADERS: list[str] = [
     "client_code",
@@ -1028,14 +1063,37 @@ ACCOUNT_IMPORT_REQUIRED: tuple[str, ...] = (
     "email",
 )
 
-# CRM Debtor Summary / UAT dump column → PayFlow account import header.
+# CRM Debtor Summary / UAT dump / daily placement column → PayFlow account import header.
 # Applied when loading CSV/XLSX so native CRM exports can be uploaded directly.
+# Account email/phone are the debtor contact channels used for collection alerts —
+# never confuse with client.contact_email (organization ops contact).
 ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "account_number": "account_id",
     "first_name": "customer_first_name",
     "last_name": "customer_last_name",
+    # Email (debtor / account customer)
     "email_address": "email",
+    "customer_email": "email",
+    "customer_email_address": "email",
+    "debtor_email": "email",
+    "acct_email": "email",
+    # Mobile / home phone (SMS channel)
+    "dn_debtorcasephonenumber_phone_number": "phone_mobile",
+    "customer_phone_home": "phone_mobile",
+    "customer_phone": "phone_mobile",
+    "phone_home": "phone_mobile",
+    "home_phone": "phone_mobile",
+    "phone_number": "phone_mobile",
+    "mobile_phone": "phone_mobile",
+    "mobile": "phone_mobile",
+    "alt_phn": "phone_mobile",
+    "customer_phone_alt": "phone_mobile",
+    # Work phone
+    "customer_phone_work": "phone_work",
+    "phone_work_number": "phone_work",
+    "work_phone": "phone_work",
     "principle_amount": "original_balance",
+    "principal_amount": "original_balance",
     "id": "crm_case_id",
     "date_last_email_sent": "last_email_sent_date",
     "date_of_last_sms_sent": "last_sms_sent_date",
@@ -1049,8 +1107,9 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "dn_debtorcaseaddress_city_name": "city",
     "dn_debtorcaseaddress_province_name": "province_state",
     "dn_debtorcaseaddress_postal_code": "postal_code",
+    # First header wins; "Canada" / ISO-2 alias both normalize to CA in import_service.
     "dn_debtorcaseaddress_country_name": "country_code",
-    "dn_debtorcasephonenumber_phone_number": "phone_mobile",
+    "dn_debtorcaseaddress_country_alias_1": "country_code",
     "dn_client_demographic_product": "product_code",
     "account_product": "product_code",
     "updated_at": "source_updated_at",
@@ -1108,7 +1167,7 @@ CRM_FILE_BEHAVIOUR: dict = {
         },
         "historical_preservation": [
             "original_balance is set only on create and is not overwritten on refresh",
-            "account timeline appends CRM import/refresh events",
+            "account timeline appends Created from file upload / Updated from file upload events",
         ],
         "negative_balance": "coerce_to_absolute_value",
     },

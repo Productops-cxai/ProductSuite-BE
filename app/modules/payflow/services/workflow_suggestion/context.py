@@ -36,7 +36,11 @@ def load_client_context(db: Session, client_id: int) -> dict[str, Any]:
 
 
 def load_rules(db: Session, client_id: int) -> dict[str, list[dict[str, Any]]]:
-    """Active system rules (everyone) + active client rules (this client)."""
+    """Active client rules for this client + active system rules assigned via governance_rules."""
+    client = db.get(PayflowClientModel, client_id)
+    assigned_system = {
+        str(name) for name in ((client.governance_rules if client else None) or []) if name
+    }
     rows = (
         db.query(PayflowRuleModel)
         .filter(
@@ -52,6 +56,8 @@ def load_rules(db: Session, client_id: int) -> dict[str, list[dict[str, Any]]]:
     rules: dict[str, list[dict[str, Any]]] = {"system": [], "client": []}
     for row in rows:
         key = "system" if row.rule_type == PayflowRuleType.SYSTEM.value else "client"
+        if key == "system" and (row.name or "") not in assigned_system:
+            continue
         rules[key].append(
             {
                 "name": row.name,

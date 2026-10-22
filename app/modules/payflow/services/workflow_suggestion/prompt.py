@@ -26,6 +26,12 @@ EXAMPLES_PATH = Path(__file__).parent / "prompts" / "workflow_examples.json"
 # Steps allowed to end a path (no `next`): a final outcome, or a hand-over.
 END_STEP_KINDS = ("Outcome", "Human Review", "Case Action")
 
+# Regenerate sends at most this many review-history entries (keeps prompts small on the free tier).
+MAX_HISTORY_ENTRIES = 10
+
+# Kept next to a client's own examples: the generic example with real branches (bounce → SMS, dispute → hold).
+BRANCHING_EXAMPLE = "Mid-Stage Channel-Aware Follow-Up"
+
 _CLIENT_TYPES = {"first_party": "First Party", "third_party": "Third Party"}
 _AI_MODES = {"autopilot": "Autopilot", "supervised_ai": "Supervised AI"}
 
@@ -41,16 +47,19 @@ def build_messages(
     limits: dict[str, Any],
     feedback: list[dict[str, Any]] | None = None,
     revision: str | None = None,
+    client_examples: list[dict[str, Any]] | None = None,
+    lessons: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """`feedback` (on a retry): [{"segment", "workflow", "errors"}] from the validator.
-    `revision` (on regenerate): the current workflow + reviewer remarks, from build_revision."""
+    `revision` (on regenerate): the current workflow + reviewer remarks, from build_revision.
+    `client_examples` / `lessons` (on suggest): learned from this client's past reviews (learning.py)."""
     user_prompt = build_user_prompt(client, portfolio_name, segments)
     if revision:
         user_prompt += "\n\n" + revision
     if feedback:
         user_prompt += "\n\n" + build_feedback(feedback)
     return [
-        {"role": "system", "content": build_system_prompt(limits)},
+        {"role": "system", "content": build_system_prompt(limits, client_examples, lessons)},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -64,31 +73,79 @@ def build_feedback(feedback: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def build_revision(segment_id: str, workflow: dict[str, Any], remarks: str) -> str:
-    """Ask for an improved version of an existing workflow, guided by a reviewer's remarks."""
+def build_revision(
+    segment_id: str,
+    workflow: dict[str, Any],
+    remarks: str,
+    versions: list[dict[str, Any]] | None = None,
+) -> str:
+    """Ask for an improved version of an existing workflow, guided by a reviewer's remarks
+    and the review history (what reviewers changed and why).
+
+    `versions`: history entries to send, newest first — default the workflow's own;
+    Regenerate also passes those of the workflows it was regenerated from."""
     current = {
         "name": workflow.get("name"),
         "summary": workflow.get("summary"),
         "entry_node_id": workflow.get("entry_node_id"),
-        "steps": [_compact_step(step) for step in workflow.get("steps") or []],
+        "steps": [compact_step(step) for step in workflow.get("steps") or []],
     }
-    return (
+    parts = [
         f"Revise the current workflow for segment_id \"{segment_id}\" using the reviewer's remarks. "
         "Keep what works and change what the remarks ask for. Return exactly one workflow, and fill "
-        "reasoning.changes_made with what you changed and how it addresses the remarks.\n"
-        f"Current workflow: {json.dumps(current, ensure_ascii=False)}\n"
-        f"Reviewer remarks: {remarks}"
+        "reasoning.changes_made with what you changed and how it addresses the remarks.",
+        f"Current workflow: {json.dumps(current, ensure_ascii=False)}",
+    ]
+    history = build_review_history(versions if versions is not None else workflow.get("versions") or [])
+    if history:
+        parts.append(history)
+    parts.append(f"Reviewer remarks: {remarks}")
+    return "\n".join(parts)
+
+
+def build_review_history(versions: list[dict[str, Any]]) -> str:
+    """Reviewer feedback from a workflow's history, oldest first — "" when there is none.
+
+    Only entries with a change list or a reviewer_note are used (the last MAX_HISTORY_ENTRIES).
+    """
+    lines = [_history_line(entry) for entry in reversed(versions) if isinstance(entry, dict)]  # stored newest first
+    lines = [line for line in lines if line][-MAX_HISTORY_ENTRIES:]
+    if not lines:
+        return ""
+    return "Review history (oldest first). Keep what reviewers changed unless the remarks say otherwise:\n" + "\n".join(
+        lines
     )
 
 
-def _compact_step(step: dict[str, Any]) -> dict[str, Any]:
+def _history_line(entry: dict[str, Any]) -> str | None:
+    reason = (entry.get("reviewer_note") or "").strip()
+    changes = [str(change) for change in entry.get("changes") or []]
+    if not (reason or changes):
+        return None  # plain status moves (review started, activated, …) carry no feedback
+    note = (entry.get("note") or "").strip()
+    # Reject stores the reviewer's text as its note, so a note equal to the reason is a rejection.
+    parts = ["Rejected" if reason and note == reason else note]
+    if changes:
+        parts.append("Changed: " + "; ".join(changes))
+    if reason:
+        parts.append(f"Reason: {reason}")
+    return "- " + ". ".join(parts)
+
+
+def compact_step(step: dict[str, Any]) -> dict[str, Any]:
+    """A stored step without its empty fields — the short form the AI reads and writes."""
     compact = {key: step[key] for key in ("id", "kind", "title") if step.get(key)}
     compact["config"] = {k: v for k, v in (step.get("config") or {}).items() if v is not None}
     compact.update({link: step[link] for link in ("next", "yes", "no") if step.get(link)})
     return compact
 
 
-def build_system_prompt(limits: dict[str, Any]) -> str:
+def build_system_prompt(
+    limits: dict[str, Any],
+    client_examples: list[dict[str, Any]] | None = None,
+    lessons: list[str] | None = None,
+) -> str:
+    """Without client_examples / lessons the prompt is exactly the generic one."""
     channels = limits["channels"]
     templates = [t for t in MESSAGE_TEMPLATES if t["channel"] in channels]
     template_lines = "\n".join(f"  {t['id']} — {t['channel']} — {t['purpose']}" for t in templates)
@@ -97,7 +154,22 @@ def build_system_prompt(limits: dict[str, Any]) -> str:
     )
     weekly_cap = limits["max_messages_per_7_days"]
     weekly_line = f"\n- At most {weekly_cap} messages in any 7 days." if weekly_cap is not None else ""
-    examples = "\n".join(json.dumps(e, ensure_ascii=False) for e in load_examples())
+    generic = load_examples()
+    if client_examples:
+        # The client's own (similar) workflows take generic slots; free slots keep generic
+        # examples, and the branching example always stays — same number of examples as before.
+        branching = [e for e in generic if e["name"] == BRANCHING_EXAMPLE]
+        free_slots = max(0, len(generic) - len(branching) - len(client_examples))
+        fillers = [e for e in generic if e["name"] != BRANCHING_EXAMPLE][:free_slots]
+        examples_intro = (
+            f"The first {len(client_examples)} are this client's own workflows, approved by its reviewers: "
+            "learn from their choices, but design for each segment's own situation and stats.\n"
+        )
+        example_list = client_examples + fillers + branching
+    else:
+        examples_intro, example_list = "", generic
+    examples = examples_intro + "\n".join(json.dumps(e, ensure_ascii=False) for e in example_list)
+    examples += _lessons_section(lessons)
 
     return f"""You design debt-collection workflows for PayFlow, a collections platform.
 You receive a client, one of its portfolios, and segments of that portfolio's accounts.
@@ -164,6 +236,19 @@ Outcomes: {", ".join(OUTCOMES)}
 
 ## Examples (illustrative only, do not copy)
 {examples}"""
+
+
+def _lessons_section(lessons: list[str] | None) -> str:
+    """This client's reviewer feedback — explicitly guidance, never hard rules."""
+    if not lessons:
+        return ""
+    return (
+        "\n\n## Lessons from this client's past reviews (guidance, not rules)\n"
+        "This client's reviewers edited, rejected or approved earlier workflows for the reasons below. "
+        "Treat them as the client's preferences, not as hard rules: follow a lesson where it fits a segment's "
+        "situation and stats, and depart from it where it does not (then say why in reasoning). "
+        "Only the Limits and Allowed values above are hard rules.\n" + "\n".join(lessons)
+    )
 
 
 def build_user_prompt(client: dict[str, Any], portfolio_name: str, segments: list[dict[str, Any]]) -> str:

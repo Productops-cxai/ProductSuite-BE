@@ -36,7 +36,7 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     },
     {
         "name": "Platform · Logs",
-        "description": "Email and deletion audit logs",
+        "description": "Email, deletion, and AI suggest job audit logs",
     },
     {
         "name": "Platform · Billing",
@@ -122,7 +122,11 @@ def tag_for_path(path: str) -> str | None:
         return "Platform · People"
     if path.startswith("/menus"):
         return "Platform · Menus"
-    if path.startswith("/email-logs") or path.startswith("/deletion-logs"):
+    if (
+        path.startswith("/email-logs")
+        or path.startswith("/deletion-logs")
+        or path.startswith("/ai-suggest-jobs")
+    ):
         return "Platform · Logs"
 
     return None

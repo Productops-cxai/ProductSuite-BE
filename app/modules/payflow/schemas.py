@@ -110,8 +110,12 @@ class PayflowClientItem(BaseModel):
     connection_status_label: Optional[str] = None
     supervisors: List[dict] = Field(default_factory=list)
     setup_incomplete: List[str] = Field(default_factory=list)
+    setup_issues: List[str] = Field(default_factory=list)
     setup_steps_remaining: int = 0
     onboarding: Optional[PayflowOnboardingProgressItem] = None
+    # How the client was first created: add_client | file_upload
+    added_through: Optional[str] = None
+    added_through_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -189,6 +193,8 @@ class UpdatePayflowClientRequest(BaseModel):
     sms_sender_id: Optional[str] = None
     channels: Optional[dict] = None
     governance_rules: Optional[List[str]] = None
+    # Portal options: allow_pay_in_full, allow_partial, allow_payment_plan, min amounts, plans.
+    payment_settings: Optional[dict] = None
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
@@ -525,17 +531,50 @@ class ReviewPaymentContext(BaseModel):
     paid_amount: Optional[float] = None
 
 
+class ReviewExceptionStep(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    kind: Optional[str] = None
+    available: bool = True
+    message: Optional[str] = None
+
+
+class ReviewExecutionSummary(BaseModel):
+    run_id: Optional[int] = None
+    status: Optional[str] = None
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_version: Optional[int] = None
+    current_step_id: Optional[str] = None
+    current_step_title: Optional[str] = None
+    current_step_kind: Optional[str] = None
+    next_step_id: Optional[str] = None
+    next_step_title: Optional[str] = None
+    next_scheduled_at: Optional[datetime] = None
+    block_reason: Optional[str] = None
+    workflow_definition_path: Optional[str] = None
+
+
+class ReviewMissingRef(BaseModel):
+    ref: str
+    message: str
+
+
 class ReviewWorkflowContext(BaseModel):
     strategy_id: Optional[int] = None
     strategy_name: Optional[str] = None
     strategy_code: Optional[str] = None
+    strategy_available: Optional[bool] = None
     workflow_version: Optional[int] = None
     exception_step_id: Optional[str] = None
+    exception_step: Optional[ReviewExceptionStep] = None
     current_workflow: Optional[str] = None
     collection_status: Optional[str] = None
     last_action: Optional[str] = None
     next_action: Optional[str] = None
     action_blocked: bool = False
+    execution: Optional[ReviewExecutionSummary] = None
+    workflow_definition_path: Optional[str] = None
 
 
 class ReviewAuditItem(BaseModel):
@@ -560,6 +599,8 @@ class PayflowReviewItem(BaseModel):
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None
     case_reference: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
     original_balance: float = 0
     outstanding_balance: float = 0
     recovered_balance: float = 0
@@ -594,10 +635,12 @@ class PayflowReviewItem(BaseModel):
     payment_context: Optional[ReviewPaymentContext] = None
     workflow_context: Optional[ReviewWorkflowContext] = None
     available_actions: List[str] = Field(default_factory=list)
+    missing_refs: List[ReviewMissingRef] = Field(default_factory=list)
     decision_version: Optional[int] = None
     strategy_id: Optional[int] = None
     workflow_version: Optional[int] = None
     exception_step_id: Optional[str] = None
+    exception_step: Optional[ReviewExceptionStep] = None
     can_decide: Optional[bool] = None
     can_modify: Optional[bool] = None
     can_release: Optional[bool] = None
@@ -756,6 +799,9 @@ class PayflowRulesListResponse(BaseModel):
 
 
 class CreatePayflowRuleRequest(BaseModel):
+    """Create or update a rule. When ``id`` is set, the same POST updates that rule."""
+
+    id: Optional[int] = None
     name: str = Field(min_length=1, max_length=255)
     description: Optional[str] = None
     rule_type: str = "Client Rule"
@@ -816,6 +862,7 @@ class StrategySegment(BaseModel):
 class StrategyVersionItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    id: Optional[int] = None  # payflow_strategy_versions.id when from immutable table
     version: int
     date: str
     note: str
@@ -826,6 +873,7 @@ class StrategyVersionItem(BaseModel):
     steps: Optional[List[Any]] = None
     segment: Optional[dict] = None
     changes: List[str] = Field(default_factory=list)
+    reviewer_note: Optional[str] = None  # why the reviewer approved / edited (optional)
 
 
 class StrategyStats(BaseModel):
@@ -895,6 +943,7 @@ class PayflowStrategyItem(BaseModel):
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
     ai_proposal_snapshot: Optional[dict] = None
+    revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
     versions: List[StrategyVersionItem] = Field(default_factory=list)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None
@@ -951,6 +1000,19 @@ class UpdatePayflowStrategyRequest(BaseModel):
     segment: Optional[dict] = None
     steps: Optional[List[StrategyStepItem]] = None
     entry_node_id: Optional[str] = None
+    note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why this edit was made")
+
+
+class ApproveStrategyRequest(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why it was approved")
+
+
+class ActivateStrategyRequest(BaseModel):
+    note: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+        description="Optional: why this workflow is being activated",
+    )
 
 
 class RejectStrategyRequest(BaseModel):
@@ -973,17 +1035,20 @@ class PayflowCommunicationItem(BaseModel):
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None
     case_reference: Optional[str] = None
+    case_status: Optional[str] = None
     channel: str
     purpose: str
     status: str
     workflow_name: Optional[str] = None
     engagement: Optional[str] = None
+    engagement_tracking: Optional[str] = None
     date_bucket: Optional[str] = None
     date_label: Optional[str] = None
     time_label: Optional[str] = None
     subject: Optional[str] = None
     body_lines: List[str] = Field(default_factory=list)
     payment_link: bool = False
+    payment_link_url: Optional[str] = None
     why_message: Optional[str] = None
     why_channel: Optional[str] = None
     why_timing: Optional[str] = None
@@ -995,6 +1060,30 @@ class PayflowCommunicationItem(BaseModel):
     sender_name: Optional[str] = None
     email_from: Optional[str] = None
     sms_sender_id: Optional[str] = None
+    provider: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
+    opens_count: int = 0
+    clicks_count: int = 0
+    first_opened_at: Optional[datetime] = None
+    last_opened_at: Optional[datetime] = None
+    first_clicked_at: Optional[datetime] = None
+    last_clicked_at: Optional[datetime] = None
+    last_clicked_url: Optional[str] = None
+    days_since_delivery_without_open: Optional[int] = None
+    days_since_delivery_without_click: Optional[int] = None
+    payment_initiated: bool = False
+    payment_completed: bool = False
+    eligibility_status: Optional[str] = None
+    restriction_reason: Optional[str] = None
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    rule_code: Optional[str] = None
+    next_eligible_at: Optional[datetime] = None
+    can_view_rule: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -1016,6 +1105,191 @@ class PayflowCommunicationsListResponse(BaseModel):
     purposes: List[str] = Field(default_factory=list)
     workflows: List[str] = Field(default_factory=list)
     drop_off_segments: List[str] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 100
+    offset: int = 0
+
+
+class CommunicationEligibilitySnapshot(BaseModel):
+    email: dict = Field(default_factory=dict)
+    sms: dict = Field(default_factory=dict)
+    latest_restriction_reason: Optional[str] = None
+    latest_eligibility_status: Optional[str] = None
+    next_eligible_at: Optional[datetime] = None
+    rule_id: Optional[int] = None
+    rule_name: Optional[str] = None
+    rule_code: Optional[str] = None
+    can_view_rule: bool = False
+    communication_id: Optional[int] = None
+
+
+class ManualSmsSendRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=1600)
+    purpose: str = "Payment Reminder"
+    include_payment_link: bool = False
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class ManualSmsSendResponse(BaseModel):
+    skipped: Optional[str] = None
+    communication_id: Optional[int] = None
+    code: Optional[str] = None
+    status: Optional[str] = None
+    comm_status: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
+    restriction_reason: Optional[str] = None
+
+
+class ManualEmailSendRequest(BaseModel):
+    subject: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=20000)
+    purpose: str = "Payment Reminder"
+    include_payment_link: bool = False
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class ManualEmailSendResponse(BaseModel):
+    skipped: Optional[str] = None
+    communication_id: Optional[int] = None
+    code: Optional[str] = None
+    status: Optional[str] = None
+    comm_status: Optional[str] = None
+    recipient: Optional[str] = None
+    provider_error: Optional[str] = None
+    restriction_reason: Optional[str] = None
+
+
+class ResendCommunicationRequest(BaseModel):
+    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+
+
+class PayflowPaymentLinkEventItem(BaseModel):
+    at: Optional[str] = None
+    label: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class PayflowPaymentLinkItem(BaseModel):
+    id: int
+    token: str
+    url: str
+    status: str
+    client_id: int
+    account_id: int
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    communication_id: Optional[int] = None
+    communication_code: Optional[str] = None
+    communication_channel: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    revoked_by: Optional[str] = None
+    completed_at: Optional[datetime] = None
+    access_count: int = 0
+    clicks_count: int = 0
+    last_accessed_at: Optional[datetime] = None
+    last_clicked_at: Optional[datetime] = None
+    events: List[PayflowPaymentLinkEventItem] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    is_usable: bool = False
+
+
+class PayflowPaymentLinksListResponse(BaseModel):
+    payment_links: List[PayflowPaymentLinkItem]
+    total: int = 0
+    active_count: int = 0
+
+
+class PayflowPaymentLinkPublicResolve(BaseModel):
+    usable: bool
+    status: str
+    block_reason: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    token: Optional[str] = None
+    customer: dict = Field(default_factory=dict)
+    case: dict = Field(default_factory=dict)
+    brand: dict = Field(default_factory=dict)
+    link_ref: Optional[str] = None
+    payment_options: List[dict] = Field(default_factory=list)
+    provider: dict = Field(default_factory=dict)
+
+
+class PayflowPaymentInitiateRequest(BaseModel):
+    option_id: str = Field(min_length=1, max_length=64)
+    amount: Optional[float] = Field(default=None, gt=0)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
+
+
+class PayflowPaymentAttemptItem(BaseModel):
+    id: str
+    status: str
+    option_type: str
+    plan_id: Optional[str] = None
+    amount: float
+    currency_code: str
+    provider: str
+    checkout_url: Optional[str] = None
+    error_message: Optional[str] = None
+    balance_at_initiation: Optional[float] = None
+    stripe_session_id: Optional[str] = None
+    reference: Optional[str] = None
+    confirmed: bool = False
+    events: List[dict] = Field(default_factory=list)
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class PayflowPaymentMockOutcomeRequest(BaseModel):
+    outcome: str = Field(min_length=1, max_length=32)
+
+
+class PayflowAccountPaymentsResponse(BaseModel):
+    account_id: int
+    balances: dict = Field(default_factory=dict)
+    transactions: List[dict] = Field(default_factory=list)
+    attempts: List[dict] = Field(default_factory=list)
+    payment_plans: List[dict] = Field(default_factory=list)
+    total_transactions: int = 0
+
+
+class PayflowOperationalExceptionItem(BaseModel):
+    id: int
+    exception_type: str
+    severity: str
+    status: str
+    retriable: bool = True
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    case_reference: Optional[str] = None
+    source_entity_type: Optional[str] = None
+    source_entity_id: Optional[str] = None
+    reason: str
+    diagnostic_ref: Optional[str] = None
+    link: Optional[str] = None
+    dedupe_key: str
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class PayflowOperationalExceptionsListResponse(BaseModel):
+    exceptions: List[PayflowOperationalExceptionItem]
+    total: int = 0
+    open_count: int = 0
+    acknowledged_count: int = 0
+    resolved_count: int = 0
+
+
+class ResolveOperationalExceptionRequest(BaseModel):
+    note: Optional[str] = Field(default=None, max_length=1000)
 
 
 class PayflowNotificationItem(BaseModel):
@@ -1064,6 +1338,7 @@ class DashboardFunnelStep(BaseModel):
     drop: Optional[str] = None
     bar: float = 0
     paid: bool = False
+    href: Optional[str] = None
 
 
 class DashboardOutcomeItem(BaseModel):
@@ -1161,6 +1436,7 @@ class PayflowImportPreviewRecord(BaseModel):
     current_balance: Optional[float] = None
     incoming_balance: Optional[float] = None
     note: Optional[str] = None
+    setup_issues: List[str] = Field(default_factory=list)
 
 
 class PayflowImportPreviewSummary(BaseModel):
@@ -1240,3 +1516,108 @@ class RegenerateWorkflowRequest(BaseModel):
         if len(cleaned) < 3:
             raise ValueError("Remarks are required")
         return cleaned
+
+
+class PayflowWorkflowWorkerLogItem(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: str
+    detail: Optional[str] = None
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
+    portfolio_code: Optional[str] = None
+    account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    run_id: Optional[int] = None
+    job_id: Optional[int] = None
+    step_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    event_count: Optional[int] = 1
+    group_key: Optional[str] = None
+    step_summary: Optional[str] = None
+    related_events: Optional[List["PayflowWorkflowWorkerLogItem"]] = None
+
+
+class PayflowWorkflowWorkerLogsResponse(BaseModel):
+    items: List[PayflowWorkflowWorkerLogItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowStepRunItem(BaseModel):
+    id: int
+    step_id: str
+    kind: str
+    title: Optional[str] = None
+    attempt: int
+    status: str
+    ui_status: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+    block_reason: Optional[str] = None
+    result_json: Optional[dict[str, Any]] = None
+    communication_id: Optional[int] = None
+
+
+class PayflowWorkflowActivityItem(BaseModel):
+    at: Optional[datetime] = None
+    label: str
+    kind: Optional[str] = None
+    detail: Optional[str] = None
+    ui_status: Optional[str] = None
+    step_id: Optional[str] = None
+    step_run_id: Optional[int] = None
+    communication_id: Optional[int] = None
+    block_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+class PayflowWorkflowCurrentStep(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    kind: Optional[str] = None
+
+
+class PayflowWorkflowRunItem(BaseModel):
+    id: int
+    account_id: int
+    strategy_id: int
+    strategy_version: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    workflow_definition_path: Optional[str] = None
+    client_id: Optional[int] = None
+    portfolio_id: Optional[int] = None
+    status: str
+    current_step_id: Optional[str] = None
+    current_step: Optional[PayflowWorkflowCurrentStep] = None
+    next_step_id: Optional[str] = None
+    next_step_title: Optional[str] = None
+    next_scheduled_at: Optional[datetime] = None
+    human_review_id: Optional[int] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    block_reason: Optional[str] = None
+    deactivate_policy: Optional[str] = None
+    step_runs: List[PayflowWorkflowStepRunItem] = Field(default_factory=list)
+    activity: List[PayflowWorkflowActivityItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowRunsResponse(BaseModel):
+    items: List[PayflowWorkflowRunItem] = Field(default_factory=list)
+
+
+class PayflowWorkflowPaymentEventRequest(BaseModel):
+    amount: Optional[float] = None
+    payment_date: Optional[str] = None
+    is_ptp: Optional[bool] = None
+    note: Optional[str] = None

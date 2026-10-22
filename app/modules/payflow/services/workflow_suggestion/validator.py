@@ -173,9 +173,16 @@ def validate_step_config(workflow: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     for step in workflow["steps"]:
         cfg = _cfg(step)
+        where = f"{_where(workflow, step.get('id'))} ({step.get('kind')})"
         missing = [field for field in REQUIRED_CONFIG.get(step.get("kind"), []) if field not in cfg]
         if missing:
-            errors.append(f"{_where(workflow, step.get('id'))} ({step.get('kind')}): missing {', '.join(missing)}")
+            errors.append(f"{where}: missing {', '.join(missing)}")
+        # Saving rejects timing without a reference_event (strategy_service._normalize_step).
+        elif _has_timing(cfg) and "reference_event" not in cfg:
+            errors.append(
+                f"{where}: has timing (amount / unit) but no reference_event - "
+                "remove the timing or add a reference_event"
+            )
     return errors
 
 
@@ -220,6 +227,11 @@ def _where(workflow: dict[str, Any], step_id: Any) -> str:
 def _cfg(step: dict[str, Any]) -> dict[str, Any]:
     cfg = step.get("config")
     return {k: v for k, v in cfg.items() if v is not None} if isinstance(cfg, dict) else {}
+
+
+def _has_timing(cfg: dict[str, Any]) -> bool:
+    """Same test as the save step: an amount other than 0, or a unit."""
+    return cfg.get("amount") not in (None, "", 0) or bool(cfg.get("unit"))
 
 
 def _steps_by_id(workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:

@@ -12,6 +12,7 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowPortfolioModel,
     PayflowStrategyModel,
+    PayflowStrategyVersionModel,
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
@@ -21,6 +22,11 @@ from app.shared.enums import (
     PayflowStrategySource,
     PayflowStrategyStatus,
 )
+
+
+def read_strategy_versions(db: Session, strategy: PayflowStrategyModel) -> list[dict[str, Any]]:
+    """Newest-first history for callers outside PayflowStrategyService (learning, suggest)."""
+    return PayflowStrategyService(db)._list_versions(strategy)
 
 STRATEGY_STEP_KINDS = [
     "Trigger",
@@ -315,6 +321,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         "action",
         "outcome",
         "note",
+        "review_reason",
         "template_id",
     ):
         if key in raw and raw[key] is not None and key not in cfg:
@@ -434,6 +441,19 @@ def _is_human_modified(row: PayflowStrategyModel, steps: list[dict]) -> bool:
     return any(s.get("origin") == PayflowStrategyOrigin.HUMAN_MODIFIED.value for s in steps)
 
 
+def _step_content(step: dict[str, Any]) -> dict[str, Any]:
+    """Everything a step holds except its origin marker (empty values ignored)."""
+    content = {key: value for key, value in step.items() if key != "origin" and value is not None}
+    content["config"] = {key: value for key, value in _cfg(step).items() if value is not None}
+    content["disabled"] = bool(step.get("disabled"))
+    return content
+
+
+def _steps_changed(before: list[dict], after: list[dict]) -> bool:
+    """True when the steps really differ — re-sending the same steps is not a change."""
+    return [_step_content(s) for s in before] != [_step_content(s) for s in after]
+
+
 def _row_source(row: PayflowStrategyModel) -> str:
     if row.source:
         return row.source
@@ -444,6 +464,11 @@ def _row_source(row: PayflowStrategyModel) -> str:
 
 def _awaiting_review(status: str) -> bool:
     return status in AWAITING_STATUSES
+
+
+def _clean_note(note: str | None) -> str | None:
+    """Optional reviewer note: trimmed, and blank means no note."""
+    return (note or "").strip() or None
 
 
 def _catalog() -> dict[str, Any]:
@@ -575,6 +600,23 @@ class PayflowStrategyService:
         if not self.access.can(user, "create_edit_workflows", client_id):
             raise ForbiddenError("Create / Edit Workflows permission required")
 
+    @staticmethod
+    def _version_row_to_dict(ver: PayflowStrategyVersionModel) -> dict[str, Any]:
+        return {
+            "id": ver.id,
+            "version": ver.version,
+            "date": ver.event_date,
+            "note": ver.note or "",
+            "status": ver.status,
+            "origin": ver.origin,
+            "approved_by": ver.approved_by,
+            "approval_date": ver.approval_date,
+            "reviewer_note": ver.reviewer_note,
+            "changes": list(ver.changes or []),
+            "steps": copy.deepcopy(list(ver.steps or [])) if ver.steps is not None else None,
+            "segment": copy.deepcopy(ver.segment) if ver.segment is not None else None,
+        }
+
     def _version_entry(
         self,
         *,
@@ -586,6 +628,7 @@ class PayflowStrategyService:
         changes: list[str] | None = None,
         status: str | None = None,
         origin: str | None = None,
+        reviewer_note: str | None = None,
     ) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "version": version,
@@ -593,6 +636,8 @@ class PayflowStrategyService:
             "note": note,
             "changes": list(changes or []),
         }
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
         if row is not None:
             entry["status"] = status or row.status
             entry["origin"] = origin or row.origin
@@ -611,10 +656,87 @@ class PayflowStrategyService:
                 entry["origin"] = origin
         return entry
 
+    def _migrate_legacy_versions(self, row: PayflowStrategyModel) -> None:
+        """One-time copy of JSON ``versions`` into payflow_strategy_versions."""
+        if not row.id:
+            return
+        existing = (
+            self.db.query(PayflowStrategyVersionModel.id)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .limit(1)
+            .first()
+        )
+        if existing:
+            return
+        legacy = list(row.versions or [])
+        if not legacy:
+            return
+        # Legacy list is newest-first; insert oldest-first so ids increase chronologically.
+        for entry in reversed(legacy):
+            if not isinstance(entry, dict):
+                continue
+            self.db.add(
+                PayflowStrategyVersionModel(
+                    strategy_id=row.id,
+                    version=int(entry.get("version") or row.version or 1),
+                    event_date=str(entry.get("date") or _stamp()),
+                    note=str(entry.get("note") or ""),
+                    status=entry.get("status"),
+                    origin=entry.get("origin"),
+                    approved_by=entry.get("approved_by"),
+                    approval_date=entry.get("approval_date"),
+                    reviewer_note=entry.get("reviewer_note"),
+                    changes=list(entry.get("changes") or []),
+                    steps=copy.deepcopy(entry.get("steps"))
+                    if entry.get("steps") is not None
+                    else None,
+                    segment=copy.deepcopy(entry.get("segment"))
+                    if entry.get("segment") is not None
+                    else None,
+                )
+            )
+        row.versions = []
+        self.db.flush()
+
+    def _list_versions(self, row: PayflowStrategyModel) -> list[dict[str, Any]]:
+        """Newest-first history from the immutable version table."""
+        self._migrate_legacy_versions(row)
+        rows = (
+            self.db.query(PayflowStrategyVersionModel)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .order_by(PayflowStrategyVersionModel.id.desc())
+            .all()
+        )
+        return [self._version_row_to_dict(v) for v in rows]
+
     def _prepend_version(self, row: PayflowStrategyModel, entry: dict[str, Any]) -> None:
-        versions = list(row.versions or [])
-        versions.insert(0, entry)
-        row.versions = versions
+        """Append an immutable history row (API still returns newest-first)."""
+        if not row.id:
+            self.db.flush()
+        self._migrate_legacy_versions(row)
+        self.db.add(
+            PayflowStrategyVersionModel(
+                strategy_id=row.id,
+                version=int(entry.get("version") or row.version or 1),
+                event_date=str(entry.get("date") or _stamp()),
+                note=str(entry.get("note") or ""),
+                status=entry.get("status"),
+                origin=entry.get("origin"),
+                approved_by=entry.get("approved_by"),
+                approval_date=entry.get("approval_date"),
+                reviewer_note=entry.get("reviewer_note"),
+                changes=list(entry.get("changes") or []),
+                steps=copy.deepcopy(entry.get("steps"))
+                if entry.get("steps") is not None
+                else None,
+                segment=copy.deepcopy(entry.get("segment"))
+                if entry.get("segment") is not None
+                else None,
+            )
+        )
+        # Stop growing the legacy JSON column.
+        if row.versions:
+            row.versions = []
 
     def _archive_current(self, row: PayflowStrategyModel, *, note: str, changes: list[str] | None = None) -> None:
         self._prepend_version(
@@ -656,7 +778,8 @@ class PayflowStrategyService:
             "stats": stats,
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
-            "versions": list(row.versions or []),
+            "revision_of_id": row.revision_of_id,
+            "versions": self._list_versions(row),
             "approved_by": row.approved_by,
             "approval_date": row.approval_date,
             "reviewed_by": row.reviewed_by,
@@ -729,7 +852,11 @@ class PayflowStrategyService:
         self._assert_view(user, row.client_id)
         return self._serialize(row)
 
-    def create_strategy(self, user: UserModel, payload: dict[str, Any]) -> dict[str, Any]:
+    def create_strategy(
+        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True
+    ) -> dict[str, Any]:
+        """commit=False only flushes and skips the notification: the caller saves several
+        workflows together, commits once, then calls notify_awaiting for each."""
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Strategy name is required")
@@ -826,29 +953,42 @@ class PayflowStrategyService:
             entry_node_id=entry_node_id,
             ai_context=ai_context,
             ai_proposal_snapshot=ai_snapshot,
-            versions=[
-                self._version_entry(
-                    version=1,
-                    note=(
-                        "Proposed by PayFlow AI"
-                        if ai_generated
-                        else f"Created by {user.full_name}"
-                    ),
-                    steps=steps,
-                    segment=segment,
-                    status=status,
-                    origin=origin,
-                )
-            ],
+            revision_of_id=payload.get("revision_of_id"),  # set by Regenerate only
+            versions=[],
             reviewed_by=None,
             created_by=user.full_name,
         )
         self.db.add(row)
+        self.db.flush()
+        self._prepend_version(
+            row,
+            self._version_entry(
+                version=1,
+                note=(
+                    "Proposed by PayFlow AI"
+                    if ai_generated
+                    else f"Created by {user.full_name}"
+                ),
+                steps=steps,
+                segment=segment,
+                status=status,
+                origin=origin,
+            ),
+        )
+        if not commit:
+            # Already flushed above so the row has an id and version history.
+            return self._serialize(self._get_row(row.id))
         self.db.commit()
         self.db.refresh(row)
         if row.status in AWAITING_STATUSES:
             self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
+
+    def notify_awaiting(self, user: UserModel, strategy_id: int) -> None:
+        """Notify reviewers about a saved workflow (for create_strategy(commit=False) callers)."""
+        row = self._get_row(strategy_id)
+        if row.status in AWAITING_STATUSES:
+            self._notify_awaiting(row, user)
 
     def begin_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
@@ -899,7 +1039,9 @@ class PayflowStrategyService:
             row.name = name
         if "summary" in payload:
             row.summary = (payload.get("summary") or "").strip() or None
+        segment_changed = False
         if "segment" in payload and payload["segment"] is not None:
+            segment_changed = payload["segment"] != (row.segment or {})
             row.segment = payload["segment"]
         if "entry_node_id" in payload:
             row.entry_node_id = payload.get("entry_node_id")
@@ -907,13 +1049,18 @@ class PayflowStrategyService:
             row.coverage = _coverage_value(payload, row.coverage)
 
         source = _row_source(row)
+        steps_changed = False
         if "steps" in payload and payload["steps"] is not None:
             default_origin = (
                 PayflowStrategyOrigin.HUMAN_MODIFIED.value
                 if source == PayflowStrategySource.AI_GENERATED.value
                 else PayflowStrategyOrigin.HUMAN_CREATED.value
             )
-            row.steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            new_steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            steps_changed = _steps_changed(before_steps, new_steps)
+            # Same steps sent back: keep the stored ones, so step origins are not re-stamped.
+            if steps_changed:
+                row.steps = new_steps
             if not row.entry_node_id and row.steps:
                 row.entry_node_id = row.steps[0].get("id")
 
@@ -935,27 +1082,33 @@ class PayflowStrategyService:
             }
 
         if source == PayflowStrategySource.AI_GENERATED.value:
-            row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
             row.source = PayflowStrategySource.AI_GENERATED.value
-        elif row.origin == PayflowStrategyOrigin.AI_PROPOSED.value:
+        # "Human Modified" only when what the workflow does changed: its steps or who it applies to.
+        # Name / summary edits do not count.
+        if (steps_changed or segment_changed) and (
+            source == PayflowStrategySource.AI_GENERATED.value
+            or row.origin == PayflowStrategyOrigin.AI_PROPOSED.value
+        ):
             row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
 
         if was_ai_proposed or row.status == PayflowStrategyStatus.AI_PROPOSED.value:
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
             row.reviewed_by = row.reviewed_by or user.full_name
 
-        if changes:
-            self._prepend_version(
-                row,
-                {
-                    "version": int(row.version or 1),
-                    "date": _stamp(),
-                    "note": f"Updated by {user.full_name}",
-                    "changes": changes,
-                    "status": row.status,
-                    "origin": row.origin,
-                },
-            )
+        # A reviewer note is kept even when no step changed (e.g. only the summary was edited).
+        note = _clean_note(payload.get("note"))
+        if changes or note:
+            entry = {
+                "version": int(row.version or 1),
+                "date": _stamp(),
+                "note": f"Updated by {user.full_name}",
+                "changes": changes,
+                "status": row.status,
+                "origin": row.origin,
+            }
+            if note:
+                entry["reviewer_note"] = note
+            self._prepend_version(row, entry)
 
         # Editing never activates
         if row.status == PayflowStrategyStatus.ACTIVE.value:
@@ -993,14 +1146,11 @@ class PayflowStrategyService:
                     "ai_context": copy.deepcopy(list(row.ai_context or [])),
                 }
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
-            row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
             row.source = PayflowStrategySource.AI_GENERATED.value
             row.reviewed_by = row.reviewed_by or user.full_name
         elif row.status == PayflowStrategyStatus.DRAFT.value:
             pass  # remain Draft
-        elif row.status == PayflowStrategyStatus.UNDER_REVIEW.value:
-            if _row_source(row) == PayflowStrategySource.AI_GENERATED.value:
-                row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
+        # Save Draft carries no edits, so it never marks "Human Modified" (update_strategy does).
 
         self._prepend_version(
             row,
@@ -1042,13 +1192,17 @@ class PayflowStrategyService:
         self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
 
-    def approve(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
+    def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
-        if row.status != PayflowStrategyStatus.UNDER_REVIEW.value:
+        # Reviewer can approve from AI Proposed or Under Review; Active still requires a separate activate.
+        if row.status not in {
+            PayflowStrategyStatus.AI_PROPOSED.value,
+            PayflowStrategyStatus.UNDER_REVIEW.value,
+        }:
             raise ValidationAppError(
-                "Only workflows Under Review can be approved "
-                "(AI Proposed workflows cannot bypass human review into Active)"
+                "Only AI Proposed or Under Review workflows can be approved "
+                "(approval does not activate — use Activate when ready)"
             )
 
         # Keep Human Modified if already modified; do not revert to AI Proposed
@@ -1065,14 +1219,15 @@ class PayflowStrategyService:
         row.approval_date = _stamp()
         row.reviewed_by = row.reviewed_by or user.full_name
         row.version = int(row.version or 1) + 1
-        self._prepend_version(
-            row,
-            self._version_entry(
-                version=row.version,
-                note=f"Approved by {user.full_name}",
-                row=row,
-            ),
+        entry = self._version_entry(
+            version=row.version,
+            note=f"Approved by {user.full_name}",
+            row=row,
         )
+        note = _clean_note(note)
+        if note:
+            entry["reviewer_note"] = note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
         self._mark_notifications_read(row)
@@ -1081,13 +1236,19 @@ class PayflowStrategyService:
     def reject(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        # Lovable: Reject / Request Regeneration is available for AI workflows in any
+        # reviewable state including Active (returns to AI Proposed for regeneration).
         if row.status not in {
+            PayflowStrategyStatus.DRAFT.value,
             PayflowStrategyStatus.UNDER_REVIEW.value,
             PayflowStrategyStatus.AI_PROPOSED.value,
             PayflowStrategyStatus.APPROVED.value,
+            PayflowStrategyStatus.ACTIVE.value,
+            PayflowStrategyStatus.INACTIVE.value,
         }:
             raise ValidationAppError("This workflow cannot be rejected in its current status")
 
+        was_active = row.status == PayflowStrategyStatus.ACTIVE.value
         source = _row_source(row)
         if source == PayflowStrategySource.AI_GENERATED.value:
             row.status = PayflowStrategyStatus.AI_PROPOSED.value
@@ -1102,24 +1263,42 @@ class PayflowStrategyService:
             row.origin = PayflowStrategyOrigin.HUMAN_CREATED.value
             row.source = PayflowStrategySource.HUMAN_CREATED.value
 
-        self._prepend_version(
-            row,
-            {
-                "version": int(row.version or 1),
-                "date": _stamp(),
-                "note": note or f"Rejected / regeneration requested by {user.full_name}",
-                "changes": [],
-                "status": row.status,
-                "origin": row.origin,
-            },
-        )
+        entry = {
+            "version": int(row.version or 1),
+            "date": _stamp(),
+            "note": note or f"Rejected / regeneration requested by {user.full_name}",
+            "changes": [],
+            "status": row.status,
+            "origin": row.origin,
+        }
+        # Same key as approve / update, so the AI can find the reviewer's reason.
+        reviewer_note = _clean_note(note)
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
+        # Rejecting an Active workflow must stop collection execution (AC1).
+        if was_active:
+            try:
+                from app.modules.payflow.services.workflow_execution_service import (
+                    WorkflowExecutionService,
+                )
+
+                WorkflowExecutionService(self.db).on_strategy_deactivated(row.id)
+            except Exception:  # noqa: BLE001
+                import logging
+
+                logging.getLogger("app.strategy").exception(
+                    "Failed to cancel runs after reject of active strategy_id=%s", row.id
+                )
         if row.status in AWAITING_STATUSES:
             self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
 
-    def activate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
+    def activate(
+        self, user: UserModel, strategy_id: int, *, note: str | None = None
+    ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
         if row.status in {
@@ -1140,19 +1319,33 @@ class PayflowStrategyService:
             raise ValidationAppError("Only an Approved workflow can become Active")
 
         row.status = PayflowStrategyStatus.ACTIVE.value
-        self._prepend_version(
-            row,
-            {
-                "version": int(row.version or 1),
-                "date": _stamp(),
-                "note": f"Activated by {user.full_name}",
-                "changes": [],
-                "status": row.status,
-                "origin": row.origin,
-            },
-        )
+        entry = {
+            "version": int(row.version or 1),
+            "date": _stamp(),
+            "note": f"Activated by {user.full_name}",
+            "changes": [],
+            "status": row.status,
+            "origin": row.origin,
+        }
+        reviewer_note = _clean_note(note)
+        if reviewer_note:
+            entry["reviewer_note"] = reviewer_note
+        self._prepend_version(row, entry)
         self.db.commit()
         self.db.refresh(row)
+        # Enqueue account enrollment for the workflow worker (PostgreSQL due-queue).
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_strategy_activated(row.id)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.strategy").exception(
+                "Failed to enqueue workflow enroll for strategy_id=%s", row.id
+            )
         return self._serialize(self._get_row(row.id))
 
     def deactivate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
@@ -1174,6 +1367,18 @@ class PayflowStrategyService:
         )
         self.db.commit()
         self.db.refresh(row)
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_strategy_deactivated(row.id)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("app.strategy").exception(
+                "Failed to cancel runs for deactivated strategy_id=%s", row.id
+            )
         return self._serialize(self._get_row(row.id))
 
     def delete_strategy(
@@ -1183,6 +1388,21 @@ class PayflowStrategyService:
             raise ForbiddenError("Operations Admin access required")
         row = self._get_row(strategy_id)
         snapshot = snapshot_model(row)
+        version_rows = (
+            self.db.query(PayflowStrategyVersionModel)
+            .filter(PayflowStrategyVersionModel.strategy_id == row.id)
+            .all()
+        )
+        related = [
+            {
+                "entity_type": "workflow_version",
+                "id": str(v.id),
+                "label": f"v{v.version}",
+            }
+            for v in version_rows
+        ]
+        for v in version_rows:
+            self.db.delete(v)
         record_deletion(
             self.db,
             actor=user,
@@ -1192,7 +1412,7 @@ class PayflowStrategyService:
             entity_label=row.name,
             source=source,
             record_snapshot=snapshot,
-            related_deleted=[],
+            related_deleted=related,
         )
         self.db.delete(row)
         self.db.commit()
@@ -1209,7 +1429,7 @@ class PayflowStrategyService:
                 strategy_name=row.name,
                 client_id=row.client_id,
                 actor_user_id=user.id,
-                send_mail=True,
+                send_mail=False,
             )
         except Exception:
             pass

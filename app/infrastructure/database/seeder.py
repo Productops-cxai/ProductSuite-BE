@@ -56,6 +56,9 @@ _PERMISSION_SEED: list[tuple[str, str, str, int]] = [
     ("create_edit_workflows", "Create / Edit Workflows", "collection_operations", 11),
     ("delete_workflows", "Delete Workflows", "collection_operations", 12),
     ("view_communications", "View Communications", "collection_operations", 13),
+    ("send_communications", "Send Communications", "collection_operations", 14),
+    ("view_operational_exceptions", "View Operational Exceptions", "collection_operations", 15),
+    ("manage_operational_exceptions", "Acknowledge / Resolve Exceptions", "collection_operations", 16),
     # Human review
     ("view_human_reviews", "View Human Reviews", "human_review", 20),
     ("approve_human_reviews", "Approve Human Reviews", "human_review", 21),
@@ -82,6 +85,9 @@ _SUPERVISOR_PERMISSION_CODES = [
     "view_collection_cases",
     "view_workflows",
     "view_communications",
+    "send_communications",
+    "view_operational_exceptions",
+    "manage_operational_exceptions",
     "view_human_reviews",
     "approve_human_reviews",
     "view_rules",
@@ -146,7 +152,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/review",
                 "access",
                 3,
-                True,  # disabled / coming soon — FE parked in _design_backup/payflow-ai-ops
+                False,
                 None,
                 "view_human_reviews",
             ),
@@ -173,7 +179,7 @@ _PAYFLOW_NAV: list[
                 "/payflow/comms",
                 "mail",
                 2,
-                True,  # disabled — FE redesign backup
+                False,
                 None,
                 "view_communications",
             ),
@@ -390,7 +396,24 @@ class DatabaseSeeder:
 
         log_items = [
             ("email_logs", "Email Logs", "/platform/email-logs", "mail", 1, False),
-            ("deletion_logs", "Deletion Logs", "/platform/deletion-logs", "billing", 2, False),
+            ("sms_logs", "SMS Logs", "/platform/sms-logs", "mail", 2, False),
+            (
+                "workflow_worker_logs",
+                "Workflow Worker Logs",
+                "/platform/worker-logs",
+                "document",
+                3,
+                False,
+            ),
+            ("deletion_logs", "Deletion Logs", "/platform/deletion-logs", "billing", 4, False),
+            (
+                "ai_suggest_jobs",
+                "AI Suggest Jobs",
+                "/platform/ai-suggest-jobs",
+                "document",
+                5,
+                False,
+            ),
         ]
         for key, label, route, icon, sort_order, soon in log_items:
             exists = (
@@ -601,6 +624,16 @@ class DatabaseSeeder:
         # Supervisor defaults only on first create — later Edit access must stick.
         if supervisor_created:
             ensure_role_perms(supervisor, _SUPERVISOR_PERMISSION_CODES)
+        else:
+            # Additive only for newly introduced permission codes (does not reset custom grants).
+            ensure_role_perms(
+                supervisor,
+                [
+                    "send_communications",
+                    "view_operational_exceptions",
+                    "manage_operational_exceptions",
+                ],
+            )
         db.flush()
 
     def _seed_payflow_menus(self, db: Session) -> None:
@@ -612,9 +645,10 @@ class DatabaseSeeder:
             "users",
             "dashboard",
             "workflows",
+            "review",
+            "comms",
         }
-        # Still parked until Communications / Human Review FE is restored.
-        parked_disabled_keys = {"review", "comms"}
+        parked_disabled_keys: set[str] = set()
         for section_key, label, sort_order, items in _PAYFLOW_NAV:
             section = (
                 db.query(NavigationSectionModel)
@@ -679,7 +713,7 @@ class DatabaseSeeder:
             db.query(NavigationItemModel)
             .join(NavigationSectionModel)
             .filter(
-                NavigationItemModel.key == "deletion_logs",
+                NavigationItemModel.key.in_(("deletion_logs", "worker_logs")),
                 NavigationSectionModel.product_code == "PAYFLOW",
             )
             .all()

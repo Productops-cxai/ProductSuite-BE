@@ -174,12 +174,86 @@ class PayflowCommStatus(str, Enum):
     AWAITING_GOVERNANCE = "Awaiting Governance"
     APPROVED = "Approved"
     SCHEDULED = "Scheduled"
+    QUEUED = "Queued"
     SENT = "Sent"
     DELIVERED = "Delivered"
     OPENED_READ = "Opened / Read"
     PAYMENT_LINK_CLICKED = "Payment Link Clicked"
     FAILED = "Failed"
     SUPPRESSED = "Suppressed"
+
+
+class PayflowOperationalExceptionType(str, Enum):
+    COMMUNICATION_FAILURE = "communication_failure"
+    WORKFLOW_EXECUTION_FAILURE = "workflow_execution_failure"
+    PAYMENT_PROCESSING_ISSUE = "payment_processing_issue"
+    PROCESSING_DISCREPANCY = "processing_discrepancy"
+
+
+class PayflowOperationalExceptionStatus(str, Enum):
+    OPEN = "Open"
+    ACKNOWLEDGED = "Acknowledged"
+    RESOLVED = "Resolved"
+
+
+class PayflowOperationalExceptionSeverity(str, Enum):
+    LOW = "Low"
+    MEDIUM = "Medium"
+    HIGH = "High"
+    CRITICAL = "Critical"
+
+
+class PayflowPaymentLinkStatus(str, Enum):
+    ACTIVE = "Active"
+    EXPIRED = "Expired"
+    REVOKED = "Revoked"
+    COMPLETED = "Completed"
+
+
+class PayflowPaymentOptionType(str, Enum):
+    PAY_IN_FULL = "pay_in_full"
+    PARTIAL = "partial"
+    PAYMENT_PLAN = "payment_plan"
+
+
+class PayflowPaymentAttemptStatus(str, Enum):
+    INITIATED = "Initiated"
+    PROCESSING = "Processing"
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+    EXPIRED = "Expired"
+
+
+class PayflowPaymentTxnStatus(str, Enum):
+    PENDING = "Pending"
+    SUCCEEDED = "Succeeded"
+    FAILED = "Failed"
+    CANCELLED = "Cancelled"
+    REFUNDED = "Refunded"
+    REVERSED = "Reversed"
+
+
+class PayflowPaymentTxnDirection(str, Enum):
+    PAYMENT = "payment"
+    REFUND = "refund"
+    REVERSAL = "reversal"
+
+
+class PayflowPaymentPlanStatus(str, Enum):
+    ACTIVE = "Active"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    OVERDUE = "Overdue"
+    DEFAULTED = "Defaulted"
+
+
+class PayflowPaymentInstallmentStatus(str, Enum):
+    PENDING = "Pending"
+    PAID = "Paid"
+    FAILED = "Failed"
+    OVERDUE = "Overdue"
+    WAIVED = "Waived"
 
 
 class PayflowCommPurpose(str, Enum):
@@ -194,11 +268,45 @@ class PayflowNotificationType(str, Enum):
     HUMAN_REVIEW_AWAITING = "human_review_awaiting"
     WORKFLOW_AWAITING_APPROVAL = "workflow_awaiting_approval"
     COMM_AWAITING_GOVERNANCE = "comm_awaiting_governance"
+    COMM_SENT = "comm_sent"
     INTEGRATION_CONNECTION_FAILED = "integration_connection_failed"
     SUPERVISOR_ASSIGNMENT = "supervisor_assignment"
     CLIENT_ACTIVATED = "client_activated"
     REVIEW_DECIDED = "review_decided"
     WORKFLOW_DECIDED = "workflow_decided"
+    WORKFLOW_STEP_FAILED = "workflow_step_failed"
+    WORKFLOW_RULE_BLOCKED = "workflow_rule_blocked"
+    WORKFLOW_RUN_SUPERSEDED = "workflow_run_superseded"
+    PROVIDER_SEND_FAILED = "provider_send_failed"
+    OPERATIONAL_EXCEPTION = "operational_exception"
+    # Customer payment portal / Stripe (or mock) outcomes
+    PAYMENT_RECEIVED = "payment_received"
+    PAYMENT_FAILED = "payment_failed"
+
+
+class PayflowWorkflowRunStatus(str, Enum):
+    ACTIVE = "Active"
+    WAITING = "Waiting"
+    PAUSED_HUMAN_REVIEW = "PausedHumanReview"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    FAILED = "Failed"
+    SUPERSEDED = "Superseded"
+
+
+class PayflowWorkflowJobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class PayflowWorkflowJobType(str, Enum):
+    ENROLL_STRATEGY = "enroll_strategy"
+    EXECUTE_STEP = "execute_step"
+    RESUME_RUN = "resume_run"
+    GAP_FILL = "gap_fill"
 
 
 class PayflowOnboardingStepStatus(str, Enum):

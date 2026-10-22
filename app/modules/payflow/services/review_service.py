@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
@@ -42,6 +42,74 @@ REVIEW_REASONS = [
     "Customer dispute raised",
     "Hardship signal detected",
 ]
+
+# Lovable: Review Reason is a fixed business catalog; Triggered Rule is separate.
+# Map governance rule category → catalog reason when a rule creates a review.
+_CATEGORY_TO_REVIEW_REASON = {
+    "Amount": "High balance treatment",
+    "Collection Attempts": "Repeated unsuccessful attempts",
+    "AI Confidence": "Low decision confidence",
+    "Promise-to-Pay": "Payment arrangement exception",
+    "Payment Plan": "Payment arrangement exception",
+    "Payment Status": "Payment arrangement exception",
+    "Payment Activity": "Payment arrangement exception",
+    "Customer Risk": "Customer dispute raised",
+    "Communication": "Repeated unsuccessful attempts",
+    "Workflow": "Payment arrangement exception",
+}
+
+_DEFAULT_REVIEW_REASON = "Payment arrangement exception"
+
+
+def reason_from_rule(rule: PayflowRuleModel | None) -> str:
+    """Resolve the Lovable catalog reason for a governance rule (not the rule name)."""
+    if rule is None:
+        return _DEFAULT_REVIEW_REASON
+    name = (rule.name or "").lower()
+    if "hardship" in name:
+        return "Hardship signal detected"
+    if "dispute" in name:
+        return "Customer dispute raised"
+    if "confidence" in name:
+        return "Low decision confidence"
+    if "balance" in name or "amount" in name or "high value" in name:
+        return "High balance treatment"
+    if "promise" in name or "arrangement" in name or "plan" in name:
+        return "Payment arrangement exception"
+    if "attempt" in name:
+        return "Repeated unsuccessful attempts"
+    cat = (rule.category or "").strip()
+    if cat in _CATEGORY_TO_REVIEW_REASON:
+        return _CATEGORY_TO_REVIEW_REASON[cat]
+    return _DEFAULT_REVIEW_REASON
+
+
+def normalize_review_reason(
+    reason: str | None, *, rule: PayflowRuleModel | None = None
+) -> str:
+    """
+    Coerce free-text / legacy reasons onto the Lovable REVIEW_REASONS catalog.
+    Rule name and workflow step titles (e.g. 'Human review') must not appear as reasons.
+    """
+    text = (reason or "").strip()
+    if text in REVIEW_REASONS:
+        return text
+    if rule is not None:
+        return reason_from_rule(rule)
+    low = text.lower()
+    if "hardship" in low:
+        return "Hardship signal detected"
+    if "dispute" in low:
+        return "Customer dispute raised"
+    if "confidence" in low:
+        return "Low decision confidence"
+    if "balance" in low or "amount" in low:
+        return "High balance treatment"
+    if "promise" in low or "arrangement" in low or "plan" in low:
+        return "Payment arrangement exception"
+    if "attempt" in low:
+        return "Repeated unsuccessful attempts"
+    return _DEFAULT_REVIEW_REASON
 
 REJECTION_REASONS = [
     "Not appropriate for customer context",
@@ -196,13 +264,8 @@ class PayflowReviewService:
         }
 
     def _next_code(self) -> str:
-        latest = (
-            self.db.query(PayflowHumanReviewModel)
-            .order_by(PayflowHumanReviewModel.id.desc())
-            .first()
-        )
-        n = (latest.id + 1) if latest else 1001
-        return f"rev-{n}"
+        """Temporary unique placeholder; replaced with rev-{id} after flush."""
+        return f"tmp-{uuid4().hex}"
 
     def _snapshot(self, row: PayflowHumanReviewModel) -> dict[str, Any]:
         return {
@@ -421,24 +484,142 @@ class PayflowReviewService:
             "paid_amount": float(account.paid_amount) if account.paid_amount is not None else None,
         }
 
+    def _resolve_exception_step(
+        self, strategy: PayflowStrategyModel | None, step_id: str | None
+    ) -> dict[str, Any] | None:
+        if not step_id:
+            return None
+        step_def: dict[str, Any] | None = None
+        if strategy and isinstance(strategy.steps, list):
+            for s in strategy.steps:
+                if isinstance(s, dict) and s.get("id") == step_id:
+                    step_def = s
+                    break
+        if step_def is None:
+            return {
+                "id": step_id,
+                "title": None,
+                "kind": None,
+                "available": False,
+                "message": "Exception step is unavailable in the current workflow definition",
+            }
+        return {
+            "id": step_id,
+            "title": step_def.get("title") or step_def.get("kind") or step_id,
+            "kind": step_def.get("kind"),
+            "available": True,
+            "message": None,
+        }
+
+    def _live_execution_summary(self, account_id: int | None) -> dict[str, Any] | None:
+        if not account_id:
+            return None
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            run = WorkflowExecutionService(self.db).get_account_workflow_execution(account_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if not run:
+            return None
+        current = run.get("current_step") or {}
+        return {
+            "run_id": run.get("id"),
+            "status": run.get("status"),
+            "strategy_id": run.get("strategy_id"),
+            "strategy_name": run.get("strategy_name"),
+            "strategy_version": run.get("strategy_version"),
+            "current_step_id": run.get("current_step_id"),
+            "current_step_title": current.get("title"),
+            "current_step_kind": current.get("kind"),
+            "next_step_id": run.get("next_step_id"),
+            "next_step_title": run.get("next_step_title"),
+            "next_scheduled_at": run.get("next_scheduled_at"),
+            "block_reason": run.get("block_reason") or run.get("last_error"),
+            "workflow_definition_path": run.get("workflow_definition_path"),
+        }
+
+    def _missing_refs(
+        self,
+        row: PayflowHumanReviewModel,
+        *,
+        client,
+        account,
+        rule,
+        strategy,
+        exception_step: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        missing: list[dict[str, str]] = []
+        if client is None:
+            missing.append(
+                {
+                    "ref": "client",
+                    "message": "Linked client is unavailable or was deleted",
+                }
+            )
+        if account is None:
+            missing.append(
+                {
+                    "ref": "account",
+                    "message": "Linked account / collection case is unavailable or was deleted",
+                }
+            )
+        if row.rule_id and rule is None:
+            missing.append(
+                {
+                    "ref": "rule",
+                    "message": "Triggering rule is unavailable or was deleted",
+                }
+            )
+        if row.strategy_id and strategy is None:
+            missing.append(
+                {
+                    "ref": "strategy",
+                    "message": "Linked workflow definition is unavailable or was deleted",
+                }
+            )
+        if row.exception_step_id and (
+            exception_step is None or not exception_step.get("available")
+        ):
+            missing.append(
+                {
+                    "ref": "exception_step",
+                    "message": "Exception step is missing from the workflow definition",
+                }
+            )
+        return missing
+
     def _workflow_context(self, row: PayflowHumanReviewModel) -> dict[str, Any]:
         account = row.account
         strategy = row.strategy
         if strategy is None and row.strategy_id:
             strategy = self.db.get(PayflowStrategyModel, row.strategy_id)
+        exception_step = self._resolve_exception_step(strategy, row.exception_step_id)
         return {
             "strategy_id": strategy.id if strategy else row.strategy_id,
-            "strategy_name": strategy.name if strategy else None,
+            "strategy_name": strategy.name
+            if strategy
+            else ("Workflow unavailable" if row.strategy_id else None),
             "strategy_code": strategy.code if strategy else None,
+            "strategy_available": strategy is not None,
             "workflow_version": row.workflow_version
             if row.workflow_version is not None
             else (strategy.version if strategy else None),
             "exception_step_id": row.exception_step_id,
-            "current_workflow": account.current_workflow if account else None,
+            "exception_step": exception_step,
+            "current_workflow": account.current_workflow
+            if account
+            else ("Case unavailable" if row.account_id else None),
             "collection_status": account.collection_status if account else None,
             "last_action": account.last_action if account else None,
             "next_action": account.next_action if account else None,
             "action_blocked": bool(account.human_review) if account else False,
+            "execution": self._live_execution_summary(row.account_id),
+            "workflow_definition_path": (
+                f"/payflow/workflows/{strategy.id}" if strategy else None
+            ),
         }
 
     def _serialize(
@@ -451,17 +632,33 @@ class PayflowReviewService:
         account = row.account
         client = row.client
         rule = row.rule
+        strategy = row.strategy
+        if strategy is None and row.strategy_id:
+            strategy = self.db.get(PayflowStrategyModel, row.strategy_id)
         waiting = self._waiting_minutes(row)
+        exception_step = self._resolve_exception_step(strategy, row.exception_step_id)
         data: dict[str, Any] = {
             "id": row.id,
             "code": row.code,
             "client_id": row.client_id,
             "client_code": client.code if client else None,
-            "client_name": client.name if client else None,
+            "client_name": client.name
+            if client
+            else ("Client unavailable" if row.client_id else None),
             "account_id": row.account_id,
-            "customer_name": account.customer_name if account else None,
-            "account_reference": account.account_reference if account else None,
+            "customer_name": account.customer_name
+            if account
+            else ("Customer unavailable" if row.account_id else None),
+            "account_reference": account.account_reference
+            if account
+            else ("Account unavailable" if row.account_id else None),
             "case_reference": account.case_reference if account else None,
+            "portfolio_id": account.portfolio_id if account else None,
+            "portfolio_name": (
+                account.portfolio.name
+                if account and getattr(account, "portfolio", None) is not None
+                else None
+            ),
             "original_balance": float(account.original_balance) if account else 0,
             "outstanding_balance": float(account.outstanding_balance) if account else 0,
             "recovered_balance": float(account.recovered_balance) if account else 0,
@@ -472,10 +669,13 @@ class PayflowReviewService:
             ),
             "current_workflow": account.current_workflow if account else None,
             "priority": row.priority,
-            "reason": row.reason,
+            # Display catalog reason even for legacy rows that stored rule/step titles.
+            "reason": normalize_review_reason(row.reason, rule=rule),
             "rule_id": row.rule_id,
             "rule_code": rule.code if rule else None,
-            "rule_name": rule.name if rule else None,
+            "rule_name": rule.name
+            if rule
+            else ("Rule unavailable" if row.rule_id else None),
             "condition_text": row.condition_text,
             "observed_value": row.observed_value,
             "proposed_action": row.proposed_action,
@@ -497,8 +697,11 @@ class PayflowReviewService:
             "history": list(row.history or []),
             "decision_version": row.decision_version or 1,
             "strategy_id": row.strategy_id,
-            "workflow_version": row.workflow_version,
+            "workflow_version": row.workflow_version
+            if row.workflow_version is not None
+            else (strategy.version if strategy else None),
             "exception_step_id": row.exception_step_id,
+            "exception_step": exception_step,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "audit_trail": [],
@@ -506,6 +709,7 @@ class PayflowReviewService:
             "payment_context": None,
             "workflow_context": None,
             "available_actions": [],
+            "missing_refs": [],
         }
         if user is not None:
             data["can_decide"] = self.can_decide(user, row.client_id)
@@ -515,7 +719,20 @@ class PayflowReviewService:
         if include_detail:
             data["payment_context"] = self._payment_context(account)
             data["workflow_context"] = self._workflow_context(row)
-            data["communications"] = self._load_communications(row.account_id)
+            # Prefer enriched exception_step from workflow_context
+            if data["workflow_context"].get("exception_step"):
+                data["exception_step"] = data["workflow_context"]["exception_step"]
+            data["communications"] = (
+                self._load_communications(row.account_id) if account else []
+            )
+            data["missing_refs"] = self._missing_refs(
+                row,
+                client=client,
+                account=account,
+                rule=rule,
+                strategy=strategy,
+                exception_step=data.get("exception_step"),
+            )
             audits = (
                 self.db.query(PayflowHumanReviewAuditModel)
                 .filter(PayflowHumanReviewAuditModel.review_id == row.id)
@@ -541,7 +758,7 @@ class PayflowReviewService:
     def _base_query(self):
         return self.db.query(PayflowHumanReviewModel).options(
             joinedload(PayflowHumanReviewModel.client),
-            joinedload(PayflowHumanReviewModel.account),
+            joinedload(PayflowHumanReviewModel.account).joinedload(PayflowAccountModel.portfolio),
             joinedload(PayflowHumanReviewModel.rule),
             joinedload(PayflowHumanReviewModel.strategy),
         )
@@ -605,6 +822,24 @@ class PayflowReviewService:
         self._assert_decision_version(row, decision_version)
         return row
 
+    def _resume_workflow_after_review(
+        self, review_id: int, *, continue_workflow: bool
+    ) -> None:
+        try:
+            from app.modules.payflow.services.workflow_execution_service import (
+                WorkflowExecutionService,
+            )
+
+            WorkflowExecutionService(self.db).on_human_review_decided(
+                review_id, continue_workflow=continue_workflow
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger("app.review").exception(
+                "Failed to resume workflow after review_id=%s", review_id
+            )
+
     def _mark_review_notifications_read(self, review_id: int) -> None:
         try:
             from app.modules.payflow.services.notification_service import (
@@ -617,13 +852,18 @@ class PayflowReviewService:
         except Exception:
             pass
 
-    def _notify_awaiting(self, row: PayflowHumanReviewModel) -> None:
+    def _notify_awaiting(
+        self, row: PayflowHumanReviewModel, *, force: bool = False
+    ) -> None:
         try:
             from app.modules.payflow.services.notification_service import (
                 PayflowNotificationService,
             )
 
-            PayflowNotificationService(self.db).notify_review_awaiting(row, send_mail=False)
+            # force=True for hold-release re-await; default dedupe stops inbox-poll spam.
+            PayflowNotificationService(self.db).notify_review_awaiting(
+                row, send_mail=False, dedupe=not force
+            )
         except Exception:
             pass
 
@@ -721,10 +961,7 @@ class PayflowReviewService:
         notify: bool = True,
         commit: bool = True,
     ) -> PayflowHumanReviewModel:
-        reason = (reason or "").strip()
         proposed_action = (proposed_action or "").strip()
-        if not reason:
-            raise ValidationAppError("Review reason is required")
         if not proposed_action:
             raise ValidationAppError("Proposed action is required")
         if priority not in {p.value for p in PayflowReviewPriority}:
@@ -763,6 +1000,11 @@ class PayflowReviewService:
                 raise ValidationAppError(
                     "Only rules with action 'Require Human Review' can create reviews"
                 )
+
+        # Catalog reason only — never store rule name or workflow step title as reason.
+        reason = normalize_review_reason(reason, rule=rule)
+        if not reason:
+            raise ValidationAppError("Review reason is required")
 
         strategy = self._resolve_strategy(account, strategy_id)
         assignee_id = _as_uuid(assigned_user_id)
@@ -834,6 +1076,8 @@ class PayflowReviewService:
         )
         self.db.add(row)
         self.db.flush()
+        # Stable unique code from PK — avoids rev-{id+1} colliding with older codes.
+        row.code = f"rev-{row.id}"
 
         self._block_account_for_review(account, proposed_action=proposed_action, stamp=stamp)
         if rule:
@@ -907,7 +1151,7 @@ class PayflowReviewService:
         reason: str = "High balance treatment",
         proposed_action: str = "Move to stronger collection treatment",
         priority: str = PayflowReviewPriority.NORMAL.value,
-        actor_name: str = "CRM import",
+        actor_name: str = "File upload",
         commit: bool = False,
     ) -> PayflowHumanReviewModel | None:
         """Create an open review when an account enters Human Review status."""
@@ -978,7 +1222,7 @@ class PayflowReviewService:
         return self.create_review(
             account_id=account_id,
             rule_id=rule.id,
-            reason=rule.name,
+            reason=reason_from_rule(rule),
             proposed_action=proposed_action
             or "Continue current treatment with adjusted communication",
             priority=priority,
@@ -1101,14 +1345,22 @@ class PayflowReviewService:
             q = q.filter(PayflowHumanReviewModel.status == status)
         if priority:
             q = q.filter(PayflowHumanReviewModel.priority == priority)
-        if reason:
-            q = q.filter(PayflowHumanReviewModel.reason == reason)
         if rule_id is not None:
             q = q.filter(PayflowHumanReviewModel.rule_id == rule_id)
         if proposed_action:
             q = q.filter(PayflowHumanReviewModel.proposed_action == proposed_action)
 
         rows = self._filter_permission_rows(user, q.all())
+
+        # Reason filter uses the Lovable catalog (including remapped legacy values).
+        if reason:
+            if reason not in REVIEW_REASONS:
+                raise ValidationAppError("Invalid reason filter")
+            rows = [
+                r
+                for r in rows
+                if normalize_review_reason(r.reason, rule=r.rule) == reason
+            ]
 
         if search:
             term = search.strip().lower()
@@ -1218,6 +1470,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def modify(
@@ -1282,6 +1535,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def reject(
@@ -1348,6 +1602,7 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
+        self._resume_workflow_after_review(row.id, continue_workflow=False)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def hold(
@@ -1476,7 +1731,7 @@ class PayflowReviewService:
         )
         self.db.commit()
         self.db.refresh(row)
-        self._notify_awaiting(self._get_row(row.id))
+        self._notify_awaiting(self._get_row(row.id), force=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def is_action_blocked(self, account_id: int) -> bool:

@@ -171,7 +171,43 @@ class PayflowRuleService:
         if not self.access.can(user, "view_rules", rule.client_id):
             raise ForbiddenError("Rule access denied")
 
-    def _serialize(self, row: PayflowRuleModel, user: UserModel | None = None) -> dict[str, Any]:
+    def _governance_usage_by_rule_name(self) -> dict[str, list[str]]:
+        """Map rule name → client names that selected it under governance_rules."""
+        usage: dict[str, list[str]] = {}
+        clients = self.db.query(PayflowClientModel).all()
+        for client in clients:
+            for rule_name in client.governance_rules or []:
+                if not rule_name or not client.name:
+                    continue
+                bucket = usage.setdefault(str(rule_name), [])
+                if client.name not in bucket:
+                    bucket.append(client.name)
+        for names in usage.values():
+            names.sort()
+        return usage
+
+    def _applied_to_names(
+        self,
+        row: PayflowRuleModel,
+        *,
+        governance_usage: dict[str, list[str]] | None = None,
+    ) -> list[str]:
+        """Client display names where this rule applies."""
+        if row.rule_type == PayflowRuleType.CLIENT.value or row.client_id is not None:
+            client = row.client
+            if client and client.name:
+                return [client.name]
+            return []
+        usage = governance_usage if governance_usage is not None else self._governance_usage_by_rule_name()
+        return list(usage.get(row.name or "", []))
+
+    def _serialize(
+        self,
+        row: PayflowRuleModel,
+        user: UserModel | None = None,
+        *,
+        governance_usage: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
         client = row.client
         conditions = list(row.conditions or [])
         data = {
@@ -191,7 +227,7 @@ class PayflowRuleService:
             "status": row.status,
             "created_by": row.created_by,
             "triggers_7d": row.triggers_7d or 0,
-            "applied_to": list(row.applied_to or []),
+            "applied_to": self._applied_to_names(row, governance_usage=governance_usage),
             "history": list(row.history or []),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
@@ -223,6 +259,8 @@ class PayflowRuleService:
                 | (PayflowRuleModel.client_id.in_(allowed))
             )
         if client_id is not None:
+            # This client's own rules + system rules assigned on the client (governance_rules).
+            # Do not return every system rule — only those selected for this client.
             q = q.filter(
                 (PayflowRuleModel.client_id == client_id)
                 | (PayflowRuleModel.client_id.is_(None))
@@ -237,6 +275,26 @@ class PayflowRuleService:
             q = q.filter(PayflowRuleModel.rule_type == rule_type)
 
         rows = q.order_by(PayflowRuleModel.name.asc()).all()
+        if client_id is not None:
+            client = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id == int(client_id))
+                .first()
+            )
+            assigned = {
+                str(name)
+                for name in (client.governance_rules or [])
+                if name
+            } if client is not None else set()
+            rows = [
+                r
+                for r in rows
+                if r.client_id == int(client_id)
+                or (
+                    (r.rule_type == PayflowRuleType.SYSTEM.value or r.client_id is None)
+                    and (r.name or "") in assigned
+                )
+            ]
         if not self.access.is_operations_admin(user):
             filtered = []
             for r in rows:
@@ -267,8 +325,11 @@ class PayflowRuleService:
             "client": sum(1 for r in rows if r.rule_type == PayflowRuleType.CLIENT.value),
             "triggers_7d": sum(r.triggers_7d or 0 for r in rows),
         }
+        governance_usage = self._governance_usage_by_rule_name()
         return {
-            "rules": [self._serialize(r, user) for r in rows],
+            "rules": [
+                self._serialize(r, user, governance_usage=governance_usage) for r in rows
+            ],
             "summary": summary,
             "can_create": can_create,
             **self.catalog(),
@@ -304,10 +365,45 @@ class PayflowRuleService:
         ]
         return data
 
-    def create_rule(self, user: UserModel, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validate_rule_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Rule name is required")
+        category = payload.get("category") or ""
+        if category not in RULE_CATEGORIES:
+            raise ValidationAppError("Invalid category")
+        action = payload.get("action") or ""
+        if action not in RULE_ACTIONS:
+            raise ValidationAppError("Invalid action")
+        logic = payload.get("logic") or PayflowRuleLogic.ALL.value
+        if logic not in {l.value for l in PayflowRuleLogic}:
+            raise ValidationAppError("Invalid logic")
+        conditions = payload.get("conditions") or []
+        if not isinstance(conditions, list) or not conditions:
+            raise ValidationAppError("At least one condition is required")
+        for c in conditions:
+            if not (c.get("field") and c.get("operator") and str(c.get("value", "")).strip()):
+                raise ValidationAppError("Each condition needs field, operator and value")
+        status = payload.get("status") or PayflowRuleStatus.DRAFT.value
+        if status not in {s.value for s in PayflowRuleStatus}:
+            raise ValidationAppError("Invalid status")
+        return {
+            "name": name,
+            "description": (payload.get("description") or "").strip() or None,
+            "category": category,
+            "action": action,
+            "logic": logic,
+            "conditions": conditions,
+            "status": status,
+        }
+
+    def create_rule(self, user: UserModel, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a rule, or update when payload includes ``id`` (same POST /rules)."""
+        rule_id = payload.get("id")
+        if rule_id is not None:
+            return self.update_rule(user, int(rule_id), payload)
+
+        fields = self._validate_rule_payload(payload)
         rule_type = payload.get("rule_type") or PayflowRuleType.CLIENT.value
         if rule_type not in {t.value for t in PayflowRuleType}:
             raise ValidationAppError("Invalid rule type")
@@ -329,27 +425,7 @@ class PayflowRuleService:
             if not client:
                 raise NotFoundError("Client not found")
 
-        category = payload.get("category") or ""
-        if category not in RULE_CATEGORIES:
-            raise ValidationAppError("Invalid category")
-        action = payload.get("action") or ""
-        if action not in RULE_ACTIONS:
-            raise ValidationAppError("Invalid action")
-        logic = payload.get("logic") or PayflowRuleLogic.ALL.value
-        if logic not in {l.value for l in PayflowRuleLogic}:
-            raise ValidationAppError("Invalid logic")
-        conditions = payload.get("conditions") or []
-        if not isinstance(conditions, list) or not conditions:
-            raise ValidationAppError("At least one condition is required")
-        for c in conditions:
-            if not (c.get("field") and c.get("operator") and str(c.get("value", "")).strip()):
-                raise ValidationAppError("Each condition needs field, operator and value")
-
-        status = payload.get("status") or PayflowRuleStatus.DRAFT.value
-        if status not in {s.value for s in PayflowRuleStatus}:
-            raise ValidationAppError("Invalid status")
-
-        code = self._unique_code(_slugify(name))
+        code = self._unique_code(_slugify(fields["name"]))
         applied_to: list[str] = []
         if client_id is not None:
             client = (
@@ -357,27 +433,31 @@ class PayflowRuleService:
                 .filter(PayflowClientModel.id == int(client_id))
                 .first()
             )
-            if client:
-                applied_to = [client.code]
+            if client and client.name:
+                applied_to = [client.name]
 
         row = PayflowRuleModel(
             code=code,
-            name=name,
-            description=(payload.get("description") or "").strip() or None,
+            name=fields["name"],
+            description=fields["description"],
             rule_type=rule_type,
             client_id=int(client_id) if client_id is not None else None,
-            category=category,
-            logic=logic,
-            conditions=conditions,
-            action=action,
-            status=status,
+            category=fields["category"],
+            logic=fields["logic"],
+            conditions=fields["conditions"],
+            action=fields["action"],
+            status=fields["status"],
             created_by=user.full_name,
             triggers_7d=0,
             applied_to=applied_to,
             history=[
                 {
                     "at": _stamp_date(),
-                    "change": "Rule activated" if status == PayflowRuleStatus.ACTIVE.value else "Draft created",
+                    "change": (
+                        "Rule activated"
+                        if fields["status"] == PayflowRuleStatus.ACTIVE.value
+                        else "Draft created"
+                    ),
                     "by": user.full_name,
                 }
             ],
@@ -385,6 +465,56 @@ class PayflowRuleService:
         self.db.add(row)
         self.db.commit()
         self.db.refresh(row)
+        if row.status == PayflowRuleStatus.ACTIVE.value:
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
+        return self._serialize(row, user)
+
+    def update_rule(
+        self, user: UserModel, rule_id: int, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = self._get_row(rule_id)
+        if not self.can_edit_rule(user, row):
+            raise ForbiddenError("Create / Edit Client Rules permission required")
+
+        fields = self._validate_rule_payload(payload)
+        prev_status = row.status
+
+        # Client / system ownership stays on the existing rule (not reassigned via edit).
+        row.name = fields["name"]
+        row.description = fields["description"]
+        row.category = fields["category"]
+        row.logic = fields["logic"]
+        row.conditions = fields["conditions"]
+        row.action = fields["action"]
+        row.status = fields["status"]
+
+        if row.client_id is not None:
+            client = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id == row.client_id)
+                .first()
+            )
+            row.applied_to = [client.name] if client and client.name else list(row.applied_to or [])
+
+        history = list(row.history or [])
+        if prev_status != fields["status"]:
+            if fields["status"] == PayflowRuleStatus.ACTIVE.value:
+                change = "Rule activated"
+            elif fields["status"] == PayflowRuleStatus.INACTIVE.value:
+                change = "Rule deactivated"
+            else:
+                change = f"Status set to {fields['status']}"
+        else:
+            change = "Rule updated"
+        history.append({"at": _stamp_date(), "change": change, "by": user.full_name})
+        row.history = history
+
+        self.db.commit()
+        self.db.refresh(row)
+        # Re-scan on save while Active so condition edits (and prior failed
+        # matches) pick up existing accounts. No-op unless action is RHR.
+        if row.status == PayflowRuleStatus.ACTIVE.value:
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
     def activate(self, user: UserModel, rule_id: int) -> dict[str, Any]:
@@ -392,6 +522,8 @@ class PayflowRuleService:
         if not self.can_edit_rule(user, row):
             raise ForbiddenError("Create / Edit Client Rules permission required")
         if row.status == PayflowRuleStatus.ACTIVE.value:
+            # Idempotent re-scan: recovers accounts that should already have been queued.
+            self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
             return self._serialize(row, user)
         row.status = PayflowRuleStatus.ACTIVE.value
         history = list(row.history or [])
@@ -399,6 +531,7 @@ class PayflowRuleService:
         row.history = history
         self.db.commit()
         self.db.refresh(row)
+        self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)
         return self._serialize(row, user)
 
     def deactivate(self, user: UserModel, rule_id: int) -> dict[str, Any]:
@@ -443,6 +576,55 @@ class PayflowRuleService:
         self.db.delete(row)
         self.db.commit()
         return {"message": "Rule deleted"}
+
+    def _enqueue_retroactive_human_reviews(
+        self, rule: PayflowRuleModel, *, actor_name: str
+    ) -> int:
+        """
+        When a Require Human Review rule becomes Active, scan existing accounts now
+        (not only on the next workflow step). Same rule+account open reviews are skipped.
+        Does not change the worker step-time path.
+        """
+        if rule.status != PayflowRuleStatus.ACTIVE.value:
+            return 0
+        if rule.action != "Require Human Review":
+            return 0
+
+        from app.modules.payflow.services.review_service import (
+            OPEN_STATUSES,
+            PayflowReviewService,
+        )
+        from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
+
+        runtime = RuleRuntimeService(self.db)
+        review_svc = PayflowReviewService(self.db)
+        created = 0
+        for account in runtime.candidate_accounts_for_rule(rule):
+            if not runtime.matches_rule(rule, account):
+                continue
+            already_open = (
+                self.db.query(PayflowHumanReviewModel)
+                .filter(
+                    PayflowHumanReviewModel.account_id == account.id,
+                    PayflowHumanReviewModel.rule_id == rule.id,
+                    PayflowHumanReviewModel.status.in_(list(OPEN_STATUSES)),
+                )
+                .first()
+            )
+            if already_open:
+                continue
+            review_svc.enqueue_from_rule(
+                account_id=account.id,
+                rule_id=rule.id,
+                observed_value=f"${float(account.outstanding_balance or 0):,.2f} outstanding",
+                actor_name=actor_name or "Rule activation scan",
+                commit=False,
+                notify=False,
+            )
+            created += 1
+        if created:
+            self.db.commit()
+        return created
 
     def _get_row(self, rule_id: int) -> PayflowRuleModel:
         row = (

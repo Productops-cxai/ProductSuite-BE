@@ -192,6 +192,84 @@ class EmailLogResponse(BaseModel):
     created_at: datetime
 
 
+class SmsLogResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    to_phone: str
+    body: str
+    sms_type: str
+    status: str
+    provider_id: Optional[str] = None
+    error: Optional[str] = None
+    account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    run_id: Optional[int] = None
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
+    created_at: datetime
+
+
+class AiSuggestRequeueResponse(BaseModel):
+    enqueued: int
+    job_ids: List[int] = []
+
+
+class AiSuggestJobResponse(BaseModel):
+    id: int
+    client_id: int
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
+    portfolio_id: int
+    portfolio_name: Optional[str] = None
+    portfolio_code: Optional[str] = None
+    trigger: str
+    status: str
+    skip_reason: Optional[str] = None
+    error_message: Optional[str] = None
+    requested_by_user_id: Optional[str] = None
+    import_run_id: Optional[int] = None
+    workflows_created: int = 0
+    workflow_ids: list[int] = []
+    segments_count: Optional[int] = None
+    batches_count: Optional[int] = None
+    groq_calls: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
+    created_at: datetime
+
+
+class WorkflowWorkerLogResponse(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: str
+    detail: Optional[str] = None
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    client_code: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
+    portfolio_code: Optional[str] = None
+    account_id: Optional[int] = None
+    account_reference: Optional[str] = None
+    customer_name: Optional[str] = None
+    strategy_id: Optional[int] = None
+    strategy_name: Optional[str] = None
+    strategy_code: Optional[str] = None
+    run_id: Optional[int] = None
+    job_id: Optional[int] = None
+    step_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    event_count: Optional[int] = 1
+    group_key: Optional[str] = None
+    step_summary: Optional[str] = None
+    related_events: Optional[List["WorkflowWorkerLogResponse"]] = None
+
+
 class InviteResendResponse(BaseModel):
     message: str = "Invitation sent"
     activation_link: Optional[str] = None

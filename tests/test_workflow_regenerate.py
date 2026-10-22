@@ -92,18 +92,74 @@ def test_regenerate_gives_up_and_saves_nothing(db_session, admin, ai_workflow):
     assert db_session.query(PayflowStrategyModel).count() == count
 
 
+def test_regenerate_sends_review_history_to_the_ai(db_session, admin, ai_workflow):
+    """Edits (what changed + why) and reject notes reach the AI prompt."""
+    strategies = PayflowStrategyService(db_session)
+    steps = copy.deepcopy(ai_workflow["steps"])
+    steps[2]["config"]["amount"] = 7  # s3: wait 7 days instead of 3
+    steps[2]["timing"] = None
+    strategies.update_strategy(admin, ai_workflow["id"], {"steps": steps, "note": "SMS was too early"})
+    strategies.reject(admin, ai_workflow["id"], note="Too aggressive for this segment")
+
+    _, calls = regenerate(db_session, admin, ai_workflow["id"])
+    prompt = calls[0][1]["content"]
+    assert "Review history (oldest first)" in prompt
+    assert "timing changed from 3 Days After Previous Email to 7 Days After Previous Email" in prompt
+    assert "Reason: SMS was too early" in prompt
+    assert "- Rejected. Reason: Too aggressive for this segment" in prompt
+    assert prompt.index("Review history") < prompt.index("Reviewer remarks")
+
+
+def test_regenerate_follows_the_chain_back_for_feedback(db_session, admin, ai_workflow):
+    """#1 rejected with a note → regenerate → #2 → regenerate #2: the AI still sees #1's note."""
+    PayflowStrategyService(db_session).reject(admin, ai_workflow["id"], note="Too aggressive for this segment")
+    second, _ = regenerate(db_session, admin, ai_workflow["id"])
+    assert second["revision_of_id"] == ai_workflow["id"]
+
+    third, calls = regenerate(db_session, admin, second["id"])
+    assert third["revision_of_id"] == second["id"]
+    assert "- Rejected. Reason: Too aggressive for this segment" in calls[0][1]["content"]
+
+
+def test_regenerate_works_when_the_parent_was_deleted(db_session, admin, ai_workflow):
+    second, _ = regenerate(db_session, admin, ai_workflow["id"])
+    PayflowStrategyService(db_session).delete_strategy(admin, ai_workflow["id"])
+    third, calls = regenerate(db_session, admin, second["id"])
+    assert third["revision_of_id"] == second["id"] and len(calls) == 1
+
+
+def test_feedback_from_another_client_is_never_used(db_session, admin, portfolio, ai_workflow):  # noqa: F811
+    other = PayflowStrategyModel(
+        code="other-client-workflow",
+        name="Other client workflow",
+        client_id=portfolio["other_id"],
+        status="AI Proposed",
+        origin="AI Proposed",
+        source="AI Generated",
+        versions=[{"version": 1, "date": "x", "note": "Other secret", "changes": [], "reviewer_note": "Other secret"}],
+    )
+    db_session.add(other)
+    db_session.commit()
+    db_session.get(PayflowStrategyModel, ai_workflow["id"]).revision_of_id = other.id
+    db_session.commit()
+
+    _, calls = regenerate(db_session, admin, ai_workflow["id"])
+    assert "Other secret" not in calls[0][1]["content"]
+
+
 def test_under_review_can_be_regenerated(db_session, admin, ai_workflow):
     PayflowStrategyService(db_session).begin_review(admin, ai_workflow["id"])
     new, _ = regenerate(db_session, admin, ai_workflow["id"])
     assert new["status"] == "AI Proposed"
 
 
-def test_approved_cannot_be_regenerated(db_session, admin, ai_workflow):
+def test_approved_can_be_regenerated(db_session, admin, ai_workflow):
     strategies = PayflowStrategyService(db_session)
     strategies.begin_review(admin, ai_workflow["id"])
     strategies.approve(admin, ai_workflow["id"])
-    with pytest.raises(ValidationAppError, match="Only AI Proposed or Under Review"):
-        regenerate(db_session, admin, ai_workflow["id"])
+    new, _ = regenerate(db_session, admin, ai_workflow["id"])
+    assert new["status"] == "AI Proposed"
+    assert new["id"] != ai_workflow["id"]
 
 
 def test_human_workflow_cannot_be_regenerated(db_session, admin, portfolio):  # noqa: F811
@@ -173,6 +229,7 @@ def test_api_regenerate(client, admin_token, ai_workflow):
     body = response.json()
     assert body["id"] != ai_workflow["id"] and body["status"] == "AI Proposed"
     assert context(body)["Revision of"].startswith(f"#{ai_workflow['id']} ")
+    assert body["revision_of_id"] == ai_workflow["id"]
     assert len(calls) == 1
 
 
@@ -180,13 +237,41 @@ def test_api_remarks_required(client, admin_token, ai_workflow):
     assert _post(client, admin_token, ai_workflow["id"], remarks="   ").status_code == 422
 
 
-def test_api_approved_workflow_is_refused(client, admin_token, admin, db_session, ai_workflow):
+def test_api_approved_workflow_can_be_regenerated(client, admin_token, admin, db_session, ai_workflow):
     strategies = PayflowStrategyService(db_session)
     strategies.begin_review(admin, ai_workflow["id"])
     strategies.approve(admin, ai_workflow["id"])
-    response = _post(client, admin_token, ai_workflow["id"])
+    call, _ = fake_llm()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        response = _post(client, admin_token, ai_workflow["id"])
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["status"] == "AI Proposed"
+    assert body["id"] != ai_workflow["id"]
+
+
+def test_api_workflow_without_portfolio_is_refused(client, admin_token, db_session, portfolio):  # noqa: F811
+    """Old workflows (before the rework) may have no portfolio — refused before the AI is called."""
+    old = PayflowStrategyModel(
+        code="old-ai-workflow",
+        name="Old AI workflow",
+        client_id=portfolio["client_id"],
+        portfolio_id=None,
+        status="AI Proposed",
+        origin="AI Proposed",
+        source="AI Generated",
+        steps=load_examples()[0]["steps"],
+        entry_node_id="s1",
+    )
+    db_session.add(old)
+    db_session.commit()
+    count = db_session.query(PayflowStrategyModel).count()
+    with patch.object(suggestion_service, "call_llm") as call:
+        response = _post(client, admin_token, old.id)
     assert response.status_code == 400
-    assert response.json()["detail"] == "Only AI Proposed or Under Review workflows can be regenerated"
+    assert response.json()["detail"] == "This workflow has no portfolio, so it cannot be regenerated"
+    call.assert_not_called()
+    assert db_session.query(PayflowStrategyModel).count() == count
 
 
 def test_api_needs_workflow_permission(client, supervisor_token, ai_workflow):  # noqa: F811
