@@ -25,6 +25,15 @@ class SecretsCryptoError(RuntimeError):
     pass
 
 
+def _pad_urlsafe_b64(raw: str) -> bytes:
+    """Accept url-safe base64 with or without ``=`` padding (WinForms may omit it)."""
+    s = (raw or "").strip().encode("ascii")
+    pad = (4 - (len(s) % 4)) % 4
+    if pad:
+        s = s + (b"=" * pad)
+    return s
+
+
 def _fernet_from_env() -> Fernet:
     raw = (os.environ.get(MASTER_KEY_ENV) or "").strip()
     if not raw:
@@ -33,7 +42,7 @@ def _fernet_from_env() -> Fernet:
             "(do not put the master key inside the encrypted .env file)."
         )
     try:
-        return Fernet(raw.encode("ascii") if not isinstance(raw, bytes) else raw)
+        return Fernet(_pad_urlsafe_b64(raw))
     except Exception as exc:  # noqa: BLE001 — invalid key shape
         raise SecretsCryptoError(f"Invalid {MASTER_KEY_ENV}: {exc}") from exc
 
@@ -44,13 +53,13 @@ def decrypt_value(value: str, *, master_key: str | None = None) -> str:
         return value
     if not isinstance(value, str) or not value.startswith(ENC_PREFIX):
         return value
-    token = value[len(ENC_PREFIX) :]
+    token = _pad_urlsafe_b64(value[len(ENC_PREFIX) :])
     if master_key:
-        f = Fernet(master_key.encode("ascii"))
+        f = Fernet(_pad_urlsafe_b64(master_key))
     else:
         f = _fernet_from_env()
     try:
-        return f.decrypt(token.encode("ascii")).decode("utf-8")
+        return f.decrypt(token).decode("utf-8")
     except InvalidToken as exc:
         raise SecretsCryptoError(
             "Failed to decrypt an enc: value — wrong ENV_MASTER_KEY or corrupt token."
