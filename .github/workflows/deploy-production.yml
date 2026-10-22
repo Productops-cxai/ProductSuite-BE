@@ -1,0 +1,43 @@
+# Deploy BE: push to main → SSH EC2 → git pull → pip install → restart systemd.
+# Required GitHub secrets (repo Settings → Secrets → Actions):
+#   EC2_HOST          e.g. 35.183.138.117
+#   EC2_USER          ubuntu
+#   EC2_SSH_KEY       contents of payflow-prod.pem (private key)
+#
+# .env.production and ENV_MASTER_KEY stay on the server (never in git).
+
+name: Deploy BE (production)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-be-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /var/www/payflow/api
+            git fetch origin
+            git checkout main
+            git pull --ff-only origin main
+            source venv/bin/activate
+            pip install -r requirements.txt
+            sudo systemctl restart payflow-api payflow-worker
+            sleep 2
+            curl -fsS http://127.0.0.1:8000/health
+            echo
+            echo "BE deployed OK"

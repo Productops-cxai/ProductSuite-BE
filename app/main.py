@@ -24,6 +24,8 @@ from app.modules.platform.routes import router as platform_router
 
 logger = logging.getLogger("uvicorn.error")
 
+_IS_PROD = (settings.APP_ENV or "").strip().lower() == "production"
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -49,8 +51,12 @@ app = FastAPI(
     ),
     version="0.1.0",
     lifespan=lifespan,
-    swagger_ui_parameters={"persistAuthorization": True},
-    openapi_tags=OPENAPI_TAGS,
+    # Production: hide /docs, /redoc, /openapi.json
+    docs_url=None if _IS_PROD else "/docs",
+    redoc_url=None if _IS_PROD else "/redoc",
+    openapi_url=None if _IS_PROD else "/openapi.json",
+    swagger_ui_parameters=None if _IS_PROD else {"persistAuthorization": True},
+    openapi_tags=None if _IS_PROD else OPENAPI_TAGS,
 )
 
 _cors_origins = settings.cors_allow_origins()
@@ -96,19 +102,20 @@ def health_check():
     return {"status": "ok", "app": settings.APP_NAME}
 
 
-def custom_openapi():
-    """Regroup operations into Auth / Platform / PayFlow sections without changing paths."""
-    if app.openapi_schema:
+if not _IS_PROD:
+
+    def custom_openapi():
+        """Regroup operations into Auth / Platform / PayFlow sections without changing paths."""
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+            tags=OPENAPI_TAGS,
+        )
+        app.openapi_schema = apply_openapi_tags(schema)
         return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-        tags=OPENAPI_TAGS,
-    )
-    app.openapi_schema = apply_openapi_tags(schema)
-    return app.openapi_schema
 
-
-app.openapi = custom_openapi
+    app.openapi = custom_openapi
