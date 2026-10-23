@@ -456,6 +456,13 @@ class PayflowCommunicationService:
             "delivered_at": row.delivered_at,
             "opens_count": int(row.opens_count or 0),
             "clicks_count": int(row.clicks_count or 0),
+            # How many times customer was sent to checkout.stripe.com (Pay Now → Stripe).
+            "stripe_checkout_opens_count": sum(
+                1
+                for ev in list(row.events or [])
+                if isinstance(ev, dict)
+                and str(ev.get("label") or "").strip().lower() == "stripe checkout opened"
+            ),
             "first_opened_at": row.first_opened_at,
             "last_opened_at": row.last_opened_at,
             "first_clicked_at": row.first_clicked_at,
@@ -1058,11 +1065,15 @@ class PayflowCommunicationService:
         Separate from Stripe/provider "Payment Link Opened".
         Does NOT touch opens_count (email open = provider open only).
         """
-        row = self.db.get(PayflowCommunicationModel, communication_id)
+        row = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(PayflowCommunicationModel.id == communication_id)
+            .with_for_update()
+            .first()
+        )
         if not row:
             return
-        # Only skip identical Click fired twice in the same request burst (remount).
-        # Does NOT suppress Stripe Payment Link Opened, and a later real click counts again.
+        # Skip identical Click in the same remount burst (race-safe under row lock).
         if self._same_label_within(row, label="Click", within_seconds=3):
             return
         now = _utcnow()
@@ -1290,33 +1301,64 @@ class PayflowCommunicationService:
         account_id: int,
         *,
         event: str,
+        communication_id: int | None = None,
+        detail: str | None = None,
         commit: bool = True,
     ) -> None:
-        """Attach payment initiated/completed to the latest payment-link communication."""
-        row = (
-            self.db.query(PayflowCommunicationModel)
-            .filter(
-                PayflowCommunicationModel.account_id == account_id,
-                PayflowCommunicationModel.payment_link.is_(True),
+        """
+        Attach payment initiated/completed to the originating communication.
+
+        Prefer explicit communication_id (from payment link). Fallback: latest
+        payment-link email/SMS for the account.
+        """
+        row: PayflowCommunicationModel | None = None
+        if communication_id:
+            row = self.db.get(PayflowCommunicationModel, communication_id)
+            if row and row.account_id != account_id:
+                row = None
+        if row is None:
+            row = (
+                self.db.query(PayflowCommunicationModel)
+                .filter(
+                    PayflowCommunicationModel.account_id == account_id,
+                    PayflowCommunicationModel.payment_link.is_(True),
+                )
+                .order_by(PayflowCommunicationModel.id.desc())
+                .first()
             )
-            .order_by(PayflowCommunicationModel.id.desc())
-            .first()
-        )
         if not row:
             return
         if event == "initiated":
-            if row.payment_initiated:
-                # Idempotent — do not append a second "Payment Initiated" timeline row.
+            # Stripe Checkout session created → customer is on checkout.stripe.com.
+            # Always record "Stripe Checkout Opened" (user's Stripe-side signal).
+            # payment_initiated stays sticky once true.
+            already = bool(row.payment_initiated)
+            row.payment_initiated = True
+            if not self._same_label_within(row, label="Stripe Checkout Opened", within_seconds=3):
+                self._record_event_row(
+                    row,
+                    event_type="stripe_checkout_opened",
+                    label="Stripe Checkout Opened",
+                    detail=detail or "Customer opened Stripe Checkout",
+                )
+            if already and not detail:
                 if commit:
                     self.db.commit()
                 else:
                     self.db.flush()
                 return
-            row.payment_initiated = True
-            self._record_event_row(row, event_type="payment_initiated", label="Payment Initiated")
+            if not already and not self._same_label_within(
+                row, label="Payment Initiated", within_seconds=3
+            ):
+                # Keep legacy label once for ops that filter on it.
+                self._record_event_row(
+                    row,
+                    event_type="payment_initiated",
+                    label="Payment Initiated",
+                    detail=detail,
+                )
         elif event == "completed":
             if row.payment_completed:
-                # Idempotent — prevents duplicate "Payment Completed" from Stripe + workflow paths.
                 if commit:
                     self.db.commit()
                 else:
@@ -1325,9 +1367,6 @@ class PayflowCommunicationService:
             row.payment_initiated = True
             row.payment_completed = True
             self._record_event_row(row, event_type="payment_completed", label="Payment Completed")
-            # Do NOT auto-complete all payment links here — partial / plan first
-            # instalments must keep Active links. Full settlement completes links
-            # in payment_portal_service.apply_succeeded when balance hits zero.
         if commit:
             self.db.commit()
         else:

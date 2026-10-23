@@ -614,6 +614,24 @@ class PayflowPaymentPortalService:
             .first()
         )
         if recent and recent.checkout_url:
+            # Reused open checkout — still stamp Stripe Checkout Opened on the comm
+            # (previous attempt may have skipped mark if communication lookup failed).
+            try:
+                from app.modules.payflow.services.communication_service import (
+                    PayflowCommunicationService,
+                )
+
+                PayflowCommunicationService(self.db).mark_payment_event(
+                    account.id,
+                    event="initiated",
+                    communication_id=row.communication_id,
+                    detail=f"Stripe Checkout · {recent.stripe_session_id or recent.public_id[:12]}",
+                    commit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "mark stripe checkout opened failed (reuse) account_id=%s", account.id
+                )
             return self.serialize_attempt(recent)
 
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
@@ -730,8 +748,17 @@ class PayflowPaymentPortalService:
                 PayflowCommunicationService,
             )
 
+            # Wire Stripe Checkout open onto the originating email/SMS (not just portal Click).
             PayflowCommunicationService(self.db).mark_payment_event(
-                account.id, event="initiated", commit=False
+                account.id,
+                event="initiated",
+                communication_id=row.communication_id,
+                detail=(
+                    f"Stripe Checkout · {attempt.stripe_session_id or attempt.public_id[:12]}"
+                    if use_stripe
+                    else f"Mock checkout · {attempt.public_id[:12]}"
+                ),
+                commit=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("mark payment initiated failed account_id=%s", account.id)
