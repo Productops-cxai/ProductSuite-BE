@@ -28,11 +28,21 @@ def process_job(job_id: int) -> None:
         elif job_type == PayflowWorkflowJobType.EXECUTE_STEP.value:
             if not job.run_id or not job.step_id:
                 raise ValueError("execute_step missing run_id/step_id")
-            svc.execute_step(job.run_id, job.step_id, job_id=job.id)
+            svc.execute_step(
+                job.run_id,
+                job.step_id,
+                job_id=job.id,
+                after_human_review=bool((job.payload or {}).get("after_human_review")),
+            )
         elif job_type == PayflowWorkflowJobType.RESUME_RUN.value:
             if not job.run_id:
                 raise ValueError("resume_run missing run_id")
-            svc.resume_run(job.run_id, from_step_id=job.step_id, job_id=job.id)
+            svc.resume_run(
+                job.run_id,
+                from_step_id=job.step_id,
+                job_id=job.id,
+                after_human_review=bool((job.payload or {}).get("after_human_review")),
+            )
         elif job_type == PayflowWorkflowJobType.GAP_FILL.value:
             svc.gap_fill_active_strategies()
         else:

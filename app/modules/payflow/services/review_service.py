@@ -1040,14 +1040,25 @@ class PayflowReviewService:
         # Ensure client relationship is available for notifications / serialization.
         _ = account.client
 
-        open_q = self.db.query(PayflowHumanReviewModel).filter(
-            PayflowHumanReviewModel.account_id == account_id,
-            PayflowHumanReviewModel.status.in_(list(OPEN_STATUSES)),
+        # One open review per account — do not stack duplicates when the same
+        # case is hit by workflow pause + rule scan, or by multiple rules.
+        existing = (
+            self.db.query(PayflowHumanReviewModel)
+            .filter(
+                PayflowHumanReviewModel.account_id == account_id,
+                PayflowHumanReviewModel.status.in_(list(OPEN_STATUSES)),
+            )
+            .order_by(PayflowHumanReviewModel.id.desc())
+            .first()
         )
-        if rule_id is not None:
-            open_q = open_q.filter(PayflowHumanReviewModel.rule_id == rule_id)
-        existing = open_q.order_by(PayflowHumanReviewModel.id.desc()).first()
         if existing:
+            if exception_step_id and not existing.exception_step_id:
+                existing.exception_step_id = exception_step_id
+            if strategy_id and existing.strategy_id is None:
+                existing.strategy_id = strategy_id
+            if workflow_version is not None and existing.workflow_version is None:
+                existing.workflow_version = workflow_version
+            self.db.flush()
             return existing
 
         rule = None
