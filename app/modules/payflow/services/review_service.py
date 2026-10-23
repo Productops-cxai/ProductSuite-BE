@@ -1379,7 +1379,7 @@ class PayflowReviewService:
         proposed_action: str | None = None,
         search: str | None = None,
         waiting_bucket: str | None = None,
-        sort_by: str = "waiting_minutes",
+        sort_by: str = "created_at",
         sort_dir: str = "desc",
         page: int = 1,
         page_size: int = 50,

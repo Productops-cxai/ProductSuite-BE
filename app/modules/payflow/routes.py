@@ -758,7 +758,7 @@ def list_reviews(
     proposed_action: str | None = Query(default=None),
     search: str | None = Query(default=None),
     waiting_bucket: str | None = Query(default=None),
-    sort_by: str = Query(default="waiting_minutes"),
+    sort_by: str = Query(default="created_at"),
     sort_dir: str = Query(default="desc"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
