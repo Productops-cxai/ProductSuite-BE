@@ -149,6 +149,9 @@ def send_collection_email(
     status = "logged"
     err: str | None = None
     provider_id: str | None = None
+    # SendGrid rejects content.value of length 0.
+    if not (body or "").strip():
+        body = "Payment reminder"
 
     if provider == "sendgrid":
         ok, err, provider_id = _send_via_sendgrid(

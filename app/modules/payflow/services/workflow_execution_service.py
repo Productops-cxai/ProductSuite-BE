@@ -1294,6 +1294,12 @@ class WorkflowExecutionService:
         purpose = cfg.get("purpose") or step.get("purpose") or "Payment Reminder"
         template_id = cfg.get("template_id") or step.get("template_id")
         template = next((t for t in MESSAGE_TEMPLATES if t.get("id") == template_id), None)
+        if template is None and (channel or "").strip().lower() == "email":
+            # Step saved without template_id/body → still send a usable reminder.
+            template = next(
+                (t for t in MESSAGE_TEMPLATES if t.get("id") == "em-reminder"),
+                None,
+            )
         subject = cfg.get("subject") or (template or {}).get("subject") or f"{purpose}"
         body = cfg.get("body") or (template or {}).get("body") or ""
         subject = self._render(subject, account, strategy)

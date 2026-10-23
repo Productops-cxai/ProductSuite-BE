@@ -826,9 +826,32 @@ class PayflowCommunicationService:
         action_url: str | None = None
         if payment_link:
             action_url = self._ensure_payment_url(account, communication_id=comm.id)
-            if action_url and channel_norm == "SMS" and action_url not in body:
-                body = f"{body.rstrip()}\nPay: {action_url}"
+            if action_url and action_url not in (body or ""):
+                if channel_norm == "SMS":
+                    body = f"{(body or '').rstrip()}\nPay: {action_url}"
+                else:
+                    # Emails with payment_link flag but empty/missing template body
+                    # still need the URL in the message (SendGrid rejects empty content).
+                    base = (body or "").rstrip()
+                    body = (
+                        f"{base}\n\nPay securely: {action_url}"
+                        if base
+                        else (
+                            f"Hello,\n\nThis is a payment reminder for account "
+                            f"{account.account_reference or account.id}.\n\n"
+                            f"Pay securely: {action_url}\n\nThank you."
+                        )
+                    )
                 comm.body_lines = body.splitlines()[:40]
+
+        # SendGrid requires content value length >= 1; workflow steps with no
+        # template/body previously sent "" and failed with content.0.value.
+        if channel_norm != "SMS" and not (body or "").strip():
+            body = (
+                f"Hello,\n\nThis is a payment reminder for account "
+                f"{account.account_reference or account.id}.\n\nThank you."
+            )
+            comm.body_lines = body.splitlines()[:40]
 
         send_status = "logged"
         recipient = ""
