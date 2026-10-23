@@ -34,6 +34,54 @@ PROPOSED_ACTIONS = [
     "Pause outreach and request updated contact details",
 ]
 
+
+def _normalize_explanation(raw: Any) -> list[str]:
+    """API schema expects list[str]; older/AI rows may store {label, text} dicts."""
+    out: list[str] = []
+    for item in list(raw or []):
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(text)
+            continue
+        if isinstance(item, dict):
+            label = str(item.get("label") or "").strip()
+            text = str(item.get("text") or item.get("value") or item.get("detail") or "").strip()
+            if label and text:
+                out.append(f"{label}: {text}")
+            elif text:
+                out.append(text)
+            elif label:
+                out.append(label)
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _normalize_history(raw: Any) -> list[dict[str, Any]]:
+    """API schema expects {at, event, detail?, by?}; some writers used {at, label}."""
+    out: list[dict[str, Any]] = []
+    for item in list(raw or []):
+        if not isinstance(item, dict):
+            continue
+        event = str(
+            item.get("event") or item.get("label") or item.get("action") or ""
+        ).strip()
+        at = str(item.get("at") or item.get("when") or "").strip() or "—"
+        if not event:
+            continue
+        entry: dict[str, Any] = {"at": at, "event": event}
+        detail = item.get("detail")
+        if detail is not None and str(detail).strip():
+            entry["detail"] = str(detail)
+        by = item.get("by") or item.get("actor")
+        if by is not None and str(by).strip():
+            entry["by"] = str(by)
+        out.append(entry)
+    return out
+
 REVIEW_REASONS = [
     "Repeated unsuccessful attempts",
     "Low decision confidence",
@@ -694,7 +742,7 @@ class PayflowReviewService:
             "observed_value": row.observed_value,
             "proposed_action": row.proposed_action,
             "confidence": row.confidence,
-            "explanation": list(row.explanation or []),
+            "explanation": _normalize_explanation(row.explanation),
             "context": list(row.context or []),
             "timeline": list(row.timeline or []),
             "waiting_minutes": waiting,
@@ -708,7 +756,7 @@ class PayflowReviewService:
             "guidance": row.guidance,
             "rejection_reason": row.rejection_reason,
             "hold_until": row.hold_until,
-            "history": list(row.history or []),
+            "history": _normalize_history(row.history),
             "decision_version": row.decision_version or 1,
             "strategy_id": row.strategy_id,
             "workflow_version": row.workflow_version

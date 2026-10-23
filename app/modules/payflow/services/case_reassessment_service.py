@@ -262,8 +262,17 @@ class CaseReassessmentService:
             rationale = str(rec.get("rationale") or "")
             if rationale:
                 expl = list(open_row.explanation or [])
-                expl.append({"label": "AI reassessment", "text": rationale})
+                expl.append(f"AI reassessment: {rationale}")
                 open_row.explanation = expl[-20:]
+            hist = list(open_row.history or [])
+            hist.append(
+                {
+                    "at": _stamp(),
+                    "event": "AI reassessment updated review",
+                    "detail": rationale[:240] if rationale else None,
+                }
+            )
+            open_row.history = hist[-40:]
             account.human_review = True
             if account.collection_status != PayflowCollectionStatus.HUMAN_REVIEW.value:
                 account.collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
@@ -281,8 +290,13 @@ class CaseReassessmentService:
             status=PayflowReviewStatus.AWAITING_REVIEW.value,
             reason="AI reassessment",
             proposed_action=str(rec.get("action") or "Reassess collection treatment"),
-            explanation=[{"label": "Why", "text": rationale}],
-            history=[{"at": _stamp(), "label": "AI reassessment created review"}],
+            explanation=[f"Why: {rationale}"],
+            history=[
+                {
+                    "at": _stamp(),
+                    "event": "AI reassessment created review",
+                }
+            ],
             days_past_due=int(account.days_past_due or 0),
         )
         self.db.add(row)
