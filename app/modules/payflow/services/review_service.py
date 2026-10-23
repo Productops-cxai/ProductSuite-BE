@@ -429,6 +429,20 @@ class PayflowReviewService:
             }
         )
         account.timeline = events[-40:]
+        try:
+            from app.modules.payflow.services.case_reassessment_service import (
+                CaseReassessmentService,
+            )
+
+            CaseReassessmentService(self.db).record_human_decision(
+                account,
+                review=row,
+                decision=decision,
+                final_action=final_action,
+                actor_name=actor_name,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _available_actions(self, row: PayflowHumanReviewModel, user: UserModel) -> list[str]:
         actions: list[str] = []

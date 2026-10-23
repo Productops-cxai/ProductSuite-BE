@@ -115,6 +115,20 @@ def run_worker() -> None:
                 now = time.monotonic()
                 if now - last_sweep >= sweep_seconds:
                     _drain_due(worker_id, pool, in_flight, stale_seconds=stale_seconds)
+                    # Opportunistic payment-plan overdue refresh (no auto-charge).
+                    try:
+                        from app.modules.payflow.services.payment_outcome_service import (
+                            PayflowPaymentOutcomeService,
+                        )
+
+                        odb = SessionLocal()
+                        try:
+                            PayflowPaymentOutcomeService(odb).refresh_overdue_plans(None)
+                            odb.commit()
+                        finally:
+                            odb.close()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("overdue payment plan refresh failed")
                     last_sweep = now
 
                 # Wait for notify or timeout (sweep cadence).

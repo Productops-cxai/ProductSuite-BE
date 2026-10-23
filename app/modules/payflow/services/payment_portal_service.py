@@ -72,9 +72,22 @@ class PayflowPaymentPortalService:
 
     def _client_settings(self, client: PayflowClientModel | None) -> dict[str, Any]:
         raw = dict(_DEFAULT_PAYMENT_SETTINGS)
+        stored: dict[str, Any] = {}
         if client and isinstance(client.payment_settings, dict):
-            raw.update({k: v for k, v in client.payment_settings.items() if v is not None})
+            stored = client.payment_settings
+            raw.update({k: v for k, v in stored.items() if v is not None})
+        # FE may send allow_plans; portal uses allow_payment_plan.
+        if "allow_payment_plan" not in stored and "allow_plans" in raw:
+            raw["allow_payment_plan"] = bool(raw.get("allow_plans"))
         return raw
+
+    _PREVIEW_TOKEN_PREFIX = "preview."
+
+    @classmethod
+    def _strip_preview_token(cls, token: str) -> tuple[str, bool]:
+        if token.startswith(cls._PREVIEW_TOKEN_PREFIX):
+            return token[len(cls._PREVIEW_TOKEN_PREFIX) :], True
+        return token, False
 
     def _is_third_party(self, client: PayflowClientModel | None) -> bool:
         if not client or not client.client_type:
@@ -156,7 +169,8 @@ class PayflowPaymentPortalService:
                     }
                 )
 
-        if settings_map.get("allow_payment_plan", True) and balance > 0:
+        min_plan = float(settings_map.get("min_plan_amount") or 0)
+        if settings_map.get("allow_payment_plan", True) and balance > 0 and balance >= min_plan:
             plans = settings_map.get("payment_plan_options") or []
             for plan in plans:
                 if not isinstance(plan, dict):
@@ -212,6 +226,62 @@ class PayflowPaymentPortalService:
                     }
                 )
 
+        # Explicit pay-next for an already-active plan (manual instalment, not auto-charge).
+        try:
+            from app.modules.payflow.services.payment_outcome_service import (
+                PayflowPaymentOutcomeService,
+            )
+
+            outcome = PayflowPaymentOutcomeService(self.db)
+            outcome.refresh_overdue_plans(account.id)
+            for plan in (
+                self.db.query(PayflowPaymentPlanModel)
+                .filter(
+                    PayflowPaymentPlanModel.account_id == account.id,
+                    PayflowPaymentPlanModel.status.in_(["Active", "Overdue"]),
+                )
+                .order_by(PayflowPaymentPlanModel.id.desc())
+                .all()
+            ):
+                serialized = outcome.serialize_plan(plan)
+                next_inst = next(
+                    (
+                        i
+                        for i in (serialized.get("installments") or [])
+                        if i.get("status") in {"Pending", "Overdue", "Failed"}
+                    ),
+                    None,
+                )
+                if not next_inst:
+                    continue
+                amt = _money(next_inst.get("amount") or plan.installment_amount)
+                amt = min(amt, balance)
+                if amt <= 0:
+                    continue
+                options.append(
+                    {
+                        "id": f"pay_next_{plan.public_id}",
+                        "type": PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
+                        "label": "Pay next instalment",
+                        "description": (
+                            f"Pay the next scheduled instalment"
+                            f"{' due ' + next_inst['due_date'] if next_inst.get('due_date') else ''}"
+                            f" for {serialized.get('label') or plan.public_id}. "
+                            "Future instalments are not auto-charged."
+                        ),
+                        "amount": amt,
+                        "currency_code": currency,
+                        "amount_editable": False,
+                        "min_amount": amt,
+                        "max_amount": amt,
+                        "plan_id": plan.public_id,
+                        "installment_sequence": next_inst.get("sequence"),
+                    }
+                )
+                break
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to build pay-next instalment option")
+
         return options
 
     @staticmethod
@@ -222,15 +292,21 @@ class PayflowPaymentPortalService:
         day = min(d.day, monthrange(year, month)[1])
         return date(year, month, day)
 
-    def resolve_portal(self, token: str) -> dict[str, Any]:
-        """Public portal payload — branding, balance, options, block reasons."""
+    def resolve_portal(self, token: str, *, preview: bool = False) -> dict[str, Any]:
+        """Public portal payload — branding, balance, options, block reasons.
+
+        When preview=True (or token is preview-prefixed), skips access/visit side effects
+        and returns a preview token that cannot initiate Checkout.
+        """
+        real_token, preview_from_token = self._strip_preview_token(token)
+        preview_mode = bool(preview or preview_from_token)
         row = (
             self.db.query(PayflowPaymentLinkModel)
             .options(
                 joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
                 joinedload(PayflowPaymentLinkModel.client),
             )
-            .filter(PayflowPaymentLinkModel.token == token)
+            .filter(PayflowPaymentLinkModel.token == real_token)
             .first()
         )
         if not row:
@@ -259,22 +335,46 @@ class PayflowPaymentPortalService:
                 usable = False
                 block_reason = reason
 
-        row.access_count = int(row.access_count or 0) + 1
-        row.last_accessed_at = _utcnow()
-        self.links._append_event(
-            row, "Accessed", "usable" if usable else (block_reason or "blocked")
-        )
-        self.db.commit()
+        if not preview_mode:
+            row.access_count = int(row.access_count or 0) + 1
+            row.last_accessed_at = _utcnow()
+            self.links._append_event(
+                row, "Accessed", "usable" if usable else (block_reason or "blocked")
+            )
+            # Distinct portal visit on originating communication (vs email link click).
+            if row.communication_id:
+                try:
+                    from app.modules.payflow.services.communication_service import (
+                        PayflowCommunicationService,
+                    )
+
+                    PayflowCommunicationService(self.db).record_portal_visit(
+                        row.communication_id,
+                        detail="Customer opened payment portal",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("failed to record portal visit on communication")
+            self.db.commit()
+        else:
+            # Preview may still need overdue refresh for accurate options (no commit of link access).
+            self.db.flush()
 
         balance = _money(account.outstanding_balance)
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
-        options = self._build_options(account, client) if usable else []
+        # Preview still shows options for staff UX even when link is blocked, when balance > 0.
+        options = (
+            self._build_options(account, client)
+            if usable or (preview_mode and balance > 0)
+            else []
+        )
         provider_ready = stripe_configured() or (settings.APP_ENV or "").lower() in {
             "development",
             "dev",
             "local",
             "test",
         }
+        if preview_mode:
+            provider_ready = False
 
         active_plans: list[dict[str, Any]] = []
         try:
@@ -297,12 +397,19 @@ class PayflowPaymentPortalService:
         except Exception:  # noqa: BLE001
             logger.exception("failed to load payment plans for portal")
 
+        response_token = (
+            f"{self._PREVIEW_TOKEN_PREFIX}{real_token}" if preview_mode else real_token
+        )
         return {
-            "usable": usable,
+            "usable": usable and not preview_mode,
             "status": row.status,
-            "block_reason": block_reason,
+            "block_reason": (
+                "Staff preview — checkout is disabled"
+                if preview_mode
+                else block_reason
+            ),
             "expires_at": row.expires_at,
-            "token": token,
+            "token": response_token,
             "link_ref": row.token[:8],
             "customer": {
                 "display_name": account.customer_first_name
@@ -320,12 +427,19 @@ class PayflowPaymentPortalService:
             "brand": self._brand_payload(client),
             "payment_options": options,
             "active_payment_plans": active_plans,
+            "preview_mode": preview_mode,
             "provider": {
                 "name": "stripe" if stripe_configured() else "mock",
-                "ready": bool(provider_ready and usable and options),
-                "message": None
-                if provider_ready
-                else "Online payments are not configured for this environment",
+                "ready": bool(provider_ready and usable and options and not preview_mode),
+                "message": (
+                    "Preview only — payment cannot be started"
+                    if preview_mode
+                    else (
+                        None
+                        if provider_ready
+                        else "Online payments are not configured for this environment"
+                    )
+                ),
             },
         }
 
@@ -339,7 +453,10 @@ class PayflowPaymentPortalService:
         opt_type = option["type"]
         if opt_type == PayflowPaymentOptionType.PAY_IN_FULL.value:
             return balance
-        if opt_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+        if opt_type in {
+            PayflowPaymentOptionType.PAYMENT_PLAN.value,
+            PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
+        }:
             return _money(option["amount"])
         # partial
         if requested_amount is None:
@@ -361,13 +478,16 @@ class PayflowPaymentPortalService:
         amount: float | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        real_token, is_preview = self._strip_preview_token(token)
+        if is_preview:
+            raise ValidationAppError("Checkout cannot be started in preview mode")
         row = (
             self.db.query(PayflowPaymentLinkModel)
             .options(
                 joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
                 joinedload(PayflowPaymentLinkModel.client),
             )
-            .filter(PayflowPaymentLinkModel.token == token)
+            .filter(PayflowPaymentLinkModel.token == real_token)
             .first()
         )
         if not row:
@@ -468,14 +588,14 @@ class PayflowPaymentPortalService:
 
         fe = (settings.FRONTEND_URL or "").rstrip("/")
         success_url = (
-            f"{fe}/pay/{token}/result?attempt={public_id}&outcome=success"
+            f"{fe}/pay/{real_token}/result?attempt={public_id}&outcome=success"
             if fe
-            else f"/pay/{token}/result?attempt={public_id}&outcome=success"
+            else f"/pay/{real_token}/result?attempt={public_id}&outcome=success"
         )
         cancel_url = (
-            f"{fe}/pay/{token}/result?attempt={public_id}&outcome=cancel"
+            f"{fe}/pay/{real_token}/result?attempt={public_id}&outcome=cancel"
             if fe
-            else f"/pay/{token}/result?attempt={public_id}&outcome=cancel"
+            else f"/pay/{real_token}/result?attempt={public_id}&outcome=cancel"
         )
         brand = self._brand_payload(client)
 
@@ -489,7 +609,7 @@ class PayflowPaymentPortalService:
                     client_reference_id=public_id,
                     metadata={
                         "attempt_public_id": public_id,
-                        "payment_link_token": token[:48],
+                        "payment_link_token": real_token[:48],
                         "account_id": str(account.id),
                         "client_id": str(row.client_id),
                         "option_type": option["type"],
@@ -508,9 +628,9 @@ class PayflowPaymentPortalService:
             else:
                 # Dev mock — no card data; customer confirms on our page.
                 mock_url = (
-                    f"{fe}/pay/{token}/checkout?attempt={public_id}"
+                    f"{fe}/pay/{real_token}/checkout?attempt={public_id}"
                     if fe
-                    else f"/pay/{token}/checkout?attempt={public_id}"
+                    else f"/pay/{real_token}/checkout?attempt={public_id}"
                 )
                 attempt.checkout_url = mock_url
                 attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
@@ -577,9 +697,10 @@ class PayflowPaymentPortalService:
         }
 
     def get_attempt_public(self, token: str, attempt_public_id: str) -> dict[str, Any]:
+        real_token, _ = self._strip_preview_token(token)
         link = (
             self.db.query(PayflowPaymentLinkModel)
-            .filter(PayflowPaymentLinkModel.token == token)
+            .filter(PayflowPaymentLinkModel.token == real_token)
             .first()
         )
         if not link:
@@ -597,9 +718,12 @@ class PayflowPaymentPortalService:
         return self.serialize_attempt(row)
 
     def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
+        real_token, is_preview = self._strip_preview_token(token)
+        if is_preview:
+            raise ValidationAppError("Checkout cannot be started in preview mode")
         link = (
             self.db.query(PayflowPaymentLinkModel)
-            .filter(PayflowPaymentLinkModel.token == token)
+            .filter(PayflowPaymentLinkModel.token == real_token)
             .first()
         )
         if not link:
@@ -686,12 +810,43 @@ class PayflowPaymentPortalService:
                 source_entity_id=attempt.public_id,
                 severity="High",
                 retriable=True,
+                diagnostic_ref=attempt.stripe_session_id or attempt.public_id,
                 link=f"/payflow/cases/{attempt.account_id}",
                 notify=True,
                 commit=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("failed to raise payment ops exception")
+
+    def _raise_processing_discrepancy(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        reason: str,
+        *,
+        diagnostic_ref: str | None = None,
+    ) -> None:
+        try:
+            from app.modules.payflow.services.operational_exception_service import (
+                PayflowOperationalExceptionService,
+            )
+            from app.shared.enums import PayflowOperationalExceptionType
+
+            PayflowOperationalExceptionService(self.db).raise_exception(
+                exception_type=PayflowOperationalExceptionType.PROCESSING_DISCREPANCY.value,
+                reason=reason[:500],
+                client_id=attempt.client_id,
+                account_id=attempt.account_id,
+                source_entity_type="payment_attempt",
+                source_entity_id=attempt.public_id,
+                severity="High",
+                retriable=False,
+                diagnostic_ref=diagnostic_ref or attempt.stripe_session_id or attempt.public_id,
+                link=f"/payflow/cases/{attempt.account_id}",
+                notify=True,
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to raise processing_discrepancy")
 
     def apply_succeeded(
         self,
@@ -724,7 +879,10 @@ class PayflowPaymentPortalService:
             account.paid_amount = _money((account.paid_amount or 0) + amount)
             if new_bal <= 0 or attempt.option_type == PayflowPaymentOptionType.PAY_IN_FULL.value:
                 account.collection_status = "Resolved"
-            elif attempt.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            elif attempt.option_type in {
+                PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
+            }:
                 account.collection_status = "Payment Plan"
             # Partial keeps Active / existing status unless settled.
 
@@ -754,6 +912,27 @@ class PayflowPaymentPortalService:
                     first_txn=txn,
                     balance_at_plan_start=prev,
                 )
+            elif attempt.option_type == PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value:
+                plan = (
+                    self.db.query(PayflowPaymentPlanModel)
+                    .filter(
+                        PayflowPaymentPlanModel.account_id == account.id,
+                        PayflowPaymentPlanModel.public_id == attempt.plan_id,
+                    )
+                    .first()
+                )
+                if plan is None:
+                    plan = (
+                        self.db.query(PayflowPaymentPlanModel)
+                        .filter(
+                            PayflowPaymentPlanModel.account_id == account.id,
+                            PayflowPaymentPlanModel.status.in_(["Active", "Overdue"]),
+                        )
+                        .order_by(PayflowPaymentPlanModel.id.desc())
+                        .first()
+                    )
+                if plan is not None:
+                    outcome._apply_payment_to_plan(plan, attempt, txn)
             outcome._append_account_timeline(
                 account,
                 "Payment Confirmed",
@@ -778,7 +957,10 @@ class PayflowPaymentPortalService:
                     "case_settled": new_bal <= 0,
                     "partial": attempt.option_type == PayflowPaymentOptionType.PARTIAL.value,
                     "payment_plan": attempt.option_type
-                    == PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                    in {
+                        PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                        PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
+                    },
                     "plan_id": plan.public_id if plan else None,
                     "status": "succeeded",
                     "source": "stripe" if attempt.provider == "stripe" else "mock",
@@ -931,6 +1113,19 @@ class PayflowPaymentPortalService:
             # Only treat as paid when Stripe reports paid / complete.
             payment_status = (data_object.get("payment_status") or "").lower()
             status = (data_object.get("status") or "").lower()
+            amount_total = data_object.get("amount_total")
+            if amount_total is not None:
+                try:
+                    stripe_amt = float(amount_total) / 100.0
+                    expected = _money(attempt.amount)
+                    if abs(stripe_amt - expected) > 0.009:
+                        self._raise_processing_discrepancy(
+                            attempt,
+                            f"Stripe amount {stripe_amt:.2f} ≠ attempt {expected:.2f}",
+                            diagnostic_ref=str(session_id or attempt.public_id),
+                        )
+                except (TypeError, ValueError):
+                    pass
             if payment_status in {"paid", "no_payment_required"} or status == "complete":
                 self.apply_succeeded(
                     attempt,

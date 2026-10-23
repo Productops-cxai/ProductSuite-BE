@@ -860,8 +860,19 @@ class WorkflowExecutionService:
         if action == "Request Reassessment":
             step_run.status = "reassessment_requested"
             step_run.finished_at = _utcnow()
-            account.next_action = "AI reassessment requested"
-            # Continue to next after logging — reassessment is async side-effect.
+            try:
+                from app.modules.payflow.services.case_reassessment_service import (
+                    CaseReassessmentService,
+                )
+
+                CaseReassessmentService(self.db).run_reassessment(
+                    account,
+                    strategy,
+                    trigger="rule_request_reassessment",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("rule Request Reassessment failed")
+                account.next_action = "AI reassessment requested"
             return False
 
         if action == "Apply / Change Workflow":
@@ -1242,33 +1253,32 @@ class WorkflowExecutionService:
         strategy: PayflowStrategyModel,
         step_run: PayflowWorkflowStepRunModel,
     ) -> None:
-        account.next_action = "AI reassessment queued"
-        job_id = None
-        portfolio_id = strategy.portfolio_id or account.portfolio_id
-        if portfolio_id:
-            try:
-                from app.modules.payflow.services.ai_suggest_job_service import (
-                    AiSuggestJobService,
-                )
+        """Case-level AI recommendation (not portfolio Suggest job)."""
+        result: dict[str, Any] = {}
+        try:
+            from app.modules.payflow.services.case_reassessment_service import (
+                CaseReassessmentService,
+            )
 
-                job = AiSuggestJobService(self.db).enqueue(
-                    strategy.client_id,
-                    portfolio_id,
-                    trigger="workflow_ai_reassessment",
-                    requested_by_user_id=None,
-                )
-                if job:
-                    job_id = job.id
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("AI reassessment enqueue failed: %s", exc)
+            result = CaseReassessmentService(self.db).run_reassessment(
+                account,
+                strategy,
+                trigger="workflow_ai_reassessment",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("AI case reassessment failed: %s", exc)
+            account.next_action = "AI reassessment failed"
+            result = {"error": str(exc)}
         step_run.result_json = {
-            "queued": True,
-            "ai_suggest_job_id": job_id,
+            "queued": False,
+            "case_reassessment": True,
+            **result,
         }
+        rec = (result.get("recommendation") or {}) if isinstance(result, dict) else {}
         self._append_timeline(
             account,
             "AI reassessment",
-            f"job_id={job_id}" if job_id else "intent logged",
+            str(rec.get("action") or result.get("error") or "completed"),
         )
 
     def _send_communication(
@@ -1412,6 +1422,7 @@ class WorkflowExecutionService:
                 source_entity_id=run.id,
                 severity="High",
                 retriable=True,
+                diagnostic_ref=f"run:{run.id}:step:{getattr(run, 'current_step_id', None) or run.status}",
                 link=f"/payflow/cases/{run.account_id}",
                 notify=False,
                 commit=False,
@@ -1448,6 +1459,7 @@ class WorkflowExecutionService:
                 source_entity_id=run.id,
                 severity="High",
                 retriable=True,
+                diagnostic_ref=f"run:{run.id}:{channel}",
                 link=f"/payflow/cases/{run.account_id}",
                 notify=False,
                 commit=False,
