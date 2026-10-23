@@ -1194,47 +1194,86 @@ class PayflowPaymentPortalService:
         except Exception:  # noqa: BLE001
             logger.exception("payment failed notify failed attempt=%s", attempt.public_id)
 
+    # Stripe Dashboard destination (memorable-legacy) — keep in sync with subscribed events.
+    # These are *payment lifecycle* events, not email Click / Open engagement.
+    STRIPE_WEBHOOK_EVENTS = frozenset(
+        {
+            "checkout.session.completed",
+            "checkout.session.async_payment_succeeded",
+            "checkout.session.async_payment_failed",
+            "checkout.session.expired",
+            "payment_intent.succeeded",
+            "payment_intent.payment_failed",
+            "payment_intent.canceled",
+            "refund.created",
+            "charge.refunded",
+        }
+    )
+
     def handle_stripe_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """
+        Reconcile Stripe Checkout / PaymentIntent / refund webhooks onto attempts + ledger.
+
+        Success path is idempotent: checkout.session.completed and payment_intent.succeeded
+        may both fire — balance is cut only once (apply_succeeded).
+
+        Refunds: process refund.created only. charge.refunded is ignored when both are
+        subscribed (avoids double balance restore).
+        """
         et = str(event.get("type") or "")
+        event_id = str(event.get("id") or "")
         data_object = (event.get("data") or {}).get("object") or {}
 
-        # Refunds / chargebacks — adjust ledger without deleting originals.
-        if et in {"charge.refunded", "refund.created", "charge.dispute.funds_withdrawn"}:
+        if et and et not in self.STRIPE_WEBHOOK_EVENTS:
+            logger.info("stripe event ignored (not in reconcile set) type=%s id=%s", et, event_id)
+            return {"matched": False, "ignored": True, "type": et, "reason": "unsubscribed_event"}
+
+        # --- Refunds: one source of truth ---
+        if et == "charge.refunded":
+            # Same destination also sends refund.created — skip to prevent double refund.
+            return {
+                "matched": True,
+                "ignored": True,
+                "type": et,
+                "reason": "use_refund_created",
+                "event_id": event_id or None,
+            }
+
+        if et == "refund.created":
             try:
                 from app.modules.payflow.services.payment_outcome_service import (
                     PayflowPaymentOutcomeService,
                 )
 
                 pi = data_object.get("payment_intent")
-                charge_id = data_object.get("id")
-                amount_refunded = data_object.get("amount_refunded") or data_object.get("amount")
-                amt = None
-                if amount_refunded is not None:
-                    amt = float(amount_refunded) / 100.0
-                ref = None
-                if isinstance(pi, str) and pi:
-                    ref = pi
-                elif charge_id:
-                    # Find txn by provider_ref containing charge or use charge id.
-                    ref = str(charge_id)
-                direction = "reversal" if "dispute" in et else "refund"
-                if ref:
-                    adj = PayflowPaymentOutcomeService(self.db).apply_refund_or_reversal(
-                        original_provider_ref=ref,
-                        amount=amt,
-                        direction=direction,
-                        provider_ref=f"{et}:{data_object.get('id')}",
-                        notes=f"Stripe {et}",
-                        commit=True,
-                    )
+                refund_id = data_object.get("id")
+                amount_raw = data_object.get("amount")
+                amt = float(amount_raw) / 100.0 if amount_raw is not None else None
+                ref = pi if isinstance(pi, str) and pi else None
+                if not ref:
                     return {
-                        "matched": True,
+                        "matched": False,
+                        "reason": "refund_missing_payment_intent",
                         "type": et,
-                        "adjustment": adj.public_id,
-                        "status": adj.status,
+                        "event_id": event_id or None,
                     }
+                adj = PayflowPaymentOutcomeService(self.db).apply_refund_or_reversal(
+                    original_provider_ref=ref,
+                    amount=amt,
+                    direction="refund",
+                    provider_ref=f"refund:{refund_id}" if refund_id else f"refund_event:{event_id}",
+                    notes=f"Stripe refund.created · {event_id or refund_id or ''}".strip(),
+                    commit=True,
+                )
+                return {
+                    "matched": True,
+                    "type": et,
+                    "adjustment": adj.public_id,
+                    "status": adj.status,
+                    "event_id": event_id or None,
+                }
             except Exception as exc:  # noqa: BLE001
-                logger.exception("stripe refund/reversal handling failed")
+                logger.exception("stripe refund handling failed event=%s", event_id)
                 return {"matched": False, "reason": str(exc)[:200], "type": et}
 
         session_id = data_object.get("id") if data_object.get("object") == "checkout.session" else None
@@ -1275,18 +1314,29 @@ class PayflowPaymentPortalService:
                 )
         if not attempt:
             logger.warning(
-                "stripe event unmatched type=%s session=%s pi=%s",
+                "stripe event unmatched type=%s session=%s pi=%s id=%s",
                 et,
                 session_id,
                 pi_id,
+                event_id,
             )
-            return {"matched": False, "reason": "attempt_not_found", "type": et}
+            return {"matched": False, "reason": "attempt_not_found", "type": et, "event_id": event_id or None}
 
         if pi_id:
             attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi_id
 
+        already_paid = attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value
+
+        # --- Paid (idempotent): session completed OR payment_intent.succeeded ---
         if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
-            # Only treat as paid when Stripe reports paid / complete.
+            if already_paid:
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "idempotent": True,
+                    "event_id": event_id or None,
+                }
             payment_status = (data_object.get("payment_status") or "").lower()
             status = (data_object.get("status") or "").lower()
             amount_total = data_object.get("amount_total")
@@ -1311,40 +1361,43 @@ class PayflowPaymentPortalService:
                     "status": attempt.status,
                     "type": et,
                     "amount_mismatch": True,
+                    "event_id": event_id or None,
                 }
-            # Require Stripe payment_status=paid (do not confirm on URL / session complete alone).
             if payment_status in {"paid", "no_payment_required"}:
                 self.apply_succeeded(
                     attempt,
                     provider_ref=attempt.stripe_payment_intent_id or session_id,
                     commit=True,
                 )
-                return {"matched": True, "status": attempt.status, "type": et}
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "event_id": event_id or None,
+                }
             attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
             self._append_attempt_event(
-                attempt, "Processing", f"{et} payment_status={payment_status or status}"
+                attempt,
+                "Processing",
+                f"{et} payment_status={payment_status or status} · {event_id}",
             )
             self.db.commit()
-            return {"matched": True, "status": attempt.status, "type": et}
-
-        if et in {
-            "checkout.session.expired",
-            "checkout.session.async_payment_failed",
-        }:
-            if et.endswith("expired"):
-                if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
-                    attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
-                    self._append_attempt_event(attempt, "Expired", et)
-                    self.db.commit()
-            else:
-                self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
-            return {"matched": True, "status": attempt.status, "type": et}
-
-        if et in {"payment_intent.payment_failed", "payment_intent.canceled"}:
-            self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
-            return {"matched": True, "status": attempt.status, "type": et}
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
 
         if et == "payment_intent.succeeded":
+            if already_paid:
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "idempotent": True,
+                    "event_id": event_id or None,
+                }
             amount_received = data_object.get("amount_received") or data_object.get("amount")
             if amount_received is not None:
                 try:
@@ -1361,17 +1414,55 @@ class PayflowPaymentPortalService:
                             "status": attempt.status,
                             "type": et,
                             "amount_mismatch": True,
+                            "event_id": event_id or None,
                         }
                 except (TypeError, ValueError):
                     pass
             self.apply_succeeded(
                 attempt, provider_ref=pi_id or data_object.get("id") or session_id, commit=True
             )
-            return {"matched": True, "status": attempt.status, "type": et}
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
 
-        self._append_attempt_event(attempt, "Stripe Event", et)
+        # --- Failed / expired / canceled (never override Succeeded) ---
+        if et == "checkout.session.expired":
+            if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
+                attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
+                self._append_attempt_event(attempt, "Expired", f"{et} · {event_id}")
+                self.db.commit()
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
+
+        if et in {
+            "checkout.session.async_payment_failed",
+            "payment_intent.payment_failed",
+            "payment_intent.canceled",
+        }:
+            self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
+
+        self._append_attempt_event(attempt, "Stripe Event", f"{et} · {event_id}")
         self.db.commit()
-        return {"matched": True, "ignored": True, "type": et, "status": attempt.status}
+        return {
+            "matched": True,
+            "ignored": True,
+            "type": et,
+            "status": attempt.status,
+            "event_id": event_id or None,
+        }
 
 
 # Keep public_url helper importable for callers that only need URL composition.

@@ -1019,27 +1019,20 @@ class PayflowCommunicationService:
             "code": code,
         }
 
-    def _recent_engagement_event(
+    def _same_label_within(
         self,
         row: PayflowCommunicationModel,
         *,
-        within_seconds: int = 120,
+        label: str,
+        within_seconds: int = 3,
     ) -> bool:
-        """True if a click / portal open was already recorded in the debounce window."""
+        """Guard only against double-fire of the *same* label (e.g. React remount)."""
+        want = label.strip().lower()
         cutoff = _utcnow() - timedelta(seconds=within_seconds)
-        labels = {
-            "click",
-            "clicked",
-            "payment_link_opened",
-            "payment link opened",
-            "payment link clicked",
-        }
         for ev in reversed(list(row.events or [])):
             if not isinstance(ev, dict):
                 continue
-            label = str(ev.get("label") or "").strip().lower()
-            et = str(ev.get("event_type") or "").strip().lower()
-            if label not in labels and et not in labels and "click" not in label:
+            if str(ev.get("label") or "").strip().lower() != want:
                 continue
             raw = ev.get("at")
             if not raw:
@@ -1048,8 +1041,7 @@ class PayflowCommunicationService:
                 when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
                 if when.tzinfo is None:
                     when = when.replace(tzinfo=timezone.utc)
-                if when >= cutoff:
-                    return True
+                return when >= cutoff
             except ValueError:
                 return True
         return False
@@ -1061,17 +1053,17 @@ class PayflowCommunicationService:
         detail: str = "Customer opened payment portal",
     ) -> None:
         """
-        Portal page load after the customer follows a payment link.
+        PayFlow app Click — customer hit our /pay portal.
 
-        - Does NOT touch opens_count (Stripe / provider open tracking only).
-        - Counts as our Click once (debounced) — avoids Click + Payment Link Opened duplicates
-          when the provider webhook and portal resolve both fire for the same action.
+        Separate from Stripe/provider "Payment Link Opened".
+        Does NOT touch opens_count (email open = provider open only).
         """
         row = self.db.get(PayflowCommunicationModel, communication_id)
         if not row:
             return
-        # Stripe click webhook often lands first; skip duplicate portal noise.
-        if self._recent_engagement_event(row, within_seconds=120):
+        # Only skip identical Click fired twice in the same request burst (remount).
+        # Does NOT suppress Stripe Payment Link Opened, and a later real click counts again.
+        if self._same_label_within(row, label="Click", within_seconds=3):
             return
         now = _utcnow()
         row.clicks_count = int(row.clicks_count or 0) + 1
@@ -1079,7 +1071,6 @@ class PayflowCommunicationService:
         row.last_clicked_at = now
         if row.payment_link:
             self._advance_status(row, PayflowCommStatus.PAYMENT_LINK_CLICKED.value)
-        # One timeline row labeled Click (our side) — payment process comes after this.
         self._record_event_row(
             row,
             event_type="click",
@@ -1162,35 +1153,22 @@ class PayflowCommunicationService:
         payment_base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
         is_payment_click = bool(url and payment_base and payment_base in url)
 
-        # Provider click often arrives after portal resolve already logged our Click —
-        # update URL/status only; do not add a second Click or bump opens.
-        if et in {"click", "clicked"} and self._recent_engagement_event(row, within_seconds=120):
-            if url:
-                row.last_clicked_url = url[:1024]
-            row.last_clicked_at = when
-            row.first_clicked_at = row.first_clicked_at or when
-            if is_payment_click or row.payment_link:
-                self._advance_status(row, PayflowCommStatus.PAYMENT_LINK_CLICKED.value)
-            if commit:
-                self.db.commit()
-            else:
-                self.db.flush()
-            return {
-                "matched": True,
-                "duplicate": True,
-                "debounced": True,
-                "communication_id": row.id,
-                "status": row.status,
-            }
+        # Email provider (SendGrid) link click ≠ Stripe payment webhooks.
+        # PayFlow app Click = record_portal_visit. Stripe = checkout/PI/refund only.
+        event_label = et.replace("_", " ").title()
+        event_type_stored = et
+        if et in {"click", "clicked"} and (is_payment_click or row.payment_link):
+            event_label = "Email Link Clicked"
+            event_type_stored = "email_link_clicked"
 
         recorded = self._record_event_row(
             row,
-            event_type=et,
+            event_type=event_type_stored,
             occurred_at=when,
             detail=url,
             provider_event_id=provider_event_id,
             payload=payload,
-            label=et.replace("_", " ").title(),
+            label=event_label,
         )
         if not recorded:
             return {"matched": True, "duplicate": True, "communication_id": row.id}
@@ -1216,15 +1194,13 @@ class PayflowCommunicationService:
             self._advance_status(row, PayflowCommStatus.DELIVERED.value)
             row.delivered_at = row.delivered_at or when
         elif et in {"open", "opened"}:
-            # Stripe / provider open only — never inflate from payment-link clicks.
+            # Email open (provider) only — never from pay-link click / portal.
             row.opens_count = int(row.opens_count or 0) + 1
             row.first_opened_at = row.first_opened_at or when
             row.last_opened_at = when
             self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"click", "clicked"}:
-            row.clicks_count = int(row.clicks_count or 0) + 1
-            row.first_clicked_at = row.first_clicked_at or when
-            row.last_clicked_at = when
+            # Stripe/provider pay-link open — timeline only; clicks_count is PayFlow app.
             if url:
                 row.last_clicked_url = url[:1024]
             if is_payment_click or row.payment_link:
@@ -1238,6 +1214,7 @@ class PayflowCommunicationService:
                 except Exception:  # noqa: BLE001
                     logger.exception("payment link click record failed")
             else:
+                # Non-pay URL click in email — still engagement, not our app Click counter.
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"canceled", "cancelled"}:
             self._advance_status(row, PayflowCommStatus.CANCELLED.value)

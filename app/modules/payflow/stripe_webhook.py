@@ -1,4 +1,13 @@
-"""Stripe Checkout / PaymentIntent webhook — signature verify + attempt updates."""
+"""Stripe Checkout / PaymentIntent / refund webhook — signature verify + attempt updates.
+
+Configure in Stripe Dashboard → destination endpoint:
+  {PUBLIC_API_BASE}/webhooks/stripe
+
+Events (must match PayflowPaymentPortalService.STRIPE_WEBHOOK_EVENTS):
+  checkout.session.completed | async_payment_succeeded | async_payment_failed | expired
+  payment_intent.succeeded | payment_failed | canceled
+  refund.created | charge.refunded
+"""
 
 from __future__ import annotations
 
@@ -28,6 +37,13 @@ async def stripe_webhook(request: Request):
     db = SessionLocal()
     try:
         result = PayflowPaymentPortalService(db).handle_stripe_event(event)
+        logger.info(
+            "stripe webhook type=%s matched=%s status=%s event_id=%s",
+            result.get("type"),
+            result.get("matched"),
+            result.get("status"),
+            result.get("event_id") or event.get("id"),
+        )
         return {"ok": True, **result}
     except Exception as exc:  # noqa: BLE001
         logger.exception("stripe webhook processing failed")
