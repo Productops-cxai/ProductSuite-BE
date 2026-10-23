@@ -195,6 +195,7 @@ class UpdatePayflowClientRequest(BaseModel):
     governance_rules: Optional[List[str]] = None
     # Portal options: allow_pay_in_full, allow_partial, allow_payment_plan, min amounts, plans.
     payment_settings: Optional[dict] = None
+    communication_settings: Optional[dict] = None
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
@@ -1040,6 +1041,7 @@ class PayflowCommunicationItem(BaseModel):
     purpose: str
     status: str
     workflow_name: Optional[str] = None
+    strategy_id: Optional[int] = None
     engagement: Optional[str] = None
     engagement_tracking: Optional[str] = None
     date_bucket: Optional[str] = None
@@ -1213,7 +1215,9 @@ class PayflowPaymentLinkPublicResolve(BaseModel):
     brand: dict = Field(default_factory=dict)
     link_ref: Optional[str] = None
     payment_options: List[dict] = Field(default_factory=list)
+    active_payment_plans: List[dict] = Field(default_factory=list)
     provider: dict = Field(default_factory=dict)
+    preview_mode: bool = False
 
 
 class PayflowPaymentInitiateRequest(BaseModel):

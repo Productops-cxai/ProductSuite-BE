@@ -262,7 +262,6 @@ def _is_valid_postal_code(raw: str | None) -> bool:
 def _guess_client_import_field(message: str) -> str:
     text = (message or "").lower()
     checks = (
-        ("does not belong to master", "client_number"),
         ("was not found", "master_client__client_number"),
         ("cannot have master_client__client_number", "master_client__client_number"),
         ("master clients cannot", "master_client__client_number"),
@@ -729,6 +728,11 @@ class PayflowClientService:
             if not isinstance(settings_payload, dict):
                 raise ValidationAppError("payment_settings must be an object")
             client.payment_settings = dict(settings_payload)
+        if "communication_settings" in payload and payload["communication_settings"] is not None:
+            comm_payload = payload["communication_settings"]
+            if not isinstance(comm_payload, dict):
+                raise ValidationAppError("communication_settings must be an object")
+            client.communication_settings = dict(comm_payload)
 
         if "mappings" in payload and payload["mappings"] is not None:
             self._replace_mappings(client, payload["mappings"])
@@ -1959,12 +1963,8 @@ class PayflowClientService:
                     else _normalize_code(master_row.get("client_code") or "")
                 )
 
-                self._assert_sub_belongs_to_master(
-                    number=number or None,
-                    code=code,
-                    master_number=master_number,
-                    master_code=parent_code,
-                )
+                # Relation = master_client__client_number → parent only
+                # (no client_number / client_code prefix naming rule).
 
                 existing = (
                     self._resolve_portfolio_for_upsert(
@@ -2660,34 +2660,6 @@ class PayflowClientService:
                 + ". Keep the original number, or use a new number and a new "
                 "code to create a new record."
             )
-
-    @staticmethod
-    def _assert_sub_belongs_to_master(
-        *,
-        number: str | None,
-        code: str,
-        master_number: str,
-        master_code: str,
-    ) -> None:
-        """Reject subs whose number/code do not follow the parent master pattern."""
-        master_number = (master_number or "").strip()
-        master_code = _normalize_code(master_code or "")
-        number = (number or "").strip()
-        code = _normalize_code(code or "")
-        if not master_number or not master_code:
-            return
-
-        num_ok = bool(number) and number.lower().startswith(
-            f"{master_number.lower()}-"
-        )
-        code_ok = bool(code) and code.lower().startswith(f"{master_code.lower()}-")
-        if num_ok and code_ok:
-            return
-        raise ValidationAppError(
-            f'This sub-client does not belong to master "{master_number}" / '
-            f'"{master_code}". Use a client_number starting with '
-            f'"{master_number}-" and a client_code starting with "{master_code}-".'
-        )
 
     def _find_portfolio_by_crm_number_global(
         self, crm_number: str
@@ -3597,6 +3569,7 @@ class PayflowClientService:
             },
             "governance_rules": list(client.governance_rules or []),
             "payment_settings": dict(client.payment_settings or {}),
+            "communication_settings": dict(client.communication_settings or {}),
             "mappings": [
                 {
                     "id": m.id,

@@ -111,6 +111,10 @@ from app.modules.payflow.services.operational_exception_service import (
 from app.modules.payflow.services.payment_link_service import PayflowPaymentLinkService
 from app.modules.payflow.services.payment_outcome_service import PayflowPaymentOutcomeService
 from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
+from app.modules.payflow.services.payment_reconciliation_service import (
+    PaymentReconciliationService,
+)
+from app.modules.payflow.services.ai_eval_export_service import AiEvalExportService
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
@@ -552,6 +556,35 @@ def list_accounts(
             human_review=human_review,
             search=search,
         )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/accounts/{account_id}/ai-reassess")
+def reassess_account_ai(account_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Case-level AI reassessment (not portfolio Suggest). Writes ai_decision_context."""
+    try:
+        from app.infrastructure.database.models import PayflowAccountModel
+        from app.modules.payflow.services.case_reassessment_service import (
+            CaseReassessmentService,
+        )
+
+        # Permission + scope check via existing account get.
+        PayflowAccountService(db).get_account(user, account_id)
+        account = db.get(PayflowAccountModel, account_id)
+        if account is None:
+            raise NotFoundError("Account not found")
+        result = CaseReassessmentService(db).run_reassessment(
+            account,
+            trigger="manual_case_suggest",
+            note=f"Requested by {getattr(user, 'email', None) or user.id}",
+        )
+        db.commit()
+        return {
+            "account_id": account_id,
+            "recommendation": result,
+            "case": PayflowAccountService(db).get_account(user, account_id),
+        }
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1389,6 +1422,100 @@ def list_account_payments(account_id: int, user: RequirePayflowProduct, db: DbSe
         raise _map_error(exc) from exc
 
 
+@router.get("/reports/payment-reconciliation")
+def payment_reconciliation_preview(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+):
+    """CRM payment reconciliation preview (confirmed ledger rows). No CRM writeback."""
+    try:
+        return PaymentReconciliationService(db).preview(
+            user,
+            client_id=client_id,
+            portfolio_id=portfolio_id,
+            date_from=date_from,
+            date_to=date_to,
+            status=status,
+            limit=limit,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/reports/ai-eval")
+def ai_eval_preview(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
+):
+    """AI evaluation preview — workflow versions + human review audits."""
+    try:
+        return AiEvalExportService(db).preview(user, client_id=client_id, limit=limit)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/reports/ai-eval/export")
+def ai_eval_export(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    format: str = Query(default="csv", pattern="^(csv|json)$"),
+):
+    """Download AI evaluation export as CSV or JSON."""
+    try:
+        svc = AiEvalExportService(db)
+        if format == "json":
+            filename, body = svc.export_json(user, client_id=client_id)
+            media = "application/json"
+        else:
+            filename, body = svc.export_csv(user, client_id=client_id)
+            media = "text/csv"
+        return Response(
+            content=body,
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/reports/payment-reconciliation/export")
+def payment_reconciliation_export(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    """CSV download for CRM payment reconciliation."""
+    try:
+        filename, body = PaymentReconciliationService(db).export_csv(
+            user,
+            client_id=client_id,
+            portfolio_id=portfolio_id,
+            date_from=date_from,
+            date_to=date_to,
+            status=status,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/payment-links/{link_id}", response_model=PayflowPaymentLinkItem)
 def get_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
@@ -1409,10 +1536,17 @@ def revoke_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession
     "/public/payment-links/{token}",
     response_model=PayflowPaymentLinkPublicResolve,
 )
-def resolve_public_payment_link(token: str, db: DbSession):
-    """Customer payment portal resolve — no JWT. Branding, balance, options."""
+def resolve_public_payment_link(
+    token: str,
+    db: DbSession,
+    preview: bool = False,
+):
+    """Customer payment portal resolve — no JWT. Branding, balance, options.
+
+    Pass preview=1 for staff-safe preview (no access side effects; checkout blocked).
+    """
     try:
-        return PayflowPaymentPortalService(db).resolve_portal(token)
+        return PayflowPaymentPortalService(db).resolve_portal(token, preview=preview)
     except AppError as exc:
         raise _map_error(exc) from exc
 

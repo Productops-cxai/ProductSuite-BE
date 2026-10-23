@@ -158,6 +158,7 @@ class WorkflowSuggestionService:
         client = load_client_context(self.db, original["client_id"])
         rules = load_rules(self.db, original["client_id"])
         limits = design_limits(client, rules)
+        learning = load_client_learning(self.db, original["client_id"], limits)
 
         # AI workflows store segment/stats in ai_context; human-created may have none.
         kept = [
@@ -169,14 +170,37 @@ class WorkflowSuggestionService:
             "segment_id": "A",
             "label": next((i["value"] for i in kept if i["label"] == "Segment"), "Current segment"),
             "stats": {i["label"]: i["value"] for i in kept if i["label"] != "Segment"},
+            "segment": original.get("segment") or {},
         }
+        examples = pick_examples(
+            learning["pool"], [segment], original["portfolio_id"]
+        )
+        lessons = pick_lessons(learning["lessons"], [segment])
         revision = build_revision(segment["segment_id"], original, remarks, self._review_history(original))
-        workflow = self._suggest_batch(client, original["portfolio_name"] or "", [segment], limits, revision)["A"]
+        workflow = self._suggest_batch(
+            client,
+            original["portfolio_name"] or "",
+            [segment],
+            limits,
+            revision,
+            client_examples=[item["example"] for item in examples],
+            lessons=lessons,
+        )["A"]
 
         ai_context = kept + _reasoning_context(workflow) + [
             {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
             {"label": "Reviewer remarks", "value": remarks},
         ]
+        if examples:
+            ai_context.append(
+                {
+                    "label": "Learned from",
+                    "value": ", ".join(
+                        str(item.get("example", {}).get("name") or item.get("name") or "prior")
+                        for item in examples[:3]
+                    ),
+                }
+            )
         ai_context += [{"label": "Governed by", "value": line} for line in governing_rules(client, rules)]
         return self._save(
             user,

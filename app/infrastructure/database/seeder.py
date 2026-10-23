@@ -183,6 +183,36 @@ _PAYFLOW_NAV: list[
                 None,
                 "view_communications",
             ),
+            (
+                "exceptions",
+                "Exceptions",
+                "/payflow/exceptions",
+                "overview",
+                3,
+                False,
+                None,
+                "view_operational_exceptions",
+            ),
+            (
+                "payment_recon",
+                "Payment Reconciliation",
+                "/payflow/reports/payment-reconciliation",
+                "billing",
+                4,
+                False,
+                None,
+                "view_analytics|view_collection_cases",
+            ),
+            (
+                "ai_eval",
+                "AI Eval Export",
+                "/payflow/reports/ai-eval",
+                "overview",
+                5,
+                False,
+                None,
+                "view_workflows|view_analytics",
+            ),
         ],
     ),
     (
@@ -647,6 +677,8 @@ class DatabaseSeeder:
             "workflows",
             "review",
             "comms",
+            "exceptions",
+            "payment_recon",
         }
         parked_disabled_keys: set[str] = set()
         for section_key, label, sort_order, items in _PAYFLOW_NAV:

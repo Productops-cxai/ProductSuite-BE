@@ -313,6 +313,8 @@ class PayflowClientModel(Base):
     governance_rules: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Customer portal payment options (pay in full / partial / plans, min amounts).
     payment_settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Send windows / quiet hours (timezone, start/end hour). Additive JSON.
+    communication_settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # How the client was first created: add_client | file_upload
     added_through: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -466,6 +468,8 @@ class PayflowAccountModel(Base):
     hold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     email_consent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     sms_opt_out: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
+    # AI case reassessment history: recommendations + HR decisions (additive JSON).
+    ai_decision_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
     source_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -683,6 +687,9 @@ class PayflowCommunicationModel(Base):
     purpose: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(64), nullable=False, default="Sent")
     workflow_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    strategy_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_strategies.id"), nullable=True, index=True
+    )
     engagement: Mapped[str | None] = mapped_column(String(128), nullable=True)
     date_bucket: Mapped[str | None] = mapped_column(String(32), nullable=True)
     date_label: Mapped[str | None] = mapped_column(String(64), nullable=True)

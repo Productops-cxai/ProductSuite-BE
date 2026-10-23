@@ -65,6 +65,8 @@ class PayflowAccountService:
             "next_action": row.next_action,
             "human_review": bool(row.human_review),
             "timeline": list(row.timeline or []),
+            "ai_decision_context": list(getattr(row, "ai_decision_context", None) or []),
+
             "portfolio_code": portfolio.code if portfolio else None,
             "customer_first_name": row.customer_first_name,
             "customer_last_name": row.customer_last_name,

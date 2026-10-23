@@ -180,6 +180,7 @@ class PayflowCommStatus(str, Enum):
     OPENED_READ = "Opened / Read"
     PAYMENT_LINK_CLICKED = "Payment Link Clicked"
     FAILED = "Failed"
+    CANCELLED = "Cancelled"
     SUPPRESSED = "Suppressed"
 
 
@@ -214,6 +215,7 @@ class PayflowPaymentOptionType(str, Enum):
     PAY_IN_FULL = "pay_in_full"
     PARTIAL = "partial"
     PAYMENT_PLAN = "payment_plan"
+    PAY_NEXT_INSTALMENT = "pay_next_instalment"
 
 
 class PayflowPaymentAttemptStatus(str, Enum):

@@ -46,6 +46,77 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _client_comm_settings(client: PayflowClientModel | None) -> dict[str, Any]:
+    raw = getattr(client, "communication_settings", None) if client else None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _evaluate_send_window(client: PayflowClientModel | None) -> dict[str, Any]:
+    """Quiet-hours / send window in the client's timezone. Default: always open."""
+    cfg = _client_comm_settings(client)
+    if cfg.get("quiet_hours_enabled") is False:
+        return {"ok": True}
+    start_h = cfg.get("send_window_start_hour")
+    end_h = cfg.get("send_window_end_hour")
+    if start_h is None and end_h is None:
+        return {"ok": True}
+    try:
+        start_h = int(start_h if start_h is not None else 9)
+        end_h = int(end_h if end_h is not None else 20)
+    except (TypeError, ValueError):
+        return {"ok": True}
+    if start_h == end_h:
+        return {"ok": True}
+
+    tz_name = str(cfg.get("timezone") or "America/Toronto")
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        tz = timezone.utc
+        tz_name = "UTC"
+
+    local_now = datetime.now(timezone.utc).astimezone(tz)
+    hour = local_now.hour
+    in_window = start_h <= hour < end_h if start_h < end_h else hour >= start_h or hour < end_h
+    if in_window:
+        return {"ok": True}
+
+    # Next window start in client TZ → UTC.
+    next_local = local_now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+    if local_now >= next_local:
+        next_local = next_local + timedelta(days=1)
+    # When window wraps midnight and we are after midnight but before end, start is today — handled by in_window.
+    next_utc = next_local.astimezone(timezone.utc)
+    return {
+        "ok": False,
+        "eligibility_status": "Deferred",
+        "restriction_reason": (
+            f"Outside permitted send window ({start_h:02d}:00–{end_h:02d}:00 {tz_name})"
+        ),
+        "next_eligible_at": next_utc,
+    }
+
+
+def _next_eligible_after_frequency(db: Session, account_id: int) -> datetime | None:
+    """When Messages Sent (7 days) may drop: oldest message in the rolling window + 7 days."""
+    cutoff = _utcnow() - timedelta(days=7)
+    rows = (
+        db.query(PayflowCommunicationModel)
+        .filter(PayflowCommunicationModel.account_id == account_id)
+        .filter(PayflowCommunicationModel.created_at >= cutoff)
+        .order_by(PayflowCommunicationModel.created_at.asc())
+        .all()
+    )
+    if not rows or not rows[0].created_at:
+        return _utcnow() + timedelta(hours=1)
+    oldest = rows[0].created_at
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=timezone.utc)
+    return oldest + timedelta(days=7)
+
+
 DROP_OFF_SEGMENTS = [
     "Delivered but Not Opened / Read",
     "Opened / Read but Did Not Click",
@@ -63,6 +134,7 @@ _STATUS_RANK = {
     PayflowCommStatus.OPENED_READ.value: 50,
     PayflowCommStatus.PAYMENT_LINK_CLICKED.value: 60,
     PayflowCommStatus.FAILED.value: 100,
+    PayflowCommStatus.CANCELLED.value: 100,
     PayflowCommStatus.SUPPRESSED.value: 100,
 }
 
@@ -309,6 +381,7 @@ class PayflowCommunicationService:
             "recipient": recipient,
             "provider_error": provider_error,
             "workflow_name": row.workflow_name,
+            "strategy_id": row.strategy_id,
             "engagement": self._engagement_label(row),
             "engagement_tracking": tracking,
             "date_bucket": date_bucket,
@@ -507,85 +580,91 @@ class PayflowCommunicationService:
         *,
         channel: str,
     ) -> dict[str, Any]:
-        """Pre-send gates: channel flags, consent, contact, holds."""
+        """Pre-send gates: channel, consent, contact, holds, send windows, Prevent Communication."""
         channel_norm = (channel or "Email").strip()
         client: PayflowClientModel | None = account.client
-        if account.provincial_hold:
+        if account.client is None and account.client_id:
+            client = self.db.get(PayflowClientModel, account.client_id)
+
+        def _blocked(
+            reason: str,
+            *,
+            status: str = "Blocked",
+            next_at: datetime | None = None,
+            rule_id: int | None = None,
+            rule_name: str | None = None,
+            rule_code: str | None = None,
+        ) -> dict[str, Any]:
             return {
                 "ok": False,
-                "eligibility_status": "Blocked",
-                "restriction_reason": "Account is on provincial hold",
-                "next_eligible_at": None,
+                "eligibility_status": status,
+                "restriction_reason": reason,
+                "next_eligible_at": next_at,
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "rule_code": rule_code,
             }
+
+        if account.provincial_hold:
+            return _blocked("Account is on provincial hold")
         status = (account.collection_status or "").strip().lower()
         if status in {"resolved", "closed", "ineligible", "paid"}:
-            return {
-                "ok": False,
-                "eligibility_status": "Blocked",
-                "restriction_reason": f"Case status '{account.collection_status}' prevents outreach",
-                "next_eligible_at": None,
-            }
+            return _blocked(f"Case status '{account.collection_status}' prevents outreach")
         if channel_norm == "SMS":
             if client is not None and client.channel_sms is False:
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "SMS channel is disabled for this client",
-                    "next_eligible_at": None,
-                }
+                return _blocked("SMS channel is disabled for this client")
             if getattr(account, "sms_opt_out", False):
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "Customer opted out of SMS (STOP)",
-                    "next_eligible_at": None,
-                }
+                return _blocked("Customer opted out of SMS (STOP)")
             phone = (account.phone_mobile or account.phone_work or "").strip()
             if not phone:
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "No valid mobile/work phone on file",
-                    "next_eligible_at": None,
-                }
+                return _blocked("No valid mobile/work phone on file")
             if not normalize_e164(phone):
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "Phone number is not a valid E.164 / NANP number",
-                    "next_eligible_at": None,
-                }
+                return _blocked("Phone number is not a valid E.164 / NANP number")
         else:
             if client is not None and client.channel_email is False:
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "Email channel is disabled for this client",
-                    "next_eligible_at": None,
-                }
+                return _blocked("Email channel is disabled for this client")
             email = (account.email or "").strip()
             if not email:
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "No valid email on file",
-                    "next_eligible_at": None,
-                }
+                return _blocked("No valid email on file")
             if not _valid_email(email):
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "Email address format is invalid",
-                    "next_eligible_at": None,
-                }
+                return _blocked("Email address format is invalid")
             if account.email_consent is False:
-                return {
-                    "ok": False,
-                    "eligibility_status": "Blocked",
-                    "restriction_reason": "Customer has not consented to email",
-                    "next_eligible_at": None,
-                }
-        return {"ok": True, "eligibility_status": "Eligible", "restriction_reason": None, "next_eligible_at": None}
+                return _blocked("Customer has not consented to email")
+
+        window = _evaluate_send_window(client)
+        if not window["ok"]:
+            return _blocked(
+                str(window["restriction_reason"]),
+                status=str(window.get("eligibility_status") or "Deferred"),
+                next_at=window.get("next_eligible_at"),
+            )
+
+        # Same Prevent Communication / frequency path as workflow execution.
+        from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
+
+        runtime = RuleRuntimeService(self.db)
+        matched = runtime.first_blocking_action(
+            account, channel=channel_norm, for_communication=True
+        )
+        if matched and matched.get("action") == "Prevent Communication":
+            next_at = _next_eligible_after_frequency(self.db, account.id)
+            return _blocked(
+                f"Prevent Communication — {matched.get('name') or 'governance rule'}",
+                next_at=next_at,
+                rule_id=matched.get("rule_id"),
+                rule_name=matched.get("name"),
+                rule_code=matched.get("code"),
+            )
+
+        return {
+            "ok": True,
+            "eligibility_status": "Eligible",
+            "restriction_reason": None,
+            "next_eligible_at": None,
+            "rule_id": None,
+            "rule_name": None,
+            "rule_code": None,
+        }
 
     def record_blocked_communication(
         self,
@@ -620,6 +699,7 @@ class PayflowCommunicationService:
             if eligibility_status == "Blocked"
             else PayflowCommStatus.FAILED.value,
             workflow_name=strategy.name if strategy else account.current_workflow,
+            strategy_id=getattr(strategy, "id", None),
             engagement=None,
             engagement_tracking="not_available" if channel_norm == "SMS" else "available",
             date_bucket=date_bucket,
@@ -678,6 +758,9 @@ class PayflowCommunicationService:
                 payment_link=bool(payment_link),
                 restriction_reason=str(gate.get("restriction_reason") or "Not eligible"),
                 eligibility_status=str(gate.get("eligibility_status") or "Blocked"),
+                rule_id=gate.get("rule_id"),
+                rule_name=gate.get("rule_name"),
+                rule_code=gate.get("rule_code"),
                 next_eligible_at=gate.get("next_eligible_at"),
                 client_id=client_id,
             )
@@ -714,6 +797,7 @@ class PayflowCommunicationService:
             purpose=purpose_norm,
             status=PayflowCommStatus.PREPARED.value,
             workflow_name=strategy.name,
+            strategy_id=getattr(strategy, "id", None),
             engagement=None,
             engagement_tracking=tracking,
             date_bucket=date_bucket,
@@ -849,6 +933,7 @@ class PayflowCommunicationService:
                     source_entity_id=comm.id,
                     severity="High",
                     retriable=True,
+                    diagnostic_ref=comm.provider_message_id or comm.code,
                     link=f"/payflow/comms/{comm.id}",
                     notify=True,
                     commit=False,
@@ -867,6 +952,24 @@ class PayflowCommunicationService:
             "provider_message_id": provider_message_id,
             "code": code,
         }
+
+    def record_portal_visit(
+        self,
+        communication_id: int,
+        *,
+        detail: str = "Customer opened payment portal",
+    ) -> None:
+        """Distinct from email link click — portal resolve / pay page open."""
+        row = self.db.get(PayflowCommunicationModel, communication_id)
+        if not row:
+            return
+        self._record_event_row(
+            row,
+            event_type="payment_link_opened",
+            label="Payment Link Opened",
+            detail=detail,
+        )
+        self._append_json_event(row, "Payment Link Opened", detail)
 
     def update_status(
         self,
@@ -997,14 +1100,18 @@ class PayflowCommunicationService:
                     logger.exception("payment link click record failed")
             else:
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
+        elif et in {"canceled", "cancelled"}:
+            self._advance_status(row, PayflowCommStatus.CANCELLED.value)
+            self._append_json_event(row, "Cancelled", fail_detail or "Provider cancelled send")
+            row.provider_error = fail_detail or row.provider_error
+            row.eligibility_status = "Blocked"
+            row.restriction_reason = fail_detail or "Communication cancelled"
         elif et in {
             "bounce",
             "bounced",
             "dropped",
             "failed",
             "undelivered",
-            "canceled",
-            "cancelled",
         }:
             self._advance_status(row, PayflowCommStatus.FAILED.value)
             row.provider_error = fail_detail or row.provider_error or f"Provider {et}"
@@ -1023,7 +1130,8 @@ class PayflowCommunicationService:
                     source_entity_type="communication",
                     source_entity_id=row.id,
                     severity="High",
-                    retriable=et in {"deferred", "undelivered"},
+                    retriable=et in {"undelivered"},
+                    diagnostic_ref=row.provider_message_id or row.code,
                     link=f"/payflow/comms/{row.id}",
                     notify=True,
                     commit=False,
@@ -1034,8 +1142,16 @@ class PayflowCommunicationService:
             self._advance_status(row, PayflowCommStatus.SUPPRESSED.value)
             row.eligibility_status = "Blocked"
             row.restriction_reason = f"Provider event: {et}"
+            # Account-level block so future email eligibility fails.
+            if row.account_id:
+                account = self.db.get(PayflowAccountModel, row.account_id)
+                if account is not None:
+                    account.email_consent = False
         elif et in {"deferred"}:
             self._append_json_event(row, "Delivery Deferred", "Temporary delay from provider")
+            row.eligibility_status = "Deferred"
+            row.restriction_reason = "Provider deferred delivery"
+            row.next_eligible_at = _utcnow() + timedelta(hours=4)
 
         if commit:
             self.db.commit()
