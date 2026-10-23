@@ -136,6 +136,20 @@ class PayflowPaymentPortalService:
             "third_party",
         }
 
+    @staticmethod
+    def _absolute_asset_url(url: str | None) -> str | None:
+        """Make /uploads/... absolute so portal FE + Stripe can load logos cross-origin."""
+        raw = (url or "").strip()
+        if not raw:
+            return None
+        if raw.startswith(("http://", "https://")):
+            return raw
+        base = (settings.PUBLIC_API_BASE or "").strip().rstrip("/")
+        if not base:
+            return raw  # relative — FE may still prefix via VITE_API_BASE_URL
+        path = raw if raw.startswith("/") else f"/{raw}"
+        return f"{base}{path}"
+
     def _brand_payload(self, client: PayflowClientModel | None) -> dict[str, Any]:
         third = self._is_third_party(client)
         client_label = (client.brand_name or client.name) if client else "Client"
@@ -143,13 +157,15 @@ class PayflowPaymentPortalService:
             return {
                 "mode": "third_party",
                 "name": settings.PAYFLOW_OPERATOR_BRAND_NAME or "PayFlow Collections",
-                "logo_url": (settings.PAYFLOW_OPERATOR_LOGO_URL or None) or None,
+                "logo_url": self._absolute_asset_url(
+                    (settings.PAYFLOW_OPERATOR_LOGO_URL or None) or None
+                ),
                 "on_behalf_of": client_label,
             }
         return {
             "mode": "first_party",
             "name": client_label or "PayFlow",
-            "logo_url": client.logo_url if client else None,
+            "logo_url": self._absolute_asset_url(client.logo_url if client else None),
             "on_behalf_of": None,
         }
 
