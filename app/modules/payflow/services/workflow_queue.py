@@ -71,6 +71,7 @@ def enqueue_execute_step(
     account_id: int | None = None,
     strategy_id: int | None = None,
     scheduled_at: datetime | None = None,
+    payload: dict[str, Any] | None = None,
     commit: bool = False,
 ) -> PayflowWorkflowJobModel:
     return enqueue_job(
@@ -81,6 +82,7 @@ def enqueue_execute_step(
         account_id=account_id,
         strategy_id=strategy_id,
         scheduled_at=scheduled_at,
+        payload=payload,
         priority=100,
         commit=commit,
     )
@@ -92,6 +94,7 @@ def enqueue_resume_run(
     run_id: int,
     step_id: str | None = None,
     account_id: int | None = None,
+    payload: dict[str, Any] | None = None,
     commit: bool = True,
 ) -> PayflowWorkflowJobModel:
     return enqueue_job(
@@ -100,6 +103,7 @@ def enqueue_resume_run(
         run_id=run_id,
         step_id=step_id,
         account_id=account_id,
+        payload=payload,
         priority=40,
         commit=commit,
     )

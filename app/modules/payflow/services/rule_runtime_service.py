@@ -112,12 +112,15 @@ class RuleRuntimeService:
         *,
         channel: str | None = None,
         for_communication: bool = False,
+        exclude_actions: set[str] | frozenset[str] | None = None,
     ) -> dict[str, Any] | None:
         """
         Priority: Prevent Communication (comms only) → Hold Action → Require Human Review
         → Escalate / Reassessment / Change Workflow.
         """
         matched = self.evaluate(account, channel=channel, for_communication=for_communication)
+        if exclude_actions:
+            matched = [m for m in matched if m.get("action") not in exclude_actions]
         if not matched:
             return None
         priority = [

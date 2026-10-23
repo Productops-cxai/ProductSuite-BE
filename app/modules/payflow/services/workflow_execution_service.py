@@ -497,7 +497,14 @@ class WorkflowExecutionService:
         return totals
 
     # ------------------------------------------------------------------ execute / resume
-    def resume_run(self, run_id: int, *, from_step_id: str | None = None, job_id: int | None = None) -> None:
+    def resume_run(
+        self,
+        run_id: int,
+        *,
+        from_step_id: str | None = None,
+        job_id: int | None = None,
+        after_human_review: bool = False,
+    ) -> None:
         run = self.db.get(PayflowWorkflowRunModel, run_id)
         if not run or run.status in _TERMINAL:
             return
@@ -507,36 +514,52 @@ class WorkflowExecutionService:
         step_id = from_step_id or run.current_step_id
         steps = {s.get("id"): s for s in (strategy.steps or []) if isinstance(s, dict) and s.get("id")}
         step = steps.get(step_id or "")
-        next_id = None
-        if step:
-            next_id = step.get("next") or _cfg(step).get("next")
-        if not next_id:
-            # Resume from current step itself if it was Human Review pause before executing next.
-            next_id = step_id
+        # After human review, the paused step never finished (e.g. Email was blocked
+        # before send). Re-execute that step — do not jump to its .next (Wait).
+        if after_human_review:
+            target_id = step_id
+        else:
+            target_id = None
+            if step:
+                target_id = step.get("next") or _cfg(step).get("next")
+            if not target_id:
+                target_id = step_id
         run.status = PayflowWorkflowRunStatus.ACTIVE.value
         run.human_review_id = None
         self.db.flush()
-        if next_id:
+        if target_id:
             enqueue_execute_step(
                 self.db,
                 run_id=run.id,
-                step_id=next_id,
+                step_id=target_id,
                 account_id=run.account_id,
                 strategy_id=run.strategy_id,
+                payload={"after_human_review": True} if after_human_review else None,
                 commit=False,
             )
         self.log_event(
             event_type="run_resumed",
-            message=f"Run {run_id} resumed after human review",
+            message=(
+                f"Run {run_id} resumed after human review — re-executing paused step"
+                if after_human_review
+                else f"Run {run_id} resumed"
+            ),
             run_id=run.id,
             account_id=run.account_id,
             strategy_id=run.strategy_id,
             job_id=job_id,
-            step_id=next_id,
+            step_id=target_id,
         )
         self.db.commit()
 
-    def execute_step(self, run_id: int, step_id: str, *, job_id: int | None = None) -> None:
+    def execute_step(
+        self,
+        run_id: int,
+        step_id: str,
+        *,
+        job_id: int | None = None,
+        after_human_review: bool = False,
+    ) -> None:
         run = self.db.get(PayflowWorkflowRunModel, run_id)
         if not run or run.status in _TERMINAL:
             return
@@ -561,6 +584,8 @@ class WorkflowExecutionService:
             return
 
         # Idempotency: do not re-execute a step that already completed successfully.
+        # Exception: after supervisor approve, re-run the step that was only paused
+        # (communication never sent) — paused_human_review is not a successful send.
         prior_ok = (
             self.db.query(PayflowWorkflowStepRunModel)
             .filter(
@@ -572,18 +597,22 @@ class WorkflowExecutionService:
             .first()
         )
         if prior_ok is not None:
-            self.log_event(
-                event_type="step_skipped_duplicate",
-                message=f"Step {step_id} already {prior_ok.status} — skipping duplicate job",
-                run_id=run_id,
-                step_id=step_id,
-                job_id=job_id,
-                account_id=account.id,
-                strategy_id=strategy.id,
-                level="warn",
+            allow_resume = (
+                after_human_review and prior_ok.status == "paused_human_review"
             )
-            self.db.commit()
-            return
+            if not allow_resume:
+                self.log_event(
+                    event_type="step_skipped_duplicate",
+                    message=f"Step {step_id} already {prior_ok.status} — skipping duplicate job",
+                    run_id=run_id,
+                    step_id=step_id,
+                    job_id=job_id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    level="warn",
+                )
+                self.db.commit()
+                return
 
         block = _account_execution_block_reason(account)
         if block:
@@ -672,10 +701,29 @@ class WorkflowExecutionService:
 
         try:
             channel = _cfg(step).get("channel") or step.get("channel")
+            # Supervisor already approved continue — do not re-pause this step on
+            # Require Human Review / Escalate (email would never send otherwise).
+            exclude_actions = (
+                frozenset({"Require Human Review", "Escalate Case"})
+                if after_human_review
+                else None
+            )
+            if after_human_review:
+                self.log_event(
+                    event_type="rule_bypassed_after_review",
+                    message="Skipping Require Human Review / Escalate after approval",
+                    run_id=run.id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    job_id=job_id,
+                    step_id=step_id,
+                    level="info",
+                )
             blocking = self.rules.first_blocking_action(
                 account,
                 channel=channel if isinstance(channel, str) else None,
                 for_communication=(kind == "Communication"),
+                exclude_actions=exclude_actions,
             )
             if blocking:
                 handled = self._apply_rule_action(
@@ -2453,11 +2501,12 @@ class WorkflowExecutionService:
                 run_id=run.id,
                 step_id=run.current_step_id,
                 account_id=run.account_id,
+                payload={"after_human_review": True},
                 commit=False,
             )
             self.log_event(
                 event_type="human_review_continue",
-                message=f"Resume queued after review #{review_id}",
+                message=f"Resume queued after review #{review_id} (re-execute paused step)",
                 run_id=run.id,
                 account_id=run.account_id,
                 strategy_id=run.strategy_id,

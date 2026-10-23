@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationAppError
@@ -596,8 +597,17 @@ class PayflowRuleService:
         )
         from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
 
+        from app.shared.enums import PayflowReviewStatus
+
         runtime = RuleRuntimeService(self.db)
         review_svc = PayflowReviewService(self.db)
+        # After approve/modify, do not re-queue the same account on every rule
+        # save/activate — that produced duplicate Human Review rows minutes apart.
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        decided_statuses = {
+            PayflowReviewStatus.APPROVED.value,
+            PayflowReviewStatus.MODIFIED.value,
+        }
         created = 0
         for account in runtime.candidate_accounts_for_rule(rule):
             if not runtime.matches_rule(rule, account):
@@ -606,12 +616,29 @@ class PayflowRuleService:
                 self.db.query(PayflowHumanReviewModel)
                 .filter(
                     PayflowHumanReviewModel.account_id == account.id,
-                    PayflowHumanReviewModel.rule_id == rule.id,
                     PayflowHumanReviewModel.status.in_(list(OPEN_STATUSES)),
                 )
                 .first()
             )
             if already_open:
+                continue
+            recently_decided = (
+                self.db.query(PayflowHumanReviewModel)
+                .filter(
+                    PayflowHumanReviewModel.account_id == account.id,
+                    PayflowHumanReviewModel.rule_id == rule.id,
+                    PayflowHumanReviewModel.status.in_(list(decided_statuses)),
+                    or_(
+                        PayflowHumanReviewModel.decided_at >= recent_cutoff,
+                        (
+                            PayflowHumanReviewModel.decided_at.is_(None)
+                            & (PayflowHumanReviewModel.created_at >= recent_cutoff)
+                        ),
+                    ),
+                )
+                .first()
+            )
+            if recently_decided:
                 continue
             review_svc.enqueue_from_rule(
                 account_id=account.id,
