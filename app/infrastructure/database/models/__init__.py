@@ -823,6 +823,7 @@ class PayflowPaymentAttemptModel(Base):
     __table_args__ = (
         UniqueConstraint("public_id", name="uq_payflow_payment_attempt_public_id"),
         Index("ix_payflow_payment_attempts_stripe_session", "stripe_session_id"),
+        Index("ix_payflow_payment_attempts_stripe_pi", "stripe_payment_intent_id"),
         Index("ix_payflow_payment_attempts_link_status", "payment_link_id", "status"),
     )
 
@@ -953,6 +954,8 @@ class PayflowPaymentTransactionModel(Base):
     __tablename__ = "payflow_payment_transactions"
     __table_args__ = (
         UniqueConstraint("public_id", name="uq_payflow_payment_txn_public_id"),
+        # Application enforces one Succeeded payment txn per attempt; provider_ref
+        # indexed for lookup (unique not forced — legacy/mock nulls + refunds share refs).
         Index("ix_payflow_payment_txns_provider_ref", "provider_ref"),
         Index("ix_payflow_payment_txns_account", "account_id", "created_at"),
         Index("ix_payflow_payment_txns_attempt", "payment_attempt_id"),

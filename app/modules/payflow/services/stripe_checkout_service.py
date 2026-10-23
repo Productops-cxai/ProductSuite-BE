@@ -33,6 +33,8 @@ def create_checkout_session(
     client_reference_id: str,
     metadata: dict[str, str],
     brand_name: str | None = None,
+    brand_logo_url: str | None = None,
+    brand_subtitle: str | None = None,
     customer_email: str | None = None,
 ) -> dict[str, Any]:
     """Create a Stripe Checkout Session. Amount is major currency units (e.g. 12.50)."""
@@ -43,29 +45,45 @@ def create_checkout_session(
     cents = max(1, int(round(float(amount) * 100)))
     currency_norm = (currency or "USD").strip().lower()
     product_name = f"{brand_name or 'PayFlow'} payment"
+    meta = {k: str(v)[:500] for k, v in (metadata or {}).items()}
+    logo = (brand_logo_url or "").strip()
+    product_images = [logo] if logo.startswith(("http://", "https://")) else []
+    submit_msg = None
+    if brand_subtitle:
+        submit_msg = f"Payment on behalf of {brand_subtitle}"[:120]
 
     try:
         import stripe
 
         stripe.api_key = secret
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            client_reference_id=client_reference_id[:200],
-            customer_email=customer_email or None,
-            line_items=[
+        product_data: dict[str, Any] = {"name": product_name[:120]}
+        if product_images:
+            product_data["images"] = product_images[:8]
+        session_kwargs: dict[str, Any] = {
+            "mode": "payment",
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+            "client_reference_id": client_reference_id[:200],
+            "customer_email": customer_email or None,
+            "line_items": [
                 {
                     "quantity": 1,
                     "price_data": {
                         "currency": currency_norm,
                         "unit_amount": cents,
-                        "product_data": {"name": product_name[:120]},
+                        "product_data": product_data,
                     },
                 }
             ],
-            metadata={k: str(v)[:500] for k, v in (metadata or {}).items()},
-        )
+            "metadata": meta,
+            # Copy metadata onto PaymentIntent so payment_intent.* webhooks match.
+            "payment_intent_data": {"metadata": meta},
+        }
+        if submit_msg:
+            session_kwargs["custom_text"] = {
+                "submit": {"message": submit_msg},
+            }
+        session = stripe.checkout.Session.create(**session_kwargs)
         return {
             "id": session.id,
             "url": session.url,
@@ -90,8 +108,13 @@ def create_checkout_session(
     ]
     if customer_email:
         data.append(("customer_email", customer_email))
-    for i, (k, v) in enumerate((metadata or {}).items()):
-        data.append((f"metadata[{k}]", str(v)[:500]))
+    for i, img in enumerate(product_images[:8]):
+        data.append((f"line_items[0][price_data][product_data][images][{i}]", img))
+    if submit_msg:
+        data.append(("custom_text[submit][message]", submit_msg))
+    for k, v in meta.items():
+        data.append((f"metadata[{k}]", v))
+        data.append((f"payment_intent_data[metadata][{k}]", v))
 
     with httpx.Client(timeout=30.0) as client:
         res = client.post(
@@ -111,10 +134,79 @@ def create_checkout_session(
     }
 
 
+def retrieve_checkout_session(session_id: str) -> dict[str, Any] | None:
+    """Fetch Checkout Session from Stripe (reconcile stuck Processing attempts)."""
+    secret = (settings.STRIPE_SECRET_KEY or "").strip()
+    sid = (session_id or "").strip()
+    if not secret or not sid:
+        return None
+    try:
+        import stripe
+
+        stripe.api_key = secret
+        session = stripe.checkout.Session.retrieve(sid)
+        return dict(session) if hasattr(session, "keys") else session.to_dict()  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("stripe SDK session retrieve failed session=%s", sid)
+        return None
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            res = client.get(
+                f"https://api.stripe.com/v1/checkout/sessions/{sid}",
+                auth=(secret, ""),
+            )
+        if res.status_code >= 400:
+            logger.warning("stripe session retrieve HTTP %s: %s", res.status_code, res.text[:200])
+            return None
+        return res.json()
+    except Exception:
+        logger.exception("stripe httpx session retrieve failed session=%s", sid)
+        return None
+
+
+def retrieve_payment_intent(payment_intent_id: str) -> dict[str, Any] | None:
+    secret = (settings.STRIPE_SECRET_KEY or "").strip()
+    pi = (payment_intent_id or "").strip()
+    if not secret or not pi:
+        return None
+    try:
+        import stripe
+
+        stripe.api_key = secret
+        intent = stripe.PaymentIntent.retrieve(pi)
+        return dict(intent) if hasattr(intent, "keys") else intent.to_dict()  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("stripe SDK PI retrieve failed pi=%s", pi)
+        return None
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            res = client.get(
+                f"https://api.stripe.com/v1/payment_intents/{pi}",
+                auth=(secret, ""),
+            )
+        if res.status_code >= 400:
+            return None
+        return res.json()
+    except Exception:
+        logger.exception("stripe httpx PI retrieve failed pi=%s", pi)
+        return None
+
+
 def verify_and_parse_webhook(payload: bytes, sig_header: str | None) -> dict[str, Any]:
-    """Verify Stripe-Signature and return event dict. Empty secret → accept (local/dev)."""
+    """Verify Stripe-Signature and return event dict.
+
+    Production requires STRIPE_WEBHOOK_SECRET. Dev/local may accept unsigned payloads
+    when the secret is unset (mock/testing only).
+    """
     secret = (settings.STRIPE_WEBHOOK_SECRET or "").strip()
+    env = (settings.APP_ENV or "").strip().lower()
     if not secret:
+        if env == "production":
+            raise ValueError("STRIPE_WEBHOOK_SECRET is required in production")
         try:
             return json.loads(payload.decode("utf-8"))
         except Exception as exc:  # noqa: BLE001

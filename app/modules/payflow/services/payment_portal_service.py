@@ -26,6 +26,8 @@ from app.modules.payflow.services.payment_link_service import (
 )
 from app.modules.payflow.services.stripe_checkout_service import (
     create_checkout_session,
+    retrieve_checkout_session,
+    retrieve_payment_intent,
     stripe_configured,
 )
 from app.shared.enums import (
@@ -43,6 +45,9 @@ _DEFAULT_PAYMENT_SETTINGS: dict[str, Any] = {
     "allow_payment_plan": True,
     "min_partial_amount": 10.0,
     "min_partial_percent": 5.0,
+    # Stripe readiness (story BE-12): opt-in per client; currencies empty = use case currency only.
+    "stripe_payments_enabled": True,
+    "accepted_currencies": [],
     "payment_plan_options": [
         {"id": "plan_3", "label": "3 monthly instalments", "installments": 3},
         {"id": "plan_6", "label": "6 monthly instalments", "installments": 6},
@@ -80,6 +85,38 @@ class PayflowPaymentPortalService:
         if "allow_payment_plan" not in stored and "allow_plans" in raw:
             raw["allow_payment_plan"] = bool(raw.get("allow_plans"))
         return raw
+
+    def _stripe_enabled_for_client(self, client: PayflowClientModel | None) -> tuple[bool, str | None]:
+        """Per-client Stripe enablement + currency gate (does not assume every client is live)."""
+        cfg = self._client_settings(client)
+        if not bool(cfg.get("stripe_payments_enabled", True)):
+            return False, "Online card payments are not enabled for this client"
+        if not stripe_configured():
+            env = (settings.APP_ENV or "").lower()
+            if env in {"development", "dev", "local", "test"}:
+                return True, None
+            return False, "Online payments are not configured for this environment"
+        return True, None
+
+    def _currency_allowed(
+        self, client: PayflowClientModel | None, currency: str
+    ) -> tuple[bool, str | None]:
+        cfg = self._client_settings(client)
+        cur = (currency or "USD").strip().upper()
+        accepted_raw = cfg.get("accepted_currencies") or []
+        if isinstance(accepted_raw, str):
+            accepted = [c.strip().upper() for c in accepted_raw.split(",") if c.strip()]
+        elif isinstance(accepted_raw, list):
+            accepted = [str(c).strip().upper() for c in accepted_raw if str(c).strip()]
+        else:
+            accepted = []
+        if accepted and cur not in accepted:
+            return (
+                False,
+                f"Currency {cur} is not enabled for online payments for this client",
+            )
+        # When no explicit list: still require a case/client currency (already on the attempt).
+        return True, None
 
     _PREVIEW_TOKEN_PREFIX = "preview."
 
@@ -367,14 +404,25 @@ class PayflowPaymentPortalService:
             if usable or (preview_mode and balance > 0)
             else []
         )
-        provider_ready = stripe_configured() or (settings.APP_ENV or "").lower() in {
+        stripe_ok, stripe_msg = self._stripe_enabled_for_client(client)
+        currency_ok, currency_msg = self._currency_allowed(client, currency)
+        env_ok = stripe_configured() or (settings.APP_ENV or "").lower() in {
             "development",
             "dev",
             "local",
             "test",
         }
+        provider_ready = bool(env_ok and stripe_ok and currency_ok)
+        provider_message = None
         if preview_mode:
             provider_ready = False
+            provider_message = "Preview only — payment cannot be started"
+        elif not stripe_ok:
+            provider_message = stripe_msg
+        elif not currency_ok:
+            provider_message = currency_msg
+        elif not env_ok:
+            provider_message = "Online payments are not configured for this environment"
 
         active_plans: list[dict[str, Any]] = []
         try:
@@ -431,15 +479,7 @@ class PayflowPaymentPortalService:
             "provider": {
                 "name": "stripe" if stripe_configured() else "mock",
                 "ready": bool(provider_ready and usable and options and not preview_mode),
-                "message": (
-                    "Preview only — payment cannot be started"
-                    if preview_mode
-                    else (
-                        None
-                        if provider_ready
-                        else "Online payments are not configured for this environment"
-                    )
-                ),
+                "message": provider_message,
             },
         }
 
@@ -561,6 +601,12 @@ class PayflowPaymentPortalService:
             return self.serialize_attempt(recent)
 
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        stripe_ok, stripe_msg = self._stripe_enabled_for_client(client)
+        if not stripe_ok:
+            raise ValidationAppError(stripe_msg or "Online payments are not available")
+        currency_ok, currency_msg = self._currency_allowed(client, currency)
+        if not currency_ok:
+            raise ValidationAppError(currency_msg or "Currency not supported for online payment")
         public_id = uuid.uuid4().hex
         use_stripe = stripe_configured()
         attempt = PayflowPaymentAttemptModel(
@@ -615,6 +661,8 @@ class PayflowPaymentPortalService:
                         "option_type": option["type"],
                     },
                     brand_name=brand.get("name"),
+                    brand_logo_url=brand.get("logo_url"),
+                    brand_subtitle=brand.get("on_behalf_of"),
                     customer_email=(account.email or None),
                 )
                 attempt.stripe_session_id = session.get("id")
@@ -715,7 +763,80 @@ class PayflowPaymentPortalService:
         )
         if not row:
             raise NotFoundError("Payment attempt not found")
+        # Stuck Processing → pull latest from Stripe (webhook may be delayed).
+        if row.status == PayflowPaymentAttemptStatus.PROCESSING.value and stripe_configured():
+            try:
+                self.reconcile_attempt_from_stripe(row)
+                self.db.refresh(row)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "stripe reconcile failed attempt=%s", attempt_public_id
+                )
         return self.serialize_attempt(row)
+
+    def reconcile_attempt_from_stripe(self, attempt: PayflowPaymentAttemptModel) -> bool:
+        """Sync attempt from Stripe Session/PI. Returns True if status changed."""
+        if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
+            return False
+        session_payload = None
+        if attempt.stripe_session_id:
+            session_payload = retrieve_checkout_session(attempt.stripe_session_id)
+        if session_payload:
+            pi = session_payload.get("payment_intent")
+            if isinstance(pi, str) and pi:
+                attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi
+            payment_status = (session_payload.get("payment_status") or "").lower()
+            status = (session_payload.get("status") or "").lower()
+            amount_total = session_payload.get("amount_total")
+            if amount_total is not None:
+                try:
+                    stripe_amt = float(amount_total) / 100.0
+                    if abs(stripe_amt - _money(attempt.amount)) > 0.009:
+                        self._raise_processing_discrepancy(
+                            attempt,
+                            f"Stripe amount {stripe_amt:.2f} ≠ attempt {_money(attempt.amount):.2f}",
+                            diagnostic_ref=str(attempt.stripe_session_id),
+                        )
+                        self.db.commit()
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            if payment_status in {"paid", "no_payment_required"} or (
+                status == "complete" and payment_status == "paid"
+            ):
+                self.apply_succeeded(
+                    attempt,
+                    provider_ref=attempt.stripe_payment_intent_id
+                    or attempt.stripe_session_id,
+                    commit=True,
+                )
+                return True
+            if status == "expired":
+                attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
+                self._append_attempt_event(attempt, "Expired", "Reconcile from Stripe")
+                self.db.commit()
+                return True
+
+        if attempt.stripe_payment_intent_id:
+            pi_payload = retrieve_payment_intent(attempt.stripe_payment_intent_id)
+            if pi_payload:
+                pi_status = (pi_payload.get("status") or "").lower()
+                if pi_status == "succeeded":
+                    self.apply_succeeded(
+                        attempt,
+                        provider_ref=attempt.stripe_payment_intent_id,
+                        commit=True,
+                    )
+                    return True
+                if pi_status in {"canceled", "cancelled"}:
+                    self.apply_failed(
+                        attempt, error="PaymentIntent canceled (reconcile)", commit=True
+                    )
+                    return True
+                if pi_status == "requires_payment_method":
+                    # Customer abandoned / card failed before capture.
+                    pass
+        return False
 
     def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
@@ -859,12 +980,32 @@ class PayflowPaymentPortalService:
             PayflowPaymentOutcomeService,
         )
 
+        # Row lock reduces concurrent double-apply from webhook races.
+        locked = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(PayflowPaymentAttemptModel.id == attempt.id)
+            .with_for_update()
+            .first()
+        )
+        if locked is not None:
+            attempt = locked
+
         outcome = PayflowPaymentOutcomeService(self.db)
-        # Already succeeded + ledgered → no second balance hit.
-        if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
-            existing = outcome._txn_by_attempt(attempt.id)
-            if existing:
-                return
+        ref = provider_ref or attempt.stripe_payment_intent_id
+        # Ledger exists for this attempt OR same provider_ref → never cut balance again.
+        existing = outcome._txn_by_attempt(attempt.id)
+        if not existing and ref:
+            existing = outcome._txn_by_provider_ref(ref)
+        if existing:
+            attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
+            attempt.completed_at = attempt.completed_at or _utcnow()
+            if ref:
+                attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or ref
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
+            return
 
         account = self.db.get(PayflowAccountModel, attempt.account_id)
         amount = _money(attempt.amount)
@@ -888,11 +1029,9 @@ class PayflowPaymentPortalService:
 
         attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
         attempt.completed_at = _utcnow()
-        if provider_ref:
-            attempt.stripe_payment_intent_id = (
-                attempt.stripe_payment_intent_id or provider_ref
-            )
-        self._append_attempt_event(attempt, "Succeeded", provider_ref)
+        if ref:
+            attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or ref
+        self._append_attempt_event(attempt, "Succeeded", ref)
 
         txn = None
         plan = None
@@ -903,7 +1042,7 @@ class PayflowPaymentPortalService:
                 amount=amount,
                 balance_before=prev,
                 balance_after=new_bal,
-                provider_ref=provider_ref or attempt.stripe_payment_intent_id,
+                provider_ref=ref or attempt.stripe_payment_intent_id,
             )
             if attempt.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
                 plan = outcome.ensure_payment_plan_for_attempt(
@@ -1086,11 +1225,27 @@ class PayflowPaymentPortalService:
         if not session_id and "checkout.session" in et:
             session_id = data_object.get("id")
 
+        pi_id = None
+        if data_object.get("object") == "payment_intent":
+            pi_id = data_object.get("id")
+        else:
+            pi_raw = data_object.get("payment_intent")
+            if isinstance(pi_raw, str):
+                pi_id = pi_raw
+            elif isinstance(pi_raw, dict):
+                pi_id = pi_raw.get("id")
+
         attempt: PayflowPaymentAttemptModel | None = None
         if session_id:
             attempt = (
                 self.db.query(PayflowPaymentAttemptModel)
                 .filter(PayflowPaymentAttemptModel.stripe_session_id == session_id)
+                .first()
+            )
+        if not attempt and pi_id:
+            attempt = (
+                self.db.query(PayflowPaymentAttemptModel)
+                .filter(PayflowPaymentAttemptModel.stripe_payment_intent_id == pi_id)
                 .first()
             )
         if not attempt:
@@ -1103,22 +1258,29 @@ class PayflowPaymentPortalService:
                     .first()
                 )
         if not attempt:
+            logger.warning(
+                "stripe event unmatched type=%s session=%s pi=%s",
+                et,
+                session_id,
+                pi_id,
+            )
             return {"matched": False, "reason": "attempt_not_found", "type": et}
 
-        pi = data_object.get("payment_intent")
-        if isinstance(pi, str) and pi:
-            attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi
+        if pi_id:
+            attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi_id
 
         if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
             # Only treat as paid when Stripe reports paid / complete.
             payment_status = (data_object.get("payment_status") or "").lower()
             status = (data_object.get("status") or "").lower()
             amount_total = data_object.get("amount_total")
+            amount_mismatch = False
             if amount_total is not None:
                 try:
                     stripe_amt = float(amount_total) / 100.0
                     expected = _money(attempt.amount)
                     if abs(stripe_amt - expected) > 0.009:
+                        amount_mismatch = True
                         self._raise_processing_discrepancy(
                             attempt,
                             f"Stripe amount {stripe_amt:.2f} ≠ attempt {expected:.2f}",
@@ -1126,7 +1288,16 @@ class PayflowPaymentPortalService:
                         )
                 except (TypeError, ValueError):
                     pass
-            if payment_status in {"paid", "no_payment_required"} or status == "complete":
+            if amount_mismatch:
+                self.db.commit()
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "amount_mismatch": True,
+                }
+            # Require Stripe payment_status=paid (do not confirm on URL / session complete alone).
+            if payment_status in {"paid", "no_payment_required"}:
                 self.apply_succeeded(
                     attempt,
                     provider_ref=attempt.stripe_payment_intent_id or session_id,
@@ -1134,7 +1305,9 @@ class PayflowPaymentPortalService:
                 )
                 return {"matched": True, "status": attempt.status, "type": et}
             attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
-            self._append_attempt_event(attempt, "Processing", et)
+            self._append_attempt_event(
+                attempt, "Processing", f"{et} payment_status={payment_status or status}"
+            )
             self.db.commit()
             return {"matched": True, "status": attempt.status, "type": et}
 
@@ -1156,8 +1329,27 @@ class PayflowPaymentPortalService:
             return {"matched": True, "status": attempt.status, "type": et}
 
         if et == "payment_intent.succeeded":
+            amount_received = data_object.get("amount_received") or data_object.get("amount")
+            if amount_received is not None:
+                try:
+                    stripe_amt = float(amount_received) / 100.0
+                    if abs(stripe_amt - _money(attempt.amount)) > 0.009:
+                        self._raise_processing_discrepancy(
+                            attempt,
+                            f"PI amount {stripe_amt:.2f} ≠ attempt {_money(attempt.amount):.2f}",
+                            diagnostic_ref=str(pi_id or attempt.public_id),
+                        )
+                        self.db.commit()
+                        return {
+                            "matched": True,
+                            "status": attempt.status,
+                            "type": et,
+                            "amount_mismatch": True,
+                        }
+                except (TypeError, ValueError):
+                    pass
             self.apply_succeeded(
-                attempt, provider_ref=data_object.get("id") or session_id, commit=True
+                attempt, provider_ref=pi_id or data_object.get("id") or session_id, commit=True
             )
             return {"matched": True, "status": attempt.status, "type": et}
 
