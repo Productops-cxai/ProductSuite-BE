@@ -30,7 +30,12 @@ from app.infrastructure.sms.twilio_service import (
     truncate_sms_body,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
-from app.shared.enums import PayflowCommChannel, PayflowCommPurpose, PayflowCommStatus
+from app.shared.enums import (
+    PayflowClientType,
+    PayflowCommChannel,
+    PayflowCommPurpose,
+    PayflowCommStatus,
+)
 
 logger = logging.getLogger("app.comms")
 
@@ -40,6 +45,46 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 def _valid_email(value: str | None) -> bool:
     text = (value or "").strip()
     return bool(text and _EMAIL_RE.match(text) and len(text) <= 255)
+
+
+def _is_third_party_client(client: PayflowClientModel | None) -> bool:
+    """Match payment portal: missing/unknown type defaults to Third Party."""
+    if not client or not client.client_type:
+        return True
+    key = str(client.client_type).strip().lower().replace(" ", "_").replace("-", "_")
+    return key in {
+        PayflowClientType.THIRD_PARTY.value,
+        "thirdparty",
+        "third_party",
+    }
+
+
+def _resolve_collection_from(
+    client: PayflowClientModel | None,
+) -> tuple[str | None, str | None]:
+    """Wire From for collection email.
+
+    - Third Party → PayFlow operator (SENDGRID_FROM_EMAIL / operator brand)
+    - First Party → client email_from + sender/brand name
+    """
+    if _is_third_party_client(client):
+        from_email = (settings.SENDGRID_FROM_EMAIL or "").strip() or None
+        from_name = (
+            (settings.PAYFLOW_OPERATOR_BRAND_NAME or "").strip()
+            or (settings.SENDGRID_FROM_NAME or "").strip()
+            or "PayFlow Collections"
+        )
+        return from_email, from_name
+    if not client:
+        return None, None
+    from_email = (client.email_from or "").strip() or None
+    from_name = (
+        (client.sender_name or "").strip()
+        or (client.brand_name or "").strip()
+        or (client.name or "").strip()
+        or None
+    )
+    return from_email, from_name
 
 
 def _utcnow() -> datetime:
@@ -785,10 +830,7 @@ class PayflowCommunicationService:
         client = account.client
         if client is None and account.client_id:
             client = self.db.get(PayflowClientModel, account.client_id)
-        brand_from = (client.email_from if client else None) or None
-        brand_name = None
-        if client:
-            brand_name = client.sender_name or client.brand_name or client.name
+        brand_from, brand_name = _resolve_collection_from(client)
         comm = PayflowCommunicationModel(
             code=code,
             client_id=client_id or account.client_id,

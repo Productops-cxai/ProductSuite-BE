@@ -1345,12 +1345,27 @@ class WorkflowExecutionService:
         if not text:
             return ""
         first = account.customer_first_name or (account.customer_name or "").split(" ")[0]
+        client = account.client
+        from app.modules.payflow.services.communication_service import (
+            _is_third_party_client,
+            _resolve_collection_from,
+        )
+
+        if _is_third_party_client(client):
+            brand_name = (
+                (settings.PAYFLOW_OPERATOR_BRAND_NAME or "").strip()
+                or (settings.SENDGRID_FROM_NAME or "").strip()
+                or "PayFlow Collections"
+            )
+        else:
+            _, rendered_name = _resolve_collection_from(client)
+            brand_name = rendered_name or (settings.SENDGRID_FROM_NAME or "PayFlow")
         mapping = {
             "first_name": first or "Customer",
             "outstanding_balance": f"${float(account.outstanding_balance or 0):,.2f}",
             "account_reference": account.account_reference or "",
             "payment_link": self._payment_link(account),
-            "brand_name": settings.SENDGRID_FROM_NAME or "PayFlow",
+            "brand_name": brand_name,
             "promise_amount": f"${float(account.ptp_amount or 0):,.2f}",
             "promise_date": str(account.ptp_due_date or ""),
         }
