@@ -36,12 +36,32 @@ from app.shared.enums import (
 
 DATE_BUCKETS = {
     "today": {"Today"},
-    "7d": {"Today", "Yesterday", "Last 7 days"},
-    "30d": {"Today", "Yesterday", "Last 7 days", "Last 30 days"},
-    "qtd": {"Today", "Yesterday", "Last 7 days", "Last 30 days", "Quarter to date"},
+    # Match _date_meta casing ("Last 7 Days") plus legacy lowercase variants.
+    "7d": {"Today", "Yesterday", "Last 7 Days", "Last 7 days"},
+    "30d": {
+        "Today",
+        "Yesterday",
+        "Last 7 Days",
+        "Last 7 days",
+        "Last 30 Days",
+        "Last 30 days",
+        "This Month",
+    },
+    "qtd": {
+        "Today",
+        "Yesterday",
+        "Last 7 Days",
+        "Last 7 days",
+        "Last 30 Days",
+        "Last 30 days",
+        "This Month",
+        "Quarter to date",
+        "Quarter To Date",
+    },
 }
 
 # Statuses that have progressed at least to this funnel stage.
+# Opened = real open/read (or opens_count), not click-only.
 FUNNEL_STAGES: list[tuple[str, str, set[str]]] = [
     (
         "01",
@@ -333,7 +353,11 @@ class PayflowDashboardService:
         failed_payments = sum(
             1 for a in attempts if a.status == PayflowPaymentAttemptStatus.FAILED.value
         )
-        payment_initiated = sum(
+        # Prefer communication-linked initiation so funnel matches Comm detail.
+        payment_initiated_comms = sum(
+            1 for c in comms if getattr(c, "payment_initiated", False)
+        )
+        payment_initiated_attempts = sum(
             1
             for a in attempts
             if a.status
@@ -343,11 +367,14 @@ class PayflowDashboardService:
                 PayflowPaymentAttemptStatus.SUCCEEDED.value,
             }
         )
-        # Also count comms that marked payment initiated (legacy / CRM path).
-        if payment_initiated == 0:
-            payment_initiated = sum(1 for c in comms if getattr(c, "payment_initiated", False))
+        payment_initiated = max(payment_initiated_comms, payment_initiated_attempts)
 
-        paid_funnel = max(paid_in_full, paid_in_full_txns)
+        # Paid funnel = confirmed payments in range (ledger), not lifetime resolved count.
+        paid_funnel = (
+            len(succeeded_payments)
+            if since
+            else max(paid_in_full, paid_in_full_txns, len(succeeded_payments))
+        )
 
         kpis = [
             {
@@ -380,11 +407,16 @@ class PayflowDashboardService:
             {
                 "id": "recovered",
                 "label": "Amount Recovered",
-                "value": recovered_total,
-                "display": _money(recovered_total),
+                # Same definition as Payment Outcomes for the selected date range.
+                "value": recovered_period if since else recovered_total,
+                "display": _money(recovered_period if since else recovered_total),
                 "hint": (
                     f"{paid_in_full} paid in full"
-                    + (f" · {_money(recovered_period)} in range" if since else "")
+                    + (
+                        f" · lifetime {_money(recovered_total)}"
+                        if since and recovered_total != recovered_period
+                        else ""
+                    )
                 ),
                 "tone": "primary",
                 "href": "/payflow/cases?status=Resolved",
@@ -512,7 +544,18 @@ class PayflowDashboardService:
     ) -> list[dict[str, Any]]:
         counts = []
         for step, label, statuses in FUNNEL_STAGES:
-            counts.append((step, label, sum(1 for c in comms if c.status in statuses), False))
+            if label == "Opened / Read":
+                # Real opens only — click-without-open must not inflate this stage.
+                n = sum(
+                    1
+                    for c in comms
+                    if int(getattr(c, "opens_count", 0) or 0) > 0
+                    or c.status == PayflowCommStatus.OPENED_READ.value
+                    or getattr(c, "first_opened_at", None) is not None
+                )
+            else:
+                n = sum(1 for c in comms if c.status in statuses)
+            counts.append((step, label, n, False))
         # Payment stages from attempts / confirmed outcomes — not plan-status misuse.
         counts.append(("05", "Payment Initiated", payment_initiated, False))
         counts.append(("06", "Paid", paid_count, True))

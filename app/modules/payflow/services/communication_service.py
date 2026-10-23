@@ -439,7 +439,8 @@ class PayflowCommunicationService:
             "why_message": row.why_message,
             "why_channel": row.why_channel,
             "why_timing": row.why_timing,
-            "events": list(row.events or []),
+            # Latest engagement events first.
+            "events": list(reversed(list(row.events or []))),
             "balance": float(row.balance or 0),
             "review_id": row.review_id,
             "drop_off_segment": _drop_off_segment(
@@ -1028,13 +1029,22 @@ class PayflowCommunicationService:
         row = self.db.get(PayflowCommunicationModel, communication_id)
         if not row:
             return
+        now = _utcnow()
+        # Portal open is engagement; count toward opens so metrics match the timeline.
+        row.opens_count = int(row.opens_count or 0) + 1
+        if not row.first_opened_at:
+            row.first_opened_at = now
+        row.last_opened_at = now
+        if (row.channel or "") != "SMS":
+            self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
+        # Single event row (avoid duplicate timeline entries).
         self._record_event_row(
             row,
             event_type="payment_link_opened",
             label="Payment Link Opened",
             detail=detail,
+            occurred_at=now,
         )
-        self._append_json_event(row, "Payment Link Opened", detail)
 
     def update_status(
         self,

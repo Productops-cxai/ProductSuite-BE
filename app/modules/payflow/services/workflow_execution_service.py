@@ -71,6 +71,7 @@ _STEP_DONE_STATUSES = frozenset(
 _UI_STEP_STATUS = {
     "pending": "Pending",
     "scheduled": "Scheduled",
+    "waiting": "Waiting",
     "running": "In Progress",
     "done": "Completed",
     "skipped": "Completed",
@@ -514,10 +515,35 @@ class WorkflowExecutionService:
         step_id = from_step_id or run.current_step_id
         steps = {s.get("id"): s for s in (strategy.steps or []) if isinstance(s, dict) and s.get("id")}
         step = steps.get(step_id or "")
-        # After human review, the paused step never finished (e.g. Email was blocked
-        # before send). Re-execute that step — do not jump to its .next (Wait).
+        step_kind = (step.get("kind") or "") if step else ""
+        # After human review:
+        # - Human Review *step*: supervisor already decided → advance to .next
+        #   (re-running the step would create another Awaiting review).
+        # - Communication (or other) paused by a governance rule: re-execute that
+        #   step so the email/SMS actually sends — do not jump to Wait.
+        reexecute_paused = False
         if after_human_review:
-            target_id = step_id
+            if step_kind == "Human Review":
+                target_id = (step.get("next") or _cfg(step).get("next")) if step else None
+                if not target_id:
+                    target_id = step_id
+                # Close the paused HR step so activity no longer shows Awaiting Review.
+                paused_sr = (
+                    self.db.query(PayflowWorkflowStepRunModel)
+                    .filter(
+                        PayflowWorkflowStepRunModel.run_id == run.id,
+                        PayflowWorkflowStepRunModel.step_id == step_id,
+                        PayflowWorkflowStepRunModel.status == "paused_human_review",
+                    )
+                    .order_by(PayflowWorkflowStepRunModel.id.desc())
+                    .first()
+                )
+                if paused_sr:
+                    paused_sr.status = "done"
+                    paused_sr.finished_at = _utcnow()
+            else:
+                target_id = step_id
+                reexecute_paused = True
         else:
             target_id = None
             if step:
@@ -534,15 +560,20 @@ class WorkflowExecutionService:
                 step_id=target_id,
                 account_id=run.account_id,
                 strategy_id=run.strategy_id,
-                payload={"after_human_review": True} if after_human_review else None,
+                payload={"after_human_review": True} if reexecute_paused else None,
                 commit=False,
             )
         self.log_event(
             event_type="run_resumed",
             message=(
-                f"Run {run_id} resumed after human review — re-executing paused step"
-                if after_human_review
-                else f"Run {run_id} resumed"
+                f"Run {run_id} resumed after human review — "
+                + (
+                    "re-executing paused step"
+                    if reexecute_paused
+                    else "advancing past Human Review step"
+                    if after_human_review
+                    else "continuing"
+                )
             ),
             run_id=run.id,
             account_id=run.account_id,
@@ -1008,6 +1039,8 @@ class WorkflowExecutionService:
             when = self._wait_until(cfg, step, strategy)
             next_id = step.get("next") or cfg.get("next")
             run.status = PayflowWorkflowRunStatus.WAITING.value
+            # Not "done" — wait is in progress until scheduled_at elapses.
+            step_run.status = "waiting"
             step_run.result_json = {
                 "wait_until": when.isoformat(),
                 "next": next_id,
@@ -1975,6 +2008,20 @@ class WorkflowExecutionService:
     ) -> dict[str, Any]:
         step_def = (steps_by_id or {}).get(s.step_id) or {}
         ui_status = _UI_STEP_STATUS.get((s.status or "").lower(), s.status)
+        # Legacy Wait rows were marked "done" when scheduled — still show Waiting
+        # until wait_until is in the past.
+        kind = (s.kind or step_def.get("kind") or "").strip()
+        if kind == "Wait" and isinstance(s.result_json, dict):
+            raw_until = s.result_json.get("wait_until")
+            if raw_until:
+                try:
+                    until = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    if until > _utcnow():
+                        ui_status = "Waiting"
+                except ValueError:
+                    pass
         block_reason = None
         if ui_status == "Blocked":
             block_reason = s.error or (s.result_json or {}).get("reason")
@@ -2063,7 +2110,11 @@ class WorkflowExecutionService:
                     "error": None,
                 }
             )
-        activity.sort(key=lambda a: a["at"] or datetime.min.replace(tzinfo=timezone.utc))
+        # Latest activity first (case timeline / live execution).
+        activity.sort(
+            key=lambda a: a["at"] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         block_reason = run.last_error
         if not block_reason:
             for s in reversed(step_rows):
