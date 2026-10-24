@@ -166,6 +166,7 @@ DROP_OFF_SEGMENTS = [
     "Delivered but Not Opened / Read",
     "Opened / Read but Did Not Click",
     "Clicked but Did Not Initiate Payment",
+    "Initiated Payment but Did Not Complete",
 ]
 
 _STATUS_RANK = {
@@ -184,13 +185,21 @@ _STATUS_RANK = {
 }
 
 
-def _drop_off_segment(status: str, payment_link: bool, payment_initiated: bool = False) -> str | None:
+def _drop_off_segment(
+    status: str,
+    payment_link: bool,
+    payment_initiated: bool = False,
+    payment_completed: bool = False,
+) -> str | None:
     if status == PayflowCommStatus.DELIVERED.value:
         return DROP_OFF_SEGMENTS[0]
     if status == PayflowCommStatus.OPENED_READ.value and payment_link:
         return DROP_OFF_SEGMENTS[1]
     if status == PayflowCommStatus.PAYMENT_LINK_CLICKED.value and not payment_initiated:
         return DROP_OFF_SEGMENTS[2]
+    # Checkout opened / payment started but never verified paid.
+    if payment_initiated and not payment_completed:
+        return DROP_OFF_SEGMENTS[3]
     return None
 
 
@@ -324,6 +333,24 @@ class PayflowCommunicationService:
         if incoming >= 100 or incoming > current:
             row.status = new_status
 
+    def _latest_checkout_outcome(self, row: PayflowCommunicationModel) -> str | None:
+        """Newest payment lifecycle signal from the JSON timeline (not email open/click)."""
+        for ev in reversed(list(row.events or [])):
+            if not isinstance(ev, dict):
+                continue
+            label = str(ev.get("label") or "").strip().lower()
+            if label in {"payment completed"}:
+                return "completed"
+            if label in {"checkout cancelled", "payment abandoned"}:
+                return "cancelled"
+            if label in {"payment failed"}:
+                return "failed"
+            if label in {"checkout expired"}:
+                return "expired"
+            if label in {"payment initiated", "stripe checkout opened"}:
+                return "initiated"
+        return None
+
     def _engagement_label(self, row: PayflowCommunicationModel) -> str | None:
         tracking = row.engagement_tracking or (
             "not_available" if (row.channel or "") == "SMS" else "available"
@@ -332,7 +359,15 @@ class PayflowCommunicationService:
             return None
         if row.payment_completed:
             return "Payment completed"
-        if row.payment_initiated:
+        # Align with Account Payments: cancelled / failed / expired after initiate.
+        outcome = self._latest_checkout_outcome(row)
+        if outcome == "cancelled":
+            return "Checkout cancelled"
+        if outcome == "failed":
+            return "Payment failed"
+        if outcome == "expired":
+            return "Checkout expired"
+        if row.payment_initiated or outcome == "initiated":
             return "Payment initiated"
         if (row.clicks_count or 0) > 0 or row.status == PayflowCommStatus.PAYMENT_LINK_CLICKED.value:
             return "Payment link clicked"
@@ -444,7 +479,10 @@ class PayflowCommunicationService:
             "balance": float(row.balance or 0),
             "review_id": row.review_id,
             "drop_off_segment": _drop_off_segment(
-                row.status, has_link, bool(row.payment_initiated)
+                row.status,
+                has_link,
+                bool(row.payment_initiated),
+                bool(row.payment_completed),
             ),
             "brand_name": client.brand_name or (client.name if client else None),
             "sender_name": client.sender_name,
@@ -593,7 +631,12 @@ class PayflowCommunicationService:
             seg: sum(
                 1
                 for r in rows
-                if _drop_off_segment(r.status, bool(r.payment_link), bool(r.payment_initiated))
+                if _drop_off_segment(
+                    r.status,
+                    bool(r.payment_link),
+                    bool(r.payment_initiated),
+                    bool(r.payment_completed),
+                )
                 == seg
             )
             for seg in DROP_OFF_SEGMENTS
@@ -1306,8 +1349,9 @@ class PayflowCommunicationService:
         commit: bool = True,
     ) -> None:
         """
-        Attach payment initiated/completed to the originating communication.
+        Attach payment lifecycle to the originating communication.
 
+        Events: initiated | completed | cancelled | failed | expired.
         Prefer explicit communication_id (from payment link). Fallback: latest
         payment-link email/SMS for the account.
         """
@@ -1331,7 +1375,7 @@ class PayflowCommunicationService:
         if event == "initiated":
             # Stripe Checkout session created → customer is on checkout.stripe.com.
             # Always record "Stripe Checkout Opened" (user's Stripe-side signal).
-            # payment_initiated stays sticky once true.
+            # payment_initiated stays sticky once true (funnel: they did start checkout).
             already = bool(row.payment_initiated)
             row.payment_initiated = True
             if not self._same_label_within(row, label="Stripe Checkout Opened", within_seconds=3):
@@ -1367,6 +1411,49 @@ class PayflowCommunicationService:
             row.payment_initiated = True
             row.payment_completed = True
             self._record_event_row(row, event_type="payment_completed", label="Payment Completed")
+        elif event in {"cancelled", "canceled", "abandoned"}:
+            # Account attempt Cancelled — keep payment_initiated sticky; engagement flips.
+            if row.payment_completed:
+                if commit:
+                    self.db.commit()
+                else:
+                    self.db.flush()
+                return
+            if not self._same_label_within(row, label="Checkout Cancelled", within_seconds=3):
+                self._record_event_row(
+                    row,
+                    event_type="checkout_cancelled",
+                    label="Checkout Cancelled",
+                    detail=detail or "Customer left checkout without paying",
+                )
+        elif event == "failed":
+            if row.payment_completed:
+                if commit:
+                    self.db.commit()
+                else:
+                    self.db.flush()
+                return
+            if not self._same_label_within(row, label="Payment Failed", within_seconds=3):
+                self._record_event_row(
+                    row,
+                    event_type="payment_failed",
+                    label="Payment Failed",
+                    detail=detail or "Payment failed",
+                )
+        elif event == "expired":
+            if row.payment_completed:
+                if commit:
+                    self.db.commit()
+                else:
+                    self.db.flush()
+                return
+            if not self._same_label_within(row, label="Checkout Expired", within_seconds=3):
+                self._record_event_row(
+                    row,
+                    event_type="checkout_expired",
+                    label="Checkout Expired",
+                    detail=detail or "Stripe Checkout session expired",
+                )
         if commit:
             self.db.commit()
         else:

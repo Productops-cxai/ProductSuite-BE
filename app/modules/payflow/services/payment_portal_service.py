@@ -857,6 +857,12 @@ class PayflowPaymentPortalService:
             if status == "expired":
                 attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
                 self._append_attempt_event(attempt, "Expired", "Reconcile from Stripe")
+                self._sync_comm_payment_outcome(
+                    attempt,
+                    event="expired",
+                    detail=f"Reconcile expired · {attempt.stripe_session_id or attempt.public_id[:12]}",
+                    commit=False,
+                )
                 self.db.commit()
                 return True
 
@@ -880,6 +886,39 @@ class PayflowPaymentPortalService:
                     # Customer abandoned / card failed before capture.
                     pass
         return False
+
+    def _sync_comm_payment_outcome(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        *,
+        event: str,
+        detail: str | None = None,
+        commit: bool = False,
+    ) -> None:
+        """Mirror attempt cancel/fail/expire onto the originating communication timeline."""
+        try:
+            from app.modules.payflow.services.communication_service import (
+                PayflowCommunicationService,
+            )
+
+            link = (
+                self.db.get(PayflowPaymentLinkModel, attempt.payment_link_id)
+                if attempt.payment_link_id
+                else None
+            )
+            PayflowCommunicationService(self.db).mark_payment_event(
+                attempt.account_id,
+                event=event,
+                communication_id=link.communication_id if link else None,
+                detail=detail,
+                commit=commit,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sync comm payment outcome failed attempt=%s event=%s",
+                attempt.public_id,
+                event,
+            )
 
     def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
@@ -911,6 +950,14 @@ class PayflowPaymentPortalService:
             return self.serialize_attempt(row)
         row.status = PayflowPaymentAttemptStatus.CANCELLED.value
         self._append_attempt_event(row, "Cancelled", "Customer returned without paying")
+        self._sync_comm_payment_outcome(
+            row,
+            event="cancelled",
+            detail=(
+                f"Checkout cancelled · {row.stripe_session_id or row.public_id[:12]}"
+            ),
+            commit=False,
+        )
         self.db.commit()
         self.db.refresh(row)
         return self.serialize_attempt(row)
@@ -952,6 +999,12 @@ class PayflowPaymentPortalService:
         elif outcome_norm in {"cancel", "cancelled", "canceled"}:
             row.status = PayflowPaymentAttemptStatus.CANCELLED.value
             self._append_attempt_event(row, "Cancelled", "Mock cancel")
+            self._sync_comm_payment_outcome(
+                row,
+                event="cancelled",
+                detail=f"Mock checkout cancelled · {row.public_id[:12]}",
+                commit=False,
+            )
             self.db.commit()
         else:
             raise ValidationAppError("outcome must be success, failed, or cancel")
@@ -1197,6 +1250,12 @@ class PayflowPaymentPortalService:
         attempt.completed_at = _utcnow()
         self._append_attempt_event(attempt, "Failed", attempt.error_message)
         self._raise_ops_exception(attempt, attempt.error_message or "Payment failed")
+        self._sync_comm_payment_outcome(
+            attempt,
+            event="failed",
+            detail=attempt.error_message,
+            commit=False,
+        )
         if commit:
             self.db.commit()
         else:
@@ -1460,6 +1519,12 @@ class PayflowPaymentPortalService:
             if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
                 attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
                 self._append_attempt_event(attempt, "Expired", f"{et} · {event_id}")
+                self._sync_comm_payment_outcome(
+                    attempt,
+                    event="expired",
+                    detail=f"Stripe · {et} · {attempt.stripe_session_id or event_id}",
+                    commit=False,
+                )
                 self.db.commit()
             return {
                 "matched": True,
