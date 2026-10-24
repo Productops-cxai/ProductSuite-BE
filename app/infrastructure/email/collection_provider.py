@@ -5,7 +5,9 @@ Credentials stay in env/settings (never frontend). Empty SendGrid + empty SMTP �
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -19,6 +21,40 @@ from app.core.config import settings
 from app.infrastructure.database.models import EmailLogModel
 
 logger = logging.getLogger("app.email.collection")
+
+# http(s) URLs in plain body → clickable anchors in HTML (SendGrid still rewrites for click tracking).
+_URL_RE = re.compile(r"(https?://[^\s<>\"']+)", re.IGNORECASE)
+
+
+def _plain_body_to_html(body: str) -> str:
+    """Minimal HTML wrapper so SendGrid can inject the open-tracking pixel.
+
+    Plain-text-only sends never fire `open` events; click tracking can still work via URL rewrite.
+    """
+    escaped = html.escape(body or "", quote=False)
+
+    def _linkify(match: re.Match[str]) -> str:
+        url = match.group(1)
+        # Trailing punctuation often sticks to URLs in prose — keep it outside the href.
+        trail = ""
+        while url and url[-1] in ".,);]:'\"":
+            trail = url[-1] + trail
+            url = url[:-1]
+        if not url:
+            return html.escape(match.group(1), quote=False)
+        safe = html.escape(url, quote=True)
+        return f'<a href="{safe}">{safe}</a>{html.escape(trail, quote=False)}'
+
+    linked = _URL_RE.sub(_linkify, escaped)
+    with_breaks = linked.replace("\r\n", "\n").replace("\n", "<br>\n")
+    return (
+        "<!DOCTYPE html>\n"
+        '<html><head><meta charset="utf-8" /></head>'
+        '<body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; '
+        'line-height: 1.5; color: #222; margin: 0; padding: 16px;">'
+        f"{with_breaks}"
+        "</body></html>"
+    )
 
 
 def sendgrid_configured() -> bool:
@@ -64,11 +100,15 @@ def _send_via_sendgrid(
     personalization: dict[str, Any] = {"to": [{"email": to_email}]}
     if custom_args:
         personalization["custom_args"] = {str(k): str(v) for k, v in custom_args.items()}
+    # plain first, then html — SendGrid multipart; open pixel only works with HTML part.
     payload = {
         "personalizations": [personalization],
         "from": {"email": from_email, "name": from_name},
         "subject": subject,
-        "content": [{"type": "text/plain", "value": body}],
+        "content": [
+            {"type": "text/plain", "value": body},
+            {"type": "text/html", "value": _plain_body_to_html(body)},
+        ],
         "tracking_settings": {
             "click_tracking": {"enable": True, "enable_text": True},
             "open_tracking": {"enable": True},
@@ -107,6 +147,7 @@ def _send_via_smtp(
     msg["From"] = formataddr((from_name, from_email))
     msg["To"] = to_email
     msg.set_content(body)
+    msg.add_alternative(_plain_body_to_html(body), subtype="html")
     try:
         with smtplib.SMTP(host, port, timeout=20) as smtp:
             if settings.SMTP_USE_TLS:
