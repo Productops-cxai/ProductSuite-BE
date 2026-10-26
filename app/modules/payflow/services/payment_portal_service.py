@@ -6,7 +6,7 @@ import logging
 import math
 import uuid
 from calendar import monthrange
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -49,8 +49,10 @@ _DEFAULT_PAYMENT_SETTINGS: dict[str, Any] = {
     "stripe_payments_enabled": True,
     "accepted_currencies": [],
     "payment_plan_options": [
-        {"id": "plan_3", "label": "3 monthly instalments", "installments": 3},
-        {"id": "plan_6", "label": "6 monthly instalments", "installments": 6},
+        {"id": "plan_daily_7", "label": "7 daily instalments", "installments": 7, "frequency": "daily"},
+        {"id": "plan_weekly_4", "label": "4 weekly instalments", "installments": 4, "frequency": "weekly"},
+        {"id": "plan_3", "label": "3 monthly instalments", "installments": 3, "frequency": "monthly"},
+        {"id": "plan_6", "label": "6 monthly instalments", "installments": 6, "frequency": "monthly"},
     ],
 }
 
@@ -259,7 +261,19 @@ class PayflowPaymentPortalService:
 
         min_plan = float(settings_map.get("min_plan_amount") or 0)
         if settings_map.get("allow_payment_plan", True) and balance > 0 and balance >= min_plan:
-            plans = settings_map.get("payment_plan_options") or []
+            plans = list(settings_map.get("payment_plan_options") or [])
+            # Ensure Lovable frequency picker has Daily / Weekly / Monthly options
+            # even when a client only stored monthly plans.
+            present_freq = {
+                str(p.get("frequency") or "monthly").strip().lower()
+                for p in plans
+                if isinstance(p, dict)
+            }
+            for default_plan in _DEFAULT_PAYMENT_SETTINGS["payment_plan_options"]:
+                freq = str(default_plan.get("frequency") or "monthly").strip().lower()
+                if freq not in present_freq:
+                    plans.append(dict(default_plan))
+                    present_freq.add(freq)
             for plan in plans:
                 if not isinstance(plan, dict):
                     continue
@@ -268,8 +282,10 @@ class PayflowPaymentPortalService:
                     continue
                 first = _money(math.ceil((balance / installments) * 100) / 100)
                 first = min(first, balance)
-                plan_id = str(plan.get("id") or f"plan_{installments}")
-                frequency = str(plan.get("frequency") or "monthly")
+                frequency = str(plan.get("frequency") or "monthly").strip().lower()
+                if frequency not in {"daily", "weekly", "monthly"}:
+                    frequency = "monthly"
+                plan_id = str(plan.get("id") or f"plan_{frequency}_{installments}")
                 start = _utcnow().date()
                 schedule = []
                 remaining = balance
@@ -281,7 +297,7 @@ class PayflowPaymentPortalService:
                     else:
                         amt = _money(remaining / (installments - i + 1))
                     remaining = _money(remaining - amt)
-                    due = self._add_months(start, i - 1)
+                    due = self._add_period(start, i - 1, frequency)
                     schedule.append(
                         {
                             "sequence": i,
@@ -379,6 +395,17 @@ class PayflowPaymentPortalService:
         month = month % 12 + 1
         day = min(d.day, monthrange(year, month)[1])
         return date(year, month, day)
+
+    @classmethod
+    def _add_period(cls, d: date, index: int, frequency: str) -> date:
+        freq = (frequency or "monthly").strip().lower()
+        if index <= 0:
+            return d
+        if freq == "daily":
+            return d + timedelta(days=index)
+        if freq == "weekly":
+            return d + timedelta(weeks=index)
+        return cls._add_months(d, index)
 
     def resolve_portal(self, token: str, *, preview: bool = False) -> dict[str, Any]:
         """Public portal payload — branding, balance, options, block reasons.
