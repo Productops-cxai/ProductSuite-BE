@@ -1230,6 +1230,7 @@ class PayflowPaymentAttemptItem(BaseModel):
     id: str
     status: str
     option_type: str
+    option_label: Optional[str] = None
     plan_id: Optional[str] = None
     amount: float
     currency_code: str
@@ -1237,12 +1238,20 @@ class PayflowPaymentAttemptItem(BaseModel):
     checkout_url: Optional[str] = None
     error_message: Optional[str] = None
     balance_at_initiation: Optional[float] = None
+    remaining_balance: Optional[float] = None
+    outstanding_balance: Optional[float] = None
+    account_reference: Optional[str] = None
+    account_reference_masked: Optional[str] = None
+    payment_method: Optional[str] = None
     stripe_session_id: Optional[str] = None
     reference: Optional[str] = None
     confirmed: bool = False
     events: List[dict] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    paid_at: Optional[datetime] = None
+    plan: Optional[dict] = None
+    brand: Optional[dict] = None
 
 
 class PayflowPaymentMockOutcomeRequest(BaseModel):

@@ -153,6 +153,11 @@ class PayflowPaymentPortalService:
     def _brand_payload(self, client: PayflowClientModel | None) -> dict[str, Any]:
         third = self._is_third_party(client)
         client_label = (client.brand_name or client.name) if client else "Client"
+        support = {
+            "client_name": client_label,
+            "support_email": (client.contact_email if client else None) or None,
+            "support_phone": (client.contact_phone if client else None) or None,
+        }
         if third:
             return {
                 "mode": "third_party",
@@ -161,13 +166,43 @@ class PayflowPaymentPortalService:
                     (settings.PAYFLOW_OPERATOR_LOGO_URL or None) or None
                 ),
                 "on_behalf_of": client_label,
+                **support,
             }
         return {
             "mode": "first_party",
             "name": client_label or "PayFlow",
             "logo_url": self._absolute_asset_url(client.logo_url if client else None),
             "on_behalf_of": None,
+            **support,
         }
+
+    @staticmethod
+    def _option_label(option_type: str | None, plan_id: str | None = None) -> str:
+        key = (option_type or "").strip().lower()
+        if key == PayflowPaymentOptionType.PAY_IN_FULL.value:
+            return "Pay in Full"
+        if key == PayflowPaymentOptionType.PARTIAL.value:
+            return "Partial Payment"
+        if key == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            if plan_id and plan_id.startswith("plan_"):
+                try:
+                    n = int(plan_id.split("_", 1)[1])
+                    return f"{n} monthly instalments"
+                except ValueError:
+                    pass
+            return "Payment Plan"
+        if key == PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value:
+            return "Pay next instalment"
+        return option_type or "Payment"
+
+    @staticmethod
+    def _mask_reference(reference: str | None) -> str | None:
+        raw = (reference or "").strip()
+        if not raw:
+            return None
+        if len(raw) <= 4:
+            return f"•••• {raw}"
+        return f"•••• {raw[-4:]}"
 
     def _case_payment_eligible(self, account: PayflowAccountModel) -> tuple[bool, str | None]:
         ok, reason = self.links._case_eligible(account)
@@ -482,6 +517,7 @@ class PayflowPaymentPortalService:
             },
             "case": {
                 "account_reference": account.account_reference,
+                "account_reference_masked": self._mask_reference(account.account_reference),
                 "original_balance": float(account.original_balance or 0),
                 "outstanding_balance": balance,
                 "recovered_balance": float(account.recovered_balance or 0),
@@ -768,23 +804,163 @@ class PayflowPaymentPortalService:
         return self.serialize_attempt(attempt)
 
     def serialize_attempt(self, row: PayflowPaymentAttemptModel) -> dict[str, Any]:
+        account = row.account
+        if account is None and row.account_id:
+            account = self.db.get(PayflowAccountModel, row.account_id)
+        client = row.client
+        if client is None and row.client_id:
+            client = self.db.get(PayflowClientModel, row.client_id)
+
+        amount = _money(row.amount)
+        balance_at = (
+            _money(row.balance_at_initiation)
+            if row.balance_at_initiation is not None
+            else None
+        )
+        outstanding_now = _money(account.outstanding_balance) if account else None
+        succeeded = row.status == PayflowPaymentAttemptStatus.SUCCEEDED.value
+        if succeeded and outstanding_now is not None:
+            remaining_balance = outstanding_now
+        elif balance_at is not None:
+            remaining_balance = max(0.0, _money(balance_at - amount))
+        else:
+            remaining_balance = outstanding_now
+
+        method_label = (
+            "Card"
+            if (row.provider or "").lower() == "stripe"
+            else "Bank Account"
+            if (row.provider or "").lower() == "ach"
+            else "Card"
+        )
+        # Prefer ledger method when a confirmed txn exists.
+        try:
+            from app.infrastructure.database.models import PayflowPaymentTransactionModel
+
+            txn = (
+                self.db.query(PayflowPaymentTransactionModel)
+                .filter(PayflowPaymentTransactionModel.payment_attempt_id == row.id)
+                .order_by(PayflowPaymentTransactionModel.id.desc())
+                .first()
+            )
+            if txn and txn.method_label:
+                # Normalize Stripe Checkout → Card for customer-facing receipt.
+                raw_method = str(txn.method_label)
+                if "stripe" in raw_method.lower() or "card" in raw_method.lower():
+                    method_label = "Card"
+                elif "bank" in raw_method.lower() or "ach" in raw_method.lower():
+                    method_label = "Bank Account"
+                else:
+                    method_label = raw_method
+        except Exception:  # noqa: BLE001
+            logger.exception("serialize_attempt method lookup failed attempt=%s", row.public_id)
+
+        plan_summary: dict[str, Any] | None = None
+        if row.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            try:
+                from app.modules.payflow.services.payment_outcome_service import (
+                    PayflowPaymentOutcomeService,
+                )
+
+                plan_row = (
+                    self.db.query(PayflowPaymentPlanModel)
+                    .filter(
+                        PayflowPaymentPlanModel.account_id == row.account_id,
+                        PayflowPaymentPlanModel.payment_link_id == row.payment_link_id,
+                    )
+                    .order_by(PayflowPaymentPlanModel.id.desc())
+                    .first()
+                )
+                if not plan_row:
+                    plan_row = (
+                        self.db.query(PayflowPaymentPlanModel)
+                        .filter(
+                            PayflowPaymentPlanModel.account_id == row.account_id,
+                            PayflowPaymentPlanModel.status.in_(["Active", "Overdue", "Completed"]),
+                        )
+                        .order_by(PayflowPaymentPlanModel.id.desc())
+                        .first()
+                    )
+                if plan_row:
+                    plan_summary = PayflowPaymentOutcomeService(self.db).serialize_plan(plan_row)
+                elif not succeeded:
+                    # Preview schedule from initiation snapshot (plan not created until first payment).
+                    installments_n = 3
+                    if row.plan_id and str(row.plan_id).startswith("plan_"):
+                        try:
+                            installments_n = max(2, int(str(row.plan_id).split("_", 1)[1]))
+                        except ValueError:
+                            pass
+                    total = balance_at if balance_at is not None else _money(amount * installments_n)
+                    start = (row.created_at.date() if row.created_at else _utcnow().date())
+                    final = self._add_months(start, installments_n - 1)
+                    plan_summary = {
+                        "id": None,
+                        "status": "Pending",
+                        "label": self._option_label(row.option_type, row.plan_id),
+                        "plan_option_id": row.plan_id,
+                        "installments_total": installments_n,
+                        "installment_amount": amount,
+                        "frequency": "monthly",
+                        "currency_code": row.currency_code,
+                        "total_payable": total,
+                        "amount_paid": 0.0,
+                        "amount_remaining": total,
+                        "start_date": start.isoformat(),
+                        "next_due_date": start.isoformat(),
+                        "final_payment_date": final.isoformat(),
+                        "auto_charge_enabled": False,
+                        "installments": [],
+                    }
+            except Exception:  # noqa: BLE001
+                logger.exception("serialize_attempt plan lookup failed attempt=%s", row.public_id)
+
+        if plan_summary and not plan_summary.get("final_payment_date"):
+            insts = plan_summary.get("installments") or []
+            if insts:
+                last = insts[-1]
+                if last.get("due_date"):
+                    plan_summary["final_payment_date"] = last["due_date"]
+            elif plan_summary.get("start_date") and plan_summary.get("installments_total"):
+                try:
+                    y, m, d = [int(x) for x in str(plan_summary["start_date"]).split("-")[:3]]
+                    start_d = date(y, m, d)
+                    plan_summary["final_payment_date"] = self._add_months(
+                        start_d, int(plan_summary["installments_total"]) - 1
+                    ).isoformat()
+                except (TypeError, ValueError):
+                    pass
+
+        paid_at = row.completed_at or (row.created_at if succeeded else None)
+
         return {
             "id": row.public_id,
             "status": row.status,
             "option_type": row.option_type,
+            "option_label": self._option_label(row.option_type, row.plan_id),
             "plan_id": row.plan_id,
-            "amount": _money(row.amount),
+            "amount": amount,
             "currency_code": row.currency_code,
             "provider": row.provider,
             "checkout_url": row.checkout_url,
             "error_message": row.error_message,
-            "balance_at_initiation": row.balance_at_initiation,
+            "balance_at_initiation": balance_at,
+            "remaining_balance": remaining_balance,
+            "outstanding_balance": outstanding_now,
+            "account_reference": account.account_reference if account else None,
+            "account_reference_masked": self._mask_reference(
+                account.account_reference if account else None
+            ),
+            "payment_method": method_label,
             "stripe_session_id": row.stripe_session_id,
             "reference": row.stripe_payment_intent_id or row.stripe_session_id or row.public_id[:12],
-            "confirmed": row.status == PayflowPaymentAttemptStatus.SUCCEEDED.value,
+            "confirmed": succeeded,
             "events": list(row.events or []),
             "created_at": row.created_at,
             "completed_at": row.completed_at,
+            "paid_at": paid_at,
+            "plan": plan_summary,
+            "brand": self._brand_payload(client),
         }
 
     def get_attempt_public(self, token: str, attempt_public_id: str) -> dict[str, Any]:
@@ -798,6 +974,10 @@ class PayflowPaymentPortalService:
             raise NotFoundError("Payment link not found")
         row = (
             self.db.query(PayflowPaymentAttemptModel)
+            .options(
+                joinedload(PayflowPaymentAttemptModel.account),
+                joinedload(PayflowPaymentAttemptModel.client),
+            )
             .filter(
                 PayflowPaymentAttemptModel.public_id == attempt_public_id,
                 PayflowPaymentAttemptModel.payment_link_id == link.id,

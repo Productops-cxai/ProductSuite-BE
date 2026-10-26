@@ -714,24 +714,32 @@ class PayflowStrategyService:
         if not row.id:
             self.db.flush()
         self._migrate_legacy_versions(row)
+        # Always snapshot steps/segment so AI eval / version history can show
+        # what the workflow looked like at this event (not only the live draft).
+        steps = entry.get("steps")
+        if steps is None:
+            steps = list(row.steps or [])
+        segment = entry.get("segment")
+        if segment is None:
+            segment = row.segment or {}
         self.db.add(
             PayflowStrategyVersionModel(
                 strategy_id=row.id,
                 version=int(entry.get("version") or row.version or 1),
                 event_date=str(entry.get("date") or _stamp()),
                 note=str(entry.get("note") or ""),
-                status=entry.get("status"),
-                origin=entry.get("origin"),
-                approved_by=entry.get("approved_by"),
-                approval_date=entry.get("approval_date"),
+                status=entry.get("status") or row.status,
+                origin=entry.get("origin") or row.origin,
+                approved_by=entry.get("approved_by")
+                if "approved_by" in entry
+                else row.approved_by,
+                approval_date=entry.get("approval_date")
+                if "approval_date" in entry
+                else row.approval_date,
                 reviewer_note=entry.get("reviewer_note"),
                 changes=list(entry.get("changes") or []),
-                steps=copy.deepcopy(entry.get("steps"))
-                if entry.get("steps") is not None
-                else None,
-                segment=copy.deepcopy(entry.get("segment"))
-                if entry.get("segment") is not None
-                else None,
+                steps=copy.deepcopy(steps) if steps is not None else None,
+                segment=copy.deepcopy(segment) if segment is not None else None,
             )
         )
         # Stop growing the legacy JSON column.

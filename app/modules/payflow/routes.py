@@ -1455,7 +1455,7 @@ def ai_eval_preview(
     client_id: int | None = Query(default=None),
     limit: int = Query(default=500, ge=1, le=5000),
 ):
-    """AI evaluation preview — workflow versions + human review audits."""
+    """AI evaluation preview — one workflow row with version history / changes."""
     try:
         return AiEvalExportService(db).preview(user, client_id=client_id, limit=limit)
     except AppError as exc:

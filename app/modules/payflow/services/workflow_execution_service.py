@@ -614,6 +614,10 @@ class WorkflowExecutionService:
         if not strategy or not account:
             return
 
+        # Scheduled post-Wait job: close the Wait row so the timeline no longer
+        # shows "Waiting" after the wait window has elapsed.
+        self._close_waits_targeting_step(run.id, step_id)
+
         # Idempotency: do not re-execute a step that already completed successfully.
         # Exception: after supervisor approve, re-run the step that was only paused
         # (communication never sent) — paused_human_review is not a successful send.
@@ -1135,6 +1139,31 @@ class WorkflowExecutionService:
             # Prefer explicit client correspondence language region only as soft default UTC.
             tz_name = getattr(client, "timezone", None) if client else None
         return (str(tz_name).strip() if tz_name else "") or "UTC"
+
+    def _close_waits_targeting_step(self, run_id: int, next_step_id: str) -> int:
+        """Mark open Wait step-runs done when their scheduled next step starts."""
+        rows = (
+            self.db.query(PayflowWorkflowStepRunModel)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run_id,
+                PayflowWorkflowStepRunModel.kind == "Wait",
+                PayflowWorkflowStepRunModel.status == "waiting",
+            )
+            .all()
+        )
+        closed = 0
+        now = _utcnow()
+        for row in rows:
+            result = row.result_json if isinstance(row.result_json, dict) else {}
+            if result.get("next") != next_step_id:
+                continue
+            row.status = "done"
+            row.finished_at = now
+            merged = dict(result)
+            merged["closed_reason"] = "wait_elapsed"
+            row.result_json = merged
+            closed += 1
+        return closed
 
     def _wait_until(
         self, cfg: dict, step: dict, strategy: PayflowStrategyModel
@@ -2008,8 +2037,8 @@ class WorkflowExecutionService:
     ) -> dict[str, Any]:
         step_def = (steps_by_id or {}).get(s.step_id) or {}
         ui_status = _UI_STEP_STATUS.get((s.status or "").lower(), s.status)
-        # Legacy Wait rows were marked "done" when scheduled — still show Waiting
-        # until wait_until is in the past.
+        # Timed Wait: show Waiting until wait_until; once elapsed (or closed),
+        # show Completed even if the row was left as status=waiting.
         kind = (s.kind or step_def.get("kind") or "").strip()
         if kind == "Wait" and isinstance(s.result_json, dict):
             raw_until = s.result_json.get("wait_until")
@@ -2018,8 +2047,11 @@ class WorkflowExecutionService:
                     until = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
                     if until.tzinfo is None:
                         until = until.replace(tzinfo=timezone.utc)
-                    if until > _utcnow():
+                    status_l = (s.status or "").lower()
+                    if until > _utcnow() and status_l in {"waiting", "running", "done", "skipped"}:
                         ui_status = "Waiting"
+                    elif status_l == "waiting":
+                        ui_status = "Completed"
                 except ValueError:
                     pass
         block_reason = None
@@ -2482,6 +2514,13 @@ class WorkflowExecutionService:
                 return True
             return False
 
+        # Timed Wait steps must honor wait_until. Communication webhooks,
+        # delivery events, and payment/status updates must NOT skip them —
+        # otherwise "Wait 3 days" advances immediately after Email/SMS send.
+        # Advancement happens only via the scheduled EXECUTE_STEP job.
+        if kind == "Wait":
+            return False
+
         # Optional wait_for on Communication / Payment Action configs.
         wait_for = cfg.get("wait_for") or step.get("wait_for")
         if wait_for:
@@ -2519,11 +2558,11 @@ class WorkflowExecutionService:
                     )
                     return True
 
-        # Waiting runs: payment/status can resume current step.
+        # Non-Wait WAITING (e.g. account hold/blocked): payment or case-status
+        # release may resume. Communication events must not auto-resume.
         if run.status == PayflowWorkflowRunStatus.WAITING.value and event in {
             "payment",
             "case_status",
-            "communication",
         }:
             enqueue_resume_run(
                 self.db,

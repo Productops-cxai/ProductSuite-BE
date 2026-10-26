@@ -1,4 +1,4 @@
-"""AI evaluation export — workflow versions + human-review audits (CSV/JSON)."""
+"""AI evaluation export — workflow version history for AI proposal performance."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.exceptions import ForbiddenError
 from app.infrastructure.database.models import (
     PayflowClientModel,
-    PayflowHumanReviewModel,
     PayflowStrategyModel,
     PayflowStrategyVersionModel,
     UserModel,
@@ -43,21 +42,6 @@ CSV_COLUMNS = [
     "steps_count",
     "segment_summary",
     "changes_summary",
-    "review_id",
-    "review_code",
-    "review_status",
-    "priority",
-    "proposed_action",
-    "final_action",
-    "decision_outcome",
-    "confidence",
-    "rejection_reason",
-    "guidance",
-    "condition_text",
-    "observed_value",
-    "explanation",
-    "account_id",
-    "decided_at",
     "export_reference",
 ]
 
@@ -103,7 +87,16 @@ def _step_snapshot_label(step: dict[str, Any], index: int) -> dict[str, Any]:
     channel = str(step.get("channel") or cfg.get("channel") or "").strip()
     purpose = str(step.get("purpose") or cfg.get("purpose") or "").strip()
     action = str(cfg.get("action") or step.get("action") or "").strip()
+    amount = cfg.get("amount", step.get("amount"))
+    unit = str(cfg.get("unit") or step.get("unit") or "").strip()
+    reference = str(cfg.get("reference_event") or step.get("reference_event") or "").strip()
+    direction = str(cfg.get("direction") or step.get("direction") or "After").strip()
     timing = str(step.get("timing") or "").strip()
+    if not timing and amount is not None and unit:
+        timing = f"{amount} {unit} {direction}" + (f" {reference}" if reference else "")
+    elif not timing and reference:
+        timing = f"Immediately when {reference.lower()} occurs" if amount in (None, 0, "0") else reference
+
     meta_parts = [
         p
         for p in (
@@ -138,6 +131,17 @@ def _is_ai_origin(origin: str | None) -> bool:
     return "ai" in key or "suggest" in key or "generated" in key
 
 
+def _status_bucket(status: str | None) -> str:
+    s = (status or "").strip().lower()
+    if s in {"active", "approved"}:
+        return "approved"
+    if "reject" in s:
+        return "rejected"
+    if "modif" in s or s in {"under review", "ai proposed", "draft"}:
+        return "in_review"
+    return "other"
+
+
 class AiEvalExportService:
     def __init__(self, db: Session):
         self.db = db
@@ -162,56 +166,45 @@ class AiEvalExportService:
 
     def _performance(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         versions = [r for r in rows if r.get("row_type") == "workflow_version"]
-        reviews = [r for r in rows if r.get("row_type") == "human_review"]
         ai_versions = [r for r in versions if _is_ai_origin(str(r.get("origin") or ""))]
-        approved = sum(
-            1
-            for r in reviews
-            if "approv" in str(r.get("review_status") or "").lower()
-            or "approv" in str(r.get("decision_outcome") or "").lower()
-        )
-        rejected = sum(
-            1
-            for r in reviews
-            if "reject" in str(r.get("review_status") or "").lower()
-            or "reject" in str(r.get("decision_outcome") or "").lower()
-            or r.get("rejection_reason")
-        )
-        modified = sum(
-            1
-            for r in reviews
-            if "modif" in str(r.get("review_status") or "").lower()
-            or "modif" in str(r.get("decision_outcome") or "").lower()
-        )
-        held = sum(
-            1
-            for r in reviews
-            if "hold" in str(r.get("review_status") or "").lower()
-            or "hold" in str(r.get("decision_outcome") or "").lower()
-        )
-        decided = approved + rejected + modified
-        confidences = [
-            float(r["confidence"])
-            for r in reviews
-            if r.get("confidence") is not None and str(r.get("confidence")).strip() != ""
-        ]
-        avg_confidence = (
-            round(sum(confidences) / len(confidences), 3) if confidences else None
-        )
+        # One latest row per strategy for outcome rates.
+        latest_by_strategy: dict[Any, dict[str, Any]] = {}
+        for r in versions:
+            sid = r.get("strategy_id")
+            if sid is None:
+                continue
+            prev = latest_by_strategy.get(sid)
+            if prev is None or int(r.get("version") or 0) > int(prev.get("version") or 0):
+                latest_by_strategy[sid] = r
+        approved = 0
+        rejected = 0
+        in_review = 0
+        for r in latest_by_strategy.values():
+            bucket = _status_bucket(str(r.get("status") or ""))
+            if bucket == "approved":
+                approved += 1
+            elif bucket == "rejected":
+                rejected += 1
+            elif bucket == "in_review":
+                in_review += 1
+        decided = approved + rejected
+        with_changes = sum(1 for r in versions if r.get("changes_summary"))
         return {
             "workflow_versions": len(versions),
             "ai_origin_versions": len(ai_versions),
             "human_created_versions": len(versions) - len(ai_versions),
-            "human_reviews": len(reviews),
+            "human_reviews": 0,
             "hr_approved": approved,
             "hr_rejected": rejected,
-            "hr_modified": modified,
-            "hr_held": held,
+            "hr_modified": with_changes,
+            "hr_held": in_review,
             "hr_decided": decided,
             "approval_rate_pct": round((approved / decided) * 100, 1) if decided else None,
             "rejection_rate_pct": round((rejected / decided) * 100, 1) if decided else None,
-            "modify_rate_pct": round((modified / decided) * 100, 1) if decided else None,
-            "avg_confidence": avg_confidence,
+            "modify_rate_pct": round((with_changes / len(versions)) * 100, 1) if versions else None,
+            "avg_confidence": None,
+            "workflows": len(latest_by_strategy),
+            "versions_with_changes": with_changes,
         }
 
     def _rows(
@@ -253,18 +246,12 @@ class AiEvalExportService:
             if len(versions) >= limit:
                 break
 
-        reviews_q = (
-            self.db.query(PayflowHumanReviewModel)
-            .options(
-                joinedload(PayflowHumanReviewModel.client),
-                joinedload(PayflowHumanReviewModel.strategy),
-                joinedload(PayflowHumanReviewModel.audit_events),
-            )
-            .order_by(PayflowHumanReviewModel.id.desc())
-        )
-        if scoped is not None:
-            reviews_q = reviews_q.filter(PayflowHumanReviewModel.client_id.in_(scoped))
-        reviews = reviews_q.limit(limit).all()
+        # Oldest→newest within each strategy so we can attach prior changes context.
+        by_strategy: dict[int, list[PayflowStrategyVersionModel]] = {}
+        for v in versions:
+            by_strategy.setdefault(int(v.strategy_id), []).append(v)
+        for sid, items in by_strategy.items():
+            items.sort(key=lambda x: (int(x.version or 0), int(x.id or 0)))
 
         client_cache: dict[int, PayflowClientModel | None] = {}
 
@@ -276,15 +263,14 @@ class AiEvalExportService:
             return client_cache[cid]
 
         rows: list[dict[str, Any]] = []
+        # Emit newest-first overall (matches previous preview order).
         for v in versions:
             strategy = v.strategy
             client = client_for(strategy.client_id if strategy else None)
-            steps = v.steps if isinstance(v.steps, list) else (strategy.steps if strategy else None)
-            if not isinstance(steps, list) or not steps:
-                steps = strategy.steps if strategy and isinstance(strategy.steps, list) else None
-            segment = v.segment if isinstance(v.segment, dict) else (
-                strategy.segment if strategy and isinstance(strategy.segment, dict) else None
-            )
+            # Only the version's own snapshot — never fall back to live strategy.steps
+            # (that made every version look identical).
+            steps = v.steps if isinstance(v.steps, list) else None
+            segment = v.segment if isinstance(v.segment, dict) else None
             segment_bits = []
             if isinstance(segment, dict):
                 for key in ("label", "name", "dpd_band", "balance_band", "channel"):
@@ -292,12 +278,22 @@ class AiEvalExportService:
                         segment_bits.append(f"{key}={segment.get(key)}")
             step_snapshots = (
                 [
-                    {**(s if isinstance(s, dict) else {}), **_step_snapshot_label(s if isinstance(s, dict) else {}, i)}
+                    {
+                        **(s if isinstance(s, dict) else {}),
+                        **_step_snapshot_label(s if isinstance(s, dict) else {}, i),
+                    }
                     for i, s in enumerate(steps)
                 ]
-                if isinstance(steps, list)
+                if steps
                 else None
             )
+            siblings = by_strategy.get(int(v.strategy_id), [])
+            prev = None
+            for item in siblings:
+                if int(item.id or 0) == int(v.id or 0):
+                    break
+                prev = item
+            prior_changes = _text_list(prev.changes) if prev is not None else None
             rows.append(
                 {
                     "row_type": "workflow_version",
@@ -319,97 +315,20 @@ class AiEvalExportService:
                     "steps_count": len(steps) if isinstance(steps, list) else None,
                     "segment_summary": ", ".join(segment_bits) if segment_bits else None,
                     "changes_summary": _text_list(v.changes),
+                    "prior_changes_summary": prior_changes,
                     "steps_detail": step_snapshots,
                     "segment_detail": segment,
                     "changes_detail": v.changes if isinstance(v.changes, list) else None,
-                    "review_id": None,
-                    "review_code": None,
-                    "review_status": None,
-                    "priority": None,
-                    "proposed_action": None,
-                    "final_action": None,
-                    "decision_outcome": None,
-                    "confidence": None,
-                    "rejection_reason": None,
-                    "guidance": None,
-                    "condition_text": None,
-                    "observed_value": None,
-                    "explanation": None,
-                    "account_id": None,
-                    "audit_trail": None,
-                    "decided_at": None,
-                    "export_reference": export_ref,
-                }
-            )
-
-        for r in reviews:
-            client = r.client or client_for(r.client_id)
-            strategy = r.strategy
-            audits = []
-            for ev in list(r.audit_events or [])[-12:]:
-                audits.append(
-                    {
-                        "event": ev.event,
-                        "detail": ev.detail,
-                        "actor": ev.actor_name,
-                        "before_status": ev.before_status,
-                        "after_status": ev.after_status,
-                        "at": ev.created_at.isoformat() if ev.created_at else None,
-                    }
-                )
-            explanation = _text_list(r.explanation)
-            rows.append(
-                {
-                    "row_type": "human_review",
-                    "client_id": r.client_id,
-                    "client_code": client.code if client else None,
-                    "client_name": client.name if client else None,
-                    "strategy_id": r.strategy_id,
-                    "strategy_code": strategy.code if strategy else None,
-                    "strategy_name": strategy.name if strategy else None,
-                    "version": r.workflow_version,
-                    "origin": strategy.origin if strategy else None,
-                    "status": r.status,
-                    "event_date": r.created_at.isoformat() if r.created_at else None,
-                    "note": r.reason,
-                    "approved_by": None,
-                    "reviewer_note": r.guidance,
-                    "approval_date": None,
-                    "steps_count": None,
-                    "segment_summary": None,
-                    "changes_summary": None,
-                    "steps_detail": None,
-                    "segment_detail": None,
-                    "changes_detail": None,
-                    "review_id": r.id,
-                    "review_code": r.code,
-                    "review_status": r.status,
-                    "priority": r.priority,
-                    "proposed_action": r.proposed_action,
-                    "final_action": r.final_action,
-                    "decision_outcome": r.final_action or r.status,
-                    "confidence": r.confidence,
-                    "rejection_reason": r.rejection_reason,
-                    "guidance": r.guidance,
-                    "condition_text": r.condition_text,
-                    "observed_value": r.observed_value,
-                    "explanation": explanation,
-                    "explanation_detail": r.explanation
-                    if isinstance(r.explanation, list)
-                    else None,
-                    "account_id": r.account_id,
-                    "audit_trail": audits,
-                    "decided_at": r.decided_at.isoformat() if r.decided_at else None,
+                    "steps_snapshot_missing": not bool(steps),
                     "export_reference": export_ref,
                 }
             )
 
         logger.info(
-            "ai_eval_export user=%s ref=%s versions=%s reviews=%s",
+            "ai_eval_export user=%s ref=%s versions=%s",
             getattr(user, "id", None),
             export_ref,
             len(versions),
-            len(reviews),
         )
         return rows, export_ref
 
@@ -428,7 +347,8 @@ class AiEvalExportService:
             "totals": {
                 "row_count": len(rows),
                 "workflow_versions": performance["workflow_versions"],
-                "human_reviews": performance["human_reviews"],
+                "workflows": performance.get("workflows") or 0,
+                "human_reviews": 0,
             },
             "performance": performance,
             "rows": rows[:200],
