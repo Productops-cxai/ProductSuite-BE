@@ -88,8 +88,22 @@ def _add_missing_columns(engine: Engine) -> None:
                         default_sql = " DEFAULT ''"
                     elif column.name == "source":
                         default_sql = " DEFAULT 'Human Created'"
+                    elif column.name == "auto_charge_enabled":
+                        # Payment plans: new column defaults on for additive sync.
+                        default_sql = (
+                            " DEFAULT TRUE" if engine.dialect.name != "sqlite" else " DEFAULT 1"
+                        )
                     elif hasattr(column.type, "python_type") and column.type.python_type is bool:
-                        default_sql = " DEFAULT FALSE" if engine.dialect.name != "sqlite" else " DEFAULT 0"
+                        # Honour model default=True when present; otherwise FALSE.
+                        bool_default = getattr(getattr(column, "default", None), "arg", None)
+                        if bool_default is True:
+                            default_sql = (
+                                " DEFAULT TRUE" if engine.dialect.name != "sqlite" else " DEFAULT 1"
+                            )
+                        else:
+                            default_sql = (
+                                " DEFAULT FALSE" if engine.dialect.name != "sqlite" else " DEFAULT 0"
+                            )
                     elif column.name in ("is_built_in", "is_coming_soon", "is_active"):
                         default_sql = " DEFAULT FALSE" if engine.dialect.name != "sqlite" else " DEFAULT 0"
                     elif (

@@ -866,12 +866,18 @@ class PayflowPaymentAttemptModel(Base):
 
 
 class PayflowPaymentPlanModel(Base):
-    """Customer payment plan — schedule stored; future charges are NOT auto-initiated."""
+    """Customer payment plan — PayFlow owns schedule; Stripe pulls when auto_charge is on."""
 
     __tablename__ = "payflow_payment_plans"
     __table_args__ = (
         UniqueConstraint("public_id", name="uq_payflow_payment_plan_public_id"),
         Index("ix_payflow_payment_plans_account_status", "account_id", "status"),
+        Index(
+            "ix_payflow_payment_plans_autocharge",
+            "auto_charge_enabled",
+            "status",
+            "next_due_date",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -896,6 +902,11 @@ class PayflowPaymentPlanModel(Base):
     amount_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     next_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    auto_charge_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_payment_method_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payment_method_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    consecutive_charge_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     events: Mapped[list | None] = mapped_column(JSON, nullable=True)

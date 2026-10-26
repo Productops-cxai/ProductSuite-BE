@@ -7,6 +7,9 @@ Events (must match PayflowPaymentPortalService.STRIPE_WEBHOOK_EVENTS):
   checkout.session.completed | async_payment_succeeded | async_payment_failed | expired
   payment_intent.succeeded | payment_failed | canceled
   refund.created | charge.refunded
+
+Plan auto-deduct: checkout.session.completed (incl. mode=setup) saves PM;
+worker off-session charges settle via payment_intent.succeeded / payment_failed.
 """
 
 from __future__ import annotations
