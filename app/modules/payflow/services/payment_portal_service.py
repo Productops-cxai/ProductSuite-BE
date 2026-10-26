@@ -153,6 +153,11 @@ class PayflowPaymentPortalService:
     def _brand_payload(self, client: PayflowClientModel | None) -> dict[str, Any]:
         third = self._is_third_party(client)
         client_label = (client.brand_name or client.name) if client else "Client"
+        support = {
+            "client_name": client_label,
+            "support_email": (client.contact_email if client else None) or None,
+            "support_phone": (client.contact_phone if client else None) or None,
+        }
         if third:
             return {
                 "mode": "third_party",
@@ -161,13 +166,43 @@ class PayflowPaymentPortalService:
                     (settings.PAYFLOW_OPERATOR_LOGO_URL or None) or None
                 ),
                 "on_behalf_of": client_label,
+                **support,
             }
         return {
             "mode": "first_party",
             "name": client_label or "PayFlow",
             "logo_url": self._absolute_asset_url(client.logo_url if client else None),
             "on_behalf_of": None,
+            **support,
         }
+
+    @staticmethod
+    def _option_label(option_type: str | None, plan_id: str | None = None) -> str:
+        key = (option_type or "").strip().lower()
+        if key == PayflowPaymentOptionType.PAY_IN_FULL.value:
+            return "Pay in Full"
+        if key == PayflowPaymentOptionType.PARTIAL.value:
+            return "Partial Payment"
+        if key == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            if plan_id and plan_id.startswith("plan_"):
+                try:
+                    n = int(plan_id.split("_", 1)[1])
+                    return f"{n} monthly instalments"
+                except ValueError:
+                    pass
+            return "Payment Plan"
+        if key == PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value:
+            return "Pay next instalment"
+        return option_type or "Payment"
+
+    @staticmethod
+    def _mask_reference(reference: str | None) -> str | None:
+        raw = (reference or "").strip()
+        if not raw:
+            return None
+        if len(raw) <= 4:
+            return f"•••• {raw}"
+        return f"•••• {raw[-4:]}"
 
     def _case_payment_eligible(self, account: PayflowAccountModel) -> tuple[bool, str | None]:
         ok, reason = self.links._case_eligible(account)
@@ -482,6 +517,7 @@ class PayflowPaymentPortalService:
             },
             "case": {
                 "account_reference": account.account_reference,
+                "account_reference_masked": self._mask_reference(account.account_reference),
                 "original_balance": float(account.original_balance or 0),
                 "outstanding_balance": balance,
                 "recovered_balance": float(account.recovered_balance or 0),
@@ -614,6 +650,24 @@ class PayflowPaymentPortalService:
             .first()
         )
         if recent and recent.checkout_url:
+            # Reused open checkout — still stamp Stripe Checkout Opened on the comm
+            # (previous attempt may have skipped mark if communication lookup failed).
+            try:
+                from app.modules.payflow.services.communication_service import (
+                    PayflowCommunicationService,
+                )
+
+                PayflowCommunicationService(self.db).mark_payment_event(
+                    account.id,
+                    event="initiated",
+                    communication_id=row.communication_id,
+                    detail=f"Stripe Checkout · {recent.stripe_session_id or recent.public_id[:12]}",
+                    commit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "mark stripe checkout opened failed (reuse) account_id=%s", account.id
+                )
             return self.serialize_attempt(recent)
 
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
@@ -730,8 +784,17 @@ class PayflowPaymentPortalService:
                 PayflowCommunicationService,
             )
 
+            # Wire Stripe Checkout open onto the originating email/SMS (not just portal Click).
             PayflowCommunicationService(self.db).mark_payment_event(
-                account.id, event="initiated", commit=False
+                account.id,
+                event="initiated",
+                communication_id=row.communication_id,
+                detail=(
+                    f"Stripe Checkout · {attempt.stripe_session_id or attempt.public_id[:12]}"
+                    if use_stripe
+                    else f"Mock checkout · {attempt.public_id[:12]}"
+                ),
+                commit=False,
             )
         except Exception:  # noqa: BLE001
             logger.exception("mark payment initiated failed account_id=%s", account.id)
@@ -741,23 +804,163 @@ class PayflowPaymentPortalService:
         return self.serialize_attempt(attempt)
 
     def serialize_attempt(self, row: PayflowPaymentAttemptModel) -> dict[str, Any]:
+        account = row.account
+        if account is None and row.account_id:
+            account = self.db.get(PayflowAccountModel, row.account_id)
+        client = row.client
+        if client is None and row.client_id:
+            client = self.db.get(PayflowClientModel, row.client_id)
+
+        amount = _money(row.amount)
+        balance_at = (
+            _money(row.balance_at_initiation)
+            if row.balance_at_initiation is not None
+            else None
+        )
+        outstanding_now = _money(account.outstanding_balance) if account else None
+        succeeded = row.status == PayflowPaymentAttemptStatus.SUCCEEDED.value
+        if succeeded and outstanding_now is not None:
+            remaining_balance = outstanding_now
+        elif balance_at is not None:
+            remaining_balance = max(0.0, _money(balance_at - amount))
+        else:
+            remaining_balance = outstanding_now
+
+        method_label = (
+            "Card"
+            if (row.provider or "").lower() == "stripe"
+            else "Bank Account"
+            if (row.provider or "").lower() == "ach"
+            else "Card"
+        )
+        # Prefer ledger method when a confirmed txn exists.
+        try:
+            from app.infrastructure.database.models import PayflowPaymentTransactionModel
+
+            txn = (
+                self.db.query(PayflowPaymentTransactionModel)
+                .filter(PayflowPaymentTransactionModel.payment_attempt_id == row.id)
+                .order_by(PayflowPaymentTransactionModel.id.desc())
+                .first()
+            )
+            if txn and txn.method_label:
+                # Normalize Stripe Checkout → Card for customer-facing receipt.
+                raw_method = str(txn.method_label)
+                if "stripe" in raw_method.lower() or "card" in raw_method.lower():
+                    method_label = "Card"
+                elif "bank" in raw_method.lower() or "ach" in raw_method.lower():
+                    method_label = "Bank Account"
+                else:
+                    method_label = raw_method
+        except Exception:  # noqa: BLE001
+            logger.exception("serialize_attempt method lookup failed attempt=%s", row.public_id)
+
+        plan_summary: dict[str, Any] | None = None
+        if row.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            try:
+                from app.modules.payflow.services.payment_outcome_service import (
+                    PayflowPaymentOutcomeService,
+                )
+
+                plan_row = (
+                    self.db.query(PayflowPaymentPlanModel)
+                    .filter(
+                        PayflowPaymentPlanModel.account_id == row.account_id,
+                        PayflowPaymentPlanModel.payment_link_id == row.payment_link_id,
+                    )
+                    .order_by(PayflowPaymentPlanModel.id.desc())
+                    .first()
+                )
+                if not plan_row:
+                    plan_row = (
+                        self.db.query(PayflowPaymentPlanModel)
+                        .filter(
+                            PayflowPaymentPlanModel.account_id == row.account_id,
+                            PayflowPaymentPlanModel.status.in_(["Active", "Overdue", "Completed"]),
+                        )
+                        .order_by(PayflowPaymentPlanModel.id.desc())
+                        .first()
+                    )
+                if plan_row:
+                    plan_summary = PayflowPaymentOutcomeService(self.db).serialize_plan(plan_row)
+                elif not succeeded:
+                    # Preview schedule from initiation snapshot (plan not created until first payment).
+                    installments_n = 3
+                    if row.plan_id and str(row.plan_id).startswith("plan_"):
+                        try:
+                            installments_n = max(2, int(str(row.plan_id).split("_", 1)[1]))
+                        except ValueError:
+                            pass
+                    total = balance_at if balance_at is not None else _money(amount * installments_n)
+                    start = (row.created_at.date() if row.created_at else _utcnow().date())
+                    final = self._add_months(start, installments_n - 1)
+                    plan_summary = {
+                        "id": None,
+                        "status": "Pending",
+                        "label": self._option_label(row.option_type, row.plan_id),
+                        "plan_option_id": row.plan_id,
+                        "installments_total": installments_n,
+                        "installment_amount": amount,
+                        "frequency": "monthly",
+                        "currency_code": row.currency_code,
+                        "total_payable": total,
+                        "amount_paid": 0.0,
+                        "amount_remaining": total,
+                        "start_date": start.isoformat(),
+                        "next_due_date": start.isoformat(),
+                        "final_payment_date": final.isoformat(),
+                        "auto_charge_enabled": False,
+                        "installments": [],
+                    }
+            except Exception:  # noqa: BLE001
+                logger.exception("serialize_attempt plan lookup failed attempt=%s", row.public_id)
+
+        if plan_summary and not plan_summary.get("final_payment_date"):
+            insts = plan_summary.get("installments") or []
+            if insts:
+                last = insts[-1]
+                if last.get("due_date"):
+                    plan_summary["final_payment_date"] = last["due_date"]
+            elif plan_summary.get("start_date") and plan_summary.get("installments_total"):
+                try:
+                    y, m, d = [int(x) for x in str(plan_summary["start_date"]).split("-")[:3]]
+                    start_d = date(y, m, d)
+                    plan_summary["final_payment_date"] = self._add_months(
+                        start_d, int(plan_summary["installments_total"]) - 1
+                    ).isoformat()
+                except (TypeError, ValueError):
+                    pass
+
+        paid_at = row.completed_at or (row.created_at if succeeded else None)
+
         return {
             "id": row.public_id,
             "status": row.status,
             "option_type": row.option_type,
+            "option_label": self._option_label(row.option_type, row.plan_id),
             "plan_id": row.plan_id,
-            "amount": _money(row.amount),
+            "amount": amount,
             "currency_code": row.currency_code,
             "provider": row.provider,
             "checkout_url": row.checkout_url,
             "error_message": row.error_message,
-            "balance_at_initiation": row.balance_at_initiation,
+            "balance_at_initiation": balance_at,
+            "remaining_balance": remaining_balance,
+            "outstanding_balance": outstanding_now,
+            "account_reference": account.account_reference if account else None,
+            "account_reference_masked": self._mask_reference(
+                account.account_reference if account else None
+            ),
+            "payment_method": method_label,
             "stripe_session_id": row.stripe_session_id,
             "reference": row.stripe_payment_intent_id or row.stripe_session_id or row.public_id[:12],
-            "confirmed": row.status == PayflowPaymentAttemptStatus.SUCCEEDED.value,
+            "confirmed": succeeded,
             "events": list(row.events or []),
             "created_at": row.created_at,
             "completed_at": row.completed_at,
+            "paid_at": paid_at,
+            "plan": plan_summary,
+            "brand": self._brand_payload(client),
         }
 
     def get_attempt_public(self, token: str, attempt_public_id: str) -> dict[str, Any]:
@@ -771,6 +974,10 @@ class PayflowPaymentPortalService:
             raise NotFoundError("Payment link not found")
         row = (
             self.db.query(PayflowPaymentAttemptModel)
+            .options(
+                joinedload(PayflowPaymentAttemptModel.account),
+                joinedload(PayflowPaymentAttemptModel.client),
+            )
             .filter(
                 PayflowPaymentAttemptModel.public_id == attempt_public_id,
                 PayflowPaymentAttemptModel.payment_link_id == link.id,
@@ -830,6 +1037,12 @@ class PayflowPaymentPortalService:
             if status == "expired":
                 attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
                 self._append_attempt_event(attempt, "Expired", "Reconcile from Stripe")
+                self._sync_comm_payment_outcome(
+                    attempt,
+                    event="expired",
+                    detail=f"Reconcile expired · {attempt.stripe_session_id or attempt.public_id[:12]}",
+                    commit=False,
+                )
                 self.db.commit()
                 return True
 
@@ -853,6 +1066,39 @@ class PayflowPaymentPortalService:
                     # Customer abandoned / card failed before capture.
                     pass
         return False
+
+    def _sync_comm_payment_outcome(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        *,
+        event: str,
+        detail: str | None = None,
+        commit: bool = False,
+    ) -> None:
+        """Mirror attempt cancel/fail/expire onto the originating communication timeline."""
+        try:
+            from app.modules.payflow.services.communication_service import (
+                PayflowCommunicationService,
+            )
+
+            link = (
+                self.db.get(PayflowPaymentLinkModel, attempt.payment_link_id)
+                if attempt.payment_link_id
+                else None
+            )
+            PayflowCommunicationService(self.db).mark_payment_event(
+                attempt.account_id,
+                event=event,
+                communication_id=link.communication_id if link else None,
+                detail=detail,
+                commit=commit,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "sync comm payment outcome failed attempt=%s event=%s",
+                attempt.public_id,
+                event,
+            )
 
     def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
@@ -884,6 +1130,14 @@ class PayflowPaymentPortalService:
             return self.serialize_attempt(row)
         row.status = PayflowPaymentAttemptStatus.CANCELLED.value
         self._append_attempt_event(row, "Cancelled", "Customer returned without paying")
+        self._sync_comm_payment_outcome(
+            row,
+            event="cancelled",
+            detail=(
+                f"Checkout cancelled · {row.stripe_session_id or row.public_id[:12]}"
+            ),
+            commit=False,
+        )
         self.db.commit()
         self.db.refresh(row)
         return self.serialize_attempt(row)
@@ -925,6 +1179,12 @@ class PayflowPaymentPortalService:
         elif outcome_norm in {"cancel", "cancelled", "canceled"}:
             row.status = PayflowPaymentAttemptStatus.CANCELLED.value
             self._append_attempt_event(row, "Cancelled", "Mock cancel")
+            self._sync_comm_payment_outcome(
+                row,
+                event="cancelled",
+                detail=f"Mock checkout cancelled · {row.public_id[:12]}",
+                commit=False,
+            )
             self.db.commit()
         else:
             raise ValidationAppError("outcome must be success, failed, or cancel")
@@ -1170,6 +1430,12 @@ class PayflowPaymentPortalService:
         attempt.completed_at = _utcnow()
         self._append_attempt_event(attempt, "Failed", attempt.error_message)
         self._raise_ops_exception(attempt, attempt.error_message or "Payment failed")
+        self._sync_comm_payment_outcome(
+            attempt,
+            event="failed",
+            detail=attempt.error_message,
+            commit=False,
+        )
         if commit:
             self.db.commit()
         else:
@@ -1194,47 +1460,86 @@ class PayflowPaymentPortalService:
         except Exception:  # noqa: BLE001
             logger.exception("payment failed notify failed attempt=%s", attempt.public_id)
 
+    # Stripe Dashboard destination (memorable-legacy) — keep in sync with subscribed events.
+    # These are *payment lifecycle* events, not email Click / Open engagement.
+    STRIPE_WEBHOOK_EVENTS = frozenset(
+        {
+            "checkout.session.completed",
+            "checkout.session.async_payment_succeeded",
+            "checkout.session.async_payment_failed",
+            "checkout.session.expired",
+            "payment_intent.succeeded",
+            "payment_intent.payment_failed",
+            "payment_intent.canceled",
+            "refund.created",
+            "charge.refunded",
+        }
+    )
+
     def handle_stripe_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """
+        Reconcile Stripe Checkout / PaymentIntent / refund webhooks onto attempts + ledger.
+
+        Success path is idempotent: checkout.session.completed and payment_intent.succeeded
+        may both fire — balance is cut only once (apply_succeeded).
+
+        Refunds: process refund.created only. charge.refunded is ignored when both are
+        subscribed (avoids double balance restore).
+        """
         et = str(event.get("type") or "")
+        event_id = str(event.get("id") or "")
         data_object = (event.get("data") or {}).get("object") or {}
 
-        # Refunds / chargebacks — adjust ledger without deleting originals.
-        if et in {"charge.refunded", "refund.created", "charge.dispute.funds_withdrawn"}:
+        if et and et not in self.STRIPE_WEBHOOK_EVENTS:
+            logger.info("stripe event ignored (not in reconcile set) type=%s id=%s", et, event_id)
+            return {"matched": False, "ignored": True, "type": et, "reason": "unsubscribed_event"}
+
+        # --- Refunds: one source of truth ---
+        if et == "charge.refunded":
+            # Same destination also sends refund.created — skip to prevent double refund.
+            return {
+                "matched": True,
+                "ignored": True,
+                "type": et,
+                "reason": "use_refund_created",
+                "event_id": event_id or None,
+            }
+
+        if et == "refund.created":
             try:
                 from app.modules.payflow.services.payment_outcome_service import (
                     PayflowPaymentOutcomeService,
                 )
 
                 pi = data_object.get("payment_intent")
-                charge_id = data_object.get("id")
-                amount_refunded = data_object.get("amount_refunded") or data_object.get("amount")
-                amt = None
-                if amount_refunded is not None:
-                    amt = float(amount_refunded) / 100.0
-                ref = None
-                if isinstance(pi, str) and pi:
-                    ref = pi
-                elif charge_id:
-                    # Find txn by provider_ref containing charge or use charge id.
-                    ref = str(charge_id)
-                direction = "reversal" if "dispute" in et else "refund"
-                if ref:
-                    adj = PayflowPaymentOutcomeService(self.db).apply_refund_or_reversal(
-                        original_provider_ref=ref,
-                        amount=amt,
-                        direction=direction,
-                        provider_ref=f"{et}:{data_object.get('id')}",
-                        notes=f"Stripe {et}",
-                        commit=True,
-                    )
+                refund_id = data_object.get("id")
+                amount_raw = data_object.get("amount")
+                amt = float(amount_raw) / 100.0 if amount_raw is not None else None
+                ref = pi if isinstance(pi, str) and pi else None
+                if not ref:
                     return {
-                        "matched": True,
+                        "matched": False,
+                        "reason": "refund_missing_payment_intent",
                         "type": et,
-                        "adjustment": adj.public_id,
-                        "status": adj.status,
+                        "event_id": event_id or None,
                     }
+                adj = PayflowPaymentOutcomeService(self.db).apply_refund_or_reversal(
+                    original_provider_ref=ref,
+                    amount=amt,
+                    direction="refund",
+                    provider_ref=f"refund:{refund_id}" if refund_id else f"refund_event:{event_id}",
+                    notes=f"Stripe refund.created · {event_id or refund_id or ''}".strip(),
+                    commit=True,
+                )
+                return {
+                    "matched": True,
+                    "type": et,
+                    "adjustment": adj.public_id,
+                    "status": adj.status,
+                    "event_id": event_id or None,
+                }
             except Exception as exc:  # noqa: BLE001
-                logger.exception("stripe refund/reversal handling failed")
+                logger.exception("stripe refund handling failed event=%s", event_id)
                 return {"matched": False, "reason": str(exc)[:200], "type": et}
 
         session_id = data_object.get("id") if data_object.get("object") == "checkout.session" else None
@@ -1275,18 +1580,29 @@ class PayflowPaymentPortalService:
                 )
         if not attempt:
             logger.warning(
-                "stripe event unmatched type=%s session=%s pi=%s",
+                "stripe event unmatched type=%s session=%s pi=%s id=%s",
                 et,
                 session_id,
                 pi_id,
+                event_id,
             )
-            return {"matched": False, "reason": "attempt_not_found", "type": et}
+            return {"matched": False, "reason": "attempt_not_found", "type": et, "event_id": event_id or None}
 
         if pi_id:
             attempt.stripe_payment_intent_id = attempt.stripe_payment_intent_id or pi_id
 
+        already_paid = attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value
+
+        # --- Paid (idempotent): session completed OR payment_intent.succeeded ---
         if et in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
-            # Only treat as paid when Stripe reports paid / complete.
+            if already_paid:
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "idempotent": True,
+                    "event_id": event_id or None,
+                }
             payment_status = (data_object.get("payment_status") or "").lower()
             status = (data_object.get("status") or "").lower()
             amount_total = data_object.get("amount_total")
@@ -1311,40 +1627,43 @@ class PayflowPaymentPortalService:
                     "status": attempt.status,
                     "type": et,
                     "amount_mismatch": True,
+                    "event_id": event_id or None,
                 }
-            # Require Stripe payment_status=paid (do not confirm on URL / session complete alone).
             if payment_status in {"paid", "no_payment_required"}:
                 self.apply_succeeded(
                     attempt,
                     provider_ref=attempt.stripe_payment_intent_id or session_id,
                     commit=True,
                 )
-                return {"matched": True, "status": attempt.status, "type": et}
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "event_id": event_id or None,
+                }
             attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
             self._append_attempt_event(
-                attempt, "Processing", f"{et} payment_status={payment_status or status}"
+                attempt,
+                "Processing",
+                f"{et} payment_status={payment_status or status} · {event_id}",
             )
             self.db.commit()
-            return {"matched": True, "status": attempt.status, "type": et}
-
-        if et in {
-            "checkout.session.expired",
-            "checkout.session.async_payment_failed",
-        }:
-            if et.endswith("expired"):
-                if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
-                    attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
-                    self._append_attempt_event(attempt, "Expired", et)
-                    self.db.commit()
-            else:
-                self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
-            return {"matched": True, "status": attempt.status, "type": et}
-
-        if et in {"payment_intent.payment_failed", "payment_intent.canceled"}:
-            self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
-            return {"matched": True, "status": attempt.status, "type": et}
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
 
         if et == "payment_intent.succeeded":
+            if already_paid:
+                return {
+                    "matched": True,
+                    "status": attempt.status,
+                    "type": et,
+                    "idempotent": True,
+                    "event_id": event_id or None,
+                }
             amount_received = data_object.get("amount_received") or data_object.get("amount")
             if amount_received is not None:
                 try:
@@ -1361,17 +1680,61 @@ class PayflowPaymentPortalService:
                             "status": attempt.status,
                             "type": et,
                             "amount_mismatch": True,
+                            "event_id": event_id or None,
                         }
                 except (TypeError, ValueError):
                     pass
             self.apply_succeeded(
                 attempt, provider_ref=pi_id or data_object.get("id") or session_id, commit=True
             )
-            return {"matched": True, "status": attempt.status, "type": et}
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
 
-        self._append_attempt_event(attempt, "Stripe Event", et)
+        # --- Failed / expired / canceled (never override Succeeded) ---
+        if et == "checkout.session.expired":
+            if attempt.status != PayflowPaymentAttemptStatus.SUCCEEDED.value:
+                attempt.status = PayflowPaymentAttemptStatus.EXPIRED.value
+                self._append_attempt_event(attempt, "Expired", f"{et} · {event_id}")
+                self._sync_comm_payment_outcome(
+                    attempt,
+                    event="expired",
+                    detail=f"Stripe · {et} · {attempt.stripe_session_id or event_id}",
+                    commit=False,
+                )
+                self.db.commit()
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
+
+        if et in {
+            "checkout.session.async_payment_failed",
+            "payment_intent.payment_failed",
+            "payment_intent.canceled",
+        }:
+            self.apply_failed(attempt, error=f"Stripe event: {et}", commit=True)
+            return {
+                "matched": True,
+                "status": attempt.status,
+                "type": et,
+                "event_id": event_id or None,
+            }
+
+        self._append_attempt_event(attempt, "Stripe Event", f"{et} · {event_id}")
         self.db.commit()
-        return {"matched": True, "ignored": True, "type": et, "status": attempt.status}
+        return {
+            "matched": True,
+            "ignored": True,
+            "type": et,
+            "status": attempt.status,
+            "event_id": event_id or None,
+        }
 
 
 # Keep public_url helper importable for callers that only need URL composition.

@@ -33,11 +33,26 @@ jobs:
             cd /var/www/payflow/api
             git fetch origin
             git checkout main
-            git pull --ff-only origin main
+            git reset --hard origin/main
             source venv/bin/activate
             pip install -r requirements.txt
-            sudo systemctl restart payflow-api payflow-worker
-            sleep 2
-            curl -fsS http://127.0.0.1:8000/health
-            echo
+            sudo systemctl restart payflow-api
+            sudo systemctl restart payflow-worker
+            # Startup runs schema sync + seed — wait for /health (up to ~60s)
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8000/health; then
+                echo
+                ok=1
+                break
+              fi
+              echo "health attempt $i/30 — waiting…"
+              sleep 2
+            done
+            if [ "$ok" != "1" ]; then
+              echo "API failed to become healthy"
+              sudo systemctl --no-pager --full status payflow-api || true
+              sudo journalctl -u payflow-api -n 80 --no-pager || true
+              exit 1
+            fi
             echo "BE deployed OK"

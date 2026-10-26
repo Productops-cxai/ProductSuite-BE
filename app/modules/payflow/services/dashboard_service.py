@@ -85,10 +85,8 @@ FUNNEL_STAGES: list[tuple[str, str, set[str]]] = [
     (
         "03",
         "Opened / Read",
-        {
-            PayflowCommStatus.OPENED_READ.value,
-            PayflowCommStatus.PAYMENT_LINK_CLICKED.value,
-        },
+        # Stripe / provider open only — click must not inflate this stage.
+        {PayflowCommStatus.OPENED_READ.value},
     ),
     (
         "04",
@@ -353,21 +351,11 @@ class PayflowDashboardService:
         failed_payments = sum(
             1 for a in attempts if a.status == PayflowPaymentAttemptStatus.FAILED.value
         )
-        # Prefer communication-linked initiation so funnel matches Comm detail.
-        payment_initiated_comms = sum(
+        # Must match Comm detail "Payment initiated" — do not count orphan attempts
+        # that never marked the communication (that inflated funnel past Click).
+        payment_initiated = sum(
             1 for c in comms if getattr(c, "payment_initiated", False)
         )
-        payment_initiated_attempts = sum(
-            1
-            for a in attempts
-            if a.status
-            in {
-                PayflowPaymentAttemptStatus.INITIATED.value,
-                PayflowPaymentAttemptStatus.PROCESSING.value,
-                PayflowPaymentAttemptStatus.SUCCEEDED.value,
-            }
-        )
-        payment_initiated = max(payment_initiated_comms, payment_initiated_attempts)
 
         # Paid funnel = confirmed payments in range (ledger), not lifetime resolved count.
         paid_funnel = (
@@ -545,18 +533,22 @@ class PayflowDashboardService:
         counts = []
         for step, label, statuses in FUNNEL_STAGES:
             if label == "Opened / Read":
-                # Real opens only — click-without-open must not inflate this stage.
+                # Stripe open pixel / provider open only.
+                n = sum(
+                    1 for c in comms if int(getattr(c, "opens_count", 0) or 0) > 0
+                )
+            elif label == "Clicked":
+                # Our payment-link click (status or clicks_count).
                 n = sum(
                     1
                     for c in comms
-                    if int(getattr(c, "opens_count", 0) or 0) > 0
-                    or c.status == PayflowCommStatus.OPENED_READ.value
-                    or getattr(c, "first_opened_at", None) is not None
+                    if c.status == PayflowCommStatus.PAYMENT_LINK_CLICKED.value
+                    or int(getattr(c, "clicks_count", 0) or 0) > 0
                 )
             else:
                 n = sum(1 for c in comms if c.status in statuses)
             counts.append((step, label, n, False))
-        # Payment stages from attempts / confirmed outcomes — not plan-status misuse.
+        # 05 Click → 06 payment process (initiated) → Paid.
         counts.append(("05", "Payment Initiated", payment_initiated, False))
         counts.append(("06", "Paid", paid_count, True))
 
