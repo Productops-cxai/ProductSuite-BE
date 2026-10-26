@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from calendar import monthrange
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -357,6 +357,17 @@ class PayflowPaymentPortalService:
         month = month % 12 + 1
         day = min(d.day, monthrange(year, month)[1])
         return date(year, month, day)
+
+    @classmethod
+    def _add_period(cls, d: date, index: int, frequency: str) -> date:
+        freq = (frequency or "monthly").strip().lower()
+        if index <= 0:
+            return d
+        if freq == "daily":
+            return d + timedelta(days=index)
+        if freq == "weekly":
+            return d + timedelta(weeks=index)
+        return cls._add_months(d, index)
 
     def resolve_portal(self, token: str, *, preview: bool = False) -> dict[str, Any]:
         """Public portal payload — branding, balance, options, block reasons.
