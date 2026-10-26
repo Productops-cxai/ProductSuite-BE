@@ -893,6 +893,13 @@ class PayflowPaymentPortalService:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("checkout failed notify failed attempt=%s", public_id)
+            # Surface Stripe's reason when useful (e.g. unsupported PM for currency).
+            detail = str(exc)[:240]
+            if "us_bank_account" in detail.lower() or "payment_method_types" in detail.lower():
+                raise ValidationAppError(
+                    "Unable to start payment: bank debit is not available for this currency. "
+                    "Card checkout should be used — please try again."
+                ) from exc
             raise ValidationAppError(
                 "Unable to start payment. Please try again or contact support."
             ) from exc

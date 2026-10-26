@@ -19,12 +19,21 @@ from app.core.config import settings
 
 logger = logging.getLogger("app.payflow.stripe")
 
-# Card + US bank (ACH) for portal + saved-method auto-charge.
+# Card always. US bank (ACH) only with USD — Stripe rejects us_bank_account for CAD/etc.
 DEFAULT_PAYMENT_METHOD_TYPES = ["card", "us_bank_account"]
 
 
 def stripe_configured() -> bool:
     return bool((settings.STRIPE_SECRET_KEY or "").strip())
+
+
+def payment_method_types_for_currency(currency: str | None) -> list[str]:
+    """Pick Checkout PM types that Stripe accepts for this currency."""
+    cur = (currency or "USD").strip().lower()
+    if cur == "usd":
+        return ["card", "us_bank_account"]
+    # CAD and other currencies: card only (ACH is USD-only).
+    return ["card"]
 
 
 def _secret() -> str:
@@ -36,6 +45,15 @@ def _secret() -> str:
 
 def _norm_meta(metadata: dict[str, str] | None) -> dict[str, str]:
     return {k: str(v)[:500] for k, v in (metadata or {}).items()}
+
+
+def _stripe_error_message(exc: BaseException) -> str:
+    msg = str(exc) or exc.__class__.__name__
+    # stripe.error.InvalidRequestError often has .user['message']
+    user_msg = getattr(exc, "user", None)
+    if isinstance(user_msg, dict) and user_msg.get("message"):
+        msg = str(user_msg.get("message"))
+    return msg[:400]
 
 
 def create_checkout_session(
@@ -65,19 +83,16 @@ def create_checkout_session(
     submit_msg = None
     if brand_subtitle:
         submit_msg = f"Payment on behalf of {brand_subtitle}"[:120]
-    pm_types = payment_method_types or DEFAULT_PAYMENT_METHOD_TYPES
+    pm_types = payment_method_types or payment_method_types_for_currency(currency_norm)
 
-    try:
-        import stripe
-
-        stripe.api_key = secret
+    def _build_payment_kwargs(types: list[str]) -> dict[str, Any]:
         product_data: dict[str, Any] = {"name": product_name[:120]}
         if product_images:
             product_data["images"] = product_images[:8]
         pi_data: dict[str, Any] = {"metadata": meta}
         if save_payment_method:
             pi_data["setup_future_usage"] = "off_session"
-        session_kwargs: dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "mode": "payment",
             "success_url": success_url,
             "cancel_url": cancel_url,
@@ -94,18 +109,36 @@ def create_checkout_session(
             ],
             "metadata": meta,
             "payment_intent_data": pi_data,
-            "payment_method_types": pm_types,
+            "payment_method_types": types,
         }
         if stripe_customer_id:
-            session_kwargs["customer"] = stripe_customer_id
+            kwargs["customer"] = stripe_customer_id
         else:
             if customer_email:
-                session_kwargs["customer_email"] = customer_email
+                kwargs["customer_email"] = customer_email
             if save_payment_method:
-                session_kwargs["customer_creation"] = "always"
+                kwargs["customer_creation"] = "always"
         if submit_msg:
-            session_kwargs["custom_text"] = {"submit": {"message": submit_msg}}
-        session = stripe.checkout.Session.create(**session_kwargs)
+            kwargs["custom_text"] = {"submit": {"message": submit_msg}}
+        return kwargs
+
+    try:
+        import stripe
+
+        stripe.api_key = secret
+        try:
+            session = stripe.checkout.Session.create(**_build_payment_kwargs(pm_types))
+        except Exception as first_exc:
+            # Retry card-only when bank/ACH types are rejected for this currency/account.
+            if pm_types != ["card"]:
+                logger.warning(
+                    "stripe payment checkout with %s failed (%s); retrying card-only",
+                    pm_types,
+                    _stripe_error_message(first_exc),
+                )
+                session = stripe.checkout.Session.create(**_build_payment_kwargs(["card"]))
+            else:
+                raise
         return {
             "id": session.id,
             "url": session.url,
@@ -186,34 +219,46 @@ def create_setup_checkout_session(
     secret = _secret()
     currency_norm = (currency or "USD").strip().lower()
     meta = _norm_meta(metadata)
-    pm_types = payment_method_types or DEFAULT_PAYMENT_METHOD_TYPES
+    pm_types = payment_method_types or payment_method_types_for_currency(currency_norm)
     submit_msg = None
     if brand_subtitle:
         submit_msg = f"Save payment method for {brand_name or brand_subtitle}"[:120]
 
-    try:
-        import stripe
-
-        stripe.api_key = secret
-        session_kwargs: dict[str, Any] = {
+    def _build_setup_kwargs(types: list[str]) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "mode": "setup",
             "success_url": success_url,
             "cancel_url": cancel_url,
             "client_reference_id": client_reference_id[:200],
             "metadata": meta,
-            "payment_method_types": pm_types,
+            "payment_method_types": types,
             "currency": currency_norm,
-            "setup_intent_data": {
-                "metadata": meta,
-            },
+            "setup_intent_data": {"metadata": meta},
         }
         if stripe_customer_id:
-            session_kwargs["customer"] = stripe_customer_id
+            kwargs["customer"] = stripe_customer_id
         elif customer_email:
-            session_kwargs["customer_email"] = customer_email
+            kwargs["customer_email"] = customer_email
         if submit_msg:
-            session_kwargs["custom_text"] = {"submit": {"message": submit_msg}}
-        session = stripe.checkout.Session.create(**session_kwargs)
+            kwargs["custom_text"] = {"submit": {"message": submit_msg}}
+        return kwargs
+
+    try:
+        import stripe
+
+        stripe.api_key = secret
+        try:
+            session = stripe.checkout.Session.create(**_build_setup_kwargs(pm_types))
+        except Exception as first_exc:
+            if pm_types != ["card"]:
+                logger.warning(
+                    "stripe setup checkout with %s failed (%s); retrying card-only",
+                    pm_types,
+                    _stripe_error_message(first_exc),
+                )
+                session = stripe.checkout.Session.create(**_build_setup_kwargs(["card"]))
+            else:
+                raise
         return {
             "id": session.id,
             "url": session.url,
