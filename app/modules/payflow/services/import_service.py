@@ -1096,16 +1096,35 @@ class PayflowImportService:
             return self._load_account_csv(file_bytes)
         return self._load_account_xlsx(file_bytes)
 
+    @staticmethod
+    def _slug_account_header(raw: str) -> str:
+        """Title-Case / spaced CRM headers → snake_case (Account Number → account_number)."""
+        key = (raw or "").strip().lower()
+        key = key.replace("/", " ").replace("\\", " ")
+        key = re.sub(r"[#]+", "", key)
+        key = re.sub(r"[^a-z0-9]+", "_", key)
+        return re.sub(r"_+", "_", key).strip("_")
+
     def _normalize_account_headers(self, headers: list[str]) -> list[str]:
-        """Map CRM dump headers onto PayFlow names; first occurrence wins."""
+        """Map CRM dump headers onto PayFlow names; first occurrence wins.
+
+        Accepts snake_case dumps and Canaccede-style Title Case labels
+        (e.g. Client Number, Outstanding Balance) without touching client import.
+        """
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in headers:
             key = (raw or "").strip().lower()
-            canon = ACCOUNT_HEADER_ALIASES.get(key, key)
+            slug = self._slug_account_header(raw)
+            canon = (
+                ACCOUNT_HEADER_ALIASES.get(key)
+                or ACCOUNT_HEADER_ALIASES.get(slug)
+                or slug
+                or key
+            )
             if canon in seen:
                 # Keep a unique placeholder so column indices stay aligned.
-                placeholder = f"__dup_{len(normalized)}_{key}"
+                placeholder = f"__dup_{len(normalized)}_{slug or key}"
                 normalized.append(placeholder)
                 continue
             seen.add(canon)
