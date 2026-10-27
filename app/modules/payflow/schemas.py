@@ -1220,10 +1220,20 @@ class PayflowPaymentLinkPublicResolve(BaseModel):
     preview_mode: bool = False
 
 
+class PayflowPaymentPlanQuoteRequest(BaseModel):
+    frequency: str = Field(min_length=3, max_length=16)
+    installment_amount: Optional[float] = Field(default=None, gt=0)
+    start_date: Optional[str] = Field(default=None, max_length=32)
+
+
 class PayflowPaymentInitiateRequest(BaseModel):
     option_id: str = Field(min_length=1, max_length=64)
     amount: Optional[float] = Field(default=None, gt=0)
     idempotency_key: Optional[str] = Field(default=None, max_length=128)
+    # Custom amount-first plan (Lovable): frequency + instalment + start date
+    frequency: Optional[str] = Field(default=None, max_length=16)
+    installment_amount: Optional[float] = Field(default=None, gt=0)
+    start_date: Optional[str] = Field(default=None, max_length=32)
 
 
 class PayflowPaymentAttemptItem(BaseModel):

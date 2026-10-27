@@ -53,6 +53,7 @@ from app.modules.payflow.schemas import (
     PayflowAccountPaymentsResponse,
     PayflowPaymentAttemptItem,
     PayflowPaymentInitiateRequest,
+    PayflowPaymentPlanQuoteRequest,
     PayflowPaymentLinkItem,
     PayflowPaymentLinkPublicResolve,
     PayflowPaymentLinksListResponse,
@@ -1552,6 +1553,24 @@ def resolve_public_payment_link(
 
 
 @router.post(
+    "/public/payment-links/{token}/plan-quote",
+)
+def quote_public_payment_plan(
+    token: str, payload: PayflowPaymentPlanQuoteRequest, db: DbSession
+):
+    """Preview Daily/Weekly/Monthly instalment schedule (amount-first)."""
+    try:
+        return PayflowPaymentPortalService(db).quote_plan(
+            token,
+            frequency=payload.frequency,
+            installment_amount=payload.installment_amount,
+            start_date=payload.start_date,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
     "/public/payment-links/{token}/initiate",
     response_model=PayflowPaymentAttemptItem,
 )
@@ -1565,6 +1584,9 @@ def initiate_public_payment(
             option_id=payload.option_id,
             amount=payload.amount,
             idempotency_key=payload.idempotency_key,
+            frequency=payload.frequency,
+            installment_amount=payload.installment_amount,
+            start_date=payload.start_date,
         )
     except AppError as exc:
         raise _map_error(exc) from exc

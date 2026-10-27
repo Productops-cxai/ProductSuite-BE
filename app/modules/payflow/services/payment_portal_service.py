@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import uuid
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
@@ -24,8 +23,15 @@ from app.modules.payflow.services.payment_link_service import (
     PayflowPaymentLinkService,
     public_url_for_token,
 )
+from app.modules.payflow.services.plan_schedule import (
+    CUSTOM_PLAN_OPTION_ID,
+    build_plan_quote,
+    normalize_frequency,
+)
 from app.modules.payflow.services.stripe_checkout_service import (
     create_checkout_session,
+    create_setup_checkout_session,
+    extract_session_payment_method,
     retrieve_checkout_session,
     retrieve_payment_intent,
     stripe_configured,
@@ -48,12 +54,8 @@ _DEFAULT_PAYMENT_SETTINGS: dict[str, Any] = {
     # Stripe readiness (story BE-12): opt-in per client; currencies empty = use case currency only.
     "stripe_payments_enabled": True,
     "accepted_currencies": [],
-    "payment_plan_options": [
-        {"id": "plan_daily_7", "label": "7 daily instalments", "installments": 7, "frequency": "daily"},
-        {"id": "plan_weekly_4", "label": "4 weekly instalments", "installments": 4, "frequency": "weekly"},
-        {"id": "plan_3", "label": "3 monthly instalments", "installments": 3, "frequency": "monthly"},
-        {"id": "plan_6", "label": "6 monthly instalments", "installments": 6, "frequency": "monthly"},
-    ],
+    # Legacy presets ignored for portal UX — amount-first custom plan is primary.
+    "payment_plan_options": [],
 }
 
 
@@ -186,10 +188,12 @@ class PayflowPaymentPortalService:
         if key == PayflowPaymentOptionType.PARTIAL.value:
             return "Partial Payment"
         if key == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            if plan_id == CUSTOM_PLAN_OPTION_ID:
+                return "Payment Plan"
             if plan_id and plan_id.startswith("plan_"):
                 try:
-                    n = int(plan_id.split("_", 1)[1])
-                    return f"{n} monthly instalments"
+                    n = int(plan_id.rsplit("_", 1)[-1])
+                    return f"{n} instalments"
                 except ValueError:
                     pass
             return "Payment Plan"
@@ -261,76 +265,30 @@ class PayflowPaymentPortalService:
 
         min_plan = float(settings_map.get("min_plan_amount") or 0)
         if settings_map.get("allow_payment_plan", True) and balance > 0 and balance >= min_plan:
-            plans = list(settings_map.get("payment_plan_options") or [])
-            # Ensure Lovable frequency picker has Daily / Weekly / Monthly options
-            # even when a client only stored monthly plans.
-            present_freq = {
-                str(p.get("frequency") or "monthly").strip().lower()
-                for p in plans
-                if isinstance(p, dict)
-            }
-            for default_plan in _DEFAULT_PAYMENT_SETTINGS["payment_plan_options"]:
-                freq = str(default_plan.get("frequency") or "monthly").strip().lower()
-                if freq not in present_freq:
-                    plans.append(dict(default_plan))
-                    present_freq.add(freq)
-            for plan in plans:
-                if not isinstance(plan, dict):
-                    continue
-                installments = int(plan.get("installments") or 0)
-                if installments < 2:
-                    continue
-                first = _money(math.ceil((balance / installments) * 100) / 100)
-                first = min(first, balance)
-                frequency = str(plan.get("frequency") or "monthly").strip().lower()
-                if frequency not in {"daily", "weekly", "monthly"}:
-                    frequency = "monthly"
-                plan_id = str(plan.get("id") or f"plan_{frequency}_{installments}")
-                start = _utcnow().date()
-                schedule = []
-                remaining = balance
-                for i in range(1, installments + 1):
-                    if i == 1:
-                        amt = first
-                    elif i == installments:
-                        amt = _money(remaining)
-                    else:
-                        amt = _money(remaining / (installments - i + 1))
-                    remaining = _money(remaining - amt)
-                    due = self._add_period(start, i - 1, frequency)
-                    schedule.append(
-                        {
-                            "sequence": i,
-                            "amount": amt,
-                            "due_date": due.isoformat(),
-                            "frequency": frequency,
-                        }
-                    )
-                options.append(
-                    {
-                        "id": plan_id,
-                        "type": PayflowPaymentOptionType.PAYMENT_PLAN.value,
-                        "label": str(plan.get("label") or f"{installments} instalments"),
-                        "description": (
-                            f"{installments} {frequency} payments totalling {balance:.2f} {currency}. "
-                            f"Today’s charge: {first:.2f} {currency}. Future instalments are not "
-                            "auto-charged."
-                        ),
-                        "amount": first,
-                        "currency_code": currency,
-                        "amount_editable": False,
-                        "min_amount": first,
-                        "max_amount": first,
-                        "installments": installments,
-                        "plan_id": plan_id,
-                        "frequency": frequency,
-                        "total_payable": balance,
-                        "installment_amount": first,
-                        "schedule": schedule,
-                    }
-                )
+            # Lovable amount-first: customer picks Daily/Weekly/Monthly + amount + start date.
+            options.append(
+                {
+                    "id": CUSTOM_PLAN_OPTION_ID,
+                    "type": PayflowPaymentOptionType.PAYMENT_PLAN.value,
+                    "label": "Set up a payment plan",
+                    "description": (
+                        f"Choose daily, weekly, or monthly instalments for {balance:.2f} {currency}. "
+                        "Future instalments are auto-charged when a Card or Bank Account is saved."
+                    ),
+                    "amount": None,
+                    "currency_code": currency,
+                    "amount_editable": True,
+                    "min_amount": 1.0,
+                    "max_amount": balance,
+                    "plan_id": CUSTOM_PLAN_OPTION_ID,
+                    "frequencies": ["daily", "weekly", "monthly"],
+                    "custom_plan": True,
+                    "total_payable": balance,
+                    "auto_charge_enabled": True,
+                }
+            )
 
-        # Explicit pay-next for an already-active plan (manual instalment, not auto-charge).
+        # Explicit pay-next for an already-active plan (manual fallback when auto-charge is off).
         try:
             from app.modules.payflow.services.payment_outcome_service import (
                 PayflowPaymentOutcomeService,
@@ -370,8 +328,12 @@ class PayflowPaymentPortalService:
                         "description": (
                             f"Pay the next scheduled instalment"
                             f"{' due ' + next_inst['due_date'] if next_inst.get('due_date') else ''}"
-                            f" for {serialized.get('label') or plan.public_id}. "
-                            "Future instalments are not auto-charged."
+                            f" for {serialized.get('label') or plan.public_id}."
+                            + (
+                                " Auto-charge is paused — pay manually to continue."
+                                if not bool(getattr(plan, "auto_charge_enabled", True))
+                                else ""
+                            )
                         ),
                         "amount": amt,
                         "currency_code": currency,
@@ -589,6 +551,66 @@ class PayflowPaymentPortalService:
             raise ValidationAppError(f"Amount cannot exceed {max_a:.2f}")
         return amount
 
+    @staticmethod
+    def _parse_iso_date(value: str | None) -> date | None:
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        try:
+            y, m, d = [int(x) for x in raw[:10].split("-")]
+            return date(y, m, d)
+        except (TypeError, ValueError):
+            return None
+
+    def quote_plan(
+        self,
+        token: str,
+        *,
+        frequency: str,
+        installment_amount: float | None = None,
+        start_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Preview Lovable-style Daily/Weekly/Monthly schedule (no Stripe call)."""
+        real_token, _ = self._strip_preview_token(token)
+        row = (
+            self.db.query(PayflowPaymentLinkModel)
+            .options(
+                joinedload(PayflowPaymentLinkModel.account).joinedload(PayflowAccountModel.client),
+                joinedload(PayflowPaymentLinkModel.client),
+            )
+            .filter(PayflowPaymentLinkModel.token == real_token)
+            .first()
+        )
+        if not row:
+            raise NotFoundError("Payment link not found")
+        account = row.account
+        if not account:
+            raise NotFoundError("Account not found")
+        client = account.client or row.client
+        settings_map = self._client_settings(client)
+        if not settings_map.get("allow_payment_plan", True):
+            raise ValidationAppError("Payment plans are not available for this account")
+        balance = _money(account.outstanding_balance)
+        if balance <= 0:
+            raise ValidationAppError("This account has no outstanding balance")
+        today = _utcnow().date()
+        start = self._parse_iso_date(start_date) or today
+        if start < today:
+            raise ValidationAppError("Start date cannot be in the past")
+        currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        try:
+            quote = build_plan_quote(
+                balance=balance,
+                frequency=frequency,
+                installment_amount=installment_amount,
+                start_date=start,
+                currency_code=currency,
+                today=today,
+            )
+        except ValueError as exc:
+            raise ValidationAppError(str(exc)) from exc
+        return quote
+
     def initiate(
         self,
         token: str,
@@ -596,6 +618,9 @@ class PayflowPaymentPortalService:
         option_id: str,
         amount: float | None = None,
         idempotency_key: str | None = None,
+        frequency: str | None = None,
+        installment_amount: float | None = None,
+        start_date: str | None = None,
     ) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
         if is_preview:
@@ -626,7 +651,6 @@ class PayflowPaymentPortalService:
         if not ok:
             raise ValidationAppError(reason or "Case is not eligible for payment")
 
-        # Recheck live balance — prevent stale / overpayment.
         balance = _money(account.outstanding_balance)
         if balance <= 0:
             raise ValidationAppError("This account has no outstanding balance")
@@ -637,19 +661,53 @@ class PayflowPaymentPortalService:
         if not option:
             raise ValidationAppError("Selected payment option is not available")
 
-        # Recompute option amounts against current balance.
+        plan_quote: dict[str, Any] | None = None
+        setup_only = False
+        today = _utcnow().date()
+
         if option["type"] == PayflowPaymentOptionType.PAY_IN_FULL.value:
             option = {**option, "amount": balance, "min_amount": balance, "max_amount": balance}
         elif option["type"] == PayflowPaymentOptionType.PARTIAL.value:
             option = {**option, "max_amount": balance}
             if option["min_amount"] > balance:
                 raise ValidationAppError("Partial payment is not available for this balance")
+        elif option["type"] == PayflowPaymentOptionType.PAYMENT_PLAN.value and (
+            option.get("custom_plan") or option_id == CUSTOM_PLAN_OPTION_ID
+        ):
+            start = self._parse_iso_date(start_date) or today
+            if start < today:
+                raise ValidationAppError("Start date cannot be in the past")
+            try:
+                plan_quote = build_plan_quote(
+                    balance=balance,
+                    frequency=frequency or "monthly",
+                    installment_amount=installment_amount
+                    if installment_amount is not None
+                    else amount,
+                    start_date=start,
+                    currency_code=(account.currency_code or "USD"),
+                    today=today,
+                )
+            except ValueError as exc:
+                raise ValidationAppError(str(exc)) from exc
+            setup_only = bool(plan_quote.get("setup_only"))
+            charge_amount = _money(plan_quote.get("first_charge_amount") or 0)
+            option = {
+                **option,
+                "amount": charge_amount,
+                "min_amount": charge_amount,
+                "max_amount": charge_amount if charge_amount > 0 else balance,
+                "plan_id": CUSTOM_PLAN_OPTION_ID,
+            }
 
-        charge_amount = self._resolve_amount(
-            option=option, requested_amount=amount, balance=balance
-        )
+        if plan_quote is None:
+            charge_amount = self._resolve_amount(
+                option=option, requested_amount=amount, balance=balance
+            )
         if charge_amount > balance:
             raise ValidationAppError("Payment amount exceeds current outstanding balance")
+        if not setup_only and charge_amount <= 0:
+            raise ValidationAppError("Payment amount must be greater than zero")
 
         if idempotency_key:
             existing = (
@@ -660,7 +718,6 @@ class PayflowPaymentPortalService:
             if existing:
                 return self.serialize_attempt(existing)
 
-        # Avoid duplicate open attempts for same link+option+amount in a short window.
         open_statuses = {
             PayflowPaymentAttemptStatus.INITIATED.value,
             PayflowPaymentAttemptStatus.PROCESSING.value,
@@ -677,8 +734,6 @@ class PayflowPaymentPortalService:
             .first()
         )
         if recent and recent.checkout_url:
-            # Reused open checkout — still stamp Stripe Checkout Opened on the comm
-            # (previous attempt may have skipped mark if communication lookup failed).
             try:
                 from app.modules.payflow.services.communication_service import (
                     PayflowCommunicationService,
@@ -706,6 +761,7 @@ class PayflowPaymentPortalService:
             raise ValidationAppError(currency_msg or "Currency not supported for online payment")
         public_id = uuid.uuid4().hex
         use_stripe = stripe_configured()
+        save_pm = option["type"] == PayflowPaymentOptionType.PAYMENT_PLAN.value
         attempt = PayflowPaymentAttemptModel(
             public_id=public_id,
             payment_link_id=row.id,
@@ -720,13 +776,24 @@ class PayflowPaymentPortalService:
             idempotency_key=idempotency_key,
             balance_at_initiation=balance,
             events=[],
+            provider_payload={
+                "plan_quote": plan_quote,
+                "setup_only": setup_only,
+                "save_payment_method": save_pm,
+            }
+            if plan_quote or save_pm
+            else None,
         )
         self.db.add(attempt)
         self.db.flush()
         self._append_attempt_event(
             attempt,
             "Initiated",
-            f"{option['type']} {charge_amount:.2f} {currency}",
+            (
+                f"plan setup {normalize_frequency((plan_quote or {}).get('frequency'))}"
+                if setup_only
+                else f"{option['type']} {charge_amount:.2f} {currency}"
+            ),
         )
 
         fe = (settings.FRONTEND_URL or "").rstrip("/")
@@ -741,37 +808,61 @@ class PayflowPaymentPortalService:
             else f"/pay/{real_token}/result?attempt={public_id}&outcome=cancel"
         )
         brand = self._brand_payload(client)
+        meta = {
+            "attempt_public_id": public_id,
+            "payment_link_token": real_token[:48],
+            "account_id": str(account.id),
+            "client_id": str(row.client_id),
+            "option_type": option["type"],
+        }
+        if plan_quote:
+            meta["plan_frequency"] = str(plan_quote.get("frequency") or "")
+            meta["plan_start_date"] = str(plan_quote.get("start_date") or "")
+            meta["setup_only"] = "1" if setup_only else "0"
 
         try:
             if use_stripe:
-                session = create_checkout_session(
-                    amount=charge_amount,
-                    currency=currency,
-                    success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
-                    cancel_url=cancel_url,
-                    client_reference_id=public_id,
-                    metadata={
-                        "attempt_public_id": public_id,
-                        "payment_link_token": real_token[:48],
-                        "account_id": str(account.id),
-                        "client_id": str(row.client_id),
-                        "option_type": option["type"],
-                    },
-                    brand_name=brand.get("name"),
-                    brand_logo_url=brand.get("logo_url"),
-                    brand_subtitle=brand.get("on_behalf_of"),
-                    customer_email=(account.email or None),
-                )
+                if setup_only:
+                    session = create_setup_checkout_session(
+                        currency=currency,
+                        success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
+                        cancel_url=cancel_url,
+                        client_reference_id=public_id,
+                        metadata=meta,
+                        brand_name=brand.get("name"),
+                        brand_subtitle=brand.get("on_behalf_of"),
+                        customer_email=(account.email or None),
+                    )
+                else:
+                    session = create_checkout_session(
+                        amount=charge_amount,
+                        currency=currency,
+                        success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
+                        cancel_url=cancel_url,
+                        client_reference_id=public_id,
+                        metadata=meta,
+                        brand_name=brand.get("name"),
+                        brand_logo_url=brand.get("logo_url"),
+                        brand_subtitle=brand.get("on_behalf_of"),
+                        customer_email=(account.email or None),
+                        save_payment_method=save_pm,
+                    )
                 attempt.stripe_session_id = session.get("id")
                 attempt.checkout_url = session.get("url")
                 pi = session.get("payment_intent")
                 if isinstance(pi, str):
                     attempt.stripe_payment_intent_id = pi
-                attempt.provider_payload = {"session_id": session.get("id")}
+                payload = dict(attempt.provider_payload or {})
+                payload.update(
+                    {
+                        "session_id": session.get("id"),
+                        "checkout_mode": session.get("mode") or ("setup" if setup_only else "payment"),
+                    }
+                )
+                attempt.provider_payload = payload
                 attempt.status = PayflowPaymentAttemptStatus.PROCESSING.value
                 self._append_attempt_event(attempt, "Checkout Created", attempt.stripe_session_id)
             else:
-                # Dev mock — no card data; customer confirms on our page.
                 mock_url = (
                     f"{fe}/pay/{real_token}/checkout?attempt={public_id}"
                     if fe
@@ -802,6 +893,13 @@ class PayflowPaymentPortalService:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("checkout failed notify failed attempt=%s", public_id)
+            # Surface Stripe's reason when useful (e.g. unsupported PM for currency).
+            detail = str(exc)[:240]
+            if "us_bank_account" in detail.lower() or "payment_method_types" in detail.lower():
+                raise ValidationAppError(
+                    "Unable to start payment: bank debit is not available for this currency. "
+                    "Card checkout should be used — please try again."
+                ) from exc
             raise ValidationAppError(
                 "Unable to start payment. Please try again or contact support."
             ) from exc
@@ -811,7 +909,6 @@ class PayflowPaymentPortalService:
                 PayflowCommunicationService,
             )
 
-            # Wire Stripe Checkout open onto the originating email/SMS (not just portal Click).
             PayflowCommunicationService(self.db).mark_payment_event(
                 account.id,
                 event="initiated",
@@ -911,34 +1008,59 @@ class PayflowPaymentPortalService:
                 if plan_row:
                     plan_summary = PayflowPaymentOutcomeService(self.db).serialize_plan(plan_row)
                 elif not succeeded:
-                    # Preview schedule from initiation snapshot (plan not created until first payment).
-                    installments_n = 3
-                    if row.plan_id and str(row.plan_id).startswith("plan_"):
-                        try:
-                            installments_n = max(2, int(str(row.plan_id).split("_", 1)[1]))
-                        except ValueError:
-                            pass
-                    total = balance_at if balance_at is not None else _money(amount * installments_n)
-                    start = (row.created_at.date() if row.created_at else _utcnow().date())
-                    final = self._add_months(start, installments_n - 1)
-                    plan_summary = {
-                        "id": None,
-                        "status": "Pending",
-                        "label": self._option_label(row.option_type, row.plan_id),
-                        "plan_option_id": row.plan_id,
-                        "installments_total": installments_n,
-                        "installment_amount": amount,
-                        "frequency": "monthly",
-                        "currency_code": row.currency_code,
-                        "total_payable": total,
-                        "amount_paid": 0.0,
-                        "amount_remaining": total,
-                        "start_date": start.isoformat(),
-                        "next_due_date": start.isoformat(),
-                        "final_payment_date": final.isoformat(),
-                        "auto_charge_enabled": False,
-                        "installments": [],
-                    }
+                    # Preview schedule from initiation snapshot (plan not created until checkout settles).
+                    payload = (
+                        row.provider_payload if isinstance(row.provider_payload, dict) else {}
+                    )
+                    quote = payload.get("plan_quote") if isinstance(payload.get("plan_quote"), dict) else {}
+                    if quote:
+                        plan_summary = {
+                            "id": None,
+                            "status": "Pending",
+                            "label": quote.get("label") or self._option_label(row.option_type, row.plan_id),
+                            "plan_option_id": row.plan_id,
+                            "installments_total": quote.get("installments_total"),
+                            "installment_amount": quote.get("installment_amount") or amount,
+                            "frequency": quote.get("frequency") or "monthly",
+                            "currency_code": row.currency_code,
+                            "total_payable": quote.get("total_payable"),
+                            "amount_paid": 0.0,
+                            "amount_remaining": quote.get("total_payable"),
+                            "start_date": quote.get("start_date"),
+                            "next_due_date": quote.get("first_payment_date") or quote.get("start_date"),
+                            "final_payment_date": quote.get("final_payment_date"),
+                            "auto_charge_enabled": True,
+                            "setup_only": bool(payload.get("setup_only") or quote.get("setup_only")),
+                            "installments": quote.get("schedule") or [],
+                        }
+                    else:
+                        installments_n = 3
+                        if row.plan_id and str(row.plan_id).startswith("plan_"):
+                            try:
+                                installments_n = max(2, int(str(row.plan_id).rsplit("_", 1)[-1]))
+                            except ValueError:
+                                pass
+                        total = balance_at if balance_at is not None else _money(amount * installments_n)
+                        start = (row.created_at.date() if row.created_at else _utcnow().date())
+                        final = self._add_months(start, installments_n - 1)
+                        plan_summary = {
+                            "id": None,
+                            "status": "Pending",
+                            "label": self._option_label(row.option_type, row.plan_id),
+                            "plan_option_id": row.plan_id,
+                            "installments_total": installments_n,
+                            "installment_amount": amount,
+                            "frequency": "monthly",
+                            "currency_code": row.currency_code,
+                            "total_payable": total,
+                            "amount_paid": 0.0,
+                            "amount_remaining": total,
+                            "start_date": start.isoformat(),
+                            "next_due_date": start.isoformat(),
+                            "final_payment_date": final.isoformat(),
+                            "auto_charge_enabled": False,
+                            "installments": [],
+                        }
             except Exception:  # noqa: BLE001
                 logger.exception("serialize_attempt plan lookup failed attempt=%s", row.public_id)
 
@@ -1051,8 +1173,22 @@ class PayflowPaymentPortalService:
                         return False
                 except (TypeError, ValueError):
                     pass
+            mode = (session_payload.get("mode") or "").lower()
+            payload = (
+                dict(attempt.provider_payload)
+                if isinstance(attempt.provider_payload, dict)
+                else {}
+            )
+            if mode == "setup" or payload.get("setup_only"):
+                payload["setup_only"] = True
+                payload["checkout_mode"] = mode or "setup"
+                pm = extract_session_payment_method(session_payload)
+                if pm.get("payment_method_id") or pm.get("customer_id"):
+                    payload["saved_payment_method"] = pm
+                attempt.provider_payload = payload
             if payment_status in {"paid", "no_payment_required"} or (
-                status == "complete" and payment_status == "paid"
+                status == "complete"
+                and (payment_status == "paid" or mode == "setup" or payload.get("setup_only"))
             ):
                 self.apply_succeeded(
                     attempt,
@@ -1272,6 +1408,27 @@ class PayflowPaymentPortalService:
         except Exception:  # noqa: BLE001
             logger.exception("failed to raise processing_discrepancy")
 
+    def _stripe_pm_from_attempt(
+        self, attempt: PayflowPaymentAttemptModel
+    ) -> dict[str, str | None]:
+        payload = attempt.provider_payload if isinstance(attempt.provider_payload, dict) else {}
+        cached = payload.get("saved_payment_method")
+        if isinstance(cached, dict) and cached.get("payment_method_id"):
+            return {
+                "customer_id": cached.get("customer_id"),
+                "payment_method_id": cached.get("payment_method_id"),
+                "payment_method_type": cached.get("payment_method_type"),
+            }
+        if not attempt.stripe_session_id or not stripe_configured():
+            return {"customer_id": None, "payment_method_id": None, "payment_method_type": None}
+        session = retrieve_checkout_session(attempt.stripe_session_id)
+        extracted = extract_session_payment_method(session)
+        if extracted.get("payment_method_id") or extracted.get("customer_id"):
+            payload = dict(payload)
+            payload["saved_payment_method"] = extracted
+            attempt.provider_payload = payload
+        return extracted
+
     def apply_succeeded(
         self,
         attempt: PayflowPaymentAttemptModel,
@@ -1295,9 +1452,13 @@ class PayflowPaymentPortalService:
 
         outcome = PayflowPaymentOutcomeService(self.db)
         ref = provider_ref or attempt.stripe_payment_intent_id
+        payload = attempt.provider_payload if isinstance(attempt.provider_payload, dict) else {}
+        setup_only = bool(payload.get("setup_only")) or _money(attempt.amount) <= 0
+        pm_info = self._stripe_pm_from_attempt(attempt)
+
         # Ledger exists for this attempt OR same provider_ref → never cut balance again.
-        existing = outcome._txn_by_attempt(attempt.id)
-        if not existing and ref:
+        existing = outcome._txn_by_attempt(attempt.id) if not setup_only else None
+        if not existing and ref and not setup_only:
             existing = outcome._txn_by_provider_ref(ref)
         if existing:
             attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
@@ -1314,7 +1475,58 @@ class PayflowPaymentPortalService:
         amount = _money(attempt.amount)
         prev = _money(account.outstanding_balance) if account else 0.0
         new_bal = prev
-        if account:
+
+        # Setup-only (future start): save PM + create plan schedule; no balance cut.
+        if setup_only and attempt.option_type == PayflowPaymentOptionType.PAYMENT_PLAN.value:
+            attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
+            attempt.completed_at = _utcnow()
+            self._append_attempt_event(attempt, "Setup Completed", ref or attempt.stripe_session_id)
+            plan = None
+            if account:
+                plan = outcome.ensure_payment_plan_for_attempt(
+                    attempt,
+                    account,
+                    first_txn=None,
+                    balance_at_plan_start=prev,
+                    setup_only=True,
+                    stripe_customer_id=pm_info.get("customer_id"),
+                    stripe_payment_method_id=pm_info.get("payment_method_id"),
+                    payment_method_type=pm_info.get("payment_method_type"),
+                )
+                outcome._append_account_timeline(
+                    account,
+                    "Payment Plan Confirmed",
+                    f"Auto-charge armed · start {(payload.get('plan_quote') or {}).get('start_date')}",
+                )
+                try:
+                    from app.modules.payflow.services.workflow_execution_service import (
+                        WorkflowExecutionService,
+                    )
+
+                    WorkflowExecutionService(self.db).on_payment_event(
+                        attempt.account_id,
+                        {
+                            "amount": 0,
+                            "completed": False,
+                            "case_settled": False,
+                            "payment_plan": True,
+                            "plan_id": plan.public_id if plan else None,
+                            "status": "plan_setup",
+                            "source": "stripe" if attempt.provider == "stripe" else "mock",
+                            "attempt_id": attempt.public_id,
+                            "payment_date": _utcnow().date().isoformat(),
+                        },
+                        commit=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("workflow plan-setup event failed")
+            if commit:
+                self.db.commit()
+            else:
+                self.db.flush()
+            return
+
+        if account and amount > 0:
             new_bal = max(0.0, _money(prev - amount))
             account.outstanding_balance = new_bal
             account.recovered_balance = _money((account.recovered_balance or 0) + amount)
@@ -1328,7 +1540,6 @@ class PayflowPaymentPortalService:
                 PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
             }:
                 account.collection_status = "Payment Plan"
-            # Partial keeps Active / existing status unless settled.
 
         attempt.status = PayflowPaymentAttemptStatus.SUCCEEDED.value
         attempt.completed_at = _utcnow()
@@ -1353,6 +1564,10 @@ class PayflowPaymentPortalService:
                     account,
                     first_txn=txn,
                     balance_at_plan_start=prev,
+                    setup_only=False,
+                    stripe_customer_id=pm_info.get("customer_id"),
+                    stripe_payment_method_id=pm_info.get("payment_method_id"),
+                    payment_method_type=pm_info.get("payment_method_type"),
                 )
             elif attempt.option_type == PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value:
                 plan = (
@@ -1463,6 +1678,38 @@ class PayflowPaymentPortalService:
             detail=attempt.error_message,
             commit=False,
         )
+        # Auto-charge failures: bump plan consecutive failures / pause after 3.
+        payload = attempt.provider_payload if isinstance(attempt.provider_payload, dict) else {}
+        if payload.get("auto_charge") and attempt.plan_id:
+            try:
+                from app.modules.payflow.services.payment_outcome_service import (
+                    PayflowPaymentOutcomeService,
+                )
+                from app.infrastructure.database.models import PayflowPaymentPlanInstallmentModel
+
+                outcome = PayflowPaymentOutcomeService(self.db)
+                plan = (
+                    self.db.query(PayflowPaymentPlanModel)
+                    .filter(PayflowPaymentPlanModel.public_id == attempt.plan_id)
+                    .first()
+                )
+                inst = None
+                if plan is not None and payload.get("installment_sequence") is not None:
+                    inst = (
+                        self.db.query(PayflowPaymentPlanInstallmentModel)
+                        .filter(
+                            PayflowPaymentPlanInstallmentModel.plan_id == plan.id,
+                            PayflowPaymentPlanInstallmentModel.sequence
+                            == int(payload["installment_sequence"]),
+                        )
+                        .first()
+                    )
+                if plan is not None:
+                    outcome.record_auto_charge_failure(
+                        plan, installment=inst, detail=attempt.error_message
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("auto-charge failure bookkeeping failed attempt=%s", attempt.public_id)
         if commit:
             self.db.commit()
         else:
@@ -1632,9 +1879,24 @@ class PayflowPaymentPortalService:
                 }
             payment_status = (data_object.get("payment_status") or "").lower()
             status = (data_object.get("status") or "").lower()
+            mode = (data_object.get("mode") or "").lower()
+            payload = (
+                dict(attempt.provider_payload)
+                if isinstance(attempt.provider_payload, dict)
+                else {}
+            )
+            if mode == "setup" or payload.get("setup_only"):
+                payload["setup_only"] = True
+                payload["checkout_mode"] = mode or "setup"
+            pm = extract_session_payment_method(data_object)
+            if pm.get("payment_method_id") or pm.get("customer_id"):
+                payload["saved_payment_method"] = pm
+            if payload:
+                attempt.provider_payload = payload
             amount_total = data_object.get("amount_total")
             amount_mismatch = False
-            if amount_total is not None:
+            # Skip amount checks for setup sessions (no charge).
+            if amount_total is not None and not payload.get("setup_only"):
                 try:
                     stripe_amt = float(amount_total) / 100.0
                     expected = _money(attempt.amount)
@@ -1656,7 +1918,9 @@ class PayflowPaymentPortalService:
                     "amount_mismatch": True,
                     "event_id": event_id or None,
                 }
-            if payment_status in {"paid", "no_payment_required"}:
+            if payment_status in {"paid", "no_payment_required"} or (
+                status == "complete" and payload.get("setup_only")
+            ):
                 self.apply_succeeded(
                     attempt,
                     provider_ref=attempt.stripe_payment_intent_id or session_id,

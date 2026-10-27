@@ -115,20 +115,26 @@ def run_worker() -> None:
                 now = time.monotonic()
                 if now - last_sweep >= sweep_seconds:
                     _drain_due(worker_id, pool, in_flight, stale_seconds=stale_seconds)
-                    # Opportunistic payment-plan overdue refresh (no auto-charge).
+                    # Opportunistic payment-plan overdue refresh + auto-charge due instalments.
                     try:
                         from app.modules.payflow.services.payment_outcome_service import (
                             PayflowPaymentOutcomeService,
+                        )
+                        from app.modules.payflow.services.plan_auto_charge_service import (
+                            PayflowPlanAutoChargeService,
                         )
 
                         odb = SessionLocal()
                         try:
                             PayflowPaymentOutcomeService(odb).refresh_overdue_plans(None)
                             odb.commit()
+                            result = PayflowPlanAutoChargeService(odb).charge_due_installments()
+                            if result.get("charged") or result.get("failed"):
+                                logger.info("plan auto-charge sweep %s", result)
                         finally:
                             odb.close()
                     except Exception:  # noqa: BLE001
-                        logger.exception("overdue payment plan refresh failed")
+                        logger.exception("overdue / auto-charge payment plan sweep failed")
                     last_sweep = now
 
                 # Wait for notify or timeout (sweep cadence).
