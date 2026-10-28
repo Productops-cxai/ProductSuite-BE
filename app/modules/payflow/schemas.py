@@ -830,6 +830,17 @@ class StrategyNodeConfig(BaseModel):
     outcome: Optional[str] = None
     note: Optional[str] = None
     template_id: Optional[str] = None
+    # Communication steps: the step's own message text (no text → the template is sent).
+    subject: Optional[str] = Field(default=None, max_length=255)
+    body: Optional[str] = Field(default=None, max_length=5000)
+    tone: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("subject", "body", "tone")
+    @classmethod
+    def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
+        """An empty text box means "no own text", not a change."""
+        cleaned = (value or "").strip()
+        return cleaned or None
 
 
 class StrategyStepItem(BaseModel):
@@ -1497,6 +1508,7 @@ class PortfolioSegmentStats(BaseModel):
     with_email_pct: int
     with_mobile_pct: int
     email_consent_pct: int
+    email_allowed_pct: int  # has an email and consent not refused (unknown = allowed, like the worker)
     languages: dict[str, int] = Field(default_factory=dict)
 
 
@@ -1527,6 +1539,17 @@ class SuggestWorkflowsResponse(BaseModel):
     portfolio_id: int
     portfolio_name: str
     workflows: List[PayflowStrategyItem] = Field(default_factory=list)
+
+
+class WriteWorkflowMessagesRequest(BaseModel):
+    step_id: Optional[str] = Field(default=None, max_length=64, description="Rewrite only this message step")
+    remarks: Optional[str] = Field(default=None, max_length=2000, description="What the reviewer wants changed")
+
+    @field_validator("step_id", "remarks")
+    @classmethod
+    def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
+        cleaned = (value or "").strip()
+        return cleaned or None
 
 
 class RegenerateWorkflowRequest(BaseModel):

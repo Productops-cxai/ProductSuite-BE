@@ -14,6 +14,7 @@ from app.infrastructure.database.models import (
     PayflowPortfolioModel,
     PayflowRuleModel,
 )
+from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
 from app.shared.enums import PayflowRuleStatus, PayflowRuleType
 
 
@@ -33,6 +34,18 @@ def load_client_context(db: Session, client_id: int) -> dict[str, Any]:
         "channels": [channel for channel, enabled in channel_flags.items() if enabled],
         "governance_rules": list(client.governance_rules or []),
     }
+
+
+def load_payment_options(db: Session, client_id: int) -> list[str]:
+    """What the customer can do on the payment page — the portal's own settings and defaults."""
+    client = db.get(PayflowClientModel, client_id)
+    settings = PayflowPaymentPortalService(db)._client_settings(client)
+    options = {
+        "allow_pay_in_full": "pay in full",
+        "allow_partial": "pay part now",
+        "allow_payment_plan": "set up a payment plan",
+    }
+    return [label for key, label in options.items() if settings.get(key)]
 
 
 def load_rules(db: Session, client_id: int) -> dict[str, list[dict[str, Any]]]:

@@ -292,5 +292,7 @@ def _stats(members: list) -> dict[str, Any]:
         "with_email_pct": _pct(members, lambda a: bool(a.email)),
         "with_mobile_pct": _pct(members, lambda a: bool(a.phone_mobile)),
         "email_consent_pct": _pct(members, lambda a: a.email_consent is True),
+        # Who can really get email — the worker's rule: an address and consent not refused (unknown = allowed).
+        "email_allowed_pct": _pct(members, lambda a: bool(a.email) and a.email_consent is not False),
         "languages": dict(sorted(languages.items())),
     }
