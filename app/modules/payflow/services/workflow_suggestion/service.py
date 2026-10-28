@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.exceptions import ServiceUnavailableError, ValidationAppError
+from app.core.exceptions import AppError, ServiceUnavailableError, ValidationAppError
 from app.infrastructure.database.models import PayflowStrategyModel, UserModel
 from app.modules.payflow.services.strategy_service import (
     PayflowStrategyService,
@@ -16,6 +16,7 @@ from app.modules.payflow.services.strategy_service import (
 from app.modules.payflow.services.workflow_suggestion.config import REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
+    load_payment_options,
     load_portfolio_accounts,
     load_rules,
 )
@@ -26,6 +27,7 @@ from app.modules.payflow.services.workflow_suggestion.learning import (
     pick_lessons,
 )
 from app.modules.payflow.services.workflow_suggestion.llm import build_output_schema, call_llm
+from app.modules.payflow.services.workflow_suggestion.message_writer import apply_messages, write_messages
 from app.modules.payflow.services.workflow_suggestion.prompt import build_messages, build_revision
 from app.modules.payflow.services.workflow_suggestion.rules import design_limits, governing_rules
 from app.modules.payflow.services.workflow_suggestion.segmenter import build_segments
@@ -43,6 +45,12 @@ REGENERATE_STATUSES = {
     PayflowStrategyStatus.UNDER_REVIEW.value,
     PayflowStrategyStatus.APPROVED.value,
 }
+# Message text is written before approval only — approved text must not change without a review.
+WRITE_MESSAGES_STATUSES = {
+    PayflowStrategyStatus.DRAFT.value,
+    PayflowStrategyStatus.AI_PROPOSED.value,
+    PayflowStrategyStatus.UNDER_REVIEW.value,
+}
 # ai_context lines rewritten on every revision (the rest is kept from the original).
 _REWRITTEN_CONTEXT = {
     "AI rationale",  # older workflows (before the structured reasoning)
@@ -51,6 +59,7 @@ _REWRITTEN_CONTEXT = {
     "Reviewer remarks",
     "Governed by",
     "Learned from",  # Suggest only — not a segment stat
+    "Messages",  # set only when the message text could not be written
 }
 
 
@@ -102,12 +111,22 @@ class WorkflowSuggestionService:
             for segment in batch:
                 learned[segment["segment_id"]] = learned_from(examples, lessons)
 
+        # Email / SMS text for every workflow (one AI call each), written before saving.
+        writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
+        messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" line when not written
+        for segment in segments:
+            segment_id = segment["segment_id"]
+            workflows[segment_id], messages_note[segment_id] = _with_messages(
+                writer_client, workflows[segment_id], segment
+            )
+
         governed_by = governing_rules(client, rules)
         # Save all workflows together: if one fails, none are saved.
         saved = []
         try:
             for segment in segments:
-                workflow = workflows[segment["segment_id"]]
+                segment_id = segment["segment_id"]
+                workflow = workflows[segment_id]
                 saved.append(
                     self._save(
                         user,
@@ -116,7 +135,9 @@ class WorkflowSuggestionService:
                         workflow,
                         segment=segment["segment"],
                         cases_covered=segment["stats"]["accounts"],
-                        ai_context=_ai_context(client, segment, workflow, governed_by) + learned[segment["segment_id"]],
+                        ai_context=_ai_context(client, segment, workflow, governed_by)
+                        + learned[segment_id]
+                        + messages_note[segment_id],
                         commit=False,
                     )
                 )
@@ -186,6 +207,12 @@ class WorkflowSuggestionService:
             client_examples=[item["example"] for item in examples],
             lessons=lessons,
         )["A"]
+        # The new version gets fresh email / SMS text (its steps are new).
+        workflow, messages_note = _with_messages(
+            {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
+            workflow,
+            _stored_segment(original),
+        )
 
         ai_context = kept + _reasoning_context(workflow) + [
             {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
@@ -202,6 +229,7 @@ class WorkflowSuggestionService:
                 }
             )
         ai_context += [{"label": "Governed by", "value": line} for line in governing_rules(client, rules)]
+        ai_context += messages_note
         return self._save(
             user,
             original["client_id"],
@@ -211,6 +239,31 @@ class WorkflowSuggestionService:
             cases_covered=original["cases_covered"],
             ai_context=ai_context,
             revision_of_id=original["id"],
+        )
+
+    def write_workflow_messages(
+        self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
+    ) -> dict[str, Any]:
+        """AI writes the email / SMS text of a workflow — every message, or only `step_id`."""
+        workflow = self.strategies.get_strategy(user, strategy_id)
+        if workflow["status"] not in WRITE_MESSAGES_STATUSES:
+            raise ValidationAppError(
+                "Message text can only be written for Draft, AI Proposed or Under Review workflows"
+            )
+        self.strategies._assert_manage(user, workflow["client_id"])
+        client = {
+            **load_client_context(self.db, workflow["client_id"]),
+            "payment_options": load_payment_options(self.db, workflow["client_id"]),
+        }
+        written = write_messages(
+            client,
+            workflow,
+            _stored_segment(workflow),
+            step_ids=[step_id] if step_id else None,
+            remarks=remarks,
+        )
+        return self.strategies.save_ai_messages(
+            user, strategy_id, apply_messages(workflow["steps"], written), remarks=remarks
         )
 
     def _review_history(self, workflow: dict[str, Any]) -> list[dict[str, Any]]:
@@ -332,8 +385,48 @@ def _ai_context(
         {"label": "Avg outstanding", "value": f"{stats['avg_outstanding']:,.2f} {client.get('currency') or 'CAD'}"},
         {"label": "Avg days past due", "value": "Unknown" if dpd is None else str(dpd)},
         {"label": "Email consent", "value": f"{stats['email_consent_pct']}%"},
+        {"label": "Email allowed", "value": f"{stats['email_allowed_pct']}%"},
     ]
     return context + _reasoning_context(workflow) + [{"label": "Governed by", "value": line} for line in governed_by]
+
+
+def _with_messages(
+    client: dict[str, Any], workflow: dict[str, Any], segment: dict[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """The workflow with its email / SMS text written in.
+
+    Writing never blocks a save: if it fails, the workflow is kept as it is (its templates
+    are sent) and a "Messages" ai_context line tells reviewers to write them later.
+    """
+    if not any(step.get("kind") == "Communication" for step in workflow.get("steps") or []):
+        return workflow, []
+    try:
+        written = write_messages(client, workflow, segment)
+    except AppError as exc:
+        note = f"Not written, so the templates will be sent. Use Write messages to try again. ({exc.message})"
+        return workflow, [{"label": "Messages", "value": note}]
+    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, []
+
+
+def _stored_segment(workflow: dict[str, Any]) -> dict[str, Any]:
+    """A saved workflow's segment in the segmenter's shape; stats come from its ai_context (none if hand-made)."""
+    context = {
+        item["label"]: item["value"]
+        for item in workflow.get("ai_context") or []
+        if isinstance(item, dict) and item.get("label")
+    }
+    days = str(context.get("Avg days past due") or "")
+    stats = {
+        "accounts": context.get("Accounts"),
+        "avg_outstanding": context.get("Avg outstanding"),
+        "avg_days_past_due": int(days) if days.isdigit() else None,
+        "email_consent": context.get("Email consent"),
+    }
+    return {
+        "label": context.get("Segment") or "Custom segment",
+        "segment": workflow.get("segment") or {},
+        "stats": {key: value for key, value in stats.items() if value is not None},
+    }
 
 
 def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:

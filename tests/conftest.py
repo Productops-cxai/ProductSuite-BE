@@ -33,6 +33,20 @@ from app.shared.enums import (
 )
 
 
+@pytest.fixture(autouse=True)
+def message_ai_off():
+    """Suggest / Regenerate also write email & SMS text — never call the real AI from tests.
+
+    By default the message writer's AI is unavailable, so workflows keep their templates
+    (as before). Tests of the writer patch message_writer.call_llm with their own fake.
+    """
+    from app.core.exceptions import ServiceUnavailableError
+    from app.modules.payflow.services.workflow_suggestion import message_writer
+
+    with patch.object(message_writer, "call_llm", side_effect=ServiceUnavailableError("AI is off in tests")):
+        yield
+
+
 @pytest.fixture()
 def db_session():
     engine = create_engine(

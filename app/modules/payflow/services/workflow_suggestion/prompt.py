@@ -29,6 +29,15 @@ END_STEP_KINDS = ("Outcome", "Human Review", "Case Action")
 # Regenerate sends at most this many review-history entries (keeps prompts small on the free tier).
 MAX_HISTORY_ENTRIES = 10
 
+# Email / SMS text on Communication steps — written separately (message_writer.py), not part of
+# a workflow's design, so it stays out of the workflow prompts (examples, revisions).
+MESSAGE_TEXT_FIELDS = ("subject", "body", "tone")
+
+# Recorded consent counts only "Yes", but the worker also emails accounts whose consent is unknown
+# (files without a consent column) — shown to the AI, it made every workflow SMS-only. The AI reads
+# email_allowed_pct ("Email allowed" on saved workflows) instead. Suggest stats + Regenerate labels.
+HIDDEN_STATS = {"email_consent_pct", "Email consent"}
+
 # Kept next to a client's own examples: the generic example with real branches (bounce → SMS, dispute → hold).
 BRANCHING_EXAMPLE = "Mid-Stage Channel-Aware Follow-Up"
 
@@ -133,9 +142,11 @@ def _history_line(entry: dict[str, Any]) -> str | None:
 
 
 def compact_step(step: dict[str, Any]) -> dict[str, Any]:
-    """A stored step without its empty fields — the short form the AI reads and writes."""
+    """A stored step without its empty fields or message text — the short form the AI reads and writes."""
     compact = {key: step[key] for key in ("id", "kind", "title") if step.get(key)}
-    compact["config"] = {k: v for k, v in (step.get("config") or {}).items() if v is not None}
+    compact["config"] = {
+        k: v for k, v in (step.get("config") or {}).items() if v is not None and k not in MESSAGE_TEXT_FIELDS
+    }
     compact.update({link: step[link] for link in ("next", "yes", "no") if step.get(link)})
     return compact
 
@@ -223,7 +234,7 @@ Outcomes: {", ".join(OUTCOMES)}
 - Promise to Pay = remind around the Promise-to-Pay Date, check payment, follow up if broken.
 - Payment Plan = Payment Plan Reminders and checks that payments continue.
 - Partly paid = acknowledge progress, offer a payment plan for the rest.
-- Use the stats: low email consent or few emails = favour SMS; few mobiles = favour Email;
+- Use the stats: few accounts that can get email (low email allowed) = favour SMS; few mobiles = favour Email;
   neither likely to work = request a contact details update.
 - Branch on what happens, not only "Paid?": Email / SMS Delivery failed or bounced = switch channel;
   Payment Link clicked but unpaid = gentle follow-up; Customer Response = Dispute Raised = hold contact;
@@ -251,12 +262,17 @@ def _lessons_section(lessons: list[str] | None) -> str:
     )
 
 
+def _design_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    """Segment stats for the design AI, without the recorded-consent number."""
+    return {key: value for key, value in stats.items() if key not in HIDDEN_STATS}
+
+
 def build_user_prompt(client: dict[str, Any], portfolio_name: str, segments: list[dict[str, Any]]) -> str:
     client_type = _CLIENT_TYPES.get(client.get("client_type") or "", client.get("client_type") or "Unknown")
     ai_mode = _AI_MODES.get(client.get("ai_mode") or "", client.get("ai_mode") or "Unknown")
     segment_lines = "\n".join(
         json.dumps(
-            {"segment_id": s["segment_id"], "segment": s["label"], "stats": s["stats"]},
+            {"segment_id": s["segment_id"], "segment": s["label"], "stats": _design_stats(s["stats"])},
             ensure_ascii=False,
         )
         for s in segments

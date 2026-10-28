@@ -93,6 +93,13 @@ def build_output_schema(segment_ids: list[str], channels: list[str]) -> dict[str
     return _object({"workflows": {"type": "array", "items": workflow}}, required=["workflows"])
 
 
+def build_message_schema(step_ids: list[str]) -> dict[str, Any]:
+    """Reply of the message writer: one subject (emails only) + body per step."""
+    text = {"type": "string"}
+    message = _object({"step_id": _enum(step_ids), "subject": text, "body": text}, required=["step_id", "body"])
+    return _object({"messages": {"type": "array", "items": message}}, required=["messages"])
+
+
 def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
     if not settings.GROQ_API_KEY:
         raise ServiceUnavailableError("AI workflow suggestions are not configured (GROQ_API_KEY is missing)")

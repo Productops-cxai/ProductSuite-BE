@@ -1,12 +1,12 @@
 # AI Workflow Suggestion
 
-PayFlow can suggest **collection workflows** for a portfolio using an LLM. Code groups the portfolio's accounts into segments, the AI designs one workflow per segment, code checks every workflow, and the result is saved as **"AI Proposed"** for people to review, approve and activate.
+PayFlow can suggest **collection workflows** for a portfolio using an LLM. Code groups the portfolio's accounts into segments, the AI designs one workflow per segment, code checks every workflow, the AI writes the **email / SMS text** of each workflow (in a tone code decides), and the result is saved as **"AI Proposed"** for people to review, approve and activate.
 
 | | |
 |---|---|
 | **Owner** | AI team |
 | **Code** | `app/modules/payflow/services/workflow_suggestion/` |
-| **APIs** | `GET /payflow/clients/{client_id}/portfolios/{portfolio_id}/segments` · `POST /payflow/workflows/suggest` · `POST /payflow/workflows/{id}/regenerate` |
+| **APIs** | `GET /payflow/clients/{client_id}/portfolios/{portfolio_id}/segments` · `POST /payflow/workflows/suggest` · `POST /payflow/workflows/{id}/regenerate` · `POST /payflow/workflows/{id}/content` |
 | **LLM** | Groq · `openai/gpt-oss-120b` |
 | **Build plan / history** | [`WORKFLOW_SUGGESTION_PLAN.md`](WORKFLOW_SUGGESTION_PLAN.md) |
 
@@ -33,6 +33,9 @@ Portfolio accounts
  VALIDATE (code)   →  broken workflows are sent back to the AI to fix
       │
       ▼
+ WRITE    (AI)     →  email / SMS text per workflow; tone decided by code, text checked by code
+      │
+      ▼
  SAVE              →  "AI Proposed" (existing workflow create path)
       │
       ▼
@@ -45,6 +48,7 @@ Portfolio accounts
 - **Rules are handled by code, not the AI.** Rule text never goes into the prompt (see [§4](#4-how-rules-are-handled)).
 - **Nothing broken is ever saved.** Every workflow passes the validator, or the request fails and saves nothing. All workflows of a request are saved together — if one fails to save, none are.
 - **Existing code is reused.** Saving uses the normal workflow create path, so AI workflows behave like any other workflow.
+- **Code decides the tone, the AI writes the words.** How soft or firm each message is comes from code rules (segment, place in the workflow, what happened before), so it is predictable; the text is written once per workflow step and filled per account when sent.
 
 ---
 
@@ -83,6 +87,8 @@ Fail → `403`, the AI is never called.
 3. **Group** accounts with the same labels.
 4. **Merge small groups** (< 20 accounts) by widening one label to "All …", in this order: **balance → contact state → days late** (days late is kept longest — it matters most). Situations are never merged. More than 8 groups → the minimum size grows 20% at a time until it fits.
 5. **Describe** — each group becomes a segment with an id (A, B…), a label, the UI's "Who it applies to" values, and stats for the AI. *(→ 6 segments)*
+
+   **Email stats:** `email_consent_pct` counts only a recorded **Yes**; `email_allowed_pct` counts accounts with an email address whose consent is **not a recorded No** — the worker's own rule (it blocks email only on an explicit No). The AI sees **only `email_allowed_pct`**: account files without a consent column leave consent empty, and showing the AI "0% consent" made every workflow SMS-only (live: old code SMS-only "because email consent is 0"; fixed code starts with email; 90%-refused control stays SMS-only).
 
 No eligible accounts → `400`.
 
@@ -133,21 +139,53 @@ Only the Limits and Allowed values above are hard rules.
 
 All batches must pass before anything is saved.
 
-### Step 7 — Save (`service.py` → existing `create_strategy`)
+### Step 7 — Write the email / SMS text (`message_*.py`)
+
+One AI call per workflow writes the `subject` (emails) and `body` of every Communication step, before saving. Every account in the segment gets the same text; the worker fills the variables (`{{first_name}}`, `{{outstanding_balance}}`, `{{account_reference}}`, `{{payment_link}}`, `{{brand_name}}`, `{{promise_amount}}`, `{{promise_date}}`) per account when it sends. **No account data goes to the AI** — only the segment's numbers.
+
+**7a. Tone (`message_tone.py`, no AI)** — code gives every message a tone and a reason:
+
+| Tone | Feels like |
+|---|---|
+| Friendly | Warm; assumes the payment was missed by accident |
+| Clear | Direct; the balance is still open, here are the options |
+| Firm | Serious and short; overdue, one clear ask. Still polite |
+| Final notice | Firm; says it is the final reminder and that the account then goes to our team for review |
+| Supportive | Payment plans, partly paid: thanks and encouragement |
+| Neutral | Contact-details requests, open disputes: no push for payment |
+
+Rules, in order (tables at the top of the file — edit them there):
+1. **Segment → start:** 1–29 days Friendly · 30–59 Clear · 60+ Firm · Promise to Pay Friendly · Payment Plan Supportive · "All stages" from the average days late, never above Clear. "Contacted, nothing paid" → one step firmer; "Never contacted" → first message one step softer (and says who is writing); "Partly paid" → never above Clear.
+2. **Position:** each earlier message on the same path → one step firmer (up to Firm). A message that bounced does not count.
+3. **Branch:** payment link clicked but unpaid → Clear (offer help); broken promise / missed plan payment → Firm; dispute → Neutral.
+4. **Purpose:** Firm Reminder → one step firmer; Payment Plan Reminder → Supportive; Contact Details Update → Neutral.
+5. **Final notice:** late-stage segments only (start at Firm), never the first message, only when the next step hands the case over (Human Review / escalation).
+
+"Harsh" stops at Firm / Final notice — no threats.
+
+**7b. Prompt (`message_prompt.py`)** — the client (first / third party → "on behalf of …"), language, what the payment page offers (`load_payment_options`: pay in full / part / plan from the client's payment settings), the segment and what its situation means, the workflow, and per message: channel, purpose, timing, **path so far** (e.g. `… → Email bounced? = yes`), tone + reason, current text (on rewrites). Writing rules: plain words, one ask, payment link, no repeated wording between messages, never state days overdue, never type amounts / dates, no hinted consequences.
+
+**7c. Check (`message_validator.py`)** — only known variables (promise variables only in Promise-to-Pay messages); `{{brand_name}}` always, `{{payment_link}}` unless Neutral; no typed amounts / dates / number of days; no threats or hinted consequences (court, police, credit bureau, "further action", service cut…); "final" only in a Final notice, and a Final notice must say "final" and (English) mention the review; email subject ≤ 60 characters, body 30–200 words; SMS ≤ 320 characters with values filled in and "STOP"; no copy-paste between messages.
+
+**7d. Fix** — failing messages go back to the AI with the problems (max 2 fixes); messages that passed are kept. Still failing → the workflow is **saved anyway, without text** (its templates are sent) and gets an `ai_context` line **"Messages: Not written, so the templates will be sent. Use Write messages to try again."** Writing text never fails Suggest or Regenerate. Workflows with no email / SMS steps are skipped.
+
+Message text is **not** shown to the workflow-design AI (client examples, Regenerate) — `compact_step` drops it.
+
+### Step 8 — Save (`service.py` → existing `create_strategy`)
 
 | Field | Value |
 |---|---|
 | `status`, `origin` | `AI Proposed` |
 | `source` | `AI Generated` |
 | `segment` | UI dropdown values + `situation` + `contact_state` |
-| `steps`, `entry_node_id` | The AI flowchart (timing labels added automatically) |
+| `steps`, `entry_node_id` | The AI flowchart (timing labels added automatically); Communication steps carry `subject` / `body` / `tone` in `config` |
 | `cases_covered` | Accounts in the segment |
-| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule, and **"Learned from"** when the client's past reviews were used |
+| `ai_context` | Segment, accounts, avg owed, avg days late, email consent, email allowed, the AI's **reasoning** ("Why it fits", "Channels", "Timing", "Escalation"; plus "Changes made" on regenerate), one **"Governed by"** line per rule, **"Learned from"** when the client's past reviews were used, and **"Messages"** only when the text could not be written |
 | `ai_proposal_snapshot` | Frozen copy of the AI original (kept after human edits) |
 
 All workflows are saved in **one transaction** (`create_strategy(..., commit=False)`, then one commit): if any save fails, it is rolled back and nothing is saved. Ops Admins and the client's supervisors are notified **after** the commit, one notification per workflow (existing behaviour) — notifications commit on their own, so sending them earlier would save half a result.
 
-### Step 8 — Response
+### Step 9 — Response
 The saved workflows, in the same shape as `GET /payflow/workflows/{id}`.
 
 ### After the API — people (existing APIs)
@@ -160,12 +198,13 @@ AI Proposed ──begin-review / edit──► Under Review ──approve──�
 Changing an AI workflow's **steps** or **segment** marks it **Human Modified** (renaming, summary edits, re-sending the same steps and Save Draft do not); the AI original stays in `ai_proposal_snapshot`. So an Approved workflow's `origin` tells reviewers apart: `AI Proposed` = approved as the AI wrote it, `Human Modified` = approved after changes.
 Reviewers can add an optional **note** on approve (`{"note": "…"}`) and on edit (`"note"` in the update body). It is saved as `reviewer_note` on that action's `versions` entry, next to the automatic list of `changes` — *what* changed plus *why*. (Feeding these notes back to the AI is a later step.)
 To ask the AI for an improved version instead, a reviewer calls **Regenerate** with remarks ([§3.3](#33-regenerate-a-workflow)) — a new linked "AI Proposed" workflow is created and the original is left as it is.
+For the **text** only, reviewers edit `subject` / `body` through the normal update (a text edit is a real change → Human Modified, history line "`<step>`: message text edited"), or ask the AI to rewrite it with **Write messages** ([§3.4](#34-write--rewrite-the-message-text)) — all messages or one, with remarks.
 
 ---
 
 ## 3. API reference
 
-Both APIs need `Authorization: Bearer <access_token>` (from `POST /auth/login`). Both are listed in Swagger (`/docs`).
+All APIs need `Authorization: Bearer <access_token>` (from `POST /auth/login`). All are listed in Swagger (`/docs`).
 
 ### 3.1 Preview segments
 
@@ -202,7 +241,7 @@ Real response (trimmed to 2 segments):
       "stats": {
         "accounts": 37, "total_outstanding": 451305.09, "avg_outstanding": 12197.43,
         "avg_days_past_due": 11, "with_email_pct": 100, "with_mobile_pct": 73,
-        "email_consent_pct": 89, "languages": { "EN": 34, "FR": 3 }
+        "email_consent_pct": 89, "email_allowed_pct": 100, "languages": { "EN": 34, "FR": 3 }
       }
     },
     {
@@ -275,6 +314,7 @@ Each item in `workflows` is a normal workflow (`PayflowStrategyItem`). Real exam
     { "label": "Avg outstanding", "value": "7,238.13 CAD" },
     { "label": "Avg days past due", "value": "14" },
     { "label": "Email consent", "value": "79%" },
+    { "label": "Email allowed", "value": "100%" },
     { "label": "Why it fits", "value": "Accounts are 1-29 days past due with balances $1,500-$5,000; early-stage cases respond well to gentle reminders and an easy payment option." },
     { "label": "Channels", "value": "Both email and SMS have 100% reach, so we start with email (high consent) and follow with SMS for a quick payment link." },
     { "label": "Timing", "value": "Wait 3 days after the email to give time for payment, then 5 days after the SMS link before escalating." },
@@ -328,7 +368,34 @@ The new workflow's `ai_context` links them:
 
 Live example: original *Email day 0 → SMS day 3* became *Email day 0 → Email day 5 → SMS day 10*. After regenerating, both are "AI Proposed" — the reviewer approves one and rejects / deletes the other.
 
-### 3.4 Errors
+The new version also gets **fresh email / SMS text** (Step 7) — text a reviewer edited on the original is not carried over.
+
+### 3.4 Write / rewrite the message text
+
+```
+POST /payflow/workflows/{strategy_id}/content
+```
+
+| Body | What happens |
+|---|---|
+| none or `{}` | AI writes every email / SMS of the workflow (improves the current text if there is some) |
+| `{"step_id": "s5"}` | Rewrites only that message; the other messages are context |
+| `{"step_id": "s5", "remarks": "softer, mention the payment plan"}` | Same, following the remarks |
+| `{"remarks": "shorter"}` | Rewrites all messages, following the remarks |
+
+| | |
+|---|---|
+| Permission | **Create / Edit Workflows** for the client |
+| Allowed for | **Draft, AI Proposed, Under Review** — AI or hand-made. Approved / Active / Inactive are refused **before** the AI is called (approved text must not change without a review) |
+| `step_id` / `remarks` | Optional; `remarks` max 2,000 characters |
+| Response | The workflow (`PayflowStrategyItem`) with the text in its steps |
+| Time | One AI call — ~5–20 s |
+
+Suggest and Regenerate already write the text — use this to rewrite it, or for hand-made workflows (they have no stored segment stats: the segment label is "Custom segment" and the tone comes from the `delinquency` field).
+
+Saving (`strategy_service.save_ai_messages`): **status and origin do not change** (the AI wrote it, so not "Human Modified"); while the workflow is still AI Proposed the text is copied into `ai_proposal_snapshot`; one history entry `"Message text written by AI for <user>: <steps> (remarks: …)"` with an empty change list, so Suggest lessons and Regenerate history never take the AI's writing for a reviewer edit.
+
+### 3.5 Errors
 
 Errors use the project's normal format: `{ "detail": "<message>" }`.
 
@@ -337,9 +404,11 @@ Errors use the project's normal format: `{ "detail": "<message>" }`.
 | 401 | Not logged in / bad token | `Not authenticated` |
 | 403 | Missing Create / Edit Workflows, or no access to the client | `Permission required: create_edit_workflows` |
 | 404 | Client, portfolio or workflow not found, or portfolio of another client | `Portfolio not found for this client` |
-| 400 | No eligible accounts (suggest); not an AI workflow, wrong status or no portfolio (regenerate) | `Only AI Proposed or Under Review workflows can be regenerated` |
+| 400 | No eligible accounts (suggest); not an AI workflow, wrong status or no portfolio (regenerate); wrong status, no email / SMS steps or bad `step_id` (content) | `Only AI Proposed or Under Review workflows can be regenerated` · `Message text can only be written for Draft, AI Proposed or Under Review workflows` |
 | 422 | Request body invalid (e.g. empty `remarks`) | FastAPI validation detail |
-| 502 | AI not configured / unreachable / reply cut off / still invalid after 2 fixes — **nothing saved** | `AI could not produce valid workflows: Workflow B: has 16 steps (allowed 3-15); …` |
+| 502 | AI not configured / unreachable / reply cut off / still invalid after 2 fixes — **nothing saved** | `AI could not produce valid workflows: Workflow B: has 16 steps (allowed 3-15); …` · `AI could not write valid messages: s5: SMS must end with 'Reply STOP to opt out.'` |
+
+On Suggest and Regenerate, a message-writing failure is **not** an error: the workflow is saved with its templates and a "Messages" line (Step 7d).
 
 ---
 
@@ -380,6 +449,10 @@ Code constants:
 | `MAX_FIX_ATTEMPTS` | 2 | `workflow_suggestion/service.py` |
 | `MAX_CLIENT_EXAMPLES` / `MAX_LESSONS` / `MAX_CHANGES_PER_LESSON` | 2 / 15 / 3 | `workflow_suggestion/learning.py` |
 | `RATE_LIMIT_RETRIES` | 5 | `workflow_suggestion/llm.py` |
+| Tone rules: `START_TONE`, `SITUATION_TONE`, `PURPOSE_TONE`, `HAND_OVER_KINDS` / `HAND_OVER_ACTIONS` | see Step 7a | `workflow_suggestion/message_tone.py` |
+| `MAX_SUBJECT_CHARS` / `MAX_SMS_CHARS` / `EMAIL_WORDS` | 60 / 320 / 30–200 | `workflow_suggestion/message_validator.py` |
+| `VARIABLES` (must match the worker's `_render`) | 7 variables | `workflow_suggestion/message_validator.py` |
+| `MAX_FIX_ATTEMPTS` (messages) | 2 | `workflow_suggestion/message_writer.py` |
 
 ### Removing free-tier batching (paid customers)
 Set `GROQ_SEGMENTS_PER_CALL=0` in `.env` — one AI call per portfolio, no code change. To remove the code entirely, make `_batches()` in `service.py` return `[segments]`.
@@ -393,17 +466,22 @@ All in `app/modules/payflow/services/workflow_suggestion/` unless noted.
 | File | Main functions | Job |
 |---|---|---|
 | `config.py` | constants | Band meanings, limits, segment sizes |
-| `context.py` | `load_client_context`, `load_rules`, `load_portfolio_accounts` | Load data |
+| `context.py` | `load_client_context`, `load_rules`, `load_portfolio_accounts`, `load_payment_options` | Load data |
 | `segmenter.py` | `build_segments`, `filter_eligible`, `label_account`, `group_accounts`, `merge_small_groups`, `describe_segment`, **`match_account_to_segment`** | Segments; matching accounts to segments |
 | `rules.py` | `design_limits`, `governing_rules` | Rules → limits; "Governed by" text |
 | `prompt.py` + `prompts/workflow_examples.json` | `build_messages`, `build_feedback`, `build_revision` | Prompt, retry feedback, regenerate text, examples |
 | `learning.py` | `load_client_learning`, `pick_examples`, `pick_lessons`, `learned_from` | Suggest: the client's own example workflows + lesson lines from its past reviews |
-| `llm.py` | `build_output_schema`, `call_llm` | Groq call, JSON schema, rate-limit waits |
+| `llm.py` | `build_output_schema`, `build_message_schema`, `call_llm` | Groq call, JSON schemas, rate-limit waits |
 | `validator.py` | `validate_all` (+ `validate_structure`, `validate_flowchart`, `validate_catalog_values`, `validate_step_config`, `validate_limits`) | Checks AI workflows |
-| `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`, `.regenerate_workflow`; `_batches` | Orchestration, retries, saving |
-| `app/modules/payflow/routes.py` | `preview_portfolio_segments`, `suggest_workflows`, `regenerate_workflow` | Routes ("Workflow suggestions (AI)" section) |
-| `app/modules/payflow/services/strategy_service.py` | `create_strategy(..., commit=False)`, `notify_awaiting` | Existing save path; `commit=False` + `notify_awaiting` let Suggest save all workflows in one transaction |
-| `app/modules/payflow/schemas.py` | `PortfolioSegmentsResponse`, `SuggestWorkflowsRequest`, `SuggestWorkflowsResponse`, `RegenerateWorkflowRequest` | Request / response models |
+| `message_tone.py` | `message_tones` | Tone + reason + path for every message (code rules, no AI) |
+| `message_prompt.py` | `build_message_prompt`, `build_message_system_prompt` | Prompt for the message text |
+| `message_validator.py` | `check_message`, `render_sample` | Checks AI message text |
+| `message_writer.py` | `write_messages`, `apply_messages` | One AI call per workflow, fixes, text into steps (saves nothing) |
+| `service.py` | `WorkflowSuggestionService.preview_segments`, `.suggest_workflows`, `.regenerate_workflow`, `.write_workflow_messages`; `_batches`, `_with_messages`, `_stored_segment` | Orchestration, retries, saving |
+| `app/modules/payflow/routes.py` | `preview_portfolio_segments`, `suggest_workflows`, `regenerate_workflow`, `write_workflow_messages` | Routes ("Workflow suggestions (AI)" section) |
+| `app/modules/payflow/services/strategy_service.py` | `create_strategy(..., commit=False)`, `notify_awaiting`, `save_ai_messages` | Existing save path; `commit=False` + `notify_awaiting` let Suggest save all workflows in one transaction; `save_ai_messages` saves AI text without "Human Modified" |
+| `app/modules/payflow/schemas.py` | `PortfolioSegmentsResponse`, `SuggestWorkflowsRequest`, `SuggestWorkflowsResponse`, `RegenerateWorkflowRequest`, `WriteWorkflowMessagesRequest`; `subject` / `body` / `tone` on `StrategyNodeConfig` | Request / response models |
+| `app/modules/payflow/services/workflow_execution_service.py` (backend team) | `_send_communication`, `_render` | The worker: sends a step's own text (else its template), fills the variables |
 | `app/core/exceptions.py` | `ServiceUnavailableError` | AI failures → `502` |
 | `app/core/config.py` | `GROQ_*` settings | |
 
@@ -427,6 +505,14 @@ venv\Scripts\python.exe -m pytest
 | `tests/test_workflow_suggestion_api.py` | 15 | Preview + suggest: success, retry-then-pass (incl. timing without a reference event), give-up (nothing saved), all-or-nothing save, notifications after saving, batching, 400 / 403 / 404 / 502 |
 | `tests/test_workflow_learning.py` | 6 | Suggest learns from the client: similar examples + lessons in the prompt, generic examples when nothing is similar, branching example always kept, other clients / old-format workflows ignored, no history = today's prompt, similar-first lessons, lesson cap |
 | `tests/test_workflow_regenerate.py` | 21 | Regenerate: new linked version (`revision_of_id`), original unchanged, review history in the prompt (whole chain, same client only, deleted parent), retry, give-up, allowed / refused statuses, no portfolio (AI not called), 400 / 403 / 404 / 422 / 502 |
+| `tests/test_workflow_message_text.py` | 7 | `subject` / `body` / `tone` saved and returned, text edits tracked, blank boxes are no change, 422 on too long, the worker sends the step's text (else the template) |
+| `tests/test_workflow_message_tone.py` | 14 | Every tone rule: soft early / firm late, bounce, link clicked, broken promise, payment plan, partly paid, neutral, mixed stages, Firm Reminder one step, no Final notice first, path text |
+| `tests/test_workflow_message_validator.py` | 15 | One failing case per check |
+| `tests/test_workflow_message_writer.py` | 9 | Prompt content, retry only failing messages, give-up, rewrite one with remarks, payment options |
+| `tests/test_workflow_message_api.py` | 8 | `/content`: all / one + remarks, stays AI Proposed, snapshot, not taken for reviewer feedback, 400 / 502 (nothing saved), hand-made workflows |
+| `tests/test_workflow_message_auto.py` | 6 | Suggest / Regenerate write the text before saving; still save (templates + "Messages" line) when writing fails; text kept out of design prompts |
+
+`tests/conftest.py` turns the message writer's AI **off** in every test (autouse fixture `message_ai_off`), so no test calls the real Groq API; message tests patch in a fake.
 
 ### Manual testing with Postman
 
@@ -445,6 +531,8 @@ The collection's variables point at the demo client **Maple Energy (Demo)** (cli
 | Time | 249 s (204 s waiting on rate limits) | 270 s (221 s waiting) |
 | AI calls | 7 (3 retries) | 8 (4 retries) |
 | Mistakes caught & fixed | 4 (all "too many steps") | 5 (3 too many steps, 1 message cap, 1 wrong template) |
+
+**Message text (2026-10-28, demo client, 6 workflows / 14 messages, free tier):** all 6 valid; 8 AI calls (one workflow needed 2 fixes); 72 s. A first run found vague threats ("to avoid further action"), stated days overdue, a claim that an email bounced on the branch where it did not, and a new plan offered to customers already on one — all fixed in the prompt and the checks (plus tests) before the final run.
 
 ---
 
@@ -487,6 +575,7 @@ Most rules (e.g. Balance > 10,000 → Human Review, Dispute → Hold) can only b
 - Worth showing on workflow detail: the segment ("Who it applies to" — `segment`), `cases_covered`, the AI's **reasoning** lines ("Why it fits", "Channels", "Timing", "Escalation", "Changes made"), **"Governed by"** lines and the **"Learned from"** line (`ai_context`), and the AI original vs edited version (`ai_proposal_snapshot`).
 - `segment` has two extra keys the dropdowns don't know (`situation`, `contact_state`) — show them as text or ignore them; do not drop them when saving edits.
 - **Why boxes (optional):** an optional "Why?" text box on **Approve** → send `{"note": "…"}` (today `approvePayflowWorkflow` sends no body); an optional "Describe your change" box next to **Save** on edit → add `"note"` to the update payload. Show `versions[].reviewer_note` in the workflow's history. Max 2,000 characters; never required.
+- **Email / SMS text:** editable subject / body boxes, a tone badge, a preview and "Write / Rewrite with AI" buttons on message steps — see [`CHANGES_FOR_FRONTEND_TEAM.md`](CHANGES_FOR_FRONTEND_TEAM.md).
 
 ---
 
@@ -500,3 +589,8 @@ Most rules (e.g. Balance > 10,000 → Human Review, Dispute → Hold) can only b
 | 4 | Free tier: 1–5 min per request, ~40k tokens per portfolio | Development only. Paid tier + `GROQ_SEGMENTS_PER_CALL=0` for customers |
 | 5 | Request too long for normal HTTPS limits | Background job (see [§8](#long-requests)) |
 | 6 | Pre-existing (not this feature): email logging prints `→`, which crashes when the server's output is redirected on Windows (cp1252) | Set `PYTHONIOENCODING=utf-8`, or remove the special character from the log message |
+| 7 | Message text is written in the **client's** language only — French-speaking accounts of an English client get English | Later: write a version per language and let the worker pick by `account.language` (worker change) |
+| 8 | Some message checks look for English words ("STOP", "final", "review", threat words) | Fine for English; add French word lists before writing French text |
+| 9 | Live runs still show the odd stiff or muddled sentence ("This is a firm reminder that action is needed") | Reviewers edit or click Rewrite; later, learn from reviewers' text edits like workflow lessons |
+| 10 | Regenerate writes fresh text — text a reviewer edited on the original is not carried over | Later: pass the edited text as "current text" for steps that kept their purpose |
+| 11 | Only 7 variables (no due date, days late, support phone, creditor name) | Add them to the worker's `_render` (backend team) **and** to `VARIABLES` in `message_validator.py` |
