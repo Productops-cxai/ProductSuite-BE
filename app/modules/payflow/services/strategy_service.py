@@ -516,6 +516,12 @@ def _step_fingerprint(step: dict[str, Any]) -> str:
     return "|".join("" if p is None else str(p) for p in parts)
 
 
+def _message_text(step: dict[str, Any]) -> tuple[str, str]:
+    """A Communication step's own subject + body ("" when it uses its template)."""
+    cfg = _cfg(step)
+    return cfg.get("subject") or "", cfg.get("body") or ""
+
+
 def _diff_steps(before: list[dict], after: list[dict]) -> list[str]:
     before_by_id = {s.get("id"): s for s in before if s.get("id")}
     after_by_id = {s.get("id"): s for s in after if s.get("id")}
@@ -546,6 +552,8 @@ def _diff_steps(before: list[dict], after: list[dict]) -> list[str]:
         )
         if old.get("kind") == "Condition" and old_cond != new_cond:
             changes.append(f"{new.get('title') or sid}: condition changed to {new_cond.strip()}")
+        if _message_text(old) != _message_text(new):
+            changes.append(f"{new.get('title') or sid}: message text edited")
         if bool(old.get("disabled")) != bool(new.get("disabled")):
             changes.append(
                 f"{new.get('title') or sid}: "
@@ -1122,6 +1130,47 @@ class PayflowStrategyService:
         if row.status == PayflowStrategyStatus.ACTIVE.value:
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
 
+        self.db.commit()
+        self.db.refresh(row)
+        return self._serialize(self._get_row(row.id))
+
+    def save_ai_messages(
+        self, user: UserModel, strategy_id: int, steps: list[dict[str, Any]], *, remarks: str | None = None
+    ) -> dict[str, Any]:
+        """Save email / SMS text the AI wrote for a workflow's steps.
+
+        An AI change, not a human one: status and origin stay as they are ("Human Modified" is
+        not set). While no human has changed the workflow, the AI proposal snapshot gets the
+        text too, so later reviewer edits to it count as changes to the AI's words.
+        """
+        row = self._get_row(strategy_id)
+        self._assert_manage(user, row.client_id)
+        before = {step.get("id"): step for step in row.steps or []}
+        written = [
+            step.get("title") or step.get("id")
+            for step in steps
+            if _message_text(step) != _message_text(before.get(step.get("id")) or {})
+        ]
+        row.steps = copy.deepcopy(steps)
+        if row.origin == PayflowStrategyOrigin.AI_PROPOSED.value and row.ai_proposal_snapshot:
+            row.ai_proposal_snapshot = {**row.ai_proposal_snapshot, "steps": copy.deepcopy(steps)}
+
+        # No change list: reviewer-feedback readers (Regenerate history, Suggest lessons)
+        # must not take the AI's own writing for a reviewer's edit.
+        note = f"Message text written by AI for {user.full_name}: {', '.join(written) or 'no change'}"
+        if remarks:
+            note += f" (remarks: {remarks})"
+        self._prepend_version(
+            row,
+            {
+                "version": int(row.version or 1),
+                "date": _stamp(),
+                "note": note,
+                "changes": [],
+                "status": row.status,
+                "origin": row.origin,
+            },
+        )
         self.db.commit()
         self.db.refresh(row)
         return self._serialize(self._get_row(row.id))

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "PayFlow - AI Workflow Suggestion",
-    "description": "Try the AI workflow suggestion APIs against a local backend.\n\nRun '1. Login' first (it saves the token). Suggest calls take 1-5 minutes on the Groq free tier - keep Postman's request timeout at 0 (no limit).\n\nDemo data: client 'Maple Energy (Demo)' with portfolios Residential and Small Business. Adjust the collection variables if your ids differ.\n\nRegenerate: run it after 'Get workflow' (the workflow must be AI Proposed or Under Review). It saves the new revision's id as workflowId, so the review / approve / activate requests act on the revision.",
+    "description": "Try the AI workflow suggestion APIs against a local backend.\n\nRun '1. Login' first (it saves the token). Suggest calls take 1-5 minutes on the Groq free tier - keep Postman's request timeout at 0 (no limit).\n\nDemo data: client 'Maple Energy (Demo)' with portfolios Residential and Small Business. Adjust the collection variables if your ids differ.\n\nRegenerate: run it after 'Get workflow' (the workflow must be AI Proposed or Under Review). It saves the new revision's id as workflowId, so the review / approve / activate requests act on the revision.\n\nMessages: Suggest and Regenerate already write the email / SMS text. 'Write messages' rewrites all of it; 'Rewrite one message' rewrites only the first message step (saved as messageStepId), following the remarks. Both work only before approval.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -49,6 +49,10 @@
     },
     {
       "key": "originalWorkflowId",
+      "value": ""
+    },
+    {
+      "key": "messageStepId",
       "value": ""
     }
   ],
@@ -207,28 +211,68 @@
       }
     },
     {
-      "name": "9. Begin review",
+      "name": "9. Write messages (email / SMS text)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('messages written', () => pm.response.to.have.status(200));",
+              "const messages = pm.response.json().steps.filter(s => s.kind === 'Communication');",
+              "if (messages.length) pm.collectionVariables.set('messageStepId', messages[0].id);",
+              "messages.forEach(s => console.log(`${s.id} ${s.config.channel} | ${s.config.tone}\n${s.config.subject || ''}\n${s.config.body}`));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "description": "AI writes the text of every email / SMS step (tone decided by code). No body needed. Allowed for Draft, AI Proposed and Under Review workflows. Suggest and Regenerate already do this automatically - use it to rewrite, or for hand-made workflows.",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/content"
+      }
+    },
+    {
+      "name": "10. Rewrite one message (with remarks)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"step_id\": \"{{messageStepId}}\",\n  \"remarks\": \"Shorter and warmer, and mention the payment plan.\"\n}"
+        },
+        "description": "Rewrites only this step's text, following the remarks; the other messages stay as they are. Without step_id the remarks apply to every message.",
+        "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/content"
+      }
+    },
+    {
+      "name": "11. Begin review",
       "request": {
         "method": "POST",
         "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/begin-review"
       }
     },
     {
-      "name": "10. Approve",
+      "name": "12. Approve",
       "request": {
         "method": "POST",
         "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/approve"
       }
     },
     {
-      "name": "11. Activate",
+      "name": "13. Activate",
       "request": {
         "method": "POST",
         "url": "{{baseUrl}}/payflow/workflows/{{workflowId}}/activate"
       }
     },
     {
-      "name": "12. Rules for this client",
+      "name": "14. Rules for this client",
       "request": {
         "method": "GET",
         "url": "{{baseUrl}}/payflow/rules?client_id={{clientId}}"

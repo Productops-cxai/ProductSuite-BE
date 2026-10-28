@@ -91,6 +91,7 @@ from app.modules.payflow.schemas import (
     SuggestWorkflowsRequest,
     SuggestWorkflowsResponse,
     RegenerateWorkflowRequest,
+    WriteWorkflowMessagesRequest,
     PayflowWorkflowPaymentEventRequest,
     PayflowWorkflowRunItem,
     PayflowWorkflowRunsResponse,
@@ -1201,6 +1202,22 @@ def regenerate_workflow(
 ):
     try:
         return WorkflowSuggestionService(db).regenerate_workflow(user, strategy_id, payload.remarks)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/content", response_model=PayflowStrategyItem)
+def write_workflow_messages(
+    strategy_id: int,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+    payload: WriteWorkflowMessagesRequest | None = None,  # body is optional: no body = write every message
+):
+    try:
+        payload = payload or WriteWorkflowMessagesRequest()
+        return WorkflowSuggestionService(db).write_workflow_messages(
+            user, strategy_id, payload.step_id, payload.remarks
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
