@@ -435,6 +435,9 @@ class PayflowAccountsListResponse(BaseModel):
     intake: AccountsIntakeSummary
     workflows: List[str] = Field(default_factory=list)
     statuses: List[str] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
 
 
 class IntegrationIssueItem(BaseModel):

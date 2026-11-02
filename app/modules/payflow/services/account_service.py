@@ -143,7 +143,21 @@ class PayflowAccountService:
         workflow: str | None = None,
         human_review: str | None = None,
         search: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
+        # None limit = return full filtered set (backward compatible for nested tabs).
+        page_size = max(1, min(int(limit), 500)) if limit is not None else None
+        page_offset = max(0, int(offset or 0))
+        empty = {
+            "accounts": [],
+            "intake": self._empty_intake(),
+            "workflows": COLLECTION_WORKFLOWS,
+            "statuses": [s.value for s in PayflowCollectionStatus],
+            "total": 0,
+            "limit": page_size if page_size is not None else 0,
+            "offset": page_offset,
+        }
         allowed = self._visible_client_ids(user)
         q = self.db.query(PayflowAccountModel).options(
             joinedload(PayflowAccountModel.client),
@@ -151,12 +165,7 @@ class PayflowAccountService:
         )
         if allowed is not None:
             if not allowed:
-                return {
-                    "accounts": [],
-                    "intake": self._empty_intake(),
-                    "workflows": COLLECTION_WORKFLOWS,
-                    "statuses": [s.value for s in PayflowCollectionStatus],
-                }
+                return empty
             q = q.filter(PayflowAccountModel.client_id.in_(allowed))
         if client_id is not None:
             self._assert_account_permission(user, client_id)
@@ -190,18 +199,32 @@ class PayflowAccountService:
                 or self.access.can(user, "view_collection_cases", r.client_id)
             ]
 
+        total = len(rows)
+        page_rows = (
+            rows[page_offset : page_offset + page_size]
+            if page_size is not None
+            else rows[page_offset:]
+        )
+
         from app.modules.payflow.services.import_service import PayflowImportService
 
         intake = PayflowImportService(self.db).latest_account_intake()
         if client_id is not None:
-            scoped = [r for r in rows if r.client_id == client_id]
-            intake = {**intake, "accounts_in_files": len(scoped), "files": 1 if scoped else 0}
+            scoped_count = sum(1 for r in rows if r.client_id == client_id)
+            intake = {
+                **intake,
+                "accounts_in_files": scoped_count,
+                "files": 1 if scoped_count else 0,
+            }
 
         return {
-            "accounts": [self._serialize(r) for r in rows],
+            "accounts": [self._serialize(r) for r in page_rows],
             "intake": intake,
             "workflows": COLLECTION_WORKFLOWS,
             "statuses": [s.value for s in PayflowCollectionStatus],
+            "total": total,
+            "limit": page_size if page_size is not None else total,
+            "offset": page_offset,
         }
 
     def get_account(self, user: UserModel, account_id: int) -> dict[str, Any]:

@@ -547,6 +547,8 @@ def list_accounts(
     workflow: str | None = Query(default=None),
     human_review: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     try:
         return PayflowAccountService(db).list_accounts(
@@ -557,6 +559,8 @@ def list_accounts(
             workflow=workflow,
             human_review=human_review,
             search=search,
+            limit=limit,
+            offset=offset,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
