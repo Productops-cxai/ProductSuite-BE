@@ -29,6 +29,13 @@ _IS_PROD = (settings.APP_ENV or "").strip().lower() == "production"
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    if _IS_PROD:
+        secret = (settings.JWT_SECRET or "").strip()
+        if not secret or secret == "change-me-platform-suite-secret-key" or len(secret) < 32:
+            raise RuntimeError(
+                "Refusing to start in production: set a strong JWT_SECRET "
+                "(at least 32 characters, not the default placeholder)."
+            )
     # Additive only: create missing tables/columns + insert missing seed rows.
     # Existing org grants, people assignments, and product rows are never overwritten.
     logger.info("Startup: schema sync + seed (additive)…")
@@ -78,7 +85,11 @@ async def capture_frontend_origin(request: Request, call_next):
     )
     token = set_frontend_base(base)
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        # Reduce leakage of payment / auth tokens via Referer on API responses.
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
     finally:
         reset_frontend_base(token)
 

@@ -1,7 +1,13 @@
-from fastapi import APIRouter, Depends, File, Header, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Header, Request, Response, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
 
-from app.core.deps import CurrentPerson, DbSession, bearer_scheme
+from app.core.auth_cookies import (
+    REFRESH_COOKIE,
+    clear_auth_cookies,
+    set_auth_cookies,
+    tokens_for_json_body,
+)
+from app.core.deps import CurrentPerson, DbSession, _extract_access_token, bearer_scheme
 from app.core.exceptions import AppError
 from app.modules.identity.schemas import (
     ActivateAccountRequest,
@@ -45,11 +51,21 @@ def _map_error(exc: AppError):
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(payload: LoginRequest, db: DbSession):
+def login(payload: LoginRequest, response: Response, db: DbSession):
     try:
-        return IdentityService(db).login(payload.email, payload.password)
+        data = IdentityService(db).login(payload.email, payload.password)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+    access = data["access_token"]
+    refresh = data["refresh_token"]
+    set_auth_cookies(response, access, refresh)
+    body_access, body_refresh = tokens_for_json_body(access, refresh)
+    return {
+        **data,
+        "access_token": body_access,
+        "refresh_token": body_refresh,
+    }
 
 
 @router.get("/me", response_model=MeResponse)
@@ -106,22 +122,46 @@ def change_password(payload: ChangePasswordRequest, user: CurrentPerson, db: DbS
 
 
 @router.post("/refresh", response_model=TokenResponse)
-def refresh(payload: RefreshRequest, db: DbSession):
+def refresh(
+    response: Response,
+    request: Request,
+    db: DbSession,
+    payload: RefreshRequest | None = Body(default=None),
+):
+    token = (payload.refresh_token if payload else None) or request.cookies.get(REFRESH_COOKIE)
+    if not token:
+        from fastapi import HTTPException, status
+
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
-        return IdentityService(db).refresh(payload.refresh_token)
+        data = IdentityService(db).refresh(token)
     except AppError as exc:
         raise _map_error(exc) from exc
+
+    access = data["access_token"]
+    refresh_tok = data["refresh_token"]
+    set_auth_cookies(response, access, refresh_tok)
+    body_access, body_refresh = tokens_for_json_body(access, refresh_tok)
+    return {
+        "access_token": body_access,
+        "refresh_token": body_refresh,
+        "token_type": "bearer",
+    }
 
 
 @router.post("/logout", response_model=MessageResponse)
 def logout(
+    request: Request,
+    response: Response,
     user: CurrentPerson,
     db: DbSession,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     x_refresh_token: str | None = Header(default=None, alias="X-Refresh-Token"),
 ):
-    access = credentials.credentials if credentials else None
-    IdentityService(db).logout(user, access, x_refresh_token)
+    access = _extract_access_token(request, credentials)
+    refresh = x_refresh_token or request.cookies.get(REFRESH_COOKIE)
+    IdentityService(db).logout(user, access, refresh)
+    clear_auth_cookies(response)
     return {"message": "Logged out successfully"}
 
 
