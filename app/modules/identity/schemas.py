@@ -36,8 +36,9 @@ class PersonBrief(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    access_token: str
-    refresh_token: str
+    # Production omits JWTs from JSON (HttpOnly cookies carry the session).
+    access_token: str = ""
+    refresh_token: str = ""
     token_type: str = "bearer"
     user: PersonBrief
     products: List[ProductBrief]
@@ -51,12 +52,14 @@ class MeResponse(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    """Optional body — browsers send refresh via HttpOnly cookie instead."""
+
+    refresh_token: Optional[str] = None
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: str
+    access_token: str = ""
+    refresh_token: str = ""
     token_type: str = "bearer"
 
 

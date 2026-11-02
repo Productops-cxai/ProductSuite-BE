@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     JWT_ACCESS_EXPIRE_MINUTES: int = 60
     JWT_REFRESH_EXPIRE_DAYS: int = 7
 
+    # Browser session cookies (HttpOnly). Leave COOKIE_SECURE unset to follow APP_ENV.
+    # Cross-site API (app.example.com → api.example.com): COOKIE_SAMESITE=none + COOKIE_SECURE=true
+    # and usually COOKIE_DOMAIN=.example.com
+    COOKIE_SECURE: bool | None = None
+    COOKIE_SAMESITE: str = "lax"
+    COOKIE_DOMAIN: str = ""
+
     # Password-reset and activation link TTLs (minutes). Overridden by .env — restart API after change.
     PASSWORD_RESET_EXPIRE_MINUTES: int = 5
     ACTIVATION_TOKEN_EXPIRE_MINUTES: int = 5
@@ -127,6 +134,7 @@ class Settings(BaseSettings):
             raise
 
     def cors_allow_origins(self) -> list[str]:
+        """Explicit origins only — required for credentialed (cookie) browser requests."""
         raw = (self.CORS_ORIGINS or "").strip()
         if raw:
             return [o.strip() for o in raw.split(",") if o.strip()]
@@ -138,7 +146,16 @@ class Settings(BaseSettings):
                 host = fe.removeprefix("https://")
                 origins.append(f"https://www.{host}")
             return origins or ["https://testatncri.com"]
-        return ["*"]
+        # Dev: never "*" with allow_credentials=True (cookies would be blocked).
+        fe = (self.FRONTEND_URL or "").rstrip("/")
+        origins = {
+            fe,
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5173",
+            "http://127.0.0.1:5174",
+        }
+        return [o for o in origins if o]
 
 
 settings = Settings()

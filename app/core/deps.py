@@ -2,10 +2,11 @@ from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.auth_cookies import ACCESS_COOKIE
 from app.core.security import safe_decode_token
 from app.infrastructure.database.models import TokenDenylistModel, UserModel, UserSessionModel
 from app.infrastructure.database.session import get_db
@@ -23,17 +24,28 @@ def _auth_detail(message: str, code: str = "unauthorized") -> dict:
     return {"code": code, "message": message}
 
 
+def _extract_access_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        raw = credentials.credentials.strip()
+        if raw.lower().startswith("bearer "):
+            raw = raw[7:].strip()
+        if raw:
+            return raw
+    cookie = (request.cookies.get(ACCESS_COOKIE) or "").strip()
+    return cookie or None
+
+
 def get_current_user(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[Session, Depends(get_db)],
 ) -> UserModel:
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    raw_token = _extract_access_token(request, credentials)
+    if not raw_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-
-    # If user pasted "Bearer eyJ..." into Swagger value box, strip the extra word
-    raw_token = credentials.credentials.strip()
-    if raw_token.lower().startswith("bearer "):
-        raw_token = raw_token[7:].strip()
 
     payload = safe_decode_token(raw_token)
     if not payload or payload.get("type") != "access":

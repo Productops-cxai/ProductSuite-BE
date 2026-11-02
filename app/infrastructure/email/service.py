@@ -76,6 +76,7 @@ def send_email(
     db.commit()
     db.refresh(row)
 
+    is_prod = (settings.APP_ENV or "").strip().lower() == "production"
     logger.info(
         "EMAIL %s id=%s to=%s type=%s subject=%s link=%s",
         status,
@@ -83,15 +84,16 @@ def send_email(
         to_email,
         email_type,
         subject,
-        action_link,
+        "(redacted)" if is_prod else action_link,
     )
-    print(
-        f"\n=== EMAIL ({status} → email_logs id={row.id}) ===\n"
-        f"To: {to_email}\n"
-        f"Type: {email_type}\n"
-        f"Subject: {subject}\n"
-        f"Link: {action_link or '(none)'}\n"
-        f"{body}\n"
-        f"==============================================\n"
-    )
+    if not is_prod:
+        print(
+            f"\n=== EMAIL ({status} → email_logs id={row.id}) ===\n"
+            f"To: {to_email}\n"
+            f"Type: {email_type}\n"
+            f"Subject: {subject}\n"
+            f"Link: {action_link or '(none)'}\n"
+            f"{body}\n"
+            f"==============================================\n"
+        )
     return row

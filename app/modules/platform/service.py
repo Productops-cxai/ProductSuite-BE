@@ -593,6 +593,8 @@ class PlatformService:
                 )
             )
         rows = query.order_by(EmailLogModel.id.desc()).limit(min(limit, 500)).all()
+        # Production: never return one-time activation/reset URLs to the browser.
+        expose_links = (settings.APP_ENV or "").strip().lower() != "production"
         return [
             {
                 "id": r.id,
@@ -600,7 +602,7 @@ class PlatformService:
                 "subject": r.subject,
                 "body": r.body,
                 "email_type": r.email_type,
-                "action_link": r.action_link,
+                "action_link": r.action_link if expose_links else None,
                 "related_user_id": r.related_user_id,
                 "status": r.status,
                 "created_at": r.created_at,
