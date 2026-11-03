@@ -25,12 +25,7 @@ FIELD_GETTERS: dict[str, Any] = {
     "Outstanding Balance": lambda a, _: float(a.outstanding_balance or 0),
     "Original Balance": lambda a, _: float(a.original_balance or 0),
     "Recovered Amount": lambda a, _: float(a.recovered_balance or 0),
-    "Days Past Due": lambda a, _: int(a.days_past_due or 0),
-    "Last Payment Amount": lambda a, _: float(a.last_payment_amount or 0),
-    "Workflow": lambda a, _: a.current_workflow or "",
     "Channel": lambda _a, ctx: (ctx or {}).get("channel") or "",
-    "Messages Sent (7 days)": lambda a, ctx: (ctx or {}).get("messages_7d", 0),
-    "Dispute Flag": lambda a, _: "Yes" if a.provincial_hold else "No",
 }
 
 

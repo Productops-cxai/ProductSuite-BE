@@ -21,14 +21,9 @@ from app.shared.enums import PayflowRuleLogic, PayflowRuleStatus, PayflowRuleTyp
 RULE_CATEGORIES = [
     "Amount",
     "Collection Attempts",
-    "Payment Status",
     "Payment Activity",
-    "Promise-to-Pay",
     "Payment Plan",
-    "Workflow",
     "Communication",
-    "Customer Risk",
-    "AI Confidence",
 ]
 
 RULE_ACTIONS = [
@@ -45,24 +40,7 @@ RULE_FIELDS = [
     {"label": "Original Balance", "category": "Amount", "type": "currency"},
     {"label": "Recovered Amount", "category": "Amount", "type": "currency"},
     {"label": "Unsuccessful Attempts", "category": "Collection Attempts", "type": "number"},
-    {"label": "Total Contact Attempts", "category": "Collection Attempts", "type": "number"},
-    {"label": "Days Since Last Contact", "category": "Collection Attempts", "type": "number"},
-    {
-        "label": "Payment Status",
-        "category": "Payment Status",
-        "type": "enum",
-        "options": ["Unpaid", "Partially Paid", "Paid", "Failed", "Refunded"],
-    },
-    {"label": "Days Past Due", "category": "Payment Status", "type": "number"},
     {"label": "Failed Payment Attempts", "category": "Payment Activity", "type": "number"},
-    {"label": "Last Payment Amount", "category": "Payment Activity", "type": "currency"},
-    {
-        "label": "Promise-to-Pay Status",
-        "category": "Promise-to-Pay",
-        "type": "enum",
-        "options": ["None", "Active", "Kept", "Broken"],
-    },
-    {"label": "Days Until Promise Date", "category": "Promise-to-Pay", "type": "number"},
     {
         "label": "Payment Plan Status",
         "category": "Payment Plan",
@@ -71,35 +49,11 @@ RULE_FIELDS = [
     },
     {"label": "Missed Installments", "category": "Payment Plan", "type": "number"},
     {
-        "label": "Workflow",
-        "category": "Workflow",
-        "type": "enum",
-        "options": [
-            "Early Stage Collection",
-            "Progressive Reminder",
-            "Promise-to-Pay Follow-Up",
-            "Payment Plan Monitoring",
-            "Escalated Collection",
-        ],
-    },
-    {"label": "Workflow Stage", "category": "Workflow", "type": "text"},
-    {
         "label": "Channel",
         "category": "Communication",
         "type": "enum",
         "options": ["Email", "SMS", "WhatsApp"],
     },
-    {"label": "Messages Sent (7 days)", "category": "Communication", "type": "number"},
-    {"label": "Customer Reply Content", "category": "Communication", "type": "text"},
-    {
-        "label": "Customer Risk Level",
-        "category": "Customer Risk",
-        "type": "enum",
-        "options": ["Low", "Medium", "High"],
-    },
-    {"label": "Dispute Flag", "category": "Customer Risk", "type": "enum", "options": ["Yes", "No"]},
-    {"label": "AI Confidence", "category": "AI Confidence", "type": "percent"},
-    {"label": "AI Recommendation Type", "category": "AI Confidence", "type": "text"},
 ]
 
 
