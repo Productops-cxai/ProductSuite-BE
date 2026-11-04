@@ -45,6 +45,8 @@ def send_email(
 
     is_prod = (settings.APP_ENV or "").strip().lower() == "production"
     provider = getattr(row, "provider_name", "?")
+    # Logger only — never print() here. Windows cp1252 consoles raise
+    # UnicodeEncodeError on arrows/smart quotes and that 500'd person invites.
     logger.info(
         "EMAIL %s provider=%s id=%s to=%s type=%s subject=%s link=%s",
         row.status,
@@ -56,13 +58,10 @@ def send_email(
         "(redacted)" if is_prod else action_link,
     )
     if not is_prod:
-        print(
-            f"\n=== EMAIL ({row.status}/{provider} → email_logs id={row.id}) ===\n"
-            f"To: {to_email}\n"
-            f"Type: {email_type}\n"
-            f"Subject: {subject}\n"
-            f"Link: {action_link or '(none)'}\n"
-            f"{body}\n"
-            f"==============================================\n"
+        logger.info(
+            "EMAIL body id=%s type=%s\n%s",
+            row.id,
+            email_type,
+            body,
         )
     return row
