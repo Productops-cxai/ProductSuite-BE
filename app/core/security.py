@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
@@ -57,9 +58,22 @@ def safe_decode_token(token: str) -> Optional[dict[str, Any]]:
 
 
 def validate_password_policy(password: str) -> Optional[str]:
+    """Require min length, uppercase, digit, and special character."""
+    missing: list[str] = []
     if len(password) < settings.PASSWORD_MIN_LENGTH:
-        return f"Password must be at least {settings.PASSWORD_MIN_LENGTH} characters"
-    return None
+        missing.append(f"at least {settings.PASSWORD_MIN_LENGTH} characters")
+    if not re.search(r"[A-Z]", password):
+        missing.append("at least 1 uppercase letter")
+    if not re.search(r"[0-9]", password):
+        missing.append("at least 1 number")
+    if not re.search(r"[^A-Za-z0-9]", password):
+        missing.append("at least 1 special character")
+    if not missing:
+        return None
+    if len(missing) == 1:
+        return f"Password must include {missing[0]}"
+    return f"Password must include {', '.join(missing[:-1])} and {missing[-1]}"
+
 
 
 def as_uuid(value: str | UUID) -> UUID:
