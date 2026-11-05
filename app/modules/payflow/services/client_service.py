@@ -1826,17 +1826,21 @@ class PayflowClientService:
                 note = number
                 if setup_issues:
                     note = f"{number} · Setup incomplete: {'; '.join(setup_issues)}"
+                    # Draft ≠ Rejected: client imported successfully; remaining
+                    # onboarding is a warning (Complete Setup), not a failed row.
+                    err_body = "\n".join(setup_issues)
+                    if entity_id:
+                        err_body = f"{err_body}\n__client_id__={entity_id}"
                     errors.append(
                         {
                             "record_id": record_id,
                             "client": name or code or "—",
                             "sub_client": "—",
                             "field": "setup",
-                            "error": (
-                                "Client will import as Draft with remaining setup: "
-                                + "; ".join(setup_issues)
-                            ),
-                            "status": "Attention",
+                            "error": err_body,
+                            "status": "Draft",
+                            "client_id": entity_id,
+                            "setup_issues": setup_issues,
                         }
                     )
                 preview_masters.append(
