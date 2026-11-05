@@ -310,17 +310,24 @@ CRM_INBOUND_FIELDS: list[CrmFieldDef] = [
     {
         "source_field": "CLIENT_CODE",
         "payflow_field": "client_code",
-        "meaning": "Must match an existing PayFlow client code. Daily file does not create clients.",
+        "meaning": (
+            "Account↔Client link — must match an existing PayFlow client code "
+            "(Client.code). Canaccede Accounts often put this value in a column "
+            "named Client Number. Daily file does not create clients."
+        ),
         "required": True,
-        "sample_value": "paypal",
+        "sample_value": "PAYP3P",
         "group": "Client and Portfolio",
         "available": "Yes",
     },
     {
         "source_field": "SUB_CLIENT_CODE",
         "payflow_field": "sub_client_code",
-        "meaning": "Must match an existing portfolio code under the client.",
-        "required": True,
+        "meaning": (
+            "Optional. When set, must match an existing portfolio code under the client. "
+            "Blank = parent-level account."
+        ),
+        "required": False,
         "sample_value": "paypal-loans",
         "group": "Client and Portfolio",
         "available": "Yes",
@@ -1128,7 +1135,9 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "case_id": "crm_case_id",
 }
 
-# When CRM provides client_number, these PayFlow columns may be resolved/defaulted per row.
+# When CRM provides client_number / Client Number, these PayFlow columns may be
+# resolved/defaulted per row. That column value is matched to Client.code first
+# (Canaccede account dumps), then CRM client_number.
 ACCOUNT_CRM_RESOLVABLE_REQUIRED: tuple[str, ...] = (
     "client_code",
     "product_code",
@@ -1173,7 +1182,10 @@ CRM_FILE_BEHAVIOUR: dict = {
         "missing_from_file": "leave_unchanged",
         "identifiers": {
             "account": ["account_id (matched with client_id as account_reference)"],
-            "client": ["client_code", "client_number (CRM)"],
+            "client": [
+                "client_code (preferred — Account↔Client link)",
+                "client_number / Client Number (resolves via client_code first, then CRM number)",
+            ],
             "sub_client": ["sub_client_code"],
         },
         "historical_preservation": [

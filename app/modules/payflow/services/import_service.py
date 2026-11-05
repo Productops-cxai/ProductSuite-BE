@@ -778,7 +778,9 @@ class PayflowImportService:
         readme.append(["Frequency: daily. Mode: upsert/refresh (not delete)."])
         readme.append([
             "Sheet Accounts, header row 1. Clients must already exist. "
-            "sub_client_code is optional — blank attaches the account to the parent client."
+            "Link accounts by client_code (PayFlow Client.code). "
+            "Canaccede 'Client Number' / client_number also resolves via client_code first, "
+            "then CRM client_number. sub_client_code is optional — blank = parent-level."
         ])
         readme.append(["Match key: client_code + account_id. Missing accounts in this file are left unchanged (not deleted)."])
         readme.append(["original_balance is applied only when creating an account."])
@@ -1133,6 +1135,9 @@ class PayflowImportService:
 
         Accepts snake_case dumps and Canaccede-style Title Case labels
         (e.g. Client Number, Outstanding Balance) without touching client import.
+
+        Note: Canaccede Accounts "Client Number" often holds PayFlow client_code
+        values (e.g. PAYP3P), not formal CRM numbers — resolution prefers code.
         """
         normalized: list[str] = []
         seen: set[str] = set()
@@ -1159,7 +1164,8 @@ class PayflowImportService:
     ) -> tuple[dict[str, int], list[tuple[Any, ...]]]:
         headers = self._normalize_account_headers(headers)
         required = list(ACCOUNT_IMPORT_REQUIRED)
-        # Debtor dump style: client_number resolves client/sub-client; other fields default.
+        # Debtor dump style: client_number / Client Number resolves via client_code
+        # (preferred) or CRM number; other fields may default.
         if "client_number" in headers:
             required = [h for h in required if h not in ACCOUNT_CRM_RESOLVABLE_REQUIRED]
         missing = [h for h in required if h not in headers]
@@ -1185,6 +1191,20 @@ class PayflowImportService:
             for p in portfolios
             if (p.crm_client_number or "").strip()
         }
+        # Unique portfolio codes only — ambiguous codes are omitted from this map.
+        port_by_code: dict[str, PayflowPortfolioModel] = {}
+        ambiguous_port_codes: set[str] = set()
+        for p in portfolios:
+            if not p.code:
+                continue
+            ck = p.code.lower()
+            if ck in ambiguous_port_codes:
+                continue
+            if ck in port_by_code:
+                del port_by_code[ck]
+                ambiguous_port_codes.add(ck)
+            else:
+                port_by_code[ck] = p
         ports_by_client: dict[int, list[PayflowPortfolioModel]] = {}
         for p in portfolios:
             ports_by_client.setdefault(p.client_id, []).append(p)
@@ -1193,6 +1213,7 @@ class PayflowImportService:
             "by_crm": by_crm,
             "port_by_key": port_by_key,
             "port_by_crm": port_by_crm,
+            "port_by_code": port_by_code,
             "ports_by_client": ports_by_client,
             "clients_by_id": {c.id: c for c in clients},
         }
@@ -1200,10 +1221,18 @@ class PayflowImportService:
     def _resolve_client_hierarchy(
         self, parsed: dict[str, Any], lookups: dict[str, Any]
     ) -> None:
-        """Fill client_code / optional sub_client_code from CRM client_number when needed.
+        """Fill client_code / optional sub_client_code when the row omits client_code.
 
-        Blank sub_client_code = parent-level account (portfolio_id null). Sub-clients
-        are optional — only required when the row targets a specific portfolio.
+        Account ↔ Client linkage is always by PayFlow client_code (Client.code).
+        Canaccede Accounts often put that code in a column named Client Number /
+        client_number (e.g. PAYP3P). Resolution order when only that column is set:
+
+        1. Client.code (preferred — real Canaccede account dumps)
+        2. Portfolio.code (unique sub-client code)
+        3. Portfolio.crm_client_number
+        4. Client.crm_client_number (formal CRM number dumps)
+
+        Blank sub_client_code = parent-level account (portfolio_id null).
         """
         client_code = (parsed.get("client_code") or "").strip()
         sub_code = (parsed.get("sub_client_code") or "").strip()
@@ -1218,6 +1247,27 @@ class PayflowImportService:
                 "client_code is required (or provide client_number)"
             )
         key = crm_num.lower()
+
+        # 1) Prefer client_code — Accounts "Client Number" usually holds codes.
+        client = lookups["by_code"].get(key)
+        if client is not None:
+            parsed["client_code"] = client.code
+            parsed["sub_client_code"] = sub_code
+            return
+
+        # 2) Unique portfolio/sub-client code → attach under that portfolio.
+        port = lookups["port_by_code"].get(key)
+        if port is not None:
+            client = lookups["clients_by_id"].get(port.client_id)
+            if not client:
+                raise ValidationAppError(
+                    "Unknown Client — portfolio code is not linked to a PayFlow client."
+                )
+            parsed["client_code"] = client.code
+            parsed["sub_client_code"] = sub_code or port.code
+            return
+
+        # 3) Formal CRM number on a portfolio (sub-client).
         port = lookups["port_by_crm"].get(key)
         if port is not None:
             client = lookups["clients_by_id"].get(port.client_id)
@@ -1229,14 +1279,16 @@ class PayflowImportService:
             # Sub-client number in file → that portfolio; otherwise keep any explicit sub code.
             parsed["sub_client_code"] = sub_code or port.code
             return
+
+        # 4) Formal CRM number on a master client.
         client = lookups["by_crm"].get(key)
         if client is not None:
-            # Master client_number → parent-level unless sub_client_code was provided.
             parsed["client_code"] = client.code
             parsed["sub_client_code"] = sub_code
             return
+
         raise ValidationAppError(
-            "Unknown Client — this client_number has not been set up in PayFlow."
+            "Unknown Client — this client_code / client_number has not been set up in PayFlow."
         )
 
     def _load_account_csv(
