@@ -1792,12 +1792,6 @@ class PayflowClientService:
                     created += 1
                     new_clients += 1
 
-                has_subs_in_file = any(
-                    not _truthy(r.get("is_master_client"))
-                    and (r.get("master_client__client_number") or "").strip().lower()
-                    == number.lower()
-                    for r in data_rows
-                )
                 setup_issues: list[str] = []
                 if entity_id and not dry_run:
                     live = (
@@ -1807,24 +1801,10 @@ class PayflowClientService:
                     )
                     if live is not None:
                         setup_issues = self._setup_issue_messages(live)
-                        if has_subs_in_file:
-                            setup_issues = [
-                                i
-                                for i in setup_issues
-                                if "sub-clients / portfolios" not in i.lower()
-                            ]
                 elif existing is not None:
                     setup_issues = self._setup_issue_messages(existing)
-                    if has_subs_in_file:
-                        setup_issues = [
-                            i
-                            for i in setup_issues
-                            if "sub-clients / portfolios" not in i.lower()
-                        ]
                 else:
-                    setup_issues = self._simulate_setup_issues_after_file_import(
-                        payload, has_subs_in_file=has_subs_in_file
-                    )
+                    setup_issues = self._simulate_setup_issues_after_file_import(payload)
 
                 # Only accept identity after validation/create path succeeds
                 seen_numbers.add(number.lower())
@@ -3259,12 +3239,14 @@ class PayflowClientService:
             {
                 "key": "portfolios",
                 "label": "Sub-Clients / Portfolios",
+                # Optional: complete when present; otherwise pending but never required.
                 "status": (
                     PayflowOnboardingStepStatus.COMPLETE.value
                     if portfolio_count > 0
                     else PayflowOnboardingStepStatus.PENDING.value
                 ),
                 "informational": True,
+                "optional": True,
             },
             {
                 "key": "data_source",
@@ -3333,23 +3315,18 @@ class PayflowClientService:
                 issues.append("SMS sender ID is required when SMS is enabled")
         return issues
 
-    def _setup_issue_messages(
-        self, client: PayflowClientModel, *, include_informational: bool = True
-    ) -> list[str]:
-        """Concrete remaining setup issues across all config tabs (for grid / header)."""
+    def _setup_issue_messages(self, client: PayflowClientModel) -> list[str]:
+        """Concrete remaining setup issues across all config tabs (for grid / header).
+
+        Sub-clients / portfolios are optional — accounts may sit on the parent client,
+        so missing portfolios are never emitted as setup warnings.
+        """
         issues: list[str] = []
         progress = self._onboarding_progress(client)
         by_key = {s["key"]: s for s in progress["steps"]}
 
         for msg in self._profile_issues(client):
             issues.append(f"Client Profile: {msg}")
-
-        if include_informational:
-            port_status = by_key.get("portfolios", {}).get("status")
-            if port_status != PayflowOnboardingStepStatus.COMPLETE.value:
-                issues.append(
-                    "Sub-Clients / Portfolios: add at least one sub-client (optional but recommended)"
-                )
 
         if by_key.get("data_source", {}).get("status") != PayflowOnboardingStepStatus.COMPLETE.value:
             issues.append("Data Source: select and connect a primary data source")
@@ -3391,8 +3368,6 @@ class PayflowClientService:
     def _simulate_setup_issues_after_file_import(
         self,
         payload: dict[str, Any],
-        *,
-        has_subs_in_file: bool = False,
     ) -> list[str]:
         """Expected remaining issues for a master created/updated from CRM file (defaults)."""
         client_type = _parse_client_type_soft(payload.get("client_type"))
@@ -3436,10 +3411,6 @@ class PayflowClientService:
         for msg in self._branding_issues(stub):
             issues.append(f"Branding & Channels: {msg}")
         issues.append("Supervisor Assignment: assign at least one supervisor")
-        if not has_subs_in_file:
-            issues.append(
-                "Sub-Clients / Portfolios: add at least one sub-client (optional but recommended)"
-            )
         issues.append(
             "Review & Activation: finish required setup, then activate the client"
         )
@@ -3494,11 +3465,12 @@ class PayflowClientService:
             )
 
         progress = self._onboarding_progress(client)
-        # All journey steps still open (Data Mapping is not in steps).
+        # Required journey steps only — informational portfolios never count as remaining.
         incomplete = [
             s["label"]
             for s in progress["steps"]
-            if s.get("status") != PayflowOnboardingStepStatus.COMPLETE.value
+            if not s.get("informational")
+            and s.get("status") != PayflowOnboardingStepStatus.COMPLETE.value
         ]
         setup_issues = self._setup_issue_messages(client)
         return {
@@ -3525,7 +3497,7 @@ class PayflowClientService:
             "supervisors": supervisors,
             "setup_incomplete": incomplete,
             "setup_issues": setup_issues,
-            "setup_steps_remaining": max(len(incomplete), len(setup_issues)),
+            "setup_steps_remaining": len(incomplete),
             "onboarding": progress,
             "added_through": client.added_through
             or PayflowClientAddedThrough.ADD_CLIENT.value,

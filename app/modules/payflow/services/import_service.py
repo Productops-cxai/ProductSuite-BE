@@ -776,7 +776,10 @@ class PayflowImportService:
         readme = wb.create_sheet("README")
         readme.append(["PayFlow daily CRM account file"])
         readme.append(["Frequency: daily. Mode: upsert/refresh (not delete)."])
-        readme.append(["Sheet Accounts, header row 1. Clients and sub-clients must already exist."])
+        readme.append([
+            "Sheet Accounts, header row 1. Clients must already exist. "
+            "sub_client_code is optional — blank attaches the account to the parent client."
+        ])
         readme.append(["Match key: client_code + account_id. Missing accounts in this file are left unchanged (not deleted)."])
         readme.append(["original_balance is applied only when creating an account."])
         readme.append(["Negative outstanding_balance values are coerced to absolute value per CRM contract."])
@@ -838,11 +841,15 @@ class PayflowImportService:
                 client = clients.get(parsed["client_code"].lower())
                 if not client:
                     raise ValidationAppError("Unknown Client — this client has not been set up in PayFlow.")
-                portfolio = portfolios_by_key.get((client.id, parsed["sub_client_code"].lower()))
-                if not portfolio:
-                    raise ValidationAppError(
-                        "Unknown Sub-Client — this portfolio does not exist for the Client."
-                    )
+                sub_code = (parsed.get("sub_client_code") or "").strip()
+                parsed["sub_client_code"] = sub_code
+                portfolio = None
+                if sub_code:
+                    portfolio = portfolios_by_key.get((client.id, sub_code.lower()))
+                    if not portfolio:
+                        raise ValidationAppError(
+                            "Unknown Sub-Client — this portfolio does not exist for the Client."
+                        )
 
                 existing = (
                     self.db.query(PayflowAccountModel)
@@ -852,7 +859,8 @@ class PayflowImportService:
                     )
                     .first()
                 )
-                action_key = self._classify_account_action(existing, parsed, portfolio.id)
+                portfolio_id = portfolio.id if portfolio else None
+                action_key = self._classify_account_action(existing, parsed, portfolio_id)
                 if action_key == "created":
                     created += 1
                     action_label = "Create"
@@ -868,7 +876,7 @@ class PayflowImportService:
                         self._preview_account_row(
                             parsed,
                             client.name,
-                            portfolio.name,
+                            portfolio.name if portfolio else "—",
                             action_label,
                             existing,
                         )
@@ -987,11 +995,15 @@ class PayflowImportService:
                 client = clients.get(parsed["client_code"].lower())
                 if not client:
                     raise ValidationAppError("Unknown Client — this client has not been set up in PayFlow.")
-                portfolio = portfolios_by_key.get((client.id, parsed["sub_client_code"].lower()))
-                if not portfolio:
-                    raise ValidationAppError(
-                        "Unknown Sub-Client — this portfolio does not exist for the Client."
-                    )
+                sub_code = (parsed.get("sub_client_code") or "").strip()
+                parsed["sub_client_code"] = sub_code
+                portfolio = None
+                if sub_code:
+                    portfolio = portfolios_by_key.get((client.id, sub_code.lower()))
+                    if not portfolio:
+                        raise ValidationAppError(
+                            "Unknown Sub-Client — this portfolio does not exist for the Client."
+                        )
 
                 existing = (
                     self.db.query(PayflowAccountModel)
@@ -1008,7 +1020,8 @@ class PayflowImportService:
                     updated += 1
                 else:
                     unchanged += 1
-                touched_portfolios.add((client.id, portfolio.id))
+                if portfolio is not None:
+                    touched_portfolios.add((client.id, portfolio.id))
             except ValidationAppError as exc:
                 failed += 1
                 self.db.add(
@@ -1177,13 +1190,22 @@ class PayflowImportService:
     def _resolve_client_hierarchy(
         self, parsed: dict[str, Any], lookups: dict[str, Any]
     ) -> None:
-        """Fill client_code / sub_client_code from CRM client_number when needed."""
-        if parsed.get("client_code") and parsed.get("sub_client_code"):
+        """Fill client_code / optional sub_client_code from CRM client_number when needed.
+
+        Blank sub_client_code = parent-level account (portfolio_id null). Sub-clients
+        are optional — only required when the row targets a specific portfolio.
+        """
+        client_code = (parsed.get("client_code") or "").strip()
+        sub_code = (parsed.get("sub_client_code") or "").strip()
+        if client_code:
+            parsed["client_code"] = client_code
+            parsed["sub_client_code"] = sub_code
             return
+
         crm_num = (parsed.get("client_number") or "").strip()
         if not crm_num:
             raise ValidationAppError(
-                "client_code and sub_client_code are required (or provide client_number)"
+                "client_code is required (or provide client_number)"
             )
         key = crm_num.lower()
         port = lookups["port_by_crm"].get(key)
@@ -1194,23 +1216,15 @@ class PayflowImportService:
                     "Unknown Client — portfolio client_number is not linked to a PayFlow client."
                 )
             parsed["client_code"] = client.code
-            parsed["sub_client_code"] = port.code
+            # Sub-client number in file → that portfolio; otherwise keep any explicit sub code.
+            parsed["sub_client_code"] = sub_code or port.code
             return
         client = lookups["by_crm"].get(key)
         if client is not None:
-            ports = lookups["ports_by_client"].get(client.id) or []
-            if len(ports) == 1:
-                parsed["client_code"] = client.code
-                parsed["sub_client_code"] = ports[0].code
-                return
-            if not ports:
-                raise ValidationAppError(
-                    "Unknown Sub-Client — this client has no portfolio in PayFlow."
-                )
-            raise ValidationAppError(
-                "client_number matches a master client with multiple portfolios; "
-                "provide sub_client_code or import the sub-client number."
-            )
+            # Master client_number → parent-level unless sub_client_code was provided.
+            parsed["client_code"] = client.code
+            parsed["sub_client_code"] = sub_code
+            return
         raise ValidationAppError(
             "Unknown Client — this client_number has not been set up in PayFlow."
         )
@@ -1262,7 +1276,7 @@ class PayflowImportService:
         self,
         existing: PayflowAccountModel | None,
         parsed: dict[str, Any],
-        portfolio_id: int,
+        portfolio_id: int | None,
     ) -> str:
         if existing is None:
             return "created"
@@ -1281,13 +1295,14 @@ class PayflowImportService:
         account_id = parsed["account_id"]
         current = float(existing.outstanding_balance) if existing else None
         incoming = float(parsed["outstanding_balance"])
+        sub_code = (parsed.get("sub_client_code") or "").strip() or "—"
         return {
             "id": account_id,
             "record_id": account_id,
             "client": parsed["client_code"],
-            "sub_client": parsed["sub_client_code"],
+            "sub_client": sub_code,
             "client_name": client_name,
-            "sub_client_name": portfolio_name,
+            "sub_client_name": portfolio_name or "—",
             "action": action_label,
             "current_balance": current,
             "incoming_balance": incoming,
@@ -1608,18 +1623,19 @@ class PayflowImportService:
         self,
         existing: PayflowAccountModel | None,
         client: PayflowClientModel,
-        portfolio: PayflowPortfolioModel,
+        portfolio: PayflowPortfolioModel | None,
         parsed: dict[str, Any],
     ) -> str:
         now = _now()
         stamp = now.strftime("%d %b %Y, %H:%M")
+        portfolio_id = portfolio.id if portfolio is not None else None
         incoming_original = parsed["original_balance"]
         if existing is None:
             original = incoming_original if incoming_original is not None else parsed["outstanding_balance"]
             recovered = max(0.0, float(original) - float(parsed["outstanding_balance"]))
             row = PayflowAccountModel(
                 client_id=client.id,
-                portfolio_id=portfolio.id,
+                portfolio_id=portfolio_id,
                 customer_name=parsed["customer_name"],
                 account_reference=parsed["account_id"],
                 case_reference=f"CASE-{parsed['account_id']}-01",
@@ -1649,7 +1665,7 @@ class PayflowImportService:
             self._ensure_human_review_request(row)
             return "created"
 
-        if self._is_unchanged(existing, parsed, portfolio.id):
+        if self._is_unchanged(existing, parsed, portfolio_id):
             existing.last_crm_refresh_at = now
             return "unchanged"
 
@@ -1658,7 +1674,7 @@ class PayflowImportService:
         previous_hold = bool(existing.provincial_hold)
 
         original = float(existing.original_balance or 0)
-        existing.portfolio_id = portfolio.id
+        existing.portfolio_id = portfolio_id
         existing.customer_name = parsed["customer_name"]
         existing.outstanding_balance = float(parsed["outstanding_balance"])
         existing.recovered_balance = max(0.0, original - existing.outstanding_balance)
@@ -1769,7 +1785,9 @@ class PayflowImportService:
         row.email_consent = parsed["email_consent"]
         row.source_updated_at = parsed["source_updated_at"]
 
-    def _is_unchanged(self, row: PayflowAccountModel, parsed: dict[str, Any], portfolio_id: int) -> bool:
+    def _is_unchanged(
+        self, row: PayflowAccountModel, parsed: dict[str, Any], portfolio_id: int | None
+    ) -> bool:
         checks: list[tuple[Any, Any]] = [
             (row.portfolio_id, portfolio_id),
             (row.customer_name, parsed["customer_name"]),
@@ -1894,10 +1912,4 @@ def seed_demo_portfolios(db: Session) -> None:
             )
         )
     db.flush()
-    first_by_client: dict[int, PayflowPortfolioModel] = {}
-    for p in db.query(PayflowPortfolioModel).order_by(PayflowPortfolioModel.id).all():
-        first_by_client.setdefault(p.client_id, p)
-    for account in db.query(PayflowAccountModel).filter(PayflowAccountModel.portfolio_id.is_(None)).all():
-        first = first_by_client.get(account.client_id)
-        if first:
-            account.portfolio_id = first.id
+    # Parent-level accounts (portfolio_id null) are valid — do not force-assign a portfolio.
