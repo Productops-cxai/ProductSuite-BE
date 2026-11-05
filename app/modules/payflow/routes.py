@@ -5,7 +5,8 @@ from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, Uplo
 from fastapi.responses import Response
 
 from app.core.deps import DbSession
-from app.core.exceptions import AppError, NotFoundError
+from app.core.exceptions import AppError, ForbiddenError, NotFoundError
+from app.infrastructure.database.models import UserModel
 from app.modules.payflow.deps import (
     PayflowAccessContext,
     PayflowCreateClient,
@@ -138,6 +139,67 @@ def _map_error(exc: AppError) -> HTTPException:
         "service_unavailable": status.HTTP_502_BAD_GATEWAY,
     }
     return HTTPException(status_code=code_map.get(exc.code, 400), detail=exc.message)
+
+
+_CLIENT_AI_FIELDS = frozenset({"ai_mode"})
+_CLIENT_GOVERNANCE_FIELDS = frozenset({"governance_rules"})
+_CLIENT_ASSIGNMENT_FIELDS = frozenset({"supervisor_user_ids"})
+
+
+def _assert_view_client(access: AccessContextService, user: UserModel, client_id: int) -> None:
+    """List and detail share the same bar: assignment + view_client."""
+    if not access.can(user, "view_client", client_id):
+        raise ForbiddenError("Client access denied")
+
+
+def _assert_client_update_fields(
+    access: AccessContextService,
+    user: UserModel,
+    client_id: int,
+    data: dict,
+) -> None:
+    """edit_client covers all fields; otherwise enforce modify_* / assignment rules."""
+    if not access.can_see_client(user, client_id):
+        raise ForbiddenError("Client access denied")
+    keys = set(data.keys())
+    if not keys:
+        return
+    has_edit = access.can(user, "edit_client", client_id)
+    if keys & _CLIENT_AI_FIELDS and not (
+        has_edit or access.can(user, "modify_ai_mode", client_id)
+    ):
+        raise ForbiddenError("Permission required: edit_client or modify_ai_mode")
+    if keys & _CLIENT_GOVERNANCE_FIELDS and not (
+        has_edit or access.can(user, "modify_governance", client_id)
+    ):
+        raise ForbiddenError("Permission required: edit_client or modify_governance")
+    if keys & _CLIENT_ASSIGNMENT_FIELDS and not has_edit:
+        raise ForbiddenError("Permission required: edit_client")
+    config_keys = keys - _CLIENT_AI_FIELDS - _CLIENT_GOVERNANCE_FIELDS - _CLIENT_ASSIGNMENT_FIELDS
+    if config_keys and not (
+        has_edit or access.can(user, "modify_client_configuration", client_id)
+    ):
+        raise ForbiddenError(
+            "Permission required: edit_client or modify_client_configuration"
+        )
+
+
+def _scoped_client_ids_for_view_workflows(
+    access: AccessContextService,
+    user: UserModel,
+    client_id: int | None,
+) -> list[int] | None:
+    """None = unrestricted (ops). Otherwise intersection of assignment + optional filter."""
+    if not access.can(user, "view_workflows"):
+        raise ForbiddenError("Permission required: view_workflows")
+    if access.is_operations_admin(user):
+        return [client_id] if client_id is not None else None
+    allowed = [cid for cid in (access.build_context(user).get("client_ids") or []) if cid]
+    if client_id is not None:
+        if client_id not in allowed or not access.can(user, "view_workflows", client_id):
+            raise ForbiddenError("Client access denied")
+        return [client_id]
+    return allowed
 
 
 @router.get("/health")
@@ -355,8 +417,7 @@ def create_client(payload: CreatePayflowClientRequest, _: PayflowCreateClient, d
 def get_client(client_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         access = AccessContextService(db)
-        if not access.can_see_client(user, client_id):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied")
+        _assert_view_client(access, user, client_id)
         return PayflowClientService(db).get_client(client_id)
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -366,13 +427,15 @@ def get_client(client_id: int, user: RequirePayflowProduct, db: DbSession):
 def update_client(
     client_id: int,
     payload: UpdatePayflowClientRequest,
-    _: PayflowEditClient,
+    user: RequirePayflowProduct,
     db: DbSession,
 ):
     try:
         data = payload.model_dump(exclude_unset=True)
         if "supervisor_user_ids" in data and data["supervisor_user_ids"] is not None:
             data["supervisor_user_ids"] = [str(u) for u in data["supervisor_user_ids"]]
+        access = AccessContextService(db)
+        _assert_client_update_fields(access, user, client_id, data)
         return PayflowClientService(db).update_client(client_id, data)
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -424,8 +487,7 @@ def activate_client(
 def list_portfolios(client_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         access = AccessContextService(db)
-        if not access.can_see_client(user, client_id):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied")
+        _assert_view_client(access, user, client_id)
         return PayflowClientService(db).list_portfolios(client_id)
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -435,8 +497,7 @@ def list_portfolios(client_id: int, user: RequirePayflowProduct, db: DbSession):
 def get_portfolio(client_id: int, portfolio_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         access = AccessContextService(db)
-        if not access.can_see_client(user, client_id):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied")
+        _assert_view_client(access, user, client_id)
         return PayflowClientService(db).get_portfolio(client_id, portfolio_id)
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -567,7 +628,7 @@ def list_accounts(
 
 
 @router.post("/accounts/{account_id}/ai-reassess")
-def reassess_account_ai(account_id: int, user: RequirePayflowProduct, db: DbSession):
+def reassess_account_ai(account_id: int, user: PayflowManageWorkflows, db: DbSession):
     """Case-level AI reassessment (not portfolio Suggest). Writes ai_decision_context."""
     try:
         from app.infrastructure.database.models import PayflowAccountModel
@@ -575,7 +636,7 @@ def reassess_account_ai(account_id: int, user: RequirePayflowProduct, db: DbSess
             CaseReassessmentService,
         )
 
-        # Permission + scope check via existing account get.
+        # create_edit_workflows (Depends) + account assignment/view scope.
         PayflowAccountService(db).get_account(user, account_id)
         account = db.get(PayflowAccountModel, account_id)
         if account is None:
@@ -1738,17 +1799,23 @@ def list_workflow_worker_logs(
 ):
     from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
 
-    items = WorkflowExecutionService(db).list_worker_logs(
-        client_id=client_id,
-        portfolio_id=portfolio_id,
-        account_id=account_id,
-        strategy_id=strategy_id,
-        event_type=event_type,
-        level=level,
-        search=search,
-        limit=limit,
-    )
-    return {"items": items}
+    try:
+        access = AccessContextService(db)
+        allowed = _scoped_client_ids_for_view_workflows(access, user, client_id)
+        items = WorkflowExecutionService(db).list_worker_logs(
+            client_id=client_id,
+            portfolio_id=portfolio_id,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            event_type=event_type,
+            level=level,
+            search=search,
+            limit=limit,
+            allowed_client_ids=allowed,
+        )
+        return {"items": items}
+    except AppError as exc:
+        raise _map_error(exc) from exc
 
 
 @router.get("/workflow-runs", response_model=PayflowWorkflowRunsResponse)
@@ -1763,25 +1830,41 @@ def list_workflow_runs(
 ):
     from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
 
-    items = WorkflowExecutionService(db).list_runs(
-        client_id=client_id,
-        strategy_id=strategy_id,
-        account_id=account_id,
-        status=status_filter,
-        limit=limit,
-    )
-    return {"items": items}
+    try:
+        access = AccessContextService(db)
+        allowed = _scoped_client_ids_for_view_workflows(access, user, client_id)
+        items = WorkflowExecutionService(db).list_runs(
+            client_id=client_id,
+            strategy_id=strategy_id,
+            account_id=account_id,
+            status=status_filter,
+            limit=limit,
+            allowed_client_ids=allowed,
+        )
+        return {"items": items}
+    except AppError as exc:
+        raise _map_error(exc) from exc
 
 
 @router.get("/workflow-runs/{run_id}", response_model=PayflowWorkflowRunItem)
 def get_workflow_run(run_id: int, user: RequirePayflowProduct, db: DbSession):
-    from app.core.exceptions import NotFoundError
     from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
 
-    item = WorkflowExecutionService(db).get_run(run_id)
-    if not item:
-        raise _map_error(NotFoundError("Workflow run not found"))
-    return item
+    try:
+        access = AccessContextService(db)
+        if not access.can(user, "view_workflows"):
+            raise ForbiddenError("Permission required: view_workflows")
+        item = WorkflowExecutionService(db).get_run(run_id)
+        if not item:
+            raise NotFoundError("Workflow run not found")
+        run_client_id = item.get("client_id")
+        if run_client_id is not None and not access.can(
+            user, "view_workflows", int(run_client_id)
+        ):
+            raise ForbiddenError("Client access denied")
+        return item
+    except AppError as exc:
+        raise _map_error(exc) from exc
 
 
 # ---------------------------------------------------------------------------

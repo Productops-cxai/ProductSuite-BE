@@ -1878,8 +1878,13 @@ class WorkflowExecutionService:
         search: str | None = None,
         limit: int = 200,
         group: bool = True,
+        allowed_client_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         q = self.db.query(PayflowWorkflowWorkerLogModel)
+        if allowed_client_ids is not None:
+            if not allowed_client_ids:
+                return []
+            q = q.filter(PayflowWorkflowWorkerLogModel.client_id.in_(allowed_client_ids))
         if client_id is not None:
             q = q.filter(PayflowWorkflowWorkerLogModel.client_id == client_id)
         if portfolio_id is not None:
@@ -2002,8 +2007,13 @@ class WorkflowExecutionService:
         account_id: int | None = None,
         status: str | None = None,
         limit: int = 100,
+        allowed_client_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         q = self.db.query(PayflowWorkflowRunModel)
+        if allowed_client_ids is not None:
+            if not allowed_client_ids:
+                return []
+            q = q.filter(PayflowWorkflowRunModel.client_id.in_(allowed_client_ids))
         if client_id is not None:
             q = q.filter(PayflowWorkflowRunModel.client_id == client_id)
         if strategy_id is not None:
