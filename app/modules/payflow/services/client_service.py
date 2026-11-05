@@ -1443,10 +1443,17 @@ class PayflowClientService:
             for p in result.get("preview", [])
             if p.get("action") in ("Create", "Update") and p.get("entity_id")
         ]
+        # Keep hierarchy fields (status/field/setup_issues/client_id) so Draft
+        # setup warnings are not flattened into legacy Rejected/{row,code,message}.
         result["errors"] = [
             {
+                **e,
                 "row": e.get("record_id"),
-                "code": e.get("sub_client") if e.get("sub_client") not in (None, "—") else e.get("client"),
+                "code": (
+                    e.get("sub_client")
+                    if e.get("sub_client") not in (None, "—")
+                    else e.get("client")
+                ),
                 "message": e.get("error"),
             }
             for e in result.get("errors", [])
