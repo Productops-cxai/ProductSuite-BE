@@ -17,8 +17,8 @@ from app.modules.payflow.services.workflow_suggestion.config import REASONING_LA
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
     load_payment_options,
-    load_portfolio_accounts,
     load_rules,
+    load_suggest_scope,
 )
 from app.modules.payflow.services.workflow_suggestion.learning import (
     learned_from,
@@ -69,24 +69,32 @@ class WorkflowSuggestionService:
         # Reuse workflow access rules so suggestions follow the same permissions.
         self.strategies = PayflowStrategyService(db)
 
-    def preview_segments(self, user: UserModel, client_id: int, portfolio_id: int) -> dict[str, Any]:
+    def preview_segments(
+        self, user: UserModel, client_id: int, portfolio_id: int | None
+    ) -> dict[str, Any]:
         self.strategies._assert_view(user, client_id)
-        portfolio, accounts = load_portfolio_accounts(self.db, client_id, portfolio_id)
+        scope, accounts = load_suggest_scope(self.db, client_id, portfolio_id)
         return {
             "client_id": client_id,
-            "portfolio_id": portfolio.id,
-            "portfolio_name": portfolio.name,
+            "portfolio_id": scope.id,
+            "portfolio_name": scope.name,
             **build_segments(accounts),
         }
 
-    def suggest_workflows(self, user: UserModel, client_id: int, portfolio_id: int) -> dict[str, Any]:
+    def suggest_workflows(
+        self, user: UserModel, client_id: int, portfolio_id: int | None
+    ) -> dict[str, Any]:
         self.strategies._assert_manage(user, client_id)
         client = load_client_context(self.db, client_id)
-        portfolio, accounts = load_portfolio_accounts(self.db, client_id, portfolio_id)
+        scope, accounts = load_suggest_scope(self.db, client_id, portfolio_id)
         rules = load_rules(self.db, client_id)
         segments = build_segments(accounts)["segments"]
         if not segments:
-            raise ValidationAppError("This portfolio has no accounts that need a workflow")
+            raise ValidationAppError(
+                "No accounts that need a workflow"
+                if portfolio_id is None
+                else "This portfolio has no accounts that need a workflow"
+            )
         limits = design_limits(client, rules)
         # This client's past reviews: example workflows + lessons (same client only).
         learning = load_client_learning(self.db, client_id, limits)
@@ -96,12 +104,12 @@ class WorkflowSuggestionService:
         learned: dict[str, list[dict[str, str]]] = {}  # segment_id → "Learned from" ai_context line
         for batch in _batches(segments):
             # Chosen per AI call: what is "similar" depends on the segments in this call.
-            examples = pick_examples(learning["pool"], batch, portfolio.id)
+            examples = pick_examples(learning["pool"], batch, scope.id)
             lessons = pick_lessons(learning["lessons"], batch)
             workflows.update(
                 self._suggest_batch(
                     client,
-                    portfolio.name,
+                    scope.name,
                     batch,
                     limits,
                     client_examples=[item["example"] for item in examples],
@@ -131,7 +139,7 @@ class WorkflowSuggestionService:
                     self._save(
                         user,
                         client["id"],
-                        portfolio.id,
+                        scope.id,
                         workflow,
                         segment=segment["segment"],
                         cases_covered=segment["stats"]["accounts"],
@@ -150,8 +158,8 @@ class WorkflowSuggestionService:
             self.strategies.notify_awaiting(user, workflow["id"])
         return {
             "client_id": client_id,
-            "portfolio_id": portfolio.id,
-            "portfolio_name": portfolio.name,
+            "portfolio_id": scope.id,
+            "portfolio_name": scope.name,
             "workflows": saved,
         }
 
@@ -172,14 +180,16 @@ class WorkflowSuggestionService:
             raise ValidationAppError(
                 "Only Draft, AI Proposed, Under Review or Approved workflows can be regenerated"
             )
-        # Old workflows (before the rework) may have no portfolio; saving would fail after the AI call.
-        if original["portfolio_id"] is None:
-            raise ValidationAppError("This workflow has no portfolio, so it cannot be regenerated")
         self.strategies._assert_manage(user, original["client_id"])
         client = load_client_context(self.db, original["client_id"])
         rules = load_rules(self.db, original["client_id"])
         limits = design_limits(client, rules)
         learning = load_client_learning(self.db, original["client_id"], limits)
+        scope_name = original.get("portfolio_name") or (
+            f"{client.get('name') or 'Client'} (parent)"
+            if original.get("portfolio_id") is None
+            else ""
+        )
 
         # AI workflows store segment/stats in ai_context; human-created may have none.
         kept = [
@@ -200,7 +210,7 @@ class WorkflowSuggestionService:
         revision = build_revision(segment["segment_id"], original, remarks, self._review_history(original))
         workflow = self._suggest_batch(
             client,
-            original["portfolio_name"] or "",
+            scope_name,
             [segment],
             limits,
             revision,
@@ -325,7 +335,7 @@ class WorkflowSuggestionService:
         self,
         user: UserModel,
         client_id: int,
-        portfolio_id: int,
+        portfolio_id: int | None,
         workflow: dict[str, Any],
         *,
         segment: dict[str, Any],
@@ -335,6 +345,7 @@ class WorkflowSuggestionService:
         revision_of_id: int | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
+        # portfolio_id=None → client-level workflow for parent accounts.
         return self.strategies.create_strategy(
             user,
             {

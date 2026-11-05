@@ -222,7 +222,8 @@ class AiSuggestJobResponse(BaseModel):
     client_id: int
     client_name: Optional[str] = None
     client_code: Optional[str] = None
-    portfolio_id: int
+    # Null = client-level / parent accounts scope (no sub-client).
+    portfolio_id: Optional[int] = None
     portfolio_name: Optional[str] = None
     portfolio_code: Optional[str] = None
     trigger: str

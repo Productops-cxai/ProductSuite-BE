@@ -19,7 +19,7 @@ from app.infrastructure.database.models import (
     UserModel,
 )
 from app.infrastructure.database.session import SessionLocal
-from app.modules.payflow.services.workflow_suggestion.context import load_portfolio_accounts
+from app.modules.payflow.services.workflow_suggestion.context import load_suggest_scope
 from app.modules.payflow.services.workflow_suggestion.gates import (
     evaluate_suggest_gates,
     portfolio_has_ai_workflows,
@@ -51,7 +51,7 @@ class AiSuggestJobService:
     def enqueue(
         self,
         client_id: int,
-        portfolio_id: int,
+        portfolio_id: int | None,
         *,
         trigger: str,
         requested_by_user_id: uuid.UUID | None = None,
@@ -59,21 +59,24 @@ class AiSuggestJobService:
     ) -> PayflowAiSuggestJobModel | None:
         """Create a pending job unless one is already pending/running.
 
-        A prior ``done`` job only blocks when the portfolio still has AI-generated
+        ``portfolio_id=None`` = client-level job for parent accounts (no sub-client).
+
+        A prior ``done`` job only blocks when the scope still has AI-generated
         strategies. After strategies are wiped, a new job can be enqueued again.
         """
-        in_flight = (
-            self.db.query(PayflowAiSuggestJobModel)
-            .filter(
-                PayflowAiSuggestJobModel.portfolio_id == portfolio_id,
-                PayflowAiSuggestJobModel.status.in_(list(_BLOCKING_STATUSES)),
-            )
-            .order_by(PayflowAiSuggestJobModel.id.desc())
-            .first()
+        q = self.db.query(PayflowAiSuggestJobModel).filter(
+            PayflowAiSuggestJobModel.client_id == client_id,
+            PayflowAiSuggestJobModel.status.in_(list(_BLOCKING_STATUSES)),
         )
+        if portfolio_id is None:
+            q = q.filter(PayflowAiSuggestJobModel.portfolio_id.is_(None))
+        else:
+            q = q.filter(PayflowAiSuggestJobModel.portfolio_id == portfolio_id)
+        in_flight = q.order_by(PayflowAiSuggestJobModel.id.desc()).first()
         if in_flight:
             logger.info(
-                "AI suggest skip enqueue portfolio=%s status=%s trigger=%s",
+                "AI suggest skip enqueue client=%s portfolio=%s status=%s trigger=%s",
+                client_id,
                 portfolio_id,
                 in_flight.status,
                 trigger,
@@ -82,7 +85,8 @@ class AiSuggestJobService:
 
         if portfolio_has_ai_workflows(self.db, client_id, portfolio_id):
             logger.info(
-                "AI suggest skip enqueue portfolio=%s already has AI workflows trigger=%s",
+                "AI suggest skip enqueue client=%s portfolio=%s already has AI workflows trigger=%s",
+                client_id,
                 portfolio_id,
                 trigger,
             )
@@ -109,18 +113,19 @@ class AiSuggestJobService:
 
     def enqueue_many(
         self,
-        pairs: Iterable[tuple[int, int]],
+        pairs: Iterable[tuple[int, int | None]],
         *,
         trigger: str,
         requested_by_user_id: uuid.UUID | None = None,
         import_run_id: int | None = None,
     ) -> list[int]:
         ids: list[int] = []
-        seen: set[int] = set()
+        seen: set[tuple[int, int | None]] = set()
         for client_id, portfolio_id in pairs:
-            if portfolio_id in seen:
+            key = (client_id, portfolio_id)
+            if key in seen:
                 continue
-            seen.add(portfolio_id)
+            seen.add(key)
             job = self.enqueue(
                 client_id,
                 portfolio_id,
@@ -139,13 +144,17 @@ class AiSuggestJobService:
         trigger: str,
         requested_by_user_id: uuid.UUID | None = None,
     ) -> list[int]:
+        """Enqueue portfolio jobs + a client-level (parent accounts) job."""
         portfolios = (
             self.db.query(PayflowPortfolioModel)
             .filter(PayflowPortfolioModel.client_id == client_id)
             .all()
         )
+        pairs: list[tuple[int, int | None]] = [(client_id, p.id) for p in portfolios]
+        # Always include parent-level scope so accounts without a sub-client get AI coverage.
+        pairs.append((client_id, None))
         return self.enqueue_many(
-            [(client_id, p.id) for p in portfolios],
+            pairs,
             trigger=trigger,
             requested_by_user_id=requested_by_user_id,
         )
@@ -157,10 +166,9 @@ class AiSuggestJobService:
         client_id: int | None = None,
         trigger: str = "requeue_missing",
     ) -> list[int]:
-        """Enqueue AI suggest for active portfolios that have no AI-generated workflows.
+        """Enqueue AI suggest for active scopes that have no AI-generated workflows.
 
-        Use after wiping strategies / jobs while clients+portfolios stay active —
-        activate/import alone will not re-fire in that state.
+        Covers active portfolios and client-level (parent) scopes on active clients.
         """
         q = (
             self.db.query(PayflowPortfolioModel)
@@ -173,7 +181,16 @@ class AiSuggestJobService:
         if client_id is not None:
             q = q.filter(PayflowPortfolioModel.client_id == client_id)
         portfolios = q.all()
-        pairs = [(p.client_id, p.id) for p in portfolios]
+        pairs: list[tuple[int, int | None]] = [(p.client_id, p.id) for p in portfolios]
+
+        clients_q = self.db.query(PayflowClientModel).filter(
+            PayflowClientModel.status == PayflowClientStatus.ACTIVE.value
+        )
+        if client_id is not None:
+            clients_q = clients_q.filter(PayflowClientModel.id == client_id)
+        for client in clients_q.all():
+            pairs.append((client.id, None))
+
         job_ids = self.enqueue_many(
             pairs,
             trigger=trigger,
@@ -227,7 +244,11 @@ class AiSuggestJobService:
                 self._finish(
                     job,
                     STATUS_SKIPPED,
-                    skip_reason="Portfolio already has AI-generated workflows",
+                    skip_reason=(
+                        "Client already has AI-generated parent workflows"
+                        if job.portfolio_id is None
+                        else "Portfolio already has AI-generated workflows"
+                    ),
                     duration_ms=int((time.perf_counter() - t0) * 1000),
                 )
                 logger.info("AI suggest job=%s skipped: already has AI workflows", job.id)
@@ -243,7 +264,7 @@ class AiSuggestJobService:
                 )
                 return
 
-            _, accounts = load_portfolio_accounts(self.db, job.client_id, job.portfolio_id)
+            _, accounts = load_suggest_scope(self.db, job.client_id, job.portfolio_id)
             segments = build_segments(accounts)["segments"]
             batches = _batches(segments)
             job.segments_count = len(segments)
@@ -388,7 +409,11 @@ class AiSuggestJobService:
             "client_name": client.name if client else None,
             "client_code": client.code if client else None,
             "portfolio_id": job.portfolio_id,
-            "portfolio_name": portfolio.name if portfolio else None,
+            "portfolio_name": (
+                portfolio.name
+                if portfolio
+                else ("Parent client" if job.portfolio_id is None else None)
+            ),
             "portfolio_code": portfolio.code if portfolio else None,
             "trigger": job.trigger,
             "status": job.status,

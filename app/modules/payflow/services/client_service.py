@@ -1805,6 +1805,13 @@ class PayflowClientService:
                     setup_issues = self._setup_issue_messages(existing)
                 else:
                     setup_issues = self._simulate_setup_issues_after_file_import(payload)
+                # Portfolios are optional — never surface as import Draft warnings.
+                setup_issues = [
+                    i
+                    for i in setup_issues
+                    if "sub-clients / portfolios" not in (i or "").lower()
+                    and "add at least one sub-client" not in (i or "").lower()
+                ]
 
                 # Only accept identity after validation/create path succeeds
                 seen_numbers.add(number.lower())
@@ -3354,11 +3361,13 @@ class PayflowClientService:
                     "Review & Activation: finish required setup, then activate the client"
                 )
 
-        # De-dupe while preserving order
+        # De-dupe while preserving order; drop optional portfolio noise if any leftover.
         seen: set[str] = set()
         unique: list[str] = []
         for item in issues:
             key = item.lower()
+            if "sub-clients / portfolios" in key or "add at least one sub-client" in key:
+                continue
             if key in seen:
                 continue
             seen.add(key)

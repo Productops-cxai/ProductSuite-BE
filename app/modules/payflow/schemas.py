@@ -995,7 +995,8 @@ class PayflowStrategiesListResponse(BaseModel):
 class CreatePayflowStrategyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     client_id: int
-    portfolio_id: int
+    # Null = client-level workflow for parent accounts (no sub-client).
+    portfolio_id: Optional[int] = None
     summary: Optional[str] = None
     coverage: Optional[str] = None
     cases_covered: Optional[int] = None
@@ -1526,7 +1527,7 @@ class PortfolioSegmentItem(BaseModel):
 
 class PortfolioSegmentsResponse(BaseModel):
     client_id: int
-    portfolio_id: int
+    portfolio_id: Optional[int] = None
     portfolio_name: str
     total_accounts: int
     eligible_accounts: int
@@ -1536,12 +1537,13 @@ class PortfolioSegmentsResponse(BaseModel):
 
 class SuggestWorkflowsRequest(BaseModel):
     client_id: int
-    portfolio_id: int
+    # Null / omitted = client-level suggest for parent accounts (no sub-client).
+    portfolio_id: Optional[int] = None
 
 
 class SuggestWorkflowsResponse(BaseModel):
     client_id: int
-    portfolio_id: int
+    portfolio_id: Optional[int] = None
     portfolio_name: str
     workflows: List[PayflowStrategyItem] = Field(default_factory=list)
 

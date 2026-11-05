@@ -268,6 +268,8 @@ class WorkflowExecutionService:
         )
         if strategy.portfolio_id is not None:
             q = q.filter(PayflowStrategyModel.portfolio_id == strategy.portfolio_id)
+        else:
+            q = q.filter(PayflowStrategyModel.portfolio_id.is_(None))
         # Prefer strategies linked via revision chain or same segment label.
         priors = q.all()
         prior_ids: set[int] = set()
@@ -376,6 +378,9 @@ class WorkflowExecutionService:
         )
         if strategy.portfolio_id is not None:
             q = q.filter(PayflowAccountModel.portfolio_id == strategy.portfolio_id)
+        else:
+            # Client-level strategy: only parent accounts (no sub-client portfolio).
+            q = q.filter(PayflowAccountModel.portfolio_id.is_(None))
         accounts = q.all()
 
         enrolled = 0

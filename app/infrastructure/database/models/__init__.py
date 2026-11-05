@@ -555,8 +555,9 @@ class PayflowAiSuggestJobModel(Base):
     client_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
     )
-    portfolio_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("payflow_portfolios.id"), nullable=False, index=True
+    # Null = client-level / parent accounts (no sub-client portfolio).
+    portfolio_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_portfolios.id"), nullable=True, index=True
     )
     trigger: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)

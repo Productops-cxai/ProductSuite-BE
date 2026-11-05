@@ -780,7 +780,11 @@ class PayflowStrategyService:
             "client_code": row.client.code if row.client else None,
             "client_name": row.client.name if row.client else None,
             "portfolio_id": row.portfolio_id,
-            "portfolio_name": row.portfolio.name if row.portfolio else None,
+            "portfolio_name": (
+                row.portfolio.name
+                if row.portfolio
+                else ("Parent client" if row.portfolio_id is None else None)
+            ),
             "status": row.status,
             "origin": row.origin,
             "source": _row_source(row),
@@ -887,20 +891,23 @@ class PayflowStrategyService:
         if not client:
             raise NotFoundError("Client not found")
 
-        portfolio_id = payload.get("portfolio_id")
-        if portfolio_id is None:
-            raise ValidationAppError("Portfolio is required")
-        portfolio = (
-            self.db.query(PayflowPortfolioModel)
-            .filter(
-                PayflowPortfolioModel.id == int(portfolio_id),
-                PayflowPortfolioModel.client_id == client_id,
+        # portfolio_id optional — None = client-level workflow for parent accounts.
+        raw_portfolio_id = payload.get("portfolio_id")
+        portfolio_id: int | None
+        if raw_portfolio_id is None or raw_portfolio_id == "":
+            portfolio_id = None
+        else:
+            portfolio = (
+                self.db.query(PayflowPortfolioModel)
+                .filter(
+                    PayflowPortfolioModel.id == int(raw_portfolio_id),
+                    PayflowPortfolioModel.client_id == client_id,
+                )
+                .first()
             )
-            .first()
-        )
-        if not portfolio:
-            raise ValidationAppError("Portfolio not found for this client")
-        portfolio_id = portfolio.id
+            if not portfolio:
+                raise ValidationAppError("Portfolio not found for this client")
+            portfolio_id = portfolio.id
 
         source_raw = (payload.get("source") or "").strip()
         status_raw = (payload.get("status") or "").strip()

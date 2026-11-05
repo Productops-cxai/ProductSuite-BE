@@ -12,7 +12,7 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowStrategyModel,
 )
-from app.modules.payflow.services.workflow_suggestion.context import load_portfolio_accounts
+from app.modules.payflow.services.workflow_suggestion.context import load_suggest_scope
 from app.modules.payflow.services.workflow_suggestion.segmenter import filter_eligible
 from app.shared.enums import (
     PayflowClientStatus,
@@ -29,8 +29,10 @@ class SuggestGateResult:
     total_accounts: int = 0
 
 
-def evaluate_suggest_gates(db: Session, client_id: int, portfolio_id: int) -> SuggestGateResult:
-    """Client active + portfolio active + at least one eligible account."""
+def evaluate_suggest_gates(
+    db: Session, client_id: int, portfolio_id: int | None
+) -> SuggestGateResult:
+    """Client active + (portfolio active | parent scope) + at least one eligible account."""
     client = db.query(PayflowClientModel).filter(PayflowClientModel.id == client_id).first()
     if not client:
         return SuggestGateResult(ok=False, reason="Client not found")
@@ -38,12 +40,14 @@ def evaluate_suggest_gates(db: Session, client_id: int, portfolio_id: int) -> Su
         return SuggestGateResult(ok=False, reason="Client is not active")
 
     try:
-        portfolio, accounts = load_portfolio_accounts(db, client_id, portfolio_id)
-    except NotFoundError:
-        return SuggestGateResult(ok=False, reason="Portfolio not found for this client")
+        scope, accounts = load_suggest_scope(db, client_id, portfolio_id)
+    except NotFoundError as exc:
+        return SuggestGateResult(ok=False, reason=getattr(exc, "message", None) or str(exc))
 
-    if (portfolio.status or "").lower() != PayflowPortfolioStatus.ACTIVE.value:
-        return SuggestGateResult(ok=False, reason="Portfolio is not active")
+    if portfolio_id is not None:
+        if (scope.status or "").lower() != PayflowPortfolioStatus.ACTIVE.value:
+            return SuggestGateResult(ok=False, reason="Portfolio is not active")
+    # Parent-level (portfolio_id None): only client Active is required.
 
     eligible, _excluded = filter_eligible(accounts)
     if not eligible:
@@ -60,18 +64,22 @@ def evaluate_suggest_gates(db: Session, client_id: int, portfolio_id: int) -> Su
     )
 
 
-def portfolio_has_ai_workflows(db: Session, client_id: int, portfolio_id: int) -> bool:
-    """True if this portfolio already has any AI-generated strategy (idempotency)."""
-    row = (
-        db.query(PayflowStrategyModel.id)
-        .filter(
-            PayflowStrategyModel.client_id == client_id,
-            PayflowStrategyModel.portfolio_id == portfolio_id,
-            PayflowStrategyModel.source == PayflowStrategySource.AI_GENERATED.value,
-        )
-        .first()
+def portfolio_has_ai_workflows(
+    db: Session, client_id: int, portfolio_id: int | None
+) -> bool:
+    """True if this scope already has any AI-generated strategy (idempotency).
+
+    ``portfolio_id=None`` means client-level / parent-account strategies.
+    """
+    q = db.query(PayflowStrategyModel.id).filter(
+        PayflowStrategyModel.client_id == client_id,
+        PayflowStrategyModel.source == PayflowStrategySource.AI_GENERATED.value,
     )
-    return row is not None
+    if portfolio_id is None:
+        q = q.filter(PayflowStrategyModel.portfolio_id.is_(None))
+    else:
+        q = q.filter(PayflowStrategyModel.portfolio_id == portfolio_id)
+    return q.first() is not None
 
 
 def gate_summary(result: SuggestGateResult) -> dict[str, Any]:
