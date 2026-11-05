@@ -1433,6 +1433,8 @@ class PayflowImportErrorItem(BaseModel):
     field: str
     error: str
     status: str
+    client_id: Optional[int] = None
+    setup_issues: List[str] = Field(default_factory=list)
 
 
 class PayflowImportCounts(BaseModel):
