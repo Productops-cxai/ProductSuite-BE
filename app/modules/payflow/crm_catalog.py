@@ -1052,7 +1052,7 @@ ACCOUNT_IMPORT_HEADERS: list[str] = [
 
 ACCOUNT_IMPORT_REQUIRED: tuple[str, ...] = (
     "client_code",
-    "sub_client_code",
+    # sub_client_code is optional — blank = parent-level account (no portfolio).
     "account_id",
     "product_code",
     "customer_first_name",
@@ -1131,7 +1131,6 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
 # When CRM provides client_number, these PayFlow columns may be resolved/defaulted per row.
 ACCOUNT_CRM_RESOLVABLE_REQUIRED: tuple[str, ...] = (
     "client_code",
-    "sub_client_code",
     "product_code",
     "country_code",
     "currency_code",
