@@ -553,9 +553,13 @@ CRM_INBOUND_FIELDS: list[CrmFieldDef] = [
         "available": "Yes",
     },
     {
-        "source_field": "dn_client_demographic_is_provincial_hold / COMMUNICATION_HOLD",
+        "source_field": "COMMUNICATION_HOLD / provincial_hold",
         "payflow_field": "provincial_hold",
-        "meaning": "Communication / provincial hold flag. Y/N.",
+        "meaning": (
+            "Per-account communication / provincial hold (Y/N). Blocks outreach and AI "
+            "eligibility while true. Do not map Canaccede Client Is Provincial Hold here — "
+            "that is a client demographic flag, not an account hold."
+        ),
         "required": False,
         "sample_value": "N",
         "group": "Customer and Contact",
@@ -1106,8 +1110,11 @@ ACCOUNT_HEADER_ALIASES: dict[str, str] = {
     "date_last_email_sent": "last_email_sent_date",
     "date_of_last_sms_sent": "last_sms_sent_date",
     "date_of_last_contact": "last_contact_date",
-    "dn_client_demographic_is_provincial_hold": "provincial_hold",
-    "client_is_provincial_hold": "provincial_hold",
+    # Do NOT alias Client Is Provincial Hold → provincial_hold.
+    # That Canaccede column is a client demographic flag copied onto every account
+    # row; treating it as an account hold excludes the whole book from AI suggest.
+    # True per-account holds use communication_hold / provincial_hold only.
+    "communication_hold": "provincial_hold",
     "dn_debtorcaseaddress_province_hold_days": "hold_days",
     "province_hold_days": "hold_days",
     "dn_currency_name": "currency_code",

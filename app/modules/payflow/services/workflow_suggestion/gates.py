@@ -49,11 +49,25 @@ def evaluate_suggest_gates(
             return SuggestGateResult(ok=False, reason="Portfolio is not active")
     # Parent-level (portfolio_id None): only client Active is required.
 
-    eligible, _excluded = filter_eligible(accounts)
+    eligible, excluded = filter_eligible(accounts)
     if not eligible:
+        if not accounts:
+            reason = (
+                "No accounts found for this parent client"
+                if portfolio_id is None
+                else "No accounts found for this portfolio"
+            )
+        else:
+            breakdown = ", ".join(
+                f"{name}={count}" for name, count in excluded.items() if count
+            )
+            reason = (
+                f"No eligible accounts that need a workflow "
+                f"({len(accounts)} accounts; excluded: {breakdown or 'none'})"
+            )
         return SuggestGateResult(
             ok=False,
-            reason="No eligible accounts that need a workflow",
+            reason=reason,
             eligible_accounts=0,
             total_accounts=len(accounts),
         )

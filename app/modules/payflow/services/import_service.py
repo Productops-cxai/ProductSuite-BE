@@ -1611,6 +1611,8 @@ class PayflowImportService:
             "last_contact_date": self._soft_date(
                 c("last_contact_date"), "last_contact_date", soft=bool(crm_number)
             ),
+            # Per-account hold only. Canaccede "Client Is Provincial Hold" is ignored
+            # (client demographic, not account hold) — see ACCOUNT_HEADER_ALIASES.
             "provincial_hold": self._soft_yn(
                 c("provincial_hold") or c("communication_hold"), soft=bool(crm_number)
             ),
