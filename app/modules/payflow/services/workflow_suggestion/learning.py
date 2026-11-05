@@ -59,7 +59,7 @@ def load_client_learning(db: Session, client_id: int, limits: dict[str, Any]) ->
     }
 
 
-def pick_examples(pool: list[dict], segments: list[dict], portfolio_id: int) -> list[dict]:
+def pick_examples(pool: list[dict], segments: list[dict], portfolio_id: int | None) -> list[dict]:
     """Up to MAX_CLIENT_EXAMPLES candidates for SIMILAR segments only: one best match per
     segment, then the next best. No similar workflow → nothing (generic examples are used)."""
     chosen: list[dict] = []
@@ -136,7 +136,7 @@ def _match(have: dict, want: dict) -> int:
     return 2 if have.get("delinquency") == want.get("delinquency") else 1
 
 
-def _rank(item: dict, segment: dict, portfolio_id: int) -> tuple:
+def _rank(item: dict, segment: dict, portfolio_id: int | None) -> tuple:
     """Most similar → same portfolio → edited or written by people."""
     return (_match(item["segment"], segment["segment"]), item["portfolio_id"] == portfolio_id, item["human_touched"])
 

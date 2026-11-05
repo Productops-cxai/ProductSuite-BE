@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import or_
@@ -15,7 +16,18 @@ from app.infrastructure.database.models import (
     PayflowRuleModel,
 )
 from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
-from app.shared.enums import PayflowRuleStatus, PayflowRuleType
+from app.shared.enums import PayflowPortfolioStatus, PayflowRuleStatus, PayflowRuleType
+
+
+@dataclass
+class SuggestScope:
+    """Portfolio scope, or client-level parent accounts when id is None."""
+
+    id: int | None
+    name: str
+    code: str | None
+    status: str
+    client_id: int
 
 
 def load_client_context(db: Session, client_id: int) -> dict[str, Any]:
@@ -104,3 +116,41 @@ def load_portfolio_accounts(
         .all()
     )
     return portfolio, accounts
+
+
+def load_suggest_scope(
+    db: Session, client_id: int, portfolio_id: int | None
+) -> tuple[SuggestScope, list[PayflowAccountModel]]:
+    """Load accounts for AI suggest: portfolio-scoped, or parent-level when portfolio_id is None."""
+    if portfolio_id is not None:
+        portfolio, accounts = load_portfolio_accounts(db, client_id, portfolio_id)
+        scope = SuggestScope(
+            id=portfolio.id,
+            name=portfolio.name,
+            code=portfolio.code,
+            status=portfolio.status or PayflowPortfolioStatus.ONBOARDING.value,
+            client_id=client_id,
+        )
+        return scope, accounts
+
+    client = db.query(PayflowClientModel).filter(PayflowClientModel.id == client_id).first()
+    if not client:
+        raise NotFoundError("Client not found")
+    accounts = (
+        db.query(PayflowAccountModel)
+        .filter(
+            PayflowAccountModel.client_id == client_id,
+            PayflowAccountModel.portfolio_id.is_(None),
+        )
+        .order_by(PayflowAccountModel.id.asc())
+        .all()
+    )
+    scope = SuggestScope(
+        id=None,
+        name=f"{client.name} (parent)",
+        code=client.code,
+        # Parent scope is ready whenever the client is active (checked in gates).
+        status=PayflowPortfolioStatus.ACTIVE.value,
+        client_id=client_id,
+    )
+    return scope, accounts

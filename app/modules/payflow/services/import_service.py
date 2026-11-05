@@ -977,6 +977,7 @@ class PayflowImportService:
         seen_keys: set[tuple[str, str]] = set()
         created = updated = unchanged = failed = 0
         touched_portfolios: set[tuple[int, int]] = set()
+        touched_parent_clients: set[int] = set()
 
         for row in data_rows:
             record_id = _cell(row, idx, "account_id") or "Row"
@@ -1022,6 +1023,8 @@ class PayflowImportService:
                     unchanged += 1
                 if portfolio is not None:
                     touched_portfolios.add((client.id, portfolio.id))
+                else:
+                    touched_parent_clients.add(client.id)
             except ValidationAppError as exc:
                 failed += 1
                 self.db.add(
@@ -1047,9 +1050,16 @@ class PayflowImportService:
         run.completed_at = _now()
 
         ai_job_ids: list[int] = []
-        if run.status in ("Completed", "Completed with Errors") and touched_portfolios:
-            ai_job_ids = AiSuggestJobService(self.db).enqueue_many(
-                touched_portfolios,
+        if run.status in ("Completed", "Completed with Errors") and (
+            touched_portfolios or touched_parent_clients
+        ):
+            suggest = AiSuggestJobService(self.db)
+            pairs: list[tuple[int, int | None]] = [
+                (cid, pid) for cid, pid in touched_portfolios
+            ]
+            pairs.extend((cid, None) for cid in touched_parent_clients)
+            ai_job_ids = suggest.enqueue_many(
+                pairs,
                 trigger="import",
                 requested_by_user_id=user.id,
                 import_run_id=run.id,

@@ -28,6 +28,44 @@ def sync_schema(engine: Engine) -> None:
     Base.metadata.create_all(bind=engine)
     _rename_legacy_columns(engine)
     _add_missing_columns(engine)
+    _relax_nullable_columns(engine)
+
+
+def _relax_nullable_columns(engine: Engine) -> None:
+    """Drop NOT NULL on columns that models now mark nullable (additive)."""
+    # (table, column) — only when model says nullable=True and DB still has NOT NULL.
+    targets = [
+        ("payflow_ai_suggest_jobs", "portfolio_id"),
+    ]
+    inspector = inspect(engine)
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        for table_name, column_name in targets:
+            if table_name not in inspector.get_table_names():
+                continue
+            cols = {c["name"]: c for c in inspector.get_columns(table_name)}
+            col = cols.get(column_name)
+            if not col or col.get("nullable", True):
+                continue
+            try:
+                if dialect == "postgresql":
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE "{table_name}" '
+                            f'ALTER COLUMN "{column_name}" DROP NOT NULL'
+                        )
+                    )
+                elif dialect in ("mysql", "mariadb"):
+                    col_type = col["type"].compile(dialect=engine.dialect)
+                    conn.execute(
+                        text(
+                            f'ALTER TABLE `{table_name}` '
+                            f'MODIFY COLUMN `{column_name}` {col_type} NULL'
+                        )
+                    )
+                # SQLite cannot DROP NOT NULL without table rebuild — leave as-is.
+            except Exception:
+                pass
 
 
 def _rename_legacy_tables(engine: Engine) -> None:
