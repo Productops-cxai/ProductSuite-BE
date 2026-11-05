@@ -13,7 +13,11 @@ from app.modules.payflow.services.strategy_service import _timing_label
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema, call_llm
 from app.modules.payflow.services.workflow_suggestion.message_prompt import build_message_prompt
 from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
-from app.modules.payflow.services.workflow_suggestion.message_validator import check_message
+from app.modules.payflow.services.workflow_suggestion.message_validator import (
+    MAX_SUBJECT_CHARS,
+    check_message,
+    render_sample,
+)
 from app.shared.enums import PayflowCollectionStatus
 
 # After the first AI answer, failing messages are sent back to the AI this many times.
@@ -127,9 +131,24 @@ def _clean(message: Any, channel: str) -> dict[str, Any] | None:
         return None
     subject = str(message.get("subject") or "").strip()
     return {
-        "subject": subject if channel == "Email" and subject else None,  # SMS has no subject
+        "subject": _fit_subject(subject) if channel == "Email" and subject else None,  # SMS has no subject
         "body": str(message["body"]).strip(),
     }
+
+
+def _fit_subject(subject: str) -> str:
+    """One line, and at most MAX_SUBJECT_CHARS once sample values are filled in."""
+    text = " ".join(subject.split())
+    if len(render_sample(text)) <= MAX_SUBJECT_CHARS:
+        return text
+    words = text.split(" ")
+    while len(words) > 1 and len(render_sample(" ".join(words))) > MAX_SUBJECT_CHARS:
+        words.pop()
+    text = " ".join(words).rstrip(" -–|,;:")
+    # Drop a trailing partial {{variable if word-trim left one open.
+    if "{{" in text and "}}" not in text[text.rfind("{{") :]:
+        text = text[: text.rfind("{{")].rstrip(" -–|,;:")
+    return text
 
 
 def _messages_by_step(reply: Any) -> dict[str, dict]:
