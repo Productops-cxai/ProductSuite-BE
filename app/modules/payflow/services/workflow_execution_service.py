@@ -16,6 +16,7 @@ from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowClientModel,
     PayflowCommunicationModel,
+    PayflowHumanReviewModel,
     PayflowPortfolioModel,
     PayflowStrategyModel,
     PayflowWorkflowJobModel,
@@ -2661,33 +2662,69 @@ class WorkflowExecutionService:
             )
             .first()
         )
-        if not run:
+        if run:
+            if continue_workflow:
+                enqueue_resume_run(
+                    self.db,
+                    run_id=run.id,
+                    step_id=run.current_step_id,
+                    account_id=run.account_id,
+                    payload={"after_human_review": True},
+                    commit=False,
+                )
+                self.log_event(
+                    event_type="human_review_continue",
+                    message=f"Resume queued after review #{review_id} (re-execute paused step)",
+                    run_id=run.id,
+                    account_id=run.account_id,
+                    strategy_id=run.strategy_id,
+                )
+            else:
+                run.status = PayflowWorkflowRunStatus.CANCELLED.value
+                run.completed_at = _utcnow()
+                cancel_pending_jobs_for_run(self.db, run.id)
+                self.log_event(
+                    event_type="human_review_cancelled_run",
+                    message=f"Run cancelled after review #{review_id}",
+                    run_id=run.id,
+                    account_id=run.account_id,
+                    strategy_id=run.strategy_id,
+                )
+            self.db.commit()
             return
-        if continue_workflow:
-            enqueue_resume_run(
-                self.db,
-                run_id=run.id,
-                step_id=run.current_step_id,
-                account_id=run.account_id,
-                payload={"after_human_review": True},
-                commit=False,
-            )
-            self.log_event(
-                event_type="human_review_continue",
-                message=f"Resume queued after review #{review_id} (re-execute paused step)",
-                run_id=run.id,
-                account_id=run.account_id,
-                strategy_id=run.strategy_id,
-            )
+
+        # Governance-only HR (no paused run): after approve/modify, gap-fill enroll
+        # into any Active strategies for this account's scope (same job as import).
+        if not continue_workflow:
+            return
+        review = self.db.get(PayflowHumanReviewModel, review_id)
+        if not review or not review.account_id:
+            return
+        account = self.db.get(PayflowAccountModel, review.account_id)
+        if not account:
+            return
+        portfolio_pairs: set[tuple[int, int]] = set()
+        parent_client_ids: set[int] = set()
+        if account.portfolio_id is not None:
+            portfolio_pairs.add((account.client_id, account.portfolio_id))
         else:
-            run.status = PayflowWorkflowRunStatus.CANCELLED.value
-            run.completed_at = _utcnow()
-            cancel_pending_jobs_for_run(self.db, run.id)
+            parent_client_ids.add(account.client_id)
+        jobs = self.enqueue_enrolls_for_scopes(
+            portfolio_pairs=portfolio_pairs,
+            parent_client_ids=parent_client_ids,
+            commit=False,
+        )
+        if jobs:
             self.log_event(
-                event_type="human_review_cancelled_run",
-                message=f"Run cancelled after review #{review_id}",
-                run_id=run.id,
-                account_id=run.account_id,
-                strategy_id=run.strategy_id,
+                event_type="enroll_queued",
+                message=(
+                    f"Enroll queued after human review #{review_id} "
+                    f"(no paused run; {len(jobs)} active strateg"
+                    f"{'y' if len(jobs) == 1 else 'ies'})"
+                ),
+                account_id=account.id,
+                client_id=account.client_id,
+                portfolio_id=account.portfolio_id,
+                commit=False,
             )
         self.db.commit()
