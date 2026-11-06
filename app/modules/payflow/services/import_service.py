@@ -7,6 +7,7 @@ import io
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
@@ -21,6 +22,7 @@ from app.infrastructure.database.models import (
     PayflowPortfolioModel,
     UserModel,
 )
+from app.modules.payflow.services.import_progress import tick_progress
 from app.modules.payflow.crm_catalog import (
     ACCOUNT_CRM_DEFAULT_COUNTRY,
     ACCOUNT_CRM_DEFAULT_CURRENCY,
@@ -802,7 +804,12 @@ class PayflowImportService:
         _SAMPLE_PATH.write_bytes(self.template_bytes(include_samples=True))
         return _SAMPLE_PATH
 
-    def validate_account_file(self, file_bytes: bytes, filename: str) -> dict[str, Any]:
+    def validate_account_file(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
         """Dry-run validation — no DB writes."""
         safe_name = Path(filename or "upload.xlsx").name
         try:
@@ -816,6 +823,9 @@ class PayflowImportService:
                 "The file is not a valid CSV or Excel workbook.",
             )
 
+        total_rows = len(data_rows)
+        tick_progress(progress_cb, 0, total_rows, force=True)
+
         lookups = self._build_client_lookups()
         clients = lookups["by_code"]
         portfolios_by_key = lookups["port_by_key"]
@@ -826,7 +836,7 @@ class PayflowImportService:
         errors: list[dict[str, Any]] = []
         preview_limit = 50
 
-        for row in data_rows:
+        for row_i, row in enumerate(data_rows, start=1):
             record_id = _cell(row, idx, "account_id") or "Row"
             client_code = _cell(row, idx, "client_code") or _cell(row, idx, "client_number")
             sub_code = _cell(row, idx, "sub_client_code")
@@ -909,6 +919,7 @@ class PayflowImportService:
                             "note": record_id,
                         }
                     )
+            tick_progress(progress_cb, row_i, total_rows, force=row_i >= total_rows)
 
         rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
         successful = created + updated + unchanged
@@ -935,8 +946,15 @@ class PayflowImportService:
         }
 
     def process_account_file(
-        self, user: UserModel, file_bytes: bytes, filename: str
+        self,
+        user: UserModel,
+        file_bytes: bytes,
+        filename: str,
+        progress_cb: Callable[[int, int], None] | None = None,
+        job_id: int | None = None,
     ) -> tuple[dict[str, Any], list[int]]:
+        from app.modules.payflow.services.import_progress import make_progress_cb, report_import_progress
+
         _UPLOADS.mkdir(parents=True, exist_ok=True)
         safe_name = Path(filename or "upload.xlsx").name
         stored = _UPLOADS / f"{int(_now().timestamp())}-{safe_name}"
@@ -970,7 +988,29 @@ class PayflowImportService:
 
         run.status = "Processing"
         run.total_count = len(data_rows)
+        run.processed_count = 0
         self.db.flush()
+        # Make run id + totals visible to pollers before the long loop.
+        self.db.commit()
+        self.db.refresh(run)
+
+        if job_id is not None:
+            report_import_progress(
+                job_id=job_id, run_id=run.id, processed=0, total=len(data_rows)
+            )
+            # Keep job.import_run_id linked for history.
+            from app.infrastructure.database.models import PayflowImportJobModel
+
+            job_row = (
+                self.db.query(PayflowImportJobModel)
+                .filter(PayflowImportJobModel.id == job_id)
+                .first()
+            )
+            if job_row:
+                job_row.import_run_id = run.id
+                self.db.commit()
+
+        row_progress = progress_cb or make_progress_cb(job_id=job_id, run_id=run.id)
 
         lookups = self._build_client_lookups()
         clients = lookups["by_code"]
@@ -980,8 +1020,9 @@ class PayflowImportService:
         created = updated = unchanged = failed = 0
         touched_portfolios: set[tuple[int, int]] = set()
         touched_parent_clients: set[int] = set()
+        total_rows = len(data_rows)
 
-        for row in data_rows:
+        for row_i, row in enumerate(data_rows, start=1):
             record_id = _cell(row, idx, "account_id") or "Row"
             client_code = _cell(row, idx, "client_code") or _cell(row, idx, "client_number")
             sub_code = _cell(row, idx, "sub_client_code")
@@ -1040,6 +1081,7 @@ class PayflowImportService:
                         status="Skipped" if "Duplicate" in str(exc.message) else "Rejected",
                     )
                 )
+            tick_progress(row_progress, row_i, total_rows, force=row_i >= total_rows)
 
         if created or updated or unchanged:
             run.status = "Completed with Errors" if failed else "Completed"
@@ -1049,6 +1091,7 @@ class PayflowImportService:
         run.updated_count = updated
         run.unchanged_count = unchanged
         run.failed_count = failed
+        run.processed_count = total_rows
         run.completed_at = _now()
 
         ai_job_ids: list[int] = []
@@ -1958,6 +2001,7 @@ class PayflowImportService:
             "status": run.status,
             "counts": {
                 "total": run.total_count,
+                "processed": getattr(run, "processed_count", None) or run.total_count,
                 "created": run.created_count,
                 "updated": run.updated_count,
                 "unchanged": run.unchanged_count,

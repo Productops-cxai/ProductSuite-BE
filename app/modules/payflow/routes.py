@@ -85,6 +85,7 @@ from app.modules.payflow.schemas import (
     UpdatePayflowUserRequest,
     UpdatePortfolioRequest,
     PayflowDashboardResponse,
+    PayflowImportJobItem,
     PayflowImportListResponse,
     PayflowImportPreviewResponse,
     PayflowImportRunItem,
@@ -105,6 +106,10 @@ from app.modules.payflow.services.account_service import PayflowAccountService
 from app.modules.payflow.services.client_service import PayflowClientService
 from app.modules.payflow.services.communication_service import PayflowCommunicationService
 from app.modules.payflow.services.dashboard_service import PayflowDashboardService
+from app.modules.payflow.services.import_job_service import (
+    ImportJobService,
+    schedule_import_job,
+)
 from app.modules.payflow.services.import_service import PayflowImportService
 from app.modules.payflow.services.integration_service import PayflowIntegrationService
 from app.modules.payflow.services.notification_service import PayflowNotificationService
@@ -350,6 +355,29 @@ async def bulk_validate_clients(
     return PayflowClientService(db).bulk_validate(data, file.filename or "upload.xlsx")
 
 
+@router.post("/clients/bulk-validate/start", response_model=PayflowImportJobItem)
+async def bulk_validate_clients_start(
+    user: PayflowImportClients,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """Async validate — poll GET /payflow/import-jobs/{id}. Sync /bulk-validate unchanged."""
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
+    data = await file.read()
+    job = ImportJobService(db).create_job(
+        job_type="client_validate",
+        file_bytes=data,
+        filename=file.filename or "upload.xlsx",
+        user=user,
+    )
+    db.commit()
+    schedule_import_job(background_tasks, job.id)
+    return ImportJobService.serialize(job)
+
+
 @router.post("/clients/bulk-upload")
 async def bulk_upload_clients(
     user: PayflowImportClients,
@@ -366,6 +394,29 @@ async def bulk_upload_clients(
         )
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+@router.post("/clients/bulk-upload/start", response_model=PayflowImportJobItem)
+async def bulk_upload_clients_start(
+    user: PayflowImportClients,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """Async upload — poll GET /payflow/import-jobs/{id}. Sync /bulk-upload unchanged."""
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
+    data = await file.read()
+    job = ImportJobService(db).create_job(
+        job_type="client_upload",
+        file_bytes=data,
+        filename=file.filename or "upload.xlsx",
+        user=user,
+    )
+    db.commit()
+    schedule_import_job(background_tasks, job.id)
+    return ImportJobService.serialize(job)
 
 
 @router.get("/clients", response_model=PayflowClientsListResponse)
@@ -730,6 +781,28 @@ async def validate_account_import(
     return PayflowImportService(db).validate_account_file(data, file.filename or "upload.xlsx")
 
 
+@router.post("/imports/accounts/validate/start", response_model=PayflowImportJobItem)
+async def validate_account_import_start(
+    user: PayflowImportAccounts,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """Async validate — poll GET /payflow/import-jobs/{id}. Sync validate unchanged."""
+    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
+    data = await file.read()
+    job = ImportJobService(db).create_job(
+        job_type="account_validate",
+        file_bytes=data,
+        filename=file.filename or "upload.xlsx",
+        user=user,
+    )
+    db.commit()
+    schedule_import_job(background_tasks, job.id)
+    return ImportJobService.serialize(job)
+
+
 @router.post("/imports/accounts/upload", response_model=PayflowImportRunItem)
 async def upload_account_import(
     admin: PayflowImportAccounts,
@@ -747,6 +820,37 @@ async def upload_account_import(
         )
         schedule_ai_suggest_jobs(background_tasks, job_ids)
         return result
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/imports/accounts/upload/start", response_model=PayflowImportJobItem)
+async def upload_account_import_start(
+    admin: PayflowImportAccounts,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
+    """Async upload — poll GET /payflow/import-jobs/{id}. Sync upload unchanged."""
+    name = (file.filename or "").lower()
+    if not name.endswith((".xlsx", ".xlsm", ".csv")):
+        raise HTTPException(status_code=400, detail="Upload an .xlsx or .csv file")
+    data = await file.read()
+    job = ImportJobService(db).create_job(
+        job_type="account_upload",
+        file_bytes=data,
+        filename=file.filename or "upload.xlsx",
+        user=admin,
+    )
+    db.commit()
+    schedule_import_job(background_tasks, job.id)
+    return ImportJobService.serialize(job)
+
+
+@router.get("/import-jobs/{job_id}", response_model=PayflowImportJobItem)
+def get_import_job(job_id: int, _: RequirePayflowProduct, db: DbSession):
+    try:
+        return ImportJobService(db).get_job(job_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 

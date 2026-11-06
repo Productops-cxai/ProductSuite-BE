@@ -1440,6 +1440,7 @@ class PayflowImportErrorItem(BaseModel):
 
 class PayflowImportCounts(BaseModel):
     total: int = 0
+    processed: int = 0
     created: int = 0
     updated: int = 0
     unchanged: int = 0
@@ -1457,6 +1458,20 @@ class PayflowImportRunItem(BaseModel):
     status: str
     counts: PayflowImportCounts
     errors: List[PayflowImportErrorItem] = Field(default_factory=list)
+
+
+class PayflowImportJobItem(BaseModel):
+    id: int
+    job_type: str
+    status: str
+    file_name: str
+    processed_count: int = 0
+    total_count: int = 0
+    import_run_id: Optional[int] = None
+    error_message: Optional[str] = None
+    result: Optional[Any] = None
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
 
 
 class PayflowImportListResponse(BaseModel):
