@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-platform-suite-secret-key"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_EXPIRE_MINUTES: int = 60
-    JWT_REFRESH_EXPIRE_MINUTES: int = 10080  # default 7 days in minutes
+    JWT_REFRESH_EXPIRE_MINUTES: int = 15  # default 15 minutes
 
     def refresh_token_ttl(self):  # timedelta — used by security / cookies / identity
         from datetime import timedelta
