@@ -7,6 +7,7 @@ import io
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
@@ -14,6 +15,7 @@ from openpyxl import Workbook, load_workbook
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ConflictError, NotFoundError, ValidationAppError
+from app.modules.payflow.services.import_progress import tick_progress
 from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowAiSuggestJobModel,
@@ -1422,7 +1424,12 @@ class PayflowClientService:
         wb.save(buf)
         return buf.getvalue()
 
-    def bulk_validate(self, file_bytes: bytes, filename: str) -> dict:
+    def bulk_validate(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> dict:
         safe_name = (filename or "upload.xlsx").split("/")[-1]
         try:
             headers, data_rows = self._load_client_rows(file_bytes, filename)
@@ -1430,10 +1437,22 @@ class PayflowClientService:
             return self._bulk_preview_fail(safe_name, "File structure", exc.message)
 
         return self._process_client_hierarchy(
-            headers, data_rows, filename=safe_name, dry_run=True, user=None
+            headers,
+            data_rows,
+            filename=safe_name,
+            dry_run=True,
+            user=None,
+            progress_cb=progress_cb,
         )
 
-    def bulk_upload(self, file_bytes: bytes, *, user: UserModel | None = None, filename: str = "upload.xlsx") -> dict:
+    def bulk_upload(
+        self,
+        file_bytes: bytes,
+        *,
+        user: UserModel | None = None,
+        filename: str = "upload.xlsx",
+        progress_cb: Callable[[int, int], None] | None = None,
+    ) -> dict:
         safe_name = (filename or "upload.xlsx").split("/")[-1]
         try:
             headers, data_rows = self._load_client_rows(file_bytes, filename)
@@ -1441,7 +1460,13 @@ class PayflowClientService:
             result = self._bulk_preview_fail(safe_name, "File structure", exc.message)
         else:
             result = self._process_client_hierarchy(
-                headers, data_rows, filename=safe_name, dry_run=False, user=user, file_bytes=file_bytes
+                headers,
+                data_rows,
+                filename=safe_name,
+                dry_run=False,
+                user=user,
+                file_bytes=file_bytes,
+                progress_cb=progress_cb,
             )
         # Back-compat shape for older FE callers
         result["created_count"] = result.get("summary", {}).get("created", 0)
@@ -1579,6 +1604,7 @@ class PayflowClientService:
         dry_run: bool,
         user: UserModel | None,
         file_bytes: bytes | None = None,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> dict:
         if not data_rows:
             return self._bulk_preview_fail(
@@ -1608,7 +1634,12 @@ class PayflowClientService:
                     f"Missing required column(s): {', '.join(missing_unique)}",
                 )
             return self._process_crm_hierarchy(
-                data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
+                data_rows,
+                filename=filename,
+                dry_run=dry_run,
+                user=user,
+                file_bytes=file_bytes,
+                progress_cb=progress_cb,
             )
 
         # Legacy simple template: client_name + client_code
@@ -1620,7 +1651,12 @@ class PayflowClientService:
                 "client_code) or legacy client_name/client_code columns.",
             )
         return self._process_simple_clients(
-            data_rows, filename=filename, dry_run=dry_run, user=user, file_bytes=file_bytes
+            data_rows,
+            filename=filename,
+            dry_run=dry_run,
+            user=user,
+            file_bytes=file_bytes,
+            progress_cb=progress_cb,
         )
 
     def _validate_master_profile_row(self, row: dict[str, str]) -> None:
@@ -1689,6 +1725,7 @@ class PayflowClientService:
         dry_run: bool,
         user: UserModel | None,
         file_bytes: bytes | None,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> dict:
         preview_masters: list[dict] = []
         preview_subs: list[dict] = []
@@ -1700,9 +1737,14 @@ class PayflowClientService:
         seen_sub_codes: set[tuple[str, str]] = set()
         seen_numbers: set[str] = set()
         flag_error_rows: set[int] = set()
+        # Two passes over the file (masters, then subs).
+        progress_total = max(1, len(data_rows) * 2)
+        tick_progress(progress_cb, 0, progress_total, force=True)
 
         # Pass 1 — masters
-        for row_num, row in enumerate(data_rows, start=2):
+        for i, row in enumerate(data_rows):
+            row_num = i + 2
+            tick_progress(progress_cb, i + 1, progress_total)
             record_id = row.get("client_number") or f"Row {row_num}"
             code = _normalize_code(row.get("client_code") or "")
             number = (row.get("client_number") or "").strip()
@@ -1906,7 +1948,15 @@ class PayflowClientService:
         }
 
         # Pass 2 — sub-clients
-        for row_num, row in enumerate(data_rows, start=2):
+        n_rows = len(data_rows)
+        for i, row in enumerate(data_rows):
+            row_num = i + 2
+            tick_progress(
+                progress_cb,
+                n_rows + i + 1,
+                progress_total,
+                force=(i + 1) >= n_rows,
+            )
             if row_num in flag_error_rows:
                 continue
             record_id = row.get("client_number") or f"Row {row_num}"
@@ -2235,12 +2285,16 @@ class PayflowClientService:
         dry_run: bool,
         user: UserModel | None,
         file_bytes: bytes | None,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> dict:
         preview: list[dict] = []
         errors: list[dict] = []
         created = updated = unchanged = failed = 0
         seen_codes: set[str] = set()
-        for row_num, row in enumerate(data_rows, start=2):
+        total_rows = len(data_rows)
+        tick_progress(progress_cb, 0, total_rows, force=True)
+        for i, row in enumerate(data_rows):
+            row_num = i + 2
             name = (row.get("client_name") or row.get("company_name") or "").strip()
             code = _normalize_code(row.get("client_code") or "")
             record_id = f"Row {row_num}"
@@ -2328,6 +2382,7 @@ class PayflowClientService:
                             "entity_id": None,
                         }
                     )
+            tick_progress(progress_cb, i + 1, total_rows, force=(i + 1) >= total_rows)
 
         rejected = sum(1 for e in errors if (e.get("status") or "").lower() == "rejected")
         successful = created + updated + unchanged
@@ -2487,6 +2542,7 @@ class PayflowClientService:
         else:
             status = "Failed"
 
+        total = created + updated + unchanged + failed
         run = PayflowImportRunModel(
             kind="client",
             file_name=filename,
@@ -2494,7 +2550,8 @@ class PayflowClientService:
             uploaded_by_user_id=user.id if user else None,
             uploaded_by_name=(user.full_name if user else None) or (user.email if user else "System"),
             status="Uploaded",
-            total_count=created + updated + unchanged + failed,
+            total_count=total,
+            processed_count=total,
             created_count=created,
             updated_count=updated,
             unchanged_count=unchanged,

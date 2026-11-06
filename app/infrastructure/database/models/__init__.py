@@ -512,6 +512,7 @@ class PayflowImportRunModel(Base):
     uploaded_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     unchanged_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -527,6 +528,34 @@ class PayflowImportRunModel(Base):
         back_populates="run",
         cascade="all, delete-orphan",
     )
+
+
+class PayflowImportJobModel(Base):
+    """Async validate/upload job so the UI can poll real row progress."""
+
+    __tablename__ = "payflow_import_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # account_validate | account_upload | client_validate | client_upload
+    job_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # queued | running | completed | failed
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True, default="queued")
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    import_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_import_runs.id"), nullable=True, index=True
+    )
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class PayflowImportErrorModel(Base):
