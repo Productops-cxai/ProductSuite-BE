@@ -112,6 +112,9 @@ class RuleRuntimeService:
         """
         Priority: Prevent Communication (comms only) → Hold Action → Require Human Review
         → Escalate / Reassessment / Change Workflow.
+
+        Require Human Review and Escalate Case only apply on Communication steps
+        (before Email / SMS is sent) — not on Trigger / Wait / Condition / etc.
         """
         matched = self.evaluate(account, channel=channel, for_communication=for_communication)
         if exclude_actions:
@@ -126,13 +129,17 @@ class RuleRuntimeService:
             "Request Reassessment",
             "Apply / Change Workflow",
         ]
+        # Only pause for review right before a message is sent — not on every workflow step.
+        communication_only = frozenset(
+            {"Prevent Communication", "Require Human Review", "Escalate Case"}
+        )
         for action in priority:
-            if for_communication is False and action == "Prevent Communication":
+            if for_communication is False and action in communication_only:
                 continue
             for m in matched:
                 if m["action"] == action:
                     return m
-        return matched[0]
+        return None
 
     def matches_rule(
         self,

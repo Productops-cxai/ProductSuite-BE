@@ -820,6 +820,8 @@ class WorkflowExecutionService:
                     step_id=step_id,
                     level="info",
                 )
+            # RHR / Escalate / Prevent Comm only on Communication (see rule_runtime).
+            # Hold / Reassessment / Change Workflow may still apply on other steps.
             blocking = self.rules.first_blocking_action(
                 account,
                 channel=channel if isinstance(channel, str) else None,
