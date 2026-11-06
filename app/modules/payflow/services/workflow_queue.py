@@ -63,6 +63,16 @@ def enqueue_enroll_strategy(db: Session, strategy_id: int, *, commit: bool = Tru
     )
 
 
+def enqueue_gap_fill(db: Session, *, commit: bool = True) -> PayflowWorkflowJobModel:
+    """Queue a pass that enrolls accounts missing from already-Active strategies."""
+    return enqueue_job(
+        db,
+        job_type=PayflowWorkflowJobType.GAP_FILL.value,
+        priority=60,
+        commit=commit,
+    )
+
+
 def enqueue_execute_step(
     db: Session,
     *,

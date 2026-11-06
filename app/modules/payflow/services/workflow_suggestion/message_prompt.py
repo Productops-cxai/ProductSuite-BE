@@ -109,8 +109,10 @@ no "to avoid further action", no service being cut or interrupted - only the Fin
 - Use the segment: e.g. a high average balance → a payment plan can spread the cost (only if the payment page
   offers plans); partly paid → thank them for what they have paid.
 - Offer only what the payment page really offers (listed with the client).
-- Email: a subject of at most {MAX_SUBJECT_CHARS} characters, and a body of {low}-{high} words that starts with
-  "Hi {{{{first_name}}}}," and ends with {{{{brand_name}}}}.
+- Email: a subject of at most {MAX_SUBJECT_CHARS} characters AFTER variables are filled
+  ({{{{brand_name}}}} alone is ~24 characters — keep your own words short, ideally under 35 characters of
+  plain text). One line only. Body: {low}-{high} words, starts with "Hi {{{{first_name}}}}," and ends with
+  {{{{brand_name}}}}.
 - SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in. Start with "{{{{brand_name}}}}:"
   and end with "Reply STOP to opt out."
 - If a message shows its current text, improve that text (and apply the reviewer remarks) instead of starting over.

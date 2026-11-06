@@ -10,7 +10,12 @@ from app.infrastructure.database.models import PayflowClientModel
 from app.modules.payflow.services.workflow_suggestion import message_writer
 from app.modules.payflow.services.workflow_suggestion.context import load_payment_options
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema
-from app.modules.payflow.services.workflow_suggestion.message_writer import apply_messages, write_messages
+from app.modules.payflow.services.workflow_suggestion.message_validator import MAX_SUBJECT_CHARS, render_sample
+from app.modules.payflow.services.workflow_suggestion.message_writer import (
+    _fit_subject,
+    apply_messages,
+    write_messages,
+)
 from app.modules.payflow.services.workflow_suggestion.prompt import load_examples
 from tests.test_workflow_message_validator import EMAIL, FINAL_SMS
 
@@ -105,6 +110,19 @@ def test_only_email_and_sms_steps_can_be_written():
     flow["steps"][0]["next"] = None
     with pytest.raises(ValidationAppError, match="no email or SMS steps"):
         write(flow, {})
+
+
+def test_long_email_subject_is_trimmed_to_the_rendered_limit():
+    long_subject = "Friendly reminder about your open balance with {{brand_name}} please pay soon"
+    assert len(render_sample(long_subject)) > MAX_SUBJECT_CHARS
+    fitted = _fit_subject(long_subject)
+    assert len(render_sample(fitted)) <= MAX_SUBJECT_CHARS
+    assert "\n" not in fitted
+    written, _ = write(
+        workflow(),
+        {"s2": {**EMAIL, "subject": long_subject}, "s5": FINAL_SMS},
+    )
+    assert len(render_sample(written["s2"]["subject"])) <= MAX_SUBJECT_CHARS
 
 
 def test_apply_messages_sets_text_on_the_message_steps_only():

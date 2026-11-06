@@ -1066,6 +1066,25 @@ class PayflowImportService:
                 requested_by_user_id=user.id,
                 import_run_id=run.id,
             )
+            # New / refreshed accounts must join already-Active workflows. Activate only
+            # enrolled the snapshot at activate time; enroll_strategy skips open runs.
+            if created or updated:
+                try:
+                    from app.modules.payflow.services.workflow_execution_service import (
+                        WorkflowExecutionService,
+                    )
+
+                    WorkflowExecutionService(self.db).enqueue_enrolls_for_scopes(
+                        portfolio_pairs=touched_portfolios,
+                        parent_client_ids=touched_parent_clients,
+                        commit=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    import logging
+
+                    logging.getLogger("app.import").exception(
+                        "workflow enroll after import failed run_id=%s", run.id
+                    )
 
         self.db.commit()
         self.db.refresh(run)

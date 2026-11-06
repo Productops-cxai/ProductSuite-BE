@@ -532,6 +532,35 @@ class PayflowRuleService:
         self.db.commit()
         return {"message": "Rule deleted"}
 
+    def scan_human_reviews_for_assigned_rules(
+        self, *, rule_names: list[str], actor_name: str
+    ) -> int:
+        """After a client newly assigns system rules, retroactively queue RHR matches.
+
+        Rule activate/create scans still run as before. This covers the gap where a
+        system rule is Active first and only later selected on a client's governance.
+        Non-RHR actions stay step-time only (unchanged).
+        """
+        names = [str(name).strip() for name in rule_names if str(name).strip()]
+        if not names:
+            return 0
+        rows = (
+            self.db.query(PayflowRuleModel)
+            .filter(
+                PayflowRuleModel.name.in_(names),
+                PayflowRuleModel.status == PayflowRuleStatus.ACTIVE.value,
+                or_(
+                    PayflowRuleModel.rule_type == PayflowRuleType.SYSTEM.value,
+                    PayflowRuleModel.client_id.is_(None),
+                ),
+            )
+            .all()
+        )
+        created = 0
+        for row in rows:
+            created += self._enqueue_retroactive_human_reviews(row, actor_name=actor_name)
+        return created
+
     def _enqueue_retroactive_human_reviews(
         self, rule: PayflowRuleModel, *, actor_name: str
     ) -> int:
