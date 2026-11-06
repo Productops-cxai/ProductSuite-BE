@@ -336,7 +336,7 @@ payflow_clients 1──* portfolios, accounts, rules, reviews, strategies, commu
 | Token | Contents | TTL setting |
 |-------|----------|-------------|
 | Access | `sub` = user UUID, `type=access`, `jti`, `email`, `role`, `org_id` | `JWT_ACCESS_EXPIRE_MINUTES` |
-| Refresh | `type=refresh`, `jti` stored in DB | `JWT_REFRESH_EXPIRE_DAYS` |
+| Refresh | `type=refresh`, `jti` stored in DB | `JWT_REFRESH_EXPIRE_MINUTES` |
 
 Algorithm: `JWT_ALGORITHM` (HS256) with `JWT_SECRET`.
 
@@ -396,7 +396,7 @@ User: GET /me/products
 | `JWT_SECRET` | Signing secret |
 | `JWT_ALGORITHM` | e.g. HS256 |
 | `JWT_ACCESS_EXPIRE_MINUTES` | Access token TTL |
-| `JWT_REFRESH_EXPIRE_DAYS` | Refresh token TTL |
+| `JWT_REFRESH_EXPIRE_MINUTES` | Refresh token TTL |
 | `PASSWORD_RESET_EXPIRE_MINUTES` | Reset link TTL |
 | `ACTIVATION_TOKEN_EXPIRE_MINUTES` | Invite link TTL |
 | `FRONTEND_URL` | Base URL for email action links |

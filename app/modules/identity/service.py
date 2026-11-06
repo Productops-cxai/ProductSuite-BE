@@ -134,7 +134,7 @@ def issue_tokens(
             user_id=user.id,
             session_id=session.id,
             jti=refresh_jti,
-            expires_at=now + timedelta(days=settings.JWT_REFRESH_EXPIRE_DAYS),
+            expires_at=now + settings.refresh_token_ttl(),
         )
     )
     db.commit()
@@ -324,7 +324,19 @@ class IdentityService:
         return None
 
     def refresh(self, refresh_token: str) -> dict:
-        payload = safe_decode_token(refresh_token)
+        from jose import ExpiredSignatureError, JWTError
+
+        from app.core.security import decode_token
+
+        try:
+            payload = decode_token(refresh_token)
+        except ExpiredSignatureError:
+            raise UnauthorizedError(
+                "Refresh token expired — please sign in again",
+                code="refresh_expired",
+            ) from None
+        except JWTError:
+            payload = None
         if not payload or payload.get("type") != "refresh":
             raise UnauthorizedError("Invalid refresh token")
 
@@ -354,6 +366,11 @@ class IdentityService:
                         SESSION_REPLACED_MESSAGE, code="session_replaced"
                     )
                 raise UnauthorizedError(SESSION_ENDED_MESSAGE, code="session_ended")
+            if row is not None and row.expires_at < now and row.revoked_at is None:
+                raise UnauthorizedError(
+                    "Refresh token expired — please sign in again",
+                    code="refresh_expired",
+                )
             raise UnauthorizedError(
                 "Refresh token expired or already used",
                 code="refresh_reused",

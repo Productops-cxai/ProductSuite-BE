@@ -39,7 +39,7 @@ def create_refresh_token(
     *,
     session_id: str | None = None,
 ) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=settings.JWT_REFRESH_EXPIRE_DAYS)
+    expire = datetime.now(timezone.utc) + settings.refresh_token_ttl()
     payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "refresh", "jti": jti}
     if session_id:
         payload["sid"] = session_id

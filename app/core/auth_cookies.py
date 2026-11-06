@@ -57,7 +57,7 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str) 
     response.set_cookie(
         key=REFRESH_COOKIE,
         value=refresh_token,
-        max_age=max(3600, int(settings.JWT_REFRESH_EXPIRE_DAYS) * 86400),
+        max_age=settings.refresh_token_max_age_seconds(),
         **common,
     )
 

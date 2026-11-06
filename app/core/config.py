@@ -40,7 +40,15 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-platform-suite-secret-key"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_EXPIRE_MINUTES: int = 60
-    JWT_REFRESH_EXPIRE_DAYS: int = 7
+    JWT_REFRESH_EXPIRE_MINUTES: int = 10080  # default 7 days in minutes
+
+    def refresh_token_ttl(self):  # timedelta — used by security / cookies / identity
+        from datetime import timedelta
+
+        return timedelta(minutes=max(1, int(self.JWT_REFRESH_EXPIRE_MINUTES or 1)))
+
+    def refresh_token_max_age_seconds(self) -> int:
+        return max(60, int(self.refresh_token_ttl().total_seconds()))
 
     # Browser session cookies (HttpOnly). Leave COOKIE_SECURE unset to follow APP_ENV.
     # Cross-site API (app.example.com → api.example.com): COOKIE_SAMESITE=none + COOKIE_SECURE=true
