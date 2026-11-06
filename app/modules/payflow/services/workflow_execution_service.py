@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -501,6 +501,67 @@ class WorkflowExecutionService:
             totals["enrolled"] += int(result.get("enrolled") or 0)
             totals["skipped"] += int(result.get("skipped") or 0)
         return totals
+
+    def enqueue_enrolls_for_scopes(
+        self,
+        *,
+        portfolio_pairs: set[tuple[int, int]] | list[tuple[int, int]] | None = None,
+        parent_client_ids: set[int] | list[int] | None = None,
+        commit: bool = False,
+    ) -> list[PayflowWorkflowJobModel]:
+        """Queue enroll jobs for Active strategies in the given import scopes.
+
+        Activate-time enrollment is unchanged. This only schedules the same
+        ``enroll_strategy`` job used on activate, so accounts already running
+        are skipped inside ``enroll_strategy`` (open-run check).
+        """
+        strategy_ids: set[int] = set()
+        pairs = list(portfolio_pairs or [])
+        parents = list(parent_client_ids or [])
+
+        if pairs:
+            scope_filters = [
+                and_(
+                    PayflowStrategyModel.client_id == client_id,
+                    PayflowStrategyModel.portfolio_id == portfolio_id,
+                )
+                for client_id, portfolio_id in pairs
+            ]
+            rows = (
+                self.db.query(PayflowStrategyModel.id)
+                .filter(
+                    PayflowStrategyModel.status == "Active",
+                    or_(*scope_filters),
+                )
+                .all()
+            )
+            strategy_ids.update(row[0] for row in rows)
+
+        if parents:
+            rows = (
+                self.db.query(PayflowStrategyModel.id)
+                .filter(
+                    PayflowStrategyModel.status == "Active",
+                    PayflowStrategyModel.client_id.in_(parents),
+                    PayflowStrategyModel.portfolio_id.is_(None),
+                )
+                .all()
+            )
+            strategy_ids.update(row[0] for row in rows)
+
+        jobs: list[PayflowWorkflowJobModel] = []
+        for strategy_id in sorted(strategy_ids):
+            jobs.append(enqueue_enroll_strategy(self.db, strategy_id, commit=False))
+            self.log_event(
+                event_type="enroll_queued",
+                message=f"Enroll queued after import for strategy {strategy_id}",
+                strategy_id=strategy_id,
+                job_id=jobs[-1].id,
+                commit=False,
+            )
+        if commit and jobs:
+            self.db.commit()
+        return jobs
 
     # ------------------------------------------------------------------ execute / resume
     def resume_run(

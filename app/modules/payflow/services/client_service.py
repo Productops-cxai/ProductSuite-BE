@@ -711,6 +711,7 @@ class PayflowClientService:
             if "whatsapp" in ch:
                 client.channel_whatsapp = bool(ch["whatsapp"])
 
+        newly_governance: list[str] = []
         if "governance_rules" in payload and payload["governance_rules"] is not None:
             rules = payload["governance_rules"]
             if not isinstance(rules, list):
@@ -722,6 +723,7 @@ class PayflowClientService:
             if unknown:
                 raise ValidationAppError(f"Unknown governance rule(s): {', '.join(map(str, unknown))}")
             client.governance_rules = list(rules)
+            newly_governance = [r for r in rules if r not in previously]
 
         if "payment_settings" in payload and payload["payment_settings"] is not None:
             settings_payload = payload["payment_settings"]
@@ -744,6 +746,20 @@ class PayflowClientService:
         client.updated_at = _utcnow()
         self.db.commit()
         self.db.refresh(client)
+        if newly_governance:
+            try:
+                from app.modules.payflow.services.rule_service import PayflowRuleService
+
+                PayflowRuleService(self.db).scan_human_reviews_for_assigned_rules(
+                    rule_names=newly_governance,
+                    actor_name="Client governance assignment",
+                )
+            except Exception:
+                import logging
+
+                logging.getLogger("app.clients").exception(
+                    "governance rule retroactive scan failed client_id=%s", client.id
+                )
         if newly_assigned:
             try:
                 from app.modules.payflow.services.notification_service import (
