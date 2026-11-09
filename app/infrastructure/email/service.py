@@ -31,7 +31,13 @@ def send_email(
     """Persist to email_logs and deliver via SendGrid (preferred) or SMTP.
 
     When neither provider is configured, status stays ``logged`` (dev / email-less).
+    Uses the same branded HTML + CTA button template as collection mail
+    (Activate Account / Reset Password). No unsubscribe footer on identity mail.
     """
+    # Branded sender only for identity CTAs — leave notifications on default From.
+    suite_from = None
+    if (email_type or "").strip().lower() in {"activation", "password_reset"}:
+        suite_from = (settings.SENDGRID_FROM_NAME or "").strip() or "Platform Suite"
     row = send_collection_email(
         db,
         to_email=to_email,
@@ -40,6 +46,7 @@ def send_email(
         email_type=email_type,
         action_link=action_link,
         related_user_id=related_user_id,
+        from_name=suite_from,
         commit=True,
     )
 

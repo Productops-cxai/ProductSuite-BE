@@ -1181,6 +1181,18 @@ class ResendCommunicationRequest(BaseModel):
     idempotency_key: Optional[str] = Field(default=None, max_length=64)
 
 
+class UpdateEmailConsentRequest(BaseModel):
+    email_consent: bool
+
+
+class PayflowEmailPreferencePublic(BaseModel):
+    account_reference: str
+    brand_name: str
+    email_masked: Optional[str] = None
+    subscribed: bool
+    email_consent: Optional[bool] = None
+
+
 class PayflowPaymentLinkEventItem(BaseModel):
     at: Optional[str] = None
     label: Optional[str] = None

@@ -33,6 +33,9 @@ def send_collection_email(
     custom_args: dict[str, str] | None = None,
     from_email: str | None = None,
     from_name: str | None = None,
+    balance: float | int | None = None,
+    unsubscribe_url: str | None = None,
+    list_unsubscribe_url: str | None = None,
     commit: bool = True,
 ) -> EmailLogModel:
     return _send(
@@ -46,5 +49,8 @@ def send_collection_email(
         custom_args=custom_args,
         from_email=from_email,
         from_name=from_name,
+        balance=balance,
+        unsubscribe_url=unsubscribe_url,
+        list_unsubscribe_url=list_unsubscribe_url,
         commit=commit,
     )

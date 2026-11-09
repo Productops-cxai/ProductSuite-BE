@@ -48,7 +48,9 @@ from app.modules.payflow.schemas import (
     ManualEmailSendResponse,
     ManualSmsSendRequest,
     ManualSmsSendResponse,
+    PayflowEmailPreferencePublic,
     ResendCommunicationRequest,
+    UpdateEmailConsentRequest,
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
     PayflowAccountPaymentsResponse,
@@ -711,6 +713,28 @@ def reassess_account_ai(account_id: int, user: PayflowManageWorkflows, db: DbSes
 def get_account(account_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         return PayflowAccountService(db).get_account(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/accounts/{account_id}/email-consent/update")
+def update_account_email_consent(
+    account_id: int,
+    payload: UpdateEmailConsentRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    """Ops restore / revoke email consent (does not change SMS opt-out)."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    try:
+        return PayflowEmailPreferenceService(db).set_email_consent(
+            user,
+            account_id,
+            email_consent=payload.email_consent,
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1715,6 +1739,54 @@ def get_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
 def revoke_payment_link(link_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
         return PayflowPaymentLinkService(db).revoke(user, link_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/public/email-preferences/{token}",
+    response_model=PayflowEmailPreferencePublic,
+)
+def resolve_public_email_preference(token: str, db: DbSession):
+    """Customer email preference page resolve — no JWT."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    try:
+        return PayflowEmailPreferenceService(db).resolve_public(token)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/email-preferences/{token}/unsubscribe",
+    response_model=PayflowEmailPreferencePublic,
+)
+def public_email_unsubscribe(token: str, db: DbSession):
+    """Unsubscribe (footer confirm + List-Unsubscribe one-click). No JWT."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    try:
+        return PayflowEmailPreferenceService(db).unsubscribe_public(token)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/public/email-preferences/{token}/resubscribe",
+    response_model=PayflowEmailPreferencePublic,
+)
+def public_email_resubscribe(token: str, db: DbSession):
+    """Customer resubscribe via preference page. No JWT."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    try:
+        return PayflowEmailPreferenceService(db).resubscribe_public(token)
     except AppError as exc:
         raise _map_error(exc) from exc
 
