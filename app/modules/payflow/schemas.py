@@ -969,6 +969,8 @@ class PayflowStrategyItem(BaseModel):
     last_updated_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Set when reject-regenerate returns immediately and AI regenerate runs in the background.
+    regeneration_pending: Optional[bool] = None
 
 
 class StrategiesSummary(BaseModel):

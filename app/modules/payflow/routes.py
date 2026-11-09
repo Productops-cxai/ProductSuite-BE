@@ -1405,12 +1405,41 @@ def reject_and_regenerate_workflow(
     payload: RegenerateWorkflowRequest,
     user: PayflowManageWorkflows,
     db: DbSession,
+    background_tasks: BackgroundTasks,
 ):
-    """Reject (keep history) then regenerate — single call for the FE Reject / Regenerate action."""
+    """Reject immediately (history kept); queue AI regenerate in the background.
+
+    Avoids nginx 504 / false CORS errors when Groq takes longer than the proxy timeout.
+    Poll GET .../latest-revision for the new AI Proposed workflow.
+    """
     try:
-        return WorkflowSuggestionService(db).reject_and_regenerate(
+        from app.modules.payflow.services.workflow_suggestion.service import (
+            schedule_regenerate_workflow,
+        )
+
+        rejected = WorkflowSuggestionService(db).reject_and_queue_regenerate(
             user, strategy_id, payload.remarks
         )
+        schedule_regenerate_workflow(
+            background_tasks, strategy_id, payload.remarks, str(user.id)
+        )
+        return rejected
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/workflows/{strategy_id}/latest-revision", response_model=PayflowStrategyItem)
+def get_latest_workflow_revision(
+    strategy_id: int,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    """Newest regenerated child of this workflow, or 404 while AI is still working."""
+    try:
+        child = WorkflowSuggestionService(db).latest_revision(user, strategy_id)
+        if child is None:
+            raise NotFoundError("Regenerated workflow is not ready yet")
+        return child
     except AppError as exc:
         raise _map_error(exc) from exc
 
