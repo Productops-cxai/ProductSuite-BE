@@ -42,8 +42,8 @@ from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 # After the first AI answer, failing workflows are sent back to the AI this many times.
 MAX_FIX_ATTEMPTS = 2
 
-# Reject first, then regenerate: Active → Under Review (same id + history);
-# other statuses → AI Proposed / Draft. Draft included so Human Created can regenerate.
+# Active / Inactive are rejected first (→ AI Proposed or Draft), then regenerated.
+# Draft is included so Human Created workflows can regenerate after reject.
 REGENERATE_STATUSES = {
     PayflowStrategyStatus.DRAFT.value,
     PayflowStrategyStatus.AI_PROPOSED.value,
@@ -225,15 +225,12 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
-        # Skip a second Groq call for message bodies on regenerate — keeps the request
-        # under reverse-proxy timeouts (browser otherwise reports a false CORS error).
-        # Reviewers use Write messages on the new AI Proposed workflow before approval.
-        messages_note = [
-            {
-                "label": "Messages",
-                "value": "Not written on regenerate. Use Write messages before approval.",
-            }
-        ]
+        # The new version gets fresh email / SMS text (its steps are new).
+        workflow, messages_note = _with_messages(
+            {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
+            workflow,
+            _stored_segment(original),
+        )
 
         ai_context = kept + _reasoning_context(workflow) + [
             {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
@@ -261,34 +258,6 @@ class WorkflowSuggestionService:
             ai_context=ai_context,
             revision_of_id=original["id"],
         )
-
-    def reject_and_queue_regenerate(
-        self, user: UserModel, strategy_id: int, remarks: str
-    ) -> dict[str, Any]:
-        """Reject now (history on same workflow); caller schedules regenerate in background.
-
-        Returns the rejected workflow immediately so nginx/proxies do not 504 on Groq latency.
-        Active → Under Review; other statuses follow reject rules.
-        """
-        rejected = self.strategies.reject(user, strategy_id, note=remarks)
-        rejected["regeneration_pending"] = True
-        return rejected
-
-    def latest_revision(
-        self, user: UserModel, strategy_id: int
-    ) -> dict[str, Any] | None:
-        """Newest workflow regenerated from strategy_id, or None if not ready yet."""
-        parent = self.strategies.get_strategy(user, strategy_id)
-        self.strategies._assert_manage(user, parent["client_id"])
-        child = (
-            self.db.query(PayflowStrategyModel)
-            .filter(PayflowStrategyModel.revision_of_id == strategy_id)
-            .order_by(PayflowStrategyModel.id.desc())
-            .first()
-        )
-        if not child:
-            return None
-        return self.strategies._serialize(self.strategies._get_row(child.id))
 
     def write_workflow_messages(
         self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
@@ -487,36 +456,3 @@ def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:
         for field, label in REASONING_LABELS.items()
         if str(reasoning.get(field) or "").strip()
     ]
-
-
-def run_regenerate_workflow(strategy_id: int, remarks: str, user_id: str) -> None:
-    """Background entry: own DB session so reject-regenerate can return before Groq finishes."""
-    import logging
-    import uuid as uuid_mod
-
-    from app.infrastructure.database.session import SessionLocal
-
-    logger = logging.getLogger("app.workflow_suggestion")
-    db = SessionLocal()
-    try:
-        try:
-            uid = uuid_mod.UUID(str(user_id))
-        except (TypeError, ValueError):
-            logger.error("Background regenerate: invalid user_id=%s", user_id)
-            return
-        user = db.get(UserModel, uid)
-        if user is None:
-            logger.error("Background regenerate: user not found id=%s", user_id)
-            return
-        WorkflowSuggestionService(db).regenerate_workflow(user, strategy_id, remarks)
-        logger.info("Background regenerate done strategy_id=%s", strategy_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("Background regenerate failed strategy_id=%s", strategy_id)
-    finally:
-        db.close()
-
-
-def schedule_regenerate_workflow(
-    background_tasks: Any, strategy_id: int, remarks: str, user_id: str
-) -> None:
-    background_tasks.add_task(run_regenerate_workflow, int(strategy_id), remarks, str(user_id))
