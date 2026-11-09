@@ -28,7 +28,12 @@ from app.modules.payflow.services.workflow_suggestion.learning import (
 )
 from app.modules.payflow.services.workflow_suggestion.llm import build_output_schema, call_llm
 from app.modules.payflow.services.workflow_suggestion.message_writer import apply_messages, write_messages
-from app.modules.payflow.services.workflow_suggestion.prompt import build_messages, build_revision
+from app.modules.payflow.services.workflow_suggestion.prompt import (
+    MAX_REGENERATE_CLIENT_EXAMPLES,
+    MAX_REGENERATE_LESSONS,
+    build_messages,
+    build_revision,
+)
 from app.modules.payflow.services.workflow_suggestion.rules import design_limits, governing_rules
 from app.modules.payflow.services.workflow_suggestion.segmenter import build_segments
 from app.modules.payflow.services.workflow_suggestion.validator import validate_all
@@ -208,14 +213,17 @@ class WorkflowSuggestionService:
         )
         lessons = pick_lessons(learning["lessons"], [segment])
         revision = build_revision(segment["segment_id"], original, remarks, self._review_history(original))
+        # Cap learning payload on regenerate — full examples + revision exceed Groq free TPM.
         workflow = self._suggest_batch(
             client,
             scope_name,
             [segment],
             limits,
             revision,
-            client_examples=[item["example"] for item in examples],
-            lessons=lessons,
+            client_examples=[
+                item["example"] for item in examples[:MAX_REGENERATE_CLIENT_EXAMPLES]
+            ],
+            lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
         # The new version gets fresh email / SMS text (its steps are new).
         workflow, messages_note = _with_messages(

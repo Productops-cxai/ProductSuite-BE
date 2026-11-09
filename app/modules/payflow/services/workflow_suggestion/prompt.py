@@ -27,7 +27,14 @@ EXAMPLES_PATH = Path(__file__).parent / "prompts" / "workflow_examples.json"
 END_STEP_KINDS = ("Outcome", "Human Review", "Case Action")
 
 # Regenerate sends at most this many review-history entries (keeps prompts small on the free tier).
-MAX_HISTORY_ENTRIES = 10
+# Groq free TPM is tight (~8k); keep history short so revision + catalog still fit.
+MAX_HISTORY_ENTRIES = 5
+MAX_CHANGES_PER_HISTORY = 4
+MAX_REMARKS_CHARS = 800
+MAX_CHANGE_CHARS = 160
+# On regenerate the current workflow is already in the user prompt — fewer examples.
+MAX_REGENERATE_CLIENT_EXAMPLES = 1
+MAX_REGENERATE_LESSONS = 5
 
 # Email / SMS text on Communication steps — written separately (message_writer.py), not part of
 # a workflow's design, so it stays out of the workflow prompts (examples, revisions).
@@ -67,8 +74,18 @@ def build_messages(
         user_prompt += "\n\n" + revision
     if feedback:
         user_prompt += "\n\n" + build_feedback(feedback)
+    # Regenerate already includes the full current workflow — use a compact example set
+    # so Groq free-tier TPM (~8k) is not exceeded.
     return [
-        {"role": "system", "content": build_system_prompt(limits, client_examples, lessons)},
+        {
+            "role": "system",
+            "content": build_system_prompt(
+                limits,
+                client_examples,
+                lessons,
+                compact=bool(revision),
+            ),
+        },
         {"role": "user", "content": user_prompt},
     ]
 
@@ -76,8 +93,17 @@ def build_messages(
 def build_feedback(feedback: list[dict[str, Any]]) -> str:
     parts = ["Your previous workflows for these segments had problems. Fix every problem and return corrected workflows:"]
     for item in feedback:
-        if item["workflow"]:
-            parts.append(json.dumps(item["workflow"], ensure_ascii=False))
+        workflow = item.get("workflow")
+        if isinstance(workflow, dict):
+            # Drop message text / empty fields so retry prompts stay under TPM.
+            trimmed = {
+                "segment_id": workflow.get("segment_id"),
+                "name": workflow.get("name"),
+                "summary": workflow.get("summary"),
+                "entry_node_id": workflow.get("entry_node_id"),
+                "steps": [compact_step(step) for step in workflow.get("steps") or []],
+            }
+            parts.append(json.dumps(trimmed, ensure_ascii=False))
         parts.append("Problems:\n" + "\n".join(f"- {error}" for error in item["errors"]))
     return "\n".join(parts)
 
@@ -99,6 +125,7 @@ def build_revision(
         "entry_node_id": workflow.get("entry_node_id"),
         "steps": [compact_step(step) for step in workflow.get("steps") or []],
     }
+    remarks_text = (remarks or "").strip()[:MAX_REMARKS_CHARS]
     parts = [
         f"Revise the current workflow for segment_id \"{segment_id}\" using the reviewer's remarks. "
         "Keep what works and change what the remarks ask for. Return exactly one workflow, and fill "
@@ -108,7 +135,7 @@ def build_revision(
     history = build_review_history(versions if versions is not None else workflow.get("versions") or [])
     if history:
         parts.append(history)
-    parts.append(f"Reviewer remarks: {remarks}")
+    parts.append(f"Reviewer remarks: {remarks_text}")
     return "\n".join(parts)
 
 
@@ -127,18 +154,21 @@ def build_review_history(versions: list[dict[str, Any]]) -> str:
 
 
 def _history_line(entry: dict[str, Any]) -> str | None:
-    reason = (entry.get("reviewer_note") or "").strip()
-    changes = [str(change) for change in entry.get("changes") or []]
+    reason = (entry.get("reviewer_note") or "").strip()[:MAX_REMARKS_CHARS]
+    raw_changes = entry.get("changes") or []
+    changes = [str(change)[:MAX_CHANGE_CHARS] for change in raw_changes[:MAX_CHANGES_PER_HISTORY]]
+    if len(raw_changes) > MAX_CHANGES_PER_HISTORY:
+        changes.append(f"(+{len(raw_changes) - MAX_CHANGES_PER_HISTORY} more)")
     if not (reason or changes):
         return None  # plain status moves (review started, activated, …) carry no feedback
-    note = (entry.get("note") or "").strip()
+    note = (entry.get("note") or "").strip()[:MAX_REMARKS_CHARS]
     # Reject stores the reviewer's text as its note, so a note equal to the reason is a rejection.
     parts = ["Rejected" if reason and note == reason else note]
     if changes:
         parts.append("Changed: " + "; ".join(changes))
     if reason:
         parts.append(f"Reason: {reason}")
-    return "- " + ". ".join(parts)
+    return "- " + ". ".join(p for p in parts if p)
 
 
 def compact_step(step: dict[str, Any]) -> dict[str, Any]:
@@ -155,8 +185,14 @@ def build_system_prompt(
     limits: dict[str, Any],
     client_examples: list[dict[str, Any]] | None = None,
     lessons: list[str] | None = None,
+    *,
+    compact: bool = False,
 ) -> str:
-    """Without client_examples / lessons the prompt is exactly the generic one."""
+    """Without client_examples / lessons the prompt is exactly the generic one.
+
+    ``compact=True`` (regenerate): keep catalog + limits, but only the branching example
+    plus at most one client example — revision already carries the current workflow.
+    """
     channels = limits["channels"]
     templates = [t for t in MESSAGE_TEMPLATES if t["channel"] in channels]
     template_lines = "\n".join(f"  {t['id']} — {t['channel']} — {t['purpose']}" for t in templates)
@@ -166,10 +202,22 @@ def build_system_prompt(
     weekly_cap = limits["max_messages_per_7_days"]
     weekly_line = f"\n- At most {weekly_cap} messages in any 7 days." if weekly_cap is not None else ""
     generic = load_examples()
-    if client_examples:
+    branching = [e for e in generic if e["name"] == BRANCHING_EXAMPLE]
+    if compact:
+        owned = list(client_examples or [])[:MAX_REGENERATE_CLIENT_EXAMPLES]
+        example_list = owned + branching
+        examples_intro = (
+            (
+                f"The first {len(owned)} are this client's own workflows, approved by its reviewers: "
+                "learn from their choices, but follow the revision remarks above all.\n"
+            )
+            if owned
+            else "Compact example set for regenerate (current workflow is in the user message).\n"
+        )
+        lesson_list = list(lessons or [])[:MAX_REGENERATE_LESSONS]
+    elif client_examples:
         # The client's own (similar) workflows take generic slots; free slots keep generic
         # examples, and the branching example always stays — same number of examples as before.
-        branching = [e for e in generic if e["name"] == BRANCHING_EXAMPLE]
         free_slots = max(0, len(generic) - len(branching) - len(client_examples))
         fillers = [e for e in generic if e["name"] != BRANCHING_EXAMPLE][:free_slots]
         examples_intro = (
@@ -177,10 +225,11 @@ def build_system_prompt(
             "learn from their choices, but design for each segment's own situation and stats.\n"
         )
         example_list = client_examples + fillers + branching
+        lesson_list = lessons
     else:
-        examples_intro, example_list = "", generic
+        examples_intro, example_list, lesson_list = "", generic, lessons
     examples = examples_intro + "\n".join(json.dumps(e, ensure_ascii=False) for e in example_list)
-    examples += _lessons_section(lessons)
+    examples += _lessons_section(lesson_list)
 
     return f"""You design debt-collection workflows for PayFlow, a collections platform.
 You receive a client, one of its portfolios, and segments of that portfolio's accounts.
