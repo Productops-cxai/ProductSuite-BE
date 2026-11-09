@@ -22,39 +22,231 @@ from app.infrastructure.database.models import EmailLogModel
 
 logger = logging.getLogger("app.email.collection")
 
-# http(s) URLs in plain body → clickable anchors in HTML (SendGrid still rewrites for click tracking).
+# http(s) URLs in plain body → used for scrubbing + optional linkify fallback.
 _URL_RE = re.compile(r"(https?://[^\s<>\"']+)", re.IGNORECASE)
+# Lines that are only a URL (optional trailing punctuation).
+_BARE_URL_LINE_RE = re.compile(r"^\s*https?://\S+\s*$", re.IGNORECASE)
 
 
-def _plain_body_to_html(body: str) -> str:
-    """Minimal HTML wrapper so SendGrid can inject the open-tracking pixel.
+def scrub_action_urls_from_body(body: str, action_link: str | None = None) -> str:
+    """Remove raw payment / CTA URLs from visible copy (button carries the href)."""
+    text = (body or "").replace("\r\n", "\n")
+    if not text.strip():
+        return ""
 
-    Plain-text-only sends never fire `open` events; click tracking can still work via URL rewrite.
-    """
-    escaped = html.escape(body or "", quote=False)
+    targets: list[str] = []
+    if action_link:
+        targets.append(action_link.strip())
+    for match in _URL_RE.finditer(text):
+        url = match.group(1).rstrip(".,);]:'\"")
+        lower = url.lower()
+        # Portal + identity action URLs belong behind the CTA button.
+        if (
+            "/pay/" in lower
+            or "/activate" in lower
+            or "/reset-password" in lower
+        ) and url not in targets:
+            targets.append(url)
 
-    def _linkify(match: re.Match[str]) -> str:
-        url = match.group(1)
-        # Trailing punctuation often sticks to URLs in prose — keep it outside the href.
-        trail = ""
-        while url and url[-1] in ".,);]:'\"":
-            trail = url[-1] + trail
-            url = url[:-1]
+    for url in targets:
         if not url:
-            return html.escape(match.group(1), quote=False)
-        safe = html.escape(url, quote=True)
-        return f'<a href="{safe}">{safe}</a>{html.escape(trail, quote=False)}'
+            continue
+        text = text.replace(url, "")
 
-    linked = _URL_RE.sub(_linkify, escaped)
-    with_breaks = linked.replace("\r\n", "\n").replace("\n", "<br>\n")
+    cleaned_lines: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        if _BARE_URL_LINE_RE.match(stripped):
+            continue
+        # Drop orphan labels left after URL removal ("Pay securely:", "Pay here:", …).
+        if re.match(
+            r"(?i)^(pay(?:\s+securely|\s+here)?|pay now|set up your plan|"
+            r"visit your secure payment page(?:[^.]*))\s*[:\-–]?\s*$",
+            stripped,
+        ):
+            continue
+        # Collapse "…. : " leftovers on the same line.
+        stripped = re.sub(r"[:\-–]\s*$", "", stripped).rstrip()
+        if stripped:
+            cleaned_lines.append(stripped)
+
+    # Collapse 3+ blank lines → one blank separator.
+    out: list[str] = []
+    blank = 0
+    for line in cleaned_lines:
+        if not line:
+            blank += 1
+            if blank <= 1:
+                out.append("")
+            continue
+        blank = 0
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _cta_label_for_type(email_type: str) -> str:
+    et = (email_type or "").strip().lower()
+    if et in {"activation"}:
+        return "Activate Account"
+    if et in {"password_reset"}:
+        return "Reset Password"
+    if "collection" in et or "payment" in et or et in {"collection_workflow"}:
+        return "Pay Now"
+    return "Continue"
+
+
+def _format_balance(balance: float | int | None) -> str | None:
+    if balance is None:
+        return None
+    try:
+        amount = float(balance)
+    except (TypeError, ValueError):
+        return None
+    return f"${amount:,.2f}"
+
+
+def _paragraphs_html(body: str) -> str:
+    """Escape body and wrap non-empty paragraphs; preserve blank-line breaks."""
+    blocks = re.split(r"\n\s*\n", (body or "").strip())
+    parts: list[str] = []
+    for block in blocks:
+        lines = [html.escape(ln.strip(), quote=False) for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        inner = "<br>\n".join(lines)
+        parts.append(
+            f'<p style="margin:0 0 14px; font-size:14px; line-height:1.55; color:#1f2937;">{inner}</p>'
+        )
+    return "".join(parts)
+
+
+def build_email_html(
+    body: str,
+    *,
+    subject: str | None = None,
+    from_name: str | None = None,
+    from_email: str | None = None,
+    action_link: str | None = None,
+    balance: float | int | None = None,
+    email_type: str = "collection_workflow",
+    unsubscribe_url: str | None = None,
+) -> str:
+    """Branded HTML for collection (and other) emails — CTA button, no raw URL in body."""
+    brand = (from_name or settings.SENDGRID_FROM_NAME or "PayFlow").strip()
+    cta = _cta_label_for_type(email_type)
+    visible = scrub_action_urls_from_body(body, action_link)
+    # Fallback: if scrubbing wiped everything, keep a short generic line.
+    if not visible.strip():
+        visible = body.strip() or "You have a message from PayFlow."
+        if action_link:
+            visible = scrub_action_urls_from_body(visible, action_link) or (
+                "Please use the button below to continue."
+            )
+
+    balance_label = _format_balance(balance)
+    primary = "#2563eb"  # Matches PayFlow primary used in the app preview
+    paragraphs = _paragraphs_html(visible)
+
+    header_sub = html.escape((subject or "").strip(), quote=False)
+    header_brand = html.escape(brand, quote=False)
+
+    balance_block = ""
+    if balance_label is not None and "collection" in (email_type or "").lower():
+        balance_block = (
+            '<div style="margin:4px 0 18px; padding:12px 14px; border:1px solid #e5e7eb; '
+            'border-radius:8px; background:#f8fafc;">'
+            '<div style="font-size:11px; color:#6b7280; margin-bottom:2px;">Outstanding Balance</div>'
+            f'<div style="font-size:18px; font-weight:700; color:#111827;">{html.escape(balance_label)}</div>'
+            "</div>"
+        )
+
+    button_block = ""
+    if action_link:
+        safe_href = html.escape(action_link, quote=True)
+        safe_cta = html.escape(cta, quote=False)
+        button_block = (
+            '<div style="margin:8px 0 20px;">'
+            f'<a href="{safe_href}" '
+            f'style="display:inline-block; background:{primary}; color:#ffffff; '
+            "font-size:14px; font-weight:700; text-decoration:none; "
+            'padding:12px 22px; border-radius:8px;">'
+            f"{safe_cta}</a>"
+            "</div>"
+        )
+
+    footer_bits = [html.escape(brand, quote=False)]
+    if from_email:
+        footer_bits.append(html.escape(from_email.strip(), quote=False))
+    footer = " · ".join(footer_bits)
+
+    unsub_block = ""
+    if unsubscribe_url:
+        safe_unsub = html.escape(unsubscribe_url, quote=True)
+        unsub_block = (
+            '<p style="margin:14px 0 0; font-size:11px; line-height:1.45; color:#9ca3af;">'
+            "If you no longer wish to receive these emails, "
+            f'<a href="{safe_unsub}" style="color:#6b7280; text-decoration:underline;">'
+            "unsubscribe</a>."
+            "</p>"
+        )
+
     return (
         "<!DOCTYPE html>\n"
-        '<html><head><meta charset="utf-8" /></head>'
-        '<body style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; '
-        'line-height: 1.5; color: #222; margin: 0; padding: 16px;">'
-        f"{with_breaks}"
+        '<html><head><meta charset="utf-8" />'
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />'
+        f"<title>{header_sub or header_brand}</title></head>"
+        '<body style="margin:0; padding:0; background:#f3f4f6;">'
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="background:#f3f4f6; padding:24px 12px;">'
+        "<tr><td align=\"center\">"
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="max-width:560px; background:#ffffff; border-radius:10px; overflow:hidden; '
+        'border:1px solid #e5e7eb;">'
+        "<tr><td "
+        f'style="background:{primary}; color:#ffffff; padding:16px 20px;">'
+        f'<div style="font-size:15px; font-weight:700;">{header_brand}</div>'
+        + (
+            f'<div style="font-size:12px; opacity:0.92; margin-top:4px;">{header_sub}</div>'
+            if header_sub
+            else ""
+        )
+        + "</td></tr>"
+        '<tr><td style="padding:20px 20px 8px; font-family:Arial, Helvetica, sans-serif;">'
+        f"{paragraphs}"
+        f"{balance_block}"
+        f"{button_block}"
+        f'<p style="margin:16px 0 0; font-size:12px; color:#6b7280;">{footer}</p>'
+        f"{unsub_block}"
+        "</td></tr></table>"
+        "</td></tr></table>"
         "</body></html>"
     )
+
+
+def _plain_body_for_send(
+    body: str,
+    *,
+    action_link: str | None,
+    cta_label: str,
+    unsubscribe_url: str | None = None,
+) -> str:
+    """Plain-text alternative: scrub raw URLs from copy; append CTA line once."""
+    visible = scrub_action_urls_from_body(body, action_link)
+    if not visible.strip():
+        visible = (body or "").strip() or "You have a message from PayFlow."
+        if action_link:
+            visible = scrub_action_urls_from_body(visible, action_link) or (
+                "Please use the link below to continue."
+            )
+    parts = [visible.rstrip()]
+    if action_link and action_link not in visible:
+        parts.append(f"{cta_label}: {action_link}")
+    if unsubscribe_url:
+        parts.append(f"Unsubscribe: {unsubscribe_url}")
+    return "\n\n".join(parts)
 
 
 def sendgrid_configured() -> bool:
@@ -92,28 +284,36 @@ def _send_via_sendgrid(
     *,
     to_email: str,
     subject: str,
-    body: str,
+    plain_body: str,
+    html_body: str,
     from_email: str,
     from_name: str,
     custom_args: dict[str, str] | None,
+    list_unsubscribe_url: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
     personalization: dict[str, Any] = {"to": [{"email": to_email}]}
     if custom_args:
         personalization["custom_args"] = {str(k): str(v) for k, v in custom_args.items()}
     # plain first, then html — SendGrid multipart; open pixel only works with HTML part.
-    payload = {
+    payload: dict[str, Any] = {
         "personalizations": [personalization],
         "from": {"email": from_email, "name": from_name},
         "subject": subject,
         "content": [
-            {"type": "text/plain", "value": body},
-            {"type": "text/html", "value": _plain_body_to_html(body)},
+            {"type": "text/plain", "value": plain_body},
+            {"type": "text/html", "value": html_body},
         ],
         "tracking_settings": {
             "click_tracking": {"enable": True, "enable_text": True},
             "open_tracking": {"enable": True},
         },
     }
+    if list_unsubscribe_url:
+        # RFC 8058 one-click — Gmail/Yahoo show Unsubscribe in the header chrome.
+        payload["headers"] = {
+            "List-Unsubscribe": f"<{list_unsubscribe_url}>",
+            "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+        }
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.post(
@@ -136,9 +336,11 @@ def _send_via_smtp(
     *,
     to_email: str,
     subject: str,
-    body: str,
+    plain_body: str,
+    html_body: str,
     from_email: str,
     from_name: str,
+    list_unsubscribe_url: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
     host = settings.SMTP_HOST.strip()
     port = int(settings.SMTP_PORT or 587)
@@ -146,8 +348,11 @@ def _send_via_smtp(
     msg["Subject"] = subject
     msg["From"] = formataddr((from_name, from_email))
     msg["To"] = to_email
-    msg.set_content(body)
-    msg.add_alternative(_plain_body_to_html(body), subtype="html")
+    if list_unsubscribe_url:
+        msg["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
     try:
         with smtplib.SMTP(host, port, timeout=20) as smtp:
             if settings.SMTP_USE_TLS:
@@ -176,6 +381,9 @@ def send_collection_email(
     custom_args: dict[str, str] | None = None,
     from_email: str | None = None,
     from_name: str | None = None,
+    balance: float | int | None = None,
+    unsubscribe_url: str | None = None,
+    list_unsubscribe_url: str | None = None,
     commit: bool = True,
 ) -> EmailLogModel:
     """Send collection email via SendGrid (if configured) else SMTP else log-only.
@@ -184,6 +392,10 @@ def send_collection_email(
     - provider_message_id
     - provider_name (sendgrid | smtp | log)
     - error (optional)
+
+    ``unsubscribe_url`` is the customer page (footer link).
+    ``list_unsubscribe_url`` is the one-click HTTPS endpoint for List-Unsubscribe.
+    Activation / password-reset callers leave both unset.
     """
     resolved_from, resolved_name = _resolve_from(from_email=from_email, from_name=from_name)
     provider = active_collection_provider()
@@ -194,31 +406,54 @@ def send_collection_email(
     if not (body or "").strip():
         body = "Payment reminder"
 
+    cta_label = _cta_label_for_type(email_type)
+    plain_body = _plain_body_for_send(
+        body,
+        action_link=action_link,
+        cta_label=cta_label,
+        unsubscribe_url=unsubscribe_url,
+    )
+    html_body = build_email_html(
+        body,
+        subject=subject,
+        from_name=resolved_name,
+        from_email=resolved_from,
+        action_link=action_link,
+        balance=balance,
+        email_type=email_type,
+        unsubscribe_url=unsubscribe_url,
+    )
+
     if provider == "sendgrid":
         ok, err, provider_id = _send_via_sendgrid(
             to_email=to_email,
             subject=subject,
-            body=body,
+            plain_body=plain_body,
+            html_body=html_body,
             from_email=resolved_from,
             from_name=resolved_name,
             custom_args=custom_args,
+            list_unsubscribe_url=list_unsubscribe_url,
         )
         status = "sent" if ok else "failed"
     elif provider == "smtp":
         ok, err, provider_id = _send_via_smtp(
             to_email=to_email,
             subject=subject,
-            body=body,
+            plain_body=plain_body,
+            html_body=html_body,
             from_email=resolved_from,
             from_name=resolved_name,
+            list_unsubscribe_url=list_unsubscribe_url,
         )
         status = "sent" if ok else "failed"
         if ok and not provider_id:
             provider_id = f"smtp-{to_email.lower()}-{subject[:24]}"
 
-    stored_body = body
+    # Log stores the customer-facing plain copy (URLs scrubbed; CTA line retained).
+    stored_body = plain_body
     if err:
-        stored_body = f"{body}\n\n[{provider}: {err}]"
+        stored_body = f"{plain_body}\n\n[{provider}: {err}]"
     if provider_id:
         stored_body = f"{stored_body}\n\n[provider_id={provider_id}]"
     stored_body = f"{stored_body}\n\n[from={resolved_name} <{resolved_from}>]"

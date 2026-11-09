@@ -38,6 +38,14 @@ def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _token_expiry_label(minutes: int) -> str:
+    mins = max(1, int(minutes or 1))
+    if mins < 60:
+        return f"{mins} minute{'s' if mins != 1 else ''}"
+    hours = mins // 60
+    return f"{hours} hour{'s' if hours != 1 else ''}"
+
+
 def resolve_next_step(user: UserModel, products: List[ProductModel]) -> LoginNextStep:
     if user.role_code == PlatformRole.PLATFORM_SUPER_ADMIN.value:
         return LoginNextStep.PLATFORM_ADMIN
@@ -600,18 +608,18 @@ class IdentityService:
             minutes=minutes,
         )
         link = f"{get_frontend_url()}/reset-password?token={raw}"
-        expiry_label = (
-            f"{minutes} minute{'s' if minutes != 1 else ''}"
-            if minutes < 60
-            else f"{minutes // 60} hour{'s' if minutes // 60 != 1 else ''}"
-        )
+        expiry_label = _token_expiry_label(minutes)
+        name = (user.full_name or "").strip() or "there"
         send_email(
             self.db,
             to_email=user.email,
             subject="Reset your Platform Suite password",
             body=(
-                f"Use this link to reset your password (expires in "
-                f"{expiry_label}):\n{link}"
+                f"Hello {name},\n\n"
+                "We received a request to reset your Platform Suite password. "
+                "Use the button below to choose a new password.\n\n"
+                f"This link expires in {expiry_label}.\n\n"
+                "If you did not request this, you can ignore this email."
             ),
             email_type="password_reset",
             action_link=link,
@@ -641,18 +649,17 @@ class IdentityService:
             user.id, AuthTokenType.ACTIVATION, minutes=minutes
         )
         link = f"{get_frontend_url()}/activate?token={raw}"
-        expiry_label = (
-            f"{minutes} minute{'s' if minutes != 1 else ''}"
-            if minutes < 60
-            else f"{minutes // 60} hour{'s' if minutes // 60 != 1 else ''}"
-        )
+        expiry_label = _token_expiry_label(minutes)
+        name = (user.full_name or "").strip() or "there"
         send_email(
             self.db,
             to_email=user.email,
             subject="Activate your Platform Suite account",
             body=(
-                f"Hello {user.full_name},\n\nSet your password using this link "
-                f"(expires in {expiry_label}):\n{link}"
+                f"Hello {name},\n\n"
+                "Welcome to Platform Suite. Use the button below to set your password "
+                "and activate your account.\n\n"
+                f"This link expires in {expiry_label}."
             ),
             email_type="activation",
             action_link=link,

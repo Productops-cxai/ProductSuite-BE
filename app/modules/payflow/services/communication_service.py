@@ -22,6 +22,7 @@ from app.infrastructure.database.models import (
 )
 from app.infrastructure.email.collection_provider import (
     active_collection_provider,
+    scrub_action_urls_from_body,
     send_collection_email,
 )
 from app.infrastructure.sms.twilio_service import (
@@ -919,23 +920,23 @@ class PayflowCommunicationService:
         action_url: str | None = None
         if payment_link:
             action_url = self._ensure_payment_url(account, communication_id=comm.id)
-            if action_url and action_url not in (body or ""):
+            if action_url:
                 if channel_norm == "SMS":
-                    body = f"{(body or '').rstrip()}\nPay: {action_url}"
+                    # SMS has no button — keep the raw URL in the message body.
+                    if action_url not in (body or ""):
+                        body = f"{(body or '').rstrip()}\nPay: {action_url}"
+                        comm.body_lines = body.splitlines()[:40]
                 else:
-                    # Emails with payment_link flag but empty/missing template body
-                    # still need the URL in the message (SendGrid rejects empty content).
+                    # Email: CTA button carries the href. Scrub raw /pay/ URLs from
+                    # stored preview lines so Message Preview matches the inbox HTML.
                     base = (body or "").rstrip()
-                    body = (
-                        f"{base}\n\nPay securely: {action_url}"
-                        if base
-                        else (
+                    if not base:
+                        base = (
                             f"Hello,\n\nThis is a payment reminder for account "
-                            f"{account.account_reference or account.id}.\n\n"
-                            f"Pay securely: {action_url}\n\nThank you."
+                            f"{account.account_reference or account.id}.\n\nThank you."
                         )
-                    )
-                comm.body_lines = body.splitlines()[:40]
+                    body = scrub_action_urls_from_body(base, action_url) or base
+                    comm.body_lines = body.splitlines()[:40]
 
         # SendGrid requires content value length >= 1; workflow steps with no
         # template/body previously sent "" and failed with content.0.value.
@@ -984,6 +985,13 @@ class PayflowCommunicationService:
             if brand_name and "{{brand_name}}" not in body:
                 # Already rendered templates may include brand; leave body as-is.
                 pass
+            from app.modules.payflow.services.email_preference_service import (
+                email_preference_page_url,
+                email_unsubscribe_one_click_url,
+            )
+
+            unsub_page = email_preference_page_url(account.id)
+            unsub_one_click = email_unsubscribe_one_click_url(account.id)
             log = send_collection_email(
                 self.db,
                 to_email=email,
@@ -994,6 +1002,9 @@ class PayflowCommunicationService:
                 custom_args=custom_args if email_provider == "sendgrid" else None,
                 from_email=brand_from,
                 from_name=brand_name,
+                balance=float(account.outstanding_balance or 0),
+                unsubscribe_url=unsub_page,
+                list_unsubscribe_url=unsub_one_click,
                 commit=False,
             )
             send_status = log.status
@@ -1317,6 +1328,16 @@ class PayflowCommunicationService:
                 account = self.db.get(PayflowAccountModel, row.account_id)
                 if account is not None:
                     account.email_consent = False
+        elif et in {"group_resubscribe", "resubscribe"}:
+            # SendGrid / ESP resubscribe — restore email consent only (do not change SMS).
+            self._append_json_event(row, "Email Resubscribed", f"Provider event: {et}")
+            if row.account_id:
+                account = self.db.get(PayflowAccountModel, row.account_id)
+                if account is not None:
+                    account.email_consent = True
+                    row.eligibility_status = "Eligible"
+                    if row.restriction_reason and "Provider event:" in (row.restriction_reason or ""):
+                        row.restriction_reason = None
         elif et in {"deferred"}:
             self._append_json_event(row, "Delivery Deferred", "Temporary delay from provider")
             row.eligibility_status = "Deferred"
