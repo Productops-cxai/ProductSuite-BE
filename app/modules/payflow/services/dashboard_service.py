@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -59,6 +60,13 @@ DATE_BUCKETS = {
         "Quarter To Date",
     },
 }
+
+# Address / contact failures that never entered a successful send path.
+_INVALID_ADDRESS_RE = re.compile(
+    r"invalid|not a valid|no valid email|no valid mobile|no valid phone|"
+    r"format is invalid|email address format|phone number is not",
+    re.IGNORECASE,
+)
 
 # Statuses that have progressed at least to this funnel stage.
 # Opened = real open/read (or opens_count), not click-only.
@@ -459,6 +467,7 @@ class PayflowDashboardService:
         ]
 
         funnel = self._build_funnel(comms, paid_funnel, payment_initiated)
+        funnel_breakdown = self._build_funnel_breakdown(comms, funnel, channel=channel)
 
         outcomes = [
             {
@@ -519,9 +528,39 @@ class PayflowDashboardService:
             "kpis": kpis,
             "attention": attention,
             "funnel": funnel,
+            "funnel_breakdown": funnel_breakdown,
             "outcomes": outcomes,
             "clients_attention": clients_attention,
             "activity": activity,
+        }
+
+    def _build_funnel_breakdown(
+        self,
+        comms: list[PayflowCommunicationModel],
+        funnel: list[dict[str, Any]],
+        *,
+        channel: str | None,
+    ) -> dict[str, Any]:
+        """Expandable Total Records + Delivered inbox placement (additive to funnel steps)."""
+        by_label = {str(step.get("label")): int(step.get("value") or 0) for step in funnel}
+        sent = by_label.get("Sent", 0)
+        delivered = by_label.get("Delivered", 0)
+
+        invalid = sum(1 for c in comms if _is_invalid_address_comm(c))
+        # Valid = outbound rows that were not invalid-address failures (floored at Sent).
+        valid = max(sent, sum(1 for c in comms if not _is_invalid_address_comm(c)))
+
+        channel_norm = (channel or "").strip().lower()
+        placement_available = channel_norm != "sms"
+        placement = _placement_split(comms, delivered) if placement_available else []
+
+        return {
+            "valid_addresses": int(valid),
+            "invalid_addresses": int(invalid),
+            "sent": int(sent),
+            "delivered": int(delivered),
+            "placement_available": placement_available,
+            "placement": placement,
         }
 
     def _build_funnel(
@@ -711,10 +750,68 @@ class PayflowDashboardService:
             ],
             "attention": [],
             "funnel": [],
+            "funnel_breakdown": {
+                "valid_addresses": 0,
+                "invalid_addresses": 0,
+                "sent": 0,
+                "delivered": 0,
+                "placement_available": True,
+                "placement": [],
+            },
             "outcomes": [],
             "clients_attention": [],
             "activity": [],
         }
+
+
+def _is_invalid_address_comm(row: PayflowCommunicationModel) -> bool:
+    if row.status != PayflowCommStatus.FAILED.value:
+        return False
+    blob = " ".join(
+        str(part or "")
+        for part in (
+            getattr(row, "restriction_reason", None),
+            getattr(row, "provider_error", None),
+            getattr(row, "eligibility_status", None),
+        )
+    )
+    return bool(_INVALID_ADDRESS_RE.search(blob))
+
+
+def _placement_split(
+    comms: list[PayflowCommunicationModel], delivered: int
+) -> list[dict[str, Any]]:
+    """Best-effort Inbox / Spam / Promotions from engagement + spam signals."""
+    if delivered <= 0:
+        return [
+            {"label": "Inbox", "volume": 0},
+            {"label": "Spam", "volume": 0},
+            {"label": "Promotions", "volume": 0},
+        ]
+
+    inbox = sum(
+        1
+        for c in comms
+        if int(getattr(c, "opens_count", 0) or 0) > 0
+        or int(getattr(c, "clicks_count", 0) or 0) > 0
+    )
+    spam = 0
+    for c in comms:
+        reason = (getattr(c, "restriction_reason", None) or "").lower()
+        if "spam" in reason or "spamreport" in reason:
+            spam += 1
+    inbox = min(delivered, max(0, inbox))
+    spam = min(max(0, delivered - inbox), max(0, spam))
+    promotions = max(0, delivered - inbox - spam)
+    # No placement signals yet — attribute all delivered to Inbox (unknown folder).
+    if inbox + spam + promotions == 0:
+        inbox = delivered
+        promotions = 0
+    return [
+        {"label": "Inbox", "volume": int(inbox)},
+        {"label": "Spam", "volume": int(spam)},
+        {"label": "Promotions", "volume": int(promotions)},
+    ]
 
 
 def _money(value: float) -> str:

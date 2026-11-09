@@ -42,8 +42,8 @@ from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 # After the first AI answer, failing workflows are sent back to the AI this many times.
 MAX_FIX_ATTEMPTS = 2
 
-# Active / Inactive are rejected first (→ AI Proposed or Draft), then regenerated.
-# Draft is included so Human Created workflows can regenerate after reject.
+# Reject first, then regenerate: Active → Under Review (same id + history);
+# other statuses → AI Proposed / Draft. Draft included so Human Created can regenerate.
 REGENERATE_STATUSES = {
     PayflowStrategyStatus.DRAFT.value,
     PayflowStrategyStatus.AI_PROPOSED.value,
