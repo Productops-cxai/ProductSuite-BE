@@ -1399,6 +1399,22 @@ def regenerate_workflow(
         raise _map_error(exc) from exc
 
 
+@router.post("/workflows/{strategy_id}/reject-regenerate", response_model=PayflowStrategyItem)
+def reject_and_regenerate_workflow(
+    strategy_id: int,
+    payload: RegenerateWorkflowRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    """Reject (keep history) then regenerate — single call for the FE Reject / Regenerate action."""
+    try:
+        return WorkflowSuggestionService(db).reject_and_regenerate(
+            user, strategy_id, payload.remarks
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.post("/workflows/{strategy_id}/content", response_model=PayflowStrategyItem)
 def write_workflow_messages(
     strategy_id: int,
