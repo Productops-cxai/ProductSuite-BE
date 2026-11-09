@@ -225,12 +225,15 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
-        # The new version gets fresh email / SMS text (its steps are new).
-        workflow, messages_note = _with_messages(
-            {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
-            workflow,
-            _stored_segment(original),
-        )
+        # Skip a second Groq call for message bodies on regenerate — keeps the request
+        # under reverse-proxy timeouts (browser otherwise reports a false CORS error).
+        # Reviewers use Write messages on the new AI Proposed workflow before approval.
+        messages_note = [
+            {
+                "label": "Messages",
+                "value": "Not written on regenerate. Use Write messages before approval.",
+            }
+        ]
 
         ai_context = kept + _reasoning_context(workflow) + [
             {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
@@ -258,6 +261,17 @@ class WorkflowSuggestionService:
             ai_context=ai_context,
             revision_of_id=original["id"],
         )
+
+    def reject_and_regenerate(
+        self, user: UserModel, strategy_id: int, remarks: str
+    ) -> dict[str, Any]:
+        """Reject (history on same workflow) then regenerate a new AI Proposed version.
+
+        Active → Under Review on the original; other statuses follow reject rules.
+        One HTTP call so proxies/CORS are not broken by a long second request.
+        """
+        self.strategies.reject(user, strategy_id, note=remarks)
+        return self.regenerate_workflow(user, strategy_id, remarks)
 
     def write_workflow_messages(
         self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
