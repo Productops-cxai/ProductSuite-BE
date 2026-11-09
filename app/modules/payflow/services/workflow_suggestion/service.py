@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -225,6 +226,17 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
+        # Keep the family name + continue version — do not create "… Revised" v1 clutter.
+        family_name = _family_workflow_name(original.get("name") or workflow.get("name") or "Workflow")
+        workflow = {**workflow, "name": family_name}
+        next_version = int(original.get("version") or 1) + 1
+        # Prior open AI Proposed revisions / same-name proposals are superseded.
+        self._retire_prior_revisions(
+            parent_id=original["id"],
+            client_id=original["client_id"],
+            portfolio_id=original.get("portfolio_id"),
+            family_name=family_name,
+        )
         # Skip a second Groq call for message bodies on regenerate — keeps the request
         # under reverse-proxy timeouts (browser otherwise reports a false CORS error).
         # Reviewers use Write messages on the new AI Proposed workflow before approval.
@@ -260,7 +272,49 @@ class WorkflowSuggestionService:
             cases_covered=original["cases_covered"],
             ai_context=ai_context,
             revision_of_id=original["id"],
+            version=next_version,
         )
+
+    def _retire_prior_revisions(
+        self,
+        *,
+        parent_id: int,
+        client_id: int,
+        portfolio_id: int | None,
+        family_name: str,
+    ) -> None:
+        """Mark earlier AI Proposed regenerations / same-name proposals Inactive (superseded)."""
+        q = self.db.query(PayflowStrategyModel).filter(
+            PayflowStrategyModel.client_id == client_id,
+            PayflowStrategyModel.status == PayflowStrategyStatus.AI_PROPOSED.value,
+            PayflowStrategyModel.id != parent_id,
+        )
+        if portfolio_id is None:
+            q = q.filter(PayflowStrategyModel.portfolio_id.is_(None))
+        else:
+            q = q.filter(PayflowStrategyModel.portfolio_id == portfolio_id)
+        prior = [
+            row
+            for row in q.all()
+            if row.revision_of_id == parent_id
+            or _family_workflow_name(row.name or "") == family_name
+        ]
+        stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+        for row in prior:
+            row.status = PayflowStrategyStatus.INACTIVE.value
+            self.strategies._prepend_version(
+                row,
+                {
+                    "version": int(row.version or 1),
+                    "date": stamp,
+                    "note": "Superseded by a newer regeneration",
+                    "changes": [],
+                    "status": row.status,
+                    "origin": row.origin,
+                },
+            )
+        if prior:
+            self.db.flush()
 
     def reject_and_queue_regenerate(
         self, user: UserModel, strategy_id: int, remarks: str
@@ -382,26 +436,41 @@ class WorkflowSuggestionService:
         ai_context: list[dict[str, str]],
         commit: bool = True,
         revision_of_id: int | None = None,
+        version: int | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
-        return self.strategies.create_strategy(
-            user,
-            {
-                "name": workflow["name"],
-                "client_id": client_id,
-                "portfolio_id": portfolio_id,
-                "summary": workflow.get("summary"),
-                "segment": segment,
-                "cases_covered": cases_covered,
-                "entry_node_id": workflow["entry_node_id"],
-                "steps": workflow["steps"],
-                "source": PayflowStrategySource.AI_GENERATED.value,
-                "ai_context": ai_context,
-                "revision_of_id": revision_of_id,
-            },
-            commit=commit,
-        )
+        payload: dict[str, Any] = {
+            "name": workflow["name"],
+            "client_id": client_id,
+            "portfolio_id": portfolio_id,
+            "summary": workflow.get("summary"),
+            "segment": segment,
+            "cases_covered": cases_covered,
+            "entry_node_id": workflow["entry_node_id"],
+            "steps": workflow["steps"],
+            "source": PayflowStrategySource.AI_GENERATED.value,
+            "ai_context": ai_context,
+            "revision_of_id": revision_of_id,
+        }
+        if version is not None:
+            payload["version"] = version
+        return self.strategies.create_strategy(user, payload, commit=commit)
+
+
+def _family_workflow_name(name: str) -> str:
+    """Strip AI 'Revised' suffixes so regenerations stay in the same named family."""
+    cleaned = (name or "").strip()
+    while True:
+        lower = cleaned.lower()
+        if lower.endswith(" revised"):
+            cleaned = cleaned[: -len(" revised")].rstrip(" -–—")
+            continue
+        if lower.endswith(" (revised)"):
+            cleaned = cleaned[: -len(" (revised)")].rstrip(" -–—")
+            continue
+        break
+    return cleaned.strip() or "Workflow"
 
 
 def _batches(segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:

@@ -959,6 +959,10 @@ class PayflowStrategyService:
                 "ai_context": copy.deepcopy(ai_context),
             }
 
+        try:
+            version = max(1, int(payload.get("version") or 1))
+        except (TypeError, ValueError):
+            version = 1
         code = self._unique_code(_slugify(name))
         row = PayflowStrategyModel(
             code=code,
@@ -968,7 +972,7 @@ class PayflowStrategyService:
             status=status,
             origin=origin,
             source=source,
-            version=1,
+            version=version,
             summary=summary,
             coverage=coverage,
             segment=segment,
@@ -986,9 +990,13 @@ class PayflowStrategyService:
         self._prepend_version(
             row,
             self._version_entry(
-                version=1,
+                version=version,
                 note=(
-                    "Proposed by PayFlow AI"
+                    (
+                        f"Proposed by PayFlow AI (revision of #{payload.get('revision_of_id')})"
+                        if payload.get("revision_of_id")
+                        else "Proposed by PayFlow AI"
+                    )
                     if ai_generated
                     else f"Created by {user.full_name}"
                 ),
