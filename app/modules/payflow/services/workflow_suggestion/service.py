@@ -262,16 +262,33 @@ class WorkflowSuggestionService:
             revision_of_id=original["id"],
         )
 
-    def reject_and_regenerate(
+    def reject_and_queue_regenerate(
         self, user: UserModel, strategy_id: int, remarks: str
     ) -> dict[str, Any]:
-        """Reject (history on same workflow) then regenerate a new AI Proposed version.
+        """Reject now (history on same workflow); caller schedules regenerate in background.
 
-        Active → Under Review on the original; other statuses follow reject rules.
-        One HTTP call so proxies/CORS are not broken by a long second request.
+        Returns the rejected workflow immediately so nginx/proxies do not 504 on Groq latency.
+        Active → Under Review; other statuses follow reject rules.
         """
-        self.strategies.reject(user, strategy_id, note=remarks)
-        return self.regenerate_workflow(user, strategy_id, remarks)
+        rejected = self.strategies.reject(user, strategy_id, note=remarks)
+        rejected["regeneration_pending"] = True
+        return rejected
+
+    def latest_revision(
+        self, user: UserModel, strategy_id: int
+    ) -> dict[str, Any] | None:
+        """Newest workflow regenerated from strategy_id, or None if not ready yet."""
+        parent = self.strategies.get_strategy(user, strategy_id)
+        self.strategies._assert_manage(user, parent["client_id"])
+        child = (
+            self.db.query(PayflowStrategyModel)
+            .filter(PayflowStrategyModel.revision_of_id == strategy_id)
+            .order_by(PayflowStrategyModel.id.desc())
+            .first()
+        )
+        if not child:
+            return None
+        return self.strategies._serialize(self.strategies._get_row(child.id))
 
     def write_workflow_messages(
         self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
@@ -470,3 +487,36 @@ def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:
         for field, label in REASONING_LABELS.items()
         if str(reasoning.get(field) or "").strip()
     ]
+
+
+def run_regenerate_workflow(strategy_id: int, remarks: str, user_id: str) -> None:
+    """Background entry: own DB session so reject-regenerate can return before Groq finishes."""
+    import logging
+    import uuid as uuid_mod
+
+    from app.infrastructure.database.session import SessionLocal
+
+    logger = logging.getLogger("app.workflow_suggestion")
+    db = SessionLocal()
+    try:
+        try:
+            uid = uuid_mod.UUID(str(user_id))
+        except (TypeError, ValueError):
+            logger.error("Background regenerate: invalid user_id=%s", user_id)
+            return
+        user = db.get(UserModel, uid)
+        if user is None:
+            logger.error("Background regenerate: user not found id=%s", user_id)
+            return
+        WorkflowSuggestionService(db).regenerate_workflow(user, strategy_id, remarks)
+        logger.info("Background regenerate done strategy_id=%s", strategy_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Background regenerate failed strategy_id=%s", strategy_id)
+    finally:
+        db.close()
+
+
+def schedule_regenerate_workflow(
+    background_tasks: Any, strategy_id: int, remarks: str, user_id: str
+) -> None:
+    background_tasks.add_task(run_regenerate_workflow, int(strategy_id), remarks, str(user_id))
