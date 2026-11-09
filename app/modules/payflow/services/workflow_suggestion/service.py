@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -43,8 +42,8 @@ from app.shared.enums import PayflowStrategySource, PayflowStrategyStatus
 # After the first AI answer, failing workflows are sent back to the AI this many times.
 MAX_FIX_ATTEMPTS = 2
 
-# Reject first, then regenerate: Active → Under Review (same id + history);
-# other statuses → AI Proposed / Draft. Draft included so Human Created can regenerate.
+# Active / Inactive are rejected first (→ AI Proposed or Draft), then regenerated.
+# Draft is included so Human Created workflows can regenerate after reject.
 REGENERATE_STATUSES = {
     PayflowStrategyStatus.DRAFT.value,
     PayflowStrategyStatus.AI_PROPOSED.value,
@@ -226,26 +225,12 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
-        # Keep the family name + continue version — do not create "… Revised" v1 clutter.
-        family_name = _family_workflow_name(original.get("name") or workflow.get("name") or "Workflow")
-        workflow = {**workflow, "name": family_name}
-        next_version = int(original.get("version") or 1) + 1
-        # Prior open AI Proposed revisions / same-name proposals are superseded.
-        self._retire_prior_revisions(
-            parent_id=original["id"],
-            client_id=original["client_id"],
-            portfolio_id=original.get("portfolio_id"),
-            family_name=family_name,
+        # The new version gets fresh email / SMS text (its steps are new).
+        workflow, messages_note = _with_messages(
+            {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
+            workflow,
+            _stored_segment(original),
         )
-        # Skip a second Groq call for message bodies on regenerate — keeps the request
-        # under reverse-proxy timeouts (browser otherwise reports a false CORS error).
-        # Reviewers use Write messages on the new AI Proposed workflow before approval.
-        messages_note = [
-            {
-                "label": "Messages",
-                "value": "Not written on regenerate. Use Write messages before approval.",
-            }
-        ]
 
         ai_context = kept + _reasoning_context(workflow) + [
             {"label": "Revision of", "value": f"#{original['id']} {original['name']} (v{original['version']})"},
@@ -272,77 +257,7 @@ class WorkflowSuggestionService:
             cases_covered=original["cases_covered"],
             ai_context=ai_context,
             revision_of_id=original["id"],
-            version=next_version,
         )
-
-    def _retire_prior_revisions(
-        self,
-        *,
-        parent_id: int,
-        client_id: int,
-        portfolio_id: int | None,
-        family_name: str,
-    ) -> None:
-        """Mark earlier AI Proposed regenerations / same-name proposals Inactive (superseded)."""
-        q = self.db.query(PayflowStrategyModel).filter(
-            PayflowStrategyModel.client_id == client_id,
-            PayflowStrategyModel.status == PayflowStrategyStatus.AI_PROPOSED.value,
-            PayflowStrategyModel.id != parent_id,
-        )
-        if portfolio_id is None:
-            q = q.filter(PayflowStrategyModel.portfolio_id.is_(None))
-        else:
-            q = q.filter(PayflowStrategyModel.portfolio_id == portfolio_id)
-        prior = [
-            row
-            for row in q.all()
-            if row.revision_of_id == parent_id
-            or _family_workflow_name(row.name or "") == family_name
-        ]
-        stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
-        for row in prior:
-            row.status = PayflowStrategyStatus.INACTIVE.value
-            self.strategies._prepend_version(
-                row,
-                {
-                    "version": int(row.version or 1),
-                    "date": stamp,
-                    "note": "Superseded by a newer regeneration",
-                    "changes": [],
-                    "status": row.status,
-                    "origin": row.origin,
-                },
-            )
-        if prior:
-            self.db.flush()
-
-    def reject_and_queue_regenerate(
-        self, user: UserModel, strategy_id: int, remarks: str
-    ) -> dict[str, Any]:
-        """Reject now (history on same workflow); caller schedules regenerate in background.
-
-        Returns the rejected workflow immediately so nginx/proxies do not 504 on Groq latency.
-        Active → Under Review; other statuses follow reject rules.
-        """
-        rejected = self.strategies.reject(user, strategy_id, note=remarks)
-        rejected["regeneration_pending"] = True
-        return rejected
-
-    def latest_revision(
-        self, user: UserModel, strategy_id: int
-    ) -> dict[str, Any] | None:
-        """Newest workflow regenerated from strategy_id, or None if not ready yet."""
-        parent = self.strategies.get_strategy(user, strategy_id)
-        self.strategies._assert_manage(user, parent["client_id"])
-        child = (
-            self.db.query(PayflowStrategyModel)
-            .filter(PayflowStrategyModel.revision_of_id == strategy_id)
-            .order_by(PayflowStrategyModel.id.desc())
-            .first()
-        )
-        if not child:
-            return None
-        return self.strategies._serialize(self.strategies._get_row(child.id))
 
     def write_workflow_messages(
         self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
@@ -436,41 +351,26 @@ class WorkflowSuggestionService:
         ai_context: list[dict[str, str]],
         commit: bool = True,
         revision_of_id: int | None = None,
-        version: int | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
-        payload: dict[str, Any] = {
-            "name": workflow["name"],
-            "client_id": client_id,
-            "portfolio_id": portfolio_id,
-            "summary": workflow.get("summary"),
-            "segment": segment,
-            "cases_covered": cases_covered,
-            "entry_node_id": workflow["entry_node_id"],
-            "steps": workflow["steps"],
-            "source": PayflowStrategySource.AI_GENERATED.value,
-            "ai_context": ai_context,
-            "revision_of_id": revision_of_id,
-        }
-        if version is not None:
-            payload["version"] = version
-        return self.strategies.create_strategy(user, payload, commit=commit)
-
-
-def _family_workflow_name(name: str) -> str:
-    """Strip AI 'Revised' suffixes so regenerations stay in the same named family."""
-    cleaned = (name or "").strip()
-    while True:
-        lower = cleaned.lower()
-        if lower.endswith(" revised"):
-            cleaned = cleaned[: -len(" revised")].rstrip(" -–—")
-            continue
-        if lower.endswith(" (revised)"):
-            cleaned = cleaned[: -len(" (revised)")].rstrip(" -–—")
-            continue
-        break
-    return cleaned.strip() or "Workflow"
+        return self.strategies.create_strategy(
+            user,
+            {
+                "name": workflow["name"],
+                "client_id": client_id,
+                "portfolio_id": portfolio_id,
+                "summary": workflow.get("summary"),
+                "segment": segment,
+                "cases_covered": cases_covered,
+                "entry_node_id": workflow["entry_node_id"],
+                "steps": workflow["steps"],
+                "source": PayflowStrategySource.AI_GENERATED.value,
+                "ai_context": ai_context,
+                "revision_of_id": revision_of_id,
+            },
+            commit=commit,
+        )
 
 
 def _batches(segments: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -556,36 +456,3 @@ def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:
         for field, label in REASONING_LABELS.items()
         if str(reasoning.get(field) or "").strip()
     ]
-
-
-def run_regenerate_workflow(strategy_id: int, remarks: str, user_id: str) -> None:
-    """Background entry: own DB session so reject-regenerate can return before Groq finishes."""
-    import logging
-    import uuid as uuid_mod
-
-    from app.infrastructure.database.session import SessionLocal
-
-    logger = logging.getLogger("app.workflow_suggestion")
-    db = SessionLocal()
-    try:
-        try:
-            uid = uuid_mod.UUID(str(user_id))
-        except (TypeError, ValueError):
-            logger.error("Background regenerate: invalid user_id=%s", user_id)
-            return
-        user = db.get(UserModel, uid)
-        if user is None:
-            logger.error("Background regenerate: user not found id=%s", user_id)
-            return
-        WorkflowSuggestionService(db).regenerate_workflow(user, strategy_id, remarks)
-        logger.info("Background regenerate done strategy_id=%s", strategy_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("Background regenerate failed strategy_id=%s", strategy_id)
-    finally:
-        db.close()
-
-
-def schedule_regenerate_workflow(
-    background_tasks: Any, strategy_id: int, remarks: str, user_id: str
-) -> None:
-    background_tasks.add_task(run_regenerate_workflow, int(strategy_id), remarks, str(user_id))

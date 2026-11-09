@@ -129,8 +129,7 @@ def build_revision(
     parts = [
         f"Revise the current workflow for segment_id \"{segment_id}\" using the reviewer's remarks. "
         "Keep what works and change what the remarks ask for. Return exactly one workflow, and fill "
-        "reasoning.changes_made with what you changed and how it addresses the remarks. "
-        "Keep the same workflow name — do not append Revised, v2, or similar suffixes.",
+        "reasoning.changes_made with what you changed and how it addresses the remarks.",
         f"Current workflow: {json.dumps(current, ensure_ascii=False)}",
     ]
     history = build_review_history(versions if versions is not None else workflow.get("versions") or [])

@@ -959,10 +959,6 @@ class PayflowStrategyService:
                 "ai_context": copy.deepcopy(ai_context),
             }
 
-        try:
-            version = max(1, int(payload.get("version") or 1))
-        except (TypeError, ValueError):
-            version = 1
         code = self._unique_code(_slugify(name))
         row = PayflowStrategyModel(
             code=code,
@@ -972,7 +968,7 @@ class PayflowStrategyService:
             status=status,
             origin=origin,
             source=source,
-            version=version,
+            version=1,
             summary=summary,
             coverage=coverage,
             segment=segment,
@@ -990,13 +986,9 @@ class PayflowStrategyService:
         self._prepend_version(
             row,
             self._version_entry(
-                version=version,
+                version=1,
                 note=(
-                    (
-                        f"Proposed by PayFlow AI (revision of #{payload.get('revision_of_id')})"
-                        if payload.get("revision_of_id")
-                        else "Proposed by PayFlow AI"
-                    )
+                    "Proposed by PayFlow AI"
                     if ai_generated
                     else f"Created by {user.full_name}"
                 ),
@@ -1308,8 +1300,8 @@ class PayflowStrategyService:
     def reject(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
-        # Reject is available in any reviewable state. Active returns to Under Review
-        # (same workflow, history retained). Other states prepare for regeneration.
+        # Lovable: Reject / Request Regeneration is available for AI workflows in any
+        # reviewable state including Active (returns to AI Proposed for regeneration).
         if row.status not in {
             PayflowStrategyStatus.DRAFT.value,
             PayflowStrategyStatus.UNDER_REVIEW.value,
@@ -1321,30 +1313,24 @@ class PayflowStrategyService:
             raise ValidationAppError("This workflow cannot be rejected in its current status")
 
         was_active = row.status == PayflowStrategyStatus.ACTIVE.value
-        if was_active:
-            # Keep the same workflow: stop execution and send it back for review.
-            row.status = PayflowStrategyStatus.UNDER_REVIEW.value
-            default_note = f"Rejected and returned to Under Review by {user.full_name}"
-        else:
-            source = _row_source(row)
-            if source == PayflowStrategySource.AI_GENERATED.value:
-                row.status = PayflowStrategyStatus.AI_PROPOSED.value
-                row.source = PayflowStrategySource.AI_GENERATED.value
-                # Keep Human Modified marker if steps were changed; otherwise AI Proposed
-                if _is_human_modified(row, list(row.steps or [])):
-                    row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
-                else:
-                    row.origin = PayflowStrategyOrigin.AI_PROPOSED.value
+        source = _row_source(row)
+        if source == PayflowStrategySource.AI_GENERATED.value:
+            row.status = PayflowStrategyStatus.AI_PROPOSED.value
+            row.source = PayflowStrategySource.AI_GENERATED.value
+            # Keep Human Modified marker if steps were changed; otherwise AI Proposed
+            if _is_human_modified(row, list(row.steps or [])):
+                row.origin = PayflowStrategyOrigin.HUMAN_MODIFIED.value
             else:
-                row.status = PayflowStrategyStatus.DRAFT.value
-                row.origin = PayflowStrategyOrigin.HUMAN_CREATED.value
-                row.source = PayflowStrategySource.HUMAN_CREATED.value
-            default_note = f"Rejected / regeneration requested by {user.full_name}"
+                row.origin = PayflowStrategyOrigin.AI_PROPOSED.value
+        else:
+            row.status = PayflowStrategyStatus.DRAFT.value
+            row.origin = PayflowStrategyOrigin.HUMAN_CREATED.value
+            row.source = PayflowStrategySource.HUMAN_CREATED.value
 
         entry = {
             "version": int(row.version or 1),
             "date": _stamp(),
-            "note": note or default_note,
+            "note": note or f"Rejected / regeneration requested by {user.full_name}",
             "changes": [],
             "status": row.status,
             "origin": row.origin,
