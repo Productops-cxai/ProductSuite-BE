@@ -1391,6 +1391,20 @@ class DashboardFunnelStep(BaseModel):
     href: Optional[str] = None
 
 
+class DashboardFunnelPlacementItem(BaseModel):
+    label: str
+    volume: int = 0
+
+
+class DashboardFunnelBreakdown(BaseModel):
+    valid_addresses: int = 0
+    invalid_addresses: int = 0
+    sent: int = 0
+    delivered: int = 0
+    placement_available: bool = True
+    placement: List[DashboardFunnelPlacementItem] = Field(default_factory=list)
+
+
 class DashboardOutcomeItem(BaseModel):
     id: str
     label: str
@@ -1434,6 +1448,7 @@ class PayflowDashboardResponse(BaseModel):
     kpis: List[DashboardKpiItem] = Field(default_factory=list)
     attention: List[DashboardAttentionItem] = Field(default_factory=list)
     funnel: List[DashboardFunnelStep] = Field(default_factory=list)
+    funnel_breakdown: Optional[DashboardFunnelBreakdown] = None
     outcomes: List[DashboardOutcomeItem] = Field(default_factory=list)
     clients_attention: List[DashboardClientAttentionItem] = Field(default_factory=list)
     activity: List[DashboardActivityItem] = Field(default_factory=list)

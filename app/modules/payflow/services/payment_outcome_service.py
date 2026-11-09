@@ -214,8 +214,10 @@ class PayflowPaymentOutcomeService:
 
         quote = self._plan_quote_from_attempt(attempt)
         schedule = list(quote.get("schedule") or [])
-        frequency = str(quote.get("frequency") or "monthly").strip().lower()
-        if frequency not in {"daily", "weekly", "monthly"}:
+        frequency = str(quote.get("frequency") or "monthly").strip().lower().replace("-", "_")
+        if frequency in {"biweekly", "fortnightly"}:
+            frequency = "bi_weekly"
+        if frequency not in {"daily", "weekly", "bi_weekly", "monthly"}:
             frequency = "monthly"
 
         if schedule:

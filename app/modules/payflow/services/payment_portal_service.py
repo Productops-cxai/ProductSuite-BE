@@ -598,6 +598,9 @@ class PayflowPaymentPortalService:
         if start < today:
             raise ValidationAppError("Start date cannot be in the past")
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
+        from app.modules.payflow.services.plan_schedule import normalize_plan_limits
+
+        plan_limits = normalize_plan_limits(settings_map.get("plan_limits"))
         try:
             quote = build_plan_quote(
                 balance=balance,
@@ -606,6 +609,7 @@ class PayflowPaymentPortalService:
                 start_date=start,
                 currency_code=currency,
                 today=today,
+                plan_limits=plan_limits,
             )
         except ValueError as exc:
             raise ValidationAppError(str(exc)) from exc
@@ -678,6 +682,9 @@ class PayflowPaymentPortalService:
             if start < today:
                 raise ValidationAppError("Start date cannot be in the past")
             try:
+                from app.modules.payflow.services.plan_schedule import normalize_plan_limits
+
+                settings_map = self._client_settings(client)
                 plan_quote = build_plan_quote(
                     balance=balance,
                     frequency=frequency or "monthly",
@@ -687,6 +694,7 @@ class PayflowPaymentPortalService:
                     start_date=start,
                     currency_code=(account.currency_code or "USD"),
                     today=today,
+                    plan_limits=normalize_plan_limits(settings_map.get("plan_limits")),
                 )
             except ValueError as exc:
                 raise ValidationAppError(str(exc)) from exc
