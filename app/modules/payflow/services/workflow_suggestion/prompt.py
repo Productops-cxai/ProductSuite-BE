@@ -20,6 +20,15 @@ from app.modules.payflow.services.strategy_service import (
     TIME_DIRECTIONS,
     TIME_UNITS,
 )
+from app.modules.payflow.services.workflow_suggestion.config import (
+    FULL_OR_PLAN_CHECK,
+    MISSED_INSTALMENT_CHECK,
+    ON_A_PLAN_OUTCOME,
+    ON_A_PLAN_SITUATION,
+    PAID_OR_PLAN_CHECK,
+    PAID_OUTCOME,
+    STOP_WHEN_PAID_SITUATIONS,
+)
 
 EXAMPLES_PATH = Path(__file__).parent / "prompts" / "workflow_examples.json"
 
@@ -277,6 +286,22 @@ Outcomes: {", ".join(OUTCOMES)}
 - At most {limits["max_communications"]} Communication steps per workflow.{weekly_line}
 - Put a Wait between two Communication steps.
 
+## Stop when the customer pays
+On the payment page the customer can pay in full, pay part, or set up a payment plan. Once they do any of these,
+the reminders must stop. In {" and ".join(STOP_WHEN_PAID_SITUATIONS)} workflows:
+- Before every follow-up message (every Communication after the first), and before handing an unpaid case to
+  Human Review or escalation, add the Condition "{check_text(PAID_OR_PLAN_CHECK)}" (any payment or plan?).
+  no = nothing paid yet, continue. yes = the customer acted, stop.
+- The stop branch: Condition "{check_text(FULL_OR_PLAN_CHECK)}" (paid in full or on a plan?):
+  yes → Outcome "{PAID_OUTCOME}"; no (paid part only) → Human Review to decide on the rest.
+  Build the stop branch once; the yes of every check points to it.
+- Never use "Payment Status Equals Paid In Full" as the check: it misses part payments and plans.
+{ON_A_PLAN_SITUATION} workflows (the customer is already on a plan): never use these two checks - for them they are
+always yes, so the workflow would stop at once. Check for a missed instalment instead, with no loops:
+reminder → Wait → Condition "{check_text(MISSED_INSTALMENT_CHECK)}" (instalment missed?): no → Outcome
+"{ON_A_PLAN_OUTCOME}"; yes → follow-up reminder → Wait → the same check again: yes → Human Review,
+no → Outcome "{ON_A_PLAN_OUTCOME}".
+
 ## Strategy guidance
 - Match intensity to the stage: early stage = friendly reminders and an easy way to pay;
   later stages = firmer reminders and payment plan offers, then Human Review before escalating.
@@ -307,8 +332,13 @@ def _lessons_section(lessons: list[str] | None) -> str:
         "This client's reviewers edited, rejected or approved earlier workflows for the reasons below. "
         "Treat them as the client's preferences, not as hard rules: follow a lesson where it fits a segment's "
         "situation and stats, and depart from it where it does not (then say why in reasoning). "
-        "Only the Limits and Allowed values above are hard rules.\n" + "\n".join(lessons)
+        "Only the Limits, Stop when the customer pays and Allowed values above are hard rules.\n"
+        + "\n".join(lessons)
     )
+
+
+def check_text(check: dict[str, str]) -> str:
+    return f"{check['attribute']} {check['operator']} {check['value']}"
 
 
 def _design_stats(stats: dict[str, Any]) -> dict[str, Any]:

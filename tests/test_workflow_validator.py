@@ -2,6 +2,7 @@ import copy
 
 import pytest
 
+from app.modules.payflow.services.workflow_suggestion.config import MAX_STEPS
 from app.modules.payflow.services.workflow_suggestion.prompt import load_examples
 from app.modules.payflow.services.workflow_suggestion.validator import validate_all
 
@@ -9,14 +10,14 @@ SEGMENTS = [{"segment_id": "A"}]
 LIMITS = {
     "channels": ["Email", "SMS"],
     "min_steps": 3,
-    "max_steps": 12,
+    "max_steps": MAX_STEPS,
     "max_communications": 5,
     "max_messages_per_7_days": 3,
 }
 
 
 def valid_workflow():
-    """Example 1: Trigger → Email → Wait → Paid? → SMS → Wait → Paid? → Review | Outcome."""
+    """Example 1: Trigger → Email → Wait → Any payment? → SMS → Wait → Any payment? → Review | stop branch."""
     workflow = copy.deepcopy(load_examples()[0])
     workflow["segment_id"] = "A"
     return workflow
@@ -78,7 +79,7 @@ def _drop(step_id, key, in_config=False):
 
 
 def _add_orphan(workflow):
-    workflow["steps"].append({"id": "s10", "kind": "Outcome", "title": "x", "config": {"outcome": "Case Closed"}})
+    workflow["steps"].append({"id": "s20", "kind": "Outcome", "title": "x", "config": {"outcome": "Case Closed"}})
 
 
 @pytest.mark.parametrize(
@@ -92,7 +93,7 @@ def _add_orphan(workflow):
         (_drop("s3", "next"), "step s3: a Wait step cannot end a path"),
         (_set("s9", next="s1"), "step s9: an Outcome ends the path and cannot have next"),
         (_set("s8", kind="Trigger"), "step s8: only the entry step may be a Trigger"),
-        (_add_orphan, "steps not reachable from the entry step: s10"),
+        (_add_orphan, "steps not reachable from the entry step: s20"),
         (_set("s6", next="s5"), "the flowchart contains a loop"),
         # Catalog values
         (_set("s3", kind="Email Blast"), "step s3: unknown step kind 'Email Blast'"),
@@ -124,7 +125,7 @@ def test_each_check_reports_a_clear_error(change, expected):
     "limits, expected",
     [
         ({"channels": ["Email"]}, "step s5: channel 'SMS' is not enabled for this client"),
-        ({"max_steps": 5}, "has 9 steps (allowed 3-5)"),
+        ({"max_steps": 5}, "has 11 steps (allowed 3-5)"),
         ({"max_communications": 1}, "has 2 Communication steps (max 1)"),
         ({"max_messages_per_7_days": 1}, "steps s2, s5 send more than 1 messages within 7 days"),
     ],
@@ -132,6 +133,78 @@ def test_each_check_reports_a_clear_error(change, expected):
 def test_limits(limits, expected):
     errors = errors_for(lambda w: None, limits)
     assert any(expected in e for e in errors), errors
+
+
+ACTIVE = [{"segment_id": "A", "segment": {"situation": "Active"}}]
+OLD_PAID_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}
+
+
+def test_prompt_examples_stop_when_the_customer_pays():
+    """Each example checked with its own segment's situation (Active / Promise to Pay)."""
+    for example in load_examples():
+        segments = [{"segment_id": "A", "segment": {"situation": example["for_segment"].split(" · ")[0]}}]
+        assert validate_all([{**copy.deepcopy(example), "segment_id": "A"}], segments, LIMITS) == [], example["name"]
+
+
+@pytest.mark.parametrize(
+    "change, expected",
+    [
+        (
+            _set("s4", config=dict(OLD_PAID_CHECK)),  # misses part payments and plans
+            'step s5: sends a follow-up message after step s2 without the check "Payment Status Not Equals Unpaid"',
+        ),
+        (
+            _set("s7", config={"attribute": "Email Delivery", "operator": "Equals", "value": "Bounced"}),
+            'step s8: hands the case over after step s5 without the check "Payment Status Not Equals Unpaid"',
+        ),
+        (
+            _set("s4", yes="s9"),
+            'step s4: yes (the customer paid or set up a plan) must go to the Condition '
+            '"Payment Status Not Equals Partial Payment"',
+        ),
+        (
+            _set_config("s9", outcome="Case Closed"),
+            'step s10: yes (paid in full or on a plan) must end in an Outcome "Paid In Full"',
+        ),
+        (
+            _set("s11", kind="Outcome", config={"outcome": "Case Closed"}),
+            "step s10: no (paid part only) must go to a Human Review to decide on the rest",
+        ),
+    ],
+)
+def test_reminders_stop_once_the_customer_pays_in_full_pays_part_or_sets_up_a_plan(change, expected):
+    workflow = valid_workflow()
+    change(workflow)
+    errors = validate_all([workflow], ACTIVE, LIMITS)
+    assert any(expected in e for e in errors), errors
+
+
+PLAN = [{"segment_id": "A", "segment": {"situation": "Payment Plan"}}]
+MISSED_INSTALMENT = {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"}
+
+
+def test_payment_plan_workflows_check_for_a_missed_instalment_instead():
+    """Already on a plan: "any payment or plan?" is always yes for them and would end the workflow at once."""
+    errors = validate_all([valid_workflow()], PLAN, LIMITS)
+    assert any(
+        'step s4: the customer is already on a payment plan, so "Payment Status Not Equals Unpaid" is always yes' in e
+        for e in errors
+    ), errors
+    assert any('step s10: the customer is already on a payment plan, so "Payment Status Not Equals Partial' in e
+               for e in errors), errors
+
+    workflow = valid_workflow()
+    for step_id, check in (("s4", MISSED_INSTALMENT), ("s7", MISSED_INSTALMENT), ("s10", OLD_PAID_CHECK)):
+        _set(step_id, config=dict(check))(workflow)
+    assert validate_all([workflow], PLAN, LIMITS) == []
+    assert validate_all([workflow], ACTIVE, LIMITS) != []  # an Active customer would not be stopped
+
+
+def test_unknown_segments_are_not_checked_for_stopping_on_payment():
+    workflow = valid_workflow()
+    _set("s4", config=dict(OLD_PAID_CHECK))(workflow)
+    assert validate_all([workflow], ACTIVE, LIMITS) != []
+    assert validate_all([workflow], SEGMENTS, LIMITS) == []
 
 
 def test_missing_reference_event_is_reported_once():

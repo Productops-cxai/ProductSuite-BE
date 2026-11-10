@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "PayFlow - AI Workflow Suggestion",
-    "description": "Try the AI workflow suggestion APIs against a local backend.\n\nRun '1. Login' first (it saves the token). Suggest calls take 1-5 minutes on the Groq free tier - keep Postman's request timeout at 0 (no limit).\n\nDemo data: client 'Maple Energy (Demo)' with portfolios Residential and Small Business. Adjust the collection variables if your ids differ.\n\nRegenerate: run it after 'Get workflow' (the workflow must be AI Proposed or Under Review). It saves the new revision's id as workflowId, so the review / approve / activate requests act on the revision.\n\nMessages: Suggest and Regenerate already write the email / SMS text. 'Write messages' rewrites all of it; 'Rewrite one message' rewrites only the first message step (saved as messageStepId), following the remarks. Both work only before approval.",
+    "description": "Try the AI workflow suggestion APIs against a local backend.\n\nRun '1. Login' first (it saves the token). Suggest calls take 1-5 minutes on the Groq free tier - keep Postman's request timeout at 0 (no limit).\n\nDemo data: client 'Maple Energy (Demo)' with portfolios Residential and Small Business. Adjust the collection variables if your ids differ.\n\nRegenerate: run it after 'Get workflow' (the workflow must be AI Proposed or Under Review). It saves the new revision's id as workflowId, so the review / approve / activate requests act on the revision.\n\nMessages: Suggest and Regenerate already write the email / SMS text. 'Write messages' rewrites all of it; 'Rewrite one message' rewrites only the first message step (saved as messageStepId), following the remarks. Both work only before approval.\n\nNo portfolio (15-18): \"portfolio_id\": null = the client's accounts that are not in any portfolio. Local data: client 2 (Canadian Tire) has no portfolios; client 1 (PayPal) has accounts outside its portfolio; Maple Energy has none, so 17 is refused (400). 15 and 16 save workflowId - then run 7-13 on it as usual.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -54,6 +54,14 @@
     {
       "key": "messageStepId",
       "value": ""
+    },
+    {
+      "key": "noPortfolioClientId",
+      "value": "2"
+    },
+    {
+      "key": "outsidePortfolioClientId",
+      "value": "1"
     }
   ],
   "item": [
@@ -276,6 +284,109 @@
       "request": {
         "method": "GET",
         "url": "{{baseUrl}}/payflow/rules?client_id={{clientId}}"
+      }
+    },
+    {
+      "name": "15. Suggest workflows - client with no portfolios",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('workflows suggested', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('for accounts with no portfolio', () => pm.expect(body.portfolio_id).to.eql(null));",
+              "const workflows = body.workflows || [];",
+              "if (workflows.length) pm.collectionVariables.set('workflowId', workflows[0].id);",
+              "console.log(`${workflows.length} workflows for ${body.portfolio_name} in ${pm.response.responseTime / 1000}s`);",
+              "workflows.forEach(w => console.log(`#${w.id} ${w.name} | ${w.portfolio_name} | ${w.cases_covered} accounts`));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": {{noPortfolioClientId}},\n  \"portfolio_id\": null\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/suggest"
+      }
+    },
+    {
+      "name": "16. Suggest workflows - accounts outside a portfolio",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('workflows suggested', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('for accounts with no portfolio', () => pm.expect(body.portfolio_id).to.eql(null));",
+              "const workflows = body.workflows || [];",
+              "if (workflows.length) pm.collectionVariables.set('workflowId', workflows[0].id);",
+              "console.log(`${workflows.length} workflows for ${body.portfolio_name} in ${pm.response.responseTime / 1000}s`);",
+              "workflows.forEach(w => console.log(`#${w.id} ${w.name} | ${w.portfolio_name} | ${w.cases_covered} accounts`));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": {{outsidePortfolioClientId}},\n  \"portfolio_id\": null\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/suggest"
+      }
+    },
+    {
+      "name": "17. Suggest workflows - no accounts outside a portfolio (expect 400)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('refused: every account of this client is in a portfolio', () => pm.response.to.have.status(400));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"client_id\": {{clientId}},\n  \"portfolio_id\": null\n}"
+        },
+        "url": "{{baseUrl}}/payflow/workflows/suggest"
+      }
+    },
+    {
+      "name": "18. List workflows - client with no portfolios",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/payflow/workflows?client_id={{noPortfolioClientId}}"
       }
     }
   ]

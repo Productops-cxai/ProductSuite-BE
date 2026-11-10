@@ -29,6 +29,7 @@ from app.modules.payflow.services.workflow_suggestion.validator import (
     validate_flowchart,
     validate_limits,
     validate_step_config,
+    validate_stop_when_paid,
 )
 from app.shared.enums import PayflowStrategyOrigin, PayflowStrategyStatus
 
@@ -96,11 +97,13 @@ def learned_from(examples: list[dict], lessons: list[str]) -> list[dict[str, str
 
 
 def _valid_today(row: PayflowStrategyModel, limits: dict[str, Any]) -> bool:
-    """Old-format workflows, or ones using e.g. a channel the client turned off, are not shown."""
+    """Old-format workflows, ones using e.g. a channel the client turned off, or ones that keep sending
+    reminders after the customer paid or set up a plan, are not shown."""
     workflow = {"segment_id": f"#{row.id}", "entry_node_id": row.entry_node_id, "steps": list(row.steps or [])}
     if not workflow["steps"] or validate_flowchart(workflow):
         return False
     errors = validate_catalog_values(workflow, limits) + validate_step_config(workflow) + validate_limits(workflow, limits)
+    errors += validate_stop_when_paid(workflow, (row.segment or {}).get("situation"))
     return not errors
 
 
@@ -200,6 +203,8 @@ def _flow_summary(steps: list[dict]) -> str:
             parts.append(cfg.get("action") or kind)
         elif kind == "Human Review":
             parts.append(kind)
+    # Workflows that stop on payment have two reviews side by side (unpaid, part paid) — name it once.
+    parts = [part for i, part in enumerate(parts) if i == 0 or part != parts[i - 1]]
     return " → ".join(parts) or "the proposed workflow"
 
 

@@ -98,6 +98,34 @@ def test_examples_only_use_catalog_values():
                 assert cfg["outcome"] in OUTCOMES
 
 
+def test_prompt_says_stop_when_the_customer_pays_in_full_pays_part_or_sets_up_a_plan():
+    system = build_messages(CLIENT, "Residential", SEGMENTS, design_limits(CLIENT, {"system": [], "client": []}))[0][
+        "content"
+    ]
+    rule_text = system.split("## Stop when the customer pays")[1].split("## Strategy guidance")[0]
+    assert "pay in full, pay part, or set up a payment plan" in rule_text
+    assert "In Active and Promise to Pay workflows" in rule_text
+    assert '"Payment Status Not Equals Unpaid"' in rule_text  # any payment or plan? yes = stop
+    assert '"Payment Status Not Equals Partial Payment"' in rule_text  # full or plan → Paid In Full, part → review
+    assert 'Outcome "Paid In Full"' in rule_text and "Human Review to decide on the rest" in rule_text
+    assert "Payment Plan workflows (the customer is already on a plan): never use these two checks" in rule_text
+    assert 'Condition "Payment Status Equals Unpaid" (instalment missed?)' in rule_text  # instead, with no loops
+    assert 'no → Outcome\n"Payment Plan Active"' in rule_text
+
+
+def test_examples_stop_on_any_payment_or_plan_and_send_part_payments_to_review():
+    for example in load_examples():
+        steps = {s["id"]: s for s in example["steps"]}
+        checks = [s for s in example["steps"] if s["config"].get("attribute") == "Payment Status"]
+        assert checks and {(c["config"]["operator"], c["config"]["value"]) for c in checks} == {
+            ("Not Equals", "Unpaid"),
+            ("Not Equals", "Partial Payment"),
+        }, example["name"]  # never the old "Equals Paid In Full" check
+        stop = next(c for c in checks if c["config"]["value"] == "Partial Payment")
+        assert steps[stop["yes"]]["config"]["outcome"] == "Paid In Full"
+        assert steps[stop["no"]]["kind"] == "Human Review"
+
+
 def _assert_closed_objects(node):
     if isinstance(node, dict):
         if node.get("type") == "object":
@@ -138,7 +166,15 @@ class FakeResponse:
 
 @pytest.fixture()
 def groq_key():
-    with patch.object(llm.settings, "GROQ_API_KEY", "test-key"):
+    with patch.object(llm.settings, "LLM_PROVIDER", "groq"), patch.object(llm.settings, "GROQ_API_KEY", "test-key"):
+        yield
+
+
+@pytest.fixture()
+def together_key():
+    with patch.object(llm.settings, "LLM_PROVIDER", "together"), patch.object(
+        llm.settings, "TOGETHER_API_KEY", "together-key"
+    ):
         yield
 
 
@@ -169,8 +205,38 @@ def test_call_llm_network_error(groq_key):
 
 
 def test_call_llm_without_key():
-    with patch.object(llm.settings, "GROQ_API_KEY", ""):
+    with patch.object(llm.settings, "LLM_PROVIDER", "groq"), patch.object(llm.settings, "GROQ_API_KEY", ""):
         with pytest.raises(ServiceUnavailableError, match="GROQ_API_KEY"):
+            llm.call_llm([], {})
+    with patch.object(llm.settings, "LLM_PROVIDER", "together"), patch.object(llm.settings, "TOGETHER_API_KEY", ""):
+        with pytest.raises(ServiceUnavailableError, match="TOGETHER_API_KEY"):
+            llm.call_llm([], {})
+
+
+def test_call_llm_groq_sends_no_max_tokens(groq_key):
+    """Groq's free tier counts max_tokens against its 8k tokens-per-minute limit."""
+    with patch.object(llm.httpx, "post", return_value=FakeResponse()) as post:
+        llm.call_llm([], {})
+    assert post.call_args.args[0] == llm.GROQ_URL
+    assert post.call_args.kwargs["json"]["model"] == llm.settings.GROQ_MODEL
+    assert "max_tokens" not in post.call_args.kwargs["json"]
+
+
+def test_call_llm_uses_together_when_chosen(together_key):
+    with patch.object(llm.httpx, "post", return_value=FakeResponse()) as post:
+        assert llm.call_llm([{"role": "user", "content": "hi"}], {}) == {"workflows": []}
+    payload = post.call_args.kwargs["json"]
+    assert post.call_args.args[0] == "https://api.together.ai/v1/chat/completions"
+    assert post.call_args.kwargs["headers"]["Authorization"] == "Bearer together-key"
+    assert payload["model"] == llm.settings.TOGETHER_MODEL
+    assert payload["max_tokens"] == llm.settings.TOGETHER_MAX_TOKENS  # reasoning + JSON share this budget
+    assert payload["reasoning_effort"] == llm.settings.GROQ_REASONING_EFFORT
+    assert payload["response_format"]["type"] == "json_schema"
+
+
+def test_call_llm_unknown_provider():
+    with patch.object(llm.settings, "LLM_PROVIDER", "openrouter"):
+        with pytest.raises(ServiceUnavailableError, match="Unknown LLM_PROVIDER 'openrouter'"):
             llm.call_llm([], {})
 
 
