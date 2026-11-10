@@ -784,5 +784,23 @@ class DatabaseSeeder:
         db.flush()
 
 
+def _seed_compliance_library() -> None:
+    """Jurisdiction rule library as Drafts (never enforced until activated)."""
+    import logging
+
+    from app.infrastructure.database.session import SessionLocal
+    from app.modules.payflow.services.compliance.rule_service import seed_compliance_library
+
+    db = SessionLocal()
+    try:
+        seed_compliance_library(db)
+    except Exception:  # noqa: BLE001 - reference data must not stop the API from starting
+        db.rollback()
+        logging.getLogger("uvicorn.error").exception("compliance library seed failed")
+    finally:
+        db.close()
+
+
 def run_seeder() -> None:
     DatabaseSeeder().run()
+    _seed_compliance_library()

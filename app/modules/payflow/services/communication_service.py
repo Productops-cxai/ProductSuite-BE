@@ -676,6 +676,9 @@ class PayflowCommunicationService:
         account: PayflowAccountModel,
         *,
         channel: str,
+        message_text: str | None = None,
+        record_compliance: bool = False,
+        compliance_review_approved: bool = False,
     ) -> dict[str, Any]:
         """Pre-send gates: channel, consent, contact, holds, send windows, Prevent Communication."""
         channel_norm = (channel or "Email").strip()
@@ -753,6 +756,36 @@ class PayflowCommunicationService:
                 rule_code=matched.get("code"),
             )
 
+        # Jurisdiction compliance rules: asked last, and asked every time (a message
+        # scheduled earlier is re-checked here when it is actually sent).
+        from app.modules.payflow.services.compliance.evaluation_service import (
+            ComplianceEvaluationService,
+        )
+
+        verdict = ComplianceEvaluationService(self.db).evaluate_account(
+            account,
+            channel=channel_norm,
+            message_text=message_text,
+            record=record_compliance,
+            actor_name="PayFlow send gate",
+        )
+        review_cleared = verdict.decision == "REVIEW_REQUIRED" and compliance_review_approved
+        if verdict.decision != "ALLOW" and not review_cleared:
+            first = verdict.matches[0] if verdict.matches else {}
+            held = _blocked(
+                f"Compliance — {verdict.explanation}",
+                status={
+                    "BLOCK": "Blocked",
+                    "RESCHEDULE": "Deferred",
+                    "REVIEW_REQUIRED": "Review Required",
+                }.get(verdict.decision, "Blocked"),
+                next_at=verdict.next_permitted_at,
+                rule_name=first.get("name"),
+                rule_code=first.get("rule_code"),
+            )
+            held["compliance"] = verdict.as_dict()
+            return held
+
         return {
             "ok": True,
             "eligibility_status": "Eligible",
@@ -762,6 +795,31 @@ class PayflowCommunicationService:
             "rule_name": None,
             "rule_code": None,
         }
+
+    def _count_contact(
+        self,
+        account: PayflowAccountModel,
+        comm: PayflowCommunicationModel,
+        *,
+        kind: str,
+        at: datetime | None,
+    ) -> None:
+        """Count this message toward frequency limits, once per message and kind."""
+        try:
+            from app.modules.payflow.services.compliance.evaluation_service import (
+                ComplianceEvaluationService,
+            )
+
+            ComplianceEvaluationService(self.db).record_event(
+                account,
+                channel=comm.channel,
+                kind=kind,
+                key=f"comm:{comm.id}:{kind}",
+                at=at,
+                source="communication",
+            )
+        except Exception:  # noqa: BLE001 - counting must never fail a send
+            logger.exception("failed to count contact for communication_id=%s", comm.id)
 
     def record_blocked_communication(
         self,
@@ -839,11 +897,18 @@ class PayflowCommunicationService:
         payment_link: str | None = None,
         run_id: int | None = None,
         client_id: int | None = None,
+        compliance_review_approved: bool = False,
     ) -> dict[str, Any]:
         channel_norm = (channel or "Email").strip()
         purpose_norm = purpose or "Payment Reminder"
 
-        gate = self.evaluate_send_eligibility(account, channel=channel_norm)
+        gate = self.evaluate_send_eligibility(
+            account,
+            channel=channel_norm,
+            message_text=f"{subject or ''}\n{body or ''}",
+            record_compliance=True,
+            compliance_review_approved=compliance_review_approved,
+        )
         if not gate.get("ok"):
             blocked = self.record_blocked_communication(
                 account=account,
@@ -868,6 +933,9 @@ class PayflowCommunicationService:
                 "communication_id": blocked.id,
                 "code": blocked.code,
                 "restriction_reason": blocked.restriction_reason,
+                "eligibility_status": gate.get("eligibility_status"),
+                "next_eligible_at": gate.get("next_eligible_at"),
+                "compliance_decision": (gate.get("compliance") or {}).get("decision"),
             }
 
         now = _utcnow()
@@ -1019,6 +1087,9 @@ class PayflowCommunicationService:
         comm.provider_message_id = provider_message_id
         comm.recipient = recipient
         comm.provider_error = provider_error
+        if send_status in {"queued", "sent", "logged"}:
+            # One counted contact attempt per message, keyed by the message itself.
+            self._count_contact(account, comm, kind="attempted", at=now)
         if send_status == "queued":
             comm.status = PayflowCommStatus.QUEUED.value
             comm.sent_at = now
@@ -1258,6 +1329,9 @@ class PayflowCommunicationService:
         elif et in {"delivered"}:
             self._advance_status(row, PayflowCommStatus.DELIVERED.value)
             row.delivered_at = row.delivered_at or when
+            # Providers repeat events: the key makes a second "delivered" a no-op.
+            if row.account is not None:
+                self._count_contact(row.account, row, kind="completed", at=when)
         elif et in {"open", "opened"}:
             # Email open (provider) only — never from pay-link click / portal.
             row.opens_count = int(row.opens_count or 0) + 1

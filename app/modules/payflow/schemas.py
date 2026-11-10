@@ -3,21 +3,33 @@ from datetime import datetime
 from typing import Any, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+from app.shared.postal import is_valid_postal_code, normalize_postal_code, postal_code_hint
 
 # Canadian postal code: A1A 1A1
 _POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
 
 
-def _normalize_postal_code(value: Optional[str]) -> Optional[str]:
+def _checked_postal_code(value: Optional[str], country: Optional[str]) -> Optional[str]:
+    """Postal code checked for the client's country.
+
+    Blank comes back as "" (not None) so that clearing the box really clears the
+    stored value. With no country in the same request the format cannot be judged
+    here; the stored country is checked when the client is activated.
+    """
     if value is None:
         return None
-    cleaned = value.strip().upper()
-    if not cleaned:
-        return None
-    if not _POSTAL_CODE_RE.fullmatch(cleaned):
-        raise ValueError("Postal code must match format A1A 1A1")
-    return cleaned
+    if not value.strip():
+        return ""
+    if country is None or not country.strip():
+        cleaned = value.strip().upper()
+        if not is_valid_postal_code(cleaned, "unknown"):
+            raise ValueError(postal_code_hint("unknown"))
+        return normalize_postal_code(cleaned, None) if is_valid_postal_code(cleaned, None) else cleaned
+    if not is_valid_postal_code(value, country):
+        raise ValueError(postal_code_hint(country))
+    return normalize_postal_code(value, country)
 
 
 class PayflowRoleSummary(BaseModel):
@@ -146,10 +158,13 @@ class CreatePayflowClientRequest(BaseModel):
     correspondence_language: Optional[str] = None
     currency_code: Optional[str] = None
 
-    @field_validator("postal_code")
-    @classmethod
-    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
-        return _normalize_postal_code(value)
+    @model_validator(mode="after")
+    def postal_code_format(self):
+        if self.postal_code is not None:
+            checked = _checked_postal_code(self.postal_code, self.country)
+            if checked != self.postal_code:
+                self.postal_code = checked
+        return self
 
 
 class MappingUpdateItem(BaseModel):
@@ -199,10 +214,13 @@ class UpdatePayflowClientRequest(BaseModel):
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
-    @field_validator("postal_code")
-    @classmethod
-    def postal_code_format(cls, value: Optional[str]) -> Optional[str]:
-        return _normalize_postal_code(value)
+    @model_validator(mode="after")
+    def postal_code_format(self):
+        if self.postal_code is not None:
+            checked = _checked_postal_code(self.postal_code, self.country)
+            if checked != self.postal_code:
+                self.postal_code = checked
+        return self
 
 
 class CreatePortfolioRequest(BaseModel):
@@ -832,6 +850,8 @@ class StrategyNodeConfig(BaseModel):
     action: Optional[str] = None
     outcome: Optional[str] = None
     note: Optional[str] = None
+    # Human Review steps: the reason shown on the review the step opens.
+    review_reason: Optional[str] = Field(default=None, max_length=255)
     template_id: Optional[str] = None
     # Communication steps: the step's own message text (no text → the template is sent).
     subject: Optional[str] = Field(default=None, max_length=255)
@@ -1296,6 +1316,14 @@ class PayflowPaymentAttemptItem(BaseModel):
 
 class PayflowPaymentMockOutcomeRequest(BaseModel):
     outcome: str = Field(min_length=1, max_length=32)
+
+
+class PayflowPlanCancelRequest(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class PayflowPlanAutoChargeRequest(BaseModel):
+    enabled: bool
 
 
 class PayflowAccountPaymentsResponse(BaseModel):

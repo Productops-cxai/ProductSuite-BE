@@ -17,8 +17,11 @@ from app.core.exceptions import NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowClientModel,
+    PayflowHumanReviewModel,
     PayflowImportErrorModel,
     PayflowImportRunModel,
+    PayflowPaymentPlanModel,
+    PayflowPaymentTransactionModel,
     PayflowPortfolioModel,
     UserModel,
 )
@@ -37,7 +40,14 @@ from app.modules.payflow.crm_catalog import (
     AGE_GROUPS,
 )
 from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
-from app.shared.enums import PayflowCollectionStatus, PayflowPortfolioStatus
+from app.shared.enums import (
+    PayflowCollectionStatus,
+    PayflowPaymentPlanStatus,
+    PayflowPaymentTxnDirection,
+    PayflowPaymentTxnStatus,
+    PayflowPortfolioStatus,
+    PayflowReviewStatus,
+)
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_DIGITS_RE = re.compile(r"\D+")
@@ -103,6 +113,22 @@ def _now() -> datetime:
 
 def _stamp() -> str:
     return _now().strftime("%d %b %Y, %H:%M")
+
+
+# Payments that reached PayFlow. One that was later refunded or reversed still
+# counts here: its refund / reversal row takes the money back off again.
+_COUNTED_PAYMENT_STATUSES = (
+    PayflowPaymentTxnStatus.SUCCEEDED.value,
+    PayflowPaymentTxnStatus.REFUNDED.value,
+    PayflowPaymentTxnStatus.REVERSED.value,
+)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """UTC-aware datetime (some drivers hand timestamps back without a zone)."""
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def _cell(row: tuple, idx: dict[str, int], key: str) -> str:
@@ -1017,6 +1043,7 @@ class PayflowImportService:
         portfolios_by_key = lookups["port_by_key"]
 
         seen_keys: set[tuple[str, str]] = set()
+        import_allowed: dict[int, bool] = {}  # client id -> uploader may import for it
         created = updated = unchanged = failed = 0
         touched_portfolios: set[tuple[int, int]] = set()
         touched_parent_clients: set[int] = set()
@@ -1039,6 +1066,7 @@ class PayflowImportService:
                 client = clients.get(parsed["client_code"].lower())
                 if not client:
                     raise ValidationAppError("Unknown Client — this client has not been set up in PayFlow.")
+                self._assert_may_import_for(user, client, import_allowed)
                 sub_code = (parsed.get("sub_client_code") or "").strip()
                 parsed["sub_client_code"] = sub_code
                 portfolio = None
@@ -1133,21 +1161,40 @@ class PayflowImportService:
         self.db.refresh(run)
         return self._serialize_run(run), ai_job_ids
 
-    def list_imports(self, kind: str | None = None) -> dict[str, Any]:
+    def _assert_may_import_for(
+        self, user: Any, client: PayflowClientModel, cache: dict[int, bool]
+    ) -> None:
+        """A file may only touch clients its uploader may import accounts for."""
+        if user is None:
+            return
+        allowed = cache.get(client.id)
+        if allowed is None:
+            from app.modules.payflow.services.access_context_service import AccessContextService
+
+            allowed = AccessContextService(self.db).can(user, "import_accounts", client.id)
+            cache[client.id] = allowed
+        if not allowed:
+            raise ValidationAppError(
+                "Not authorized — you cannot import accounts for this client."
+            )
+
+    def list_imports(self, kind: str | None = None, *, owner_id: Any = None) -> dict[str, Any]:
         q = self.db.query(PayflowImportRunModel).options(joinedload(PayflowImportRunModel.errors))
         if kind:
             q = q.filter(PayflowImportRunModel.kind == kind)
+        if owner_id is not None:
+            q = q.filter(PayflowImportRunModel.uploaded_by_user_id == owner_id)
         rows = q.order_by(PayflowImportRunModel.created_at.desc()).all()
         return {"imports": [self._serialize_run(r) for r in rows]}
 
-    def get_import(self, import_id: int) -> dict[str, Any]:
+    def get_import(self, import_id: int, *, owner_id: Any = None) -> dict[str, Any]:
         row = (
             self.db.query(PayflowImportRunModel)
             .options(joinedload(PayflowImportRunModel.errors))
             .filter(PayflowImportRunModel.id == import_id)
             .first()
         )
-        if not row:
+        if not row or (owner_id is not None and row.uploaded_by_user_id != owner_id):
             raise NotFoundError("Import not found")
         return self._serialize_run(row)
 
@@ -1786,6 +1833,7 @@ class PayflowImportService:
             )
             self._apply_crm_fields(row, parsed, original_locked=False)
             row.last_crm_refresh_at = now
+            row.crm_outstanding_balance = float(parsed["outstanding_balance"])
             self.db.add(row)
             self.db.flush()
             self._ensure_human_review_request(row)
@@ -1793,6 +1841,8 @@ class PayflowImportService:
 
         if self._is_unchanged(existing, parsed, portfolio_id):
             existing.last_crm_refresh_at = now
+            if existing.crm_outstanding_balance is None:
+                existing.crm_outstanding_balance = float(parsed["outstanding_balance"])
             return "unchanged"
 
         previous_status = existing.collection_status
@@ -1802,11 +1852,17 @@ class PayflowImportService:
         original = float(existing.original_balance or 0)
         existing.portfolio_id = portfolio_id
         existing.customer_name = parsed["customer_name"]
-        existing.outstanding_balance = float(parsed["outstanding_balance"])
+        # The CRM does not know about payments taken through PayFlow until it posts
+        # them, so its balance is reconciled with the PayFlow ledger, not copied.
+        existing.outstanding_balance = self._reconcile_balance(existing, parsed)
         existing.recovered_balance = max(0.0, original - existing.outstanding_balance)
-        existing.collection_status = parsed["collection_status"]
+        existing.collection_status = self._reconcile_status(
+            existing, parsed["collection_status"]
+        )
         existing.last_action = "Updated from file upload"
-        existing.human_review = parsed["collection_status"] == PayflowCollectionStatus.HUMAN_REVIEW.value
+        existing.human_review = (
+            existing.collection_status == PayflowCollectionStatus.HUMAN_REVIEW.value
+        )
         events = list(existing.timeline or [])
         events.append(
             {
@@ -1820,7 +1876,13 @@ class PayflowImportService:
             }
         )
         existing.timeline = events[-40:]
+        recorded_opt_out = existing.email_consent is False
         self._apply_crm_fields(existing, parsed, original_locked=True)
+        # A recorded "no" (unsubscribe link, provider event, staff) stays a "no": a
+        # file can withdraw consent but never give it back. Staff can re-consent on
+        # the account itself.
+        if recorded_opt_out:
+            existing.email_consent = False
         existing.last_crm_refresh_at = now
         self._ensure_human_review_request(existing)
         try:
@@ -1842,6 +1904,110 @@ class PayflowImportService:
                 "workflow event hook failed for account_id=%s", existing.id
             )
         return "updated"
+
+    def _reconcile_balance(self, account: PayflowAccountModel, parsed: dict[str, Any]) -> float:
+        """Outstanding balance = what the CRM reports minus PayFlow payments it has not posted.
+
+        PayFlow never writes payments back to the CRM, so a file that still shows
+        the old balance must not undo a verified payment. The CRM is taken to have
+        posted a PayFlow payment once its own number drops by at least that amount
+        (oldest payment first) and its extract is newer than the payment
+        (``source_updated_at``, when the file carries it).
+        """
+        file_balance = float(parsed["outstanding_balance"])
+        previous_crm = account.crm_outstanding_balance
+        account.crm_outstanding_balance = file_balance
+
+        rows = (
+            self.db.query(PayflowPaymentTransactionModel)
+            .filter(PayflowPaymentTransactionModel.account_id == account.id)
+            .order_by(PayflowPaymentTransactionModel.id.asc())
+            .all()
+        )
+        if not rows:
+            return file_balance
+
+        def when(txn: PayflowPaymentTransactionModel) -> datetime:
+            return _aware(txn.completed_at or txn.created_at) or _now()
+
+        if previous_crm is None:
+            # First file since this tracking began: nothing to compare with, so take
+            # the CRM number as it is and start counting from here.
+            account.crm_posted_through = max(when(t) for t in rows)
+            return file_balance
+
+        posted_through = _aware(account.crm_posted_through)
+        snapshot_at = _aware(parsed.get("source_updated_at"))
+        pending = [
+            t
+            for t in rows
+            if t.direction == PayflowPaymentTxnDirection.PAYMENT.value
+            and t.status in _COUNTED_PAYMENT_STATUSES
+            and (posted_through is None or when(t) > posted_through)
+        ]
+
+        # How far the CRM's own number came down since its last file.
+        drop = float(previous_crm) - file_balance
+        for txn in pending:
+            amount = float(txn.amount or 0)
+            if amount <= 0 or drop + 0.005 < amount:
+                break
+            if snapshot_at is not None and when(txn) > snapshot_at:
+                break  # paid after the CRM extract was taken: it cannot be in there
+            drop -= amount
+            posted_through = when(txn)
+        account.crm_posted_through = posted_through
+
+        unposted = 0.0
+        for txn in rows:
+            if posted_through is not None and when(txn) <= posted_through:
+                continue
+            amount = float(txn.amount or 0)
+            if txn.direction == PayflowPaymentTxnDirection.PAYMENT.value:
+                if txn.status in _COUNTED_PAYMENT_STATUSES:
+                    unposted += amount
+            else:
+                unposted -= amount  # refund / reversal of a payment the CRM never saw
+        return round(max(0.0, file_balance - max(0.0, unposted)), 2)
+
+    def _reconcile_status(self, account: PayflowAccountModel, file_status: str) -> str:
+        """Collection status from the file, unless PayFlow knows something the CRM does not."""
+        resolved = PayflowCollectionStatus.RESOLVED.value
+        if file_status == resolved:
+            return resolved
+        if float(account.outstanding_balance or 0) <= 0.005:
+            return resolved  # paid off through PayFlow: do not reopen the case
+        open_review = (
+            self.db.query(PayflowHumanReviewModel.id)
+            .filter(
+                PayflowHumanReviewModel.account_id == account.id,
+                PayflowHumanReviewModel.status.in_(
+                    [
+                        PayflowReviewStatus.AWAITING_REVIEW.value,
+                        PayflowReviewStatus.ON_HOLD.value,
+                    ]
+                ),
+            )
+            .first()
+        )
+        if open_review or file_status == PayflowCollectionStatus.HUMAN_REVIEW.value:
+            return PayflowCollectionStatus.HUMAN_REVIEW.value
+        open_plan = (
+            self.db.query(PayflowPaymentPlanModel.id)
+            .filter(
+                PayflowPaymentPlanModel.account_id == account.id,
+                PayflowPaymentPlanModel.status.in_(
+                    [
+                        PayflowPaymentPlanStatus.ACTIVE.value,
+                        PayflowPaymentPlanStatus.OVERDUE.value,
+                    ]
+                ),
+            )
+            .first()
+        )
+        if open_plan:
+            return PayflowCollectionStatus.PAYMENT_PLAN.value
+        return file_status
 
     def _ensure_human_review_request(self, account: PayflowAccountModel) -> None:
         """Enqueue a Human Review row when import marks the case for review."""
@@ -1917,8 +2083,15 @@ class PayflowImportService:
         checks: list[tuple[Any, Any]] = [
             (row.portfolio_id, portfolio_id),
             (row.customer_name, parsed["customer_name"]),
-            (_round2(row.outstanding_balance), _round2(parsed["outstanding_balance"])),
-            (row.collection_status, parsed["collection_status"]),
+            (
+                _round2(
+                    row.crm_outstanding_balance
+                    if row.crm_outstanding_balance is not None
+                    else row.outstanding_balance
+                ),
+                _round2(parsed["outstanding_balance"]),
+            ),
+            (row.collection_status, self._reconcile_status(row, parsed["collection_status"])),
             (row.email, parsed["email"]),
             (row.phone_mobile, parsed["phone_mobile"]),
             (row.language, parsed["language"]),

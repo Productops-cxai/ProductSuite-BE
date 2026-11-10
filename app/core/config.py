@@ -115,6 +115,12 @@ class Settings(BaseSettings):
     # Reclaim RUNNING jobs whose lock is older than this (crash / dead worker).
     WORKFLOW_WORKER_STALE_SECONDS: int = 300
     WORKFLOW_JOB_NOTIFY_CHANNEL: str = "workflow_jobs"
+    # Re-check every Active workflow for accounts that were never enrolled. 0 = off.
+    WORKFLOW_GAP_FILL_SECONDS: int = 3600
+    # Import / AI-suggest jobs run inside the API process. After this long without
+    # progress they are treated as cut off by a restart and closed by the worker.
+    IMPORT_JOB_STALE_MINUTES: int = 15
+    AI_SUGGEST_JOB_STALE_MINUTES: int = 30
     # Customer portal base (token appended). Empty → {FRONTEND_URL}/pay
     WORKFLOW_PAYMENT_LINK_BASE: str = ""
     # Opaque payment-link token TTL (hours). Default 14 days.
@@ -132,6 +138,11 @@ class Settings(BaseSettings):
     # Prod: set S3_BUCKET + rely on EC2 IAM role (no AWS keys in .env).
     S3_BUCKET: str = ""
     AWS_REGION: str = "ca-central-1"
+
+    # Throttling keys on the caller's address. Behind nginx / a load balancer every
+    # request comes from the proxy, so set this to true there (and only there: a
+    # directly exposed API must not trust a header the caller can set).
+    TRUST_FORWARDED_FOR: bool = False
 
     # Comma-separated browser origins for CORS. Empty + production → FRONTEND_URL only.
     # Dev default remains allow-all when empty and APP_ENV != production.

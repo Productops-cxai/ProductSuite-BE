@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
@@ -39,6 +39,11 @@ def _money(value: float) -> float:
     return round(float(value or 0), 2)
 
 
+# A declined instalment is retried once a day, this many tries in total.
+MAX_CHARGE_TRIES = 3
+RETRY_AFTER = timedelta(hours=24)
+
+
 class PayflowPlanAutoChargeService:
     def __init__(self, db: Session):
         self.db = db
@@ -58,6 +63,8 @@ class PayflowPlanAutoChargeService:
                     [
                         PayflowPaymentInstallmentStatus.PENDING.value,
                         PayflowPaymentInstallmentStatus.OVERDUE.value,
+                        # A declined charge is tried again (see _charge_one for pacing).
+                        PayflowPaymentInstallmentStatus.FAILED.value,
                     ]
                 ),
                 PayflowPaymentPlanInstallmentModel.due_date <= today,
@@ -132,8 +139,51 @@ class PayflowPlanAutoChargeService:
             if int(payload.get("installment_sequence") or 0) == int(inst.sequence):
                 return "skipped"
 
+        # Earlier declines of this instalment: retry at most once a day, a few times.
+        declined = [
+            row
+            for row in self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.account_id == plan.account_id,
+                PayflowPaymentAttemptModel.plan_id == plan.public_id,
+                PayflowPaymentAttemptModel.option_type
+                == PayflowPaymentOptionType.PAY_NEXT_INSTALMENT.value,
+                PayflowPaymentAttemptModel.status == PayflowPaymentAttemptStatus.FAILED.value,
+            )
+            .order_by(PayflowPaymentAttemptModel.id.desc())
+            .limit(50)
+            .all()
+            if int(
+                (row.provider_payload if isinstance(row.provider_payload, dict) else {}).get(
+                    "installment_sequence"
+                )
+                or 0
+            )
+            == int(inst.sequence)
+        ]
+        if len(declined) >= MAX_CHARGE_TRIES:
+            return "skipped"
+        if declined:
+            last = declined[0].completed_at or declined[0].created_at
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if _utcnow() - last < RETRY_AFTER:
+                    return "skipped"
+
         account = self.db.get(PayflowAccountModel, plan.account_id)
         if not account:
+            return "skipped"
+        # Same stops as outreach: no charge on a held, closed or resolved case.
+        from app.modules.payflow.services.workflow_execution_service import (
+            _account_execution_block_reason,
+        )
+
+        blocked = _account_execution_block_reason(account)
+        if blocked:
+            logger.info(
+                "auto-charge skipped plan=%s account=%s: %s", plan.public_id, plan.account_id, blocked
+            )
             return "skipped"
         balance = _money(account.outstanding_balance)
         amount = min(_money(inst.amount), balance)
@@ -173,7 +223,11 @@ class PayflowPlanAutoChargeService:
             currency_code=plan.currency_code or account.currency_code or "USD",
             status=PayflowPaymentAttemptStatus.PROCESSING.value,
             provider="stripe",
-            idempotency_key=f"autocharge_{plan.public_id}_{inst.sequence}_{inst.due_date.isoformat()}",
+            # A retry needs its own key: Stripe replays the stored decline for a reused one.
+            idempotency_key=(
+                f"autocharge_{plan.public_id}_{inst.sequence}_{inst.due_date.isoformat()}"
+                + (f"_r{len(declined)}" if declined else "")
+            ),
             balance_at_initiation=balance,
             events=[
                 {

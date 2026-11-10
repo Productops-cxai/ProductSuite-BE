@@ -27,7 +27,8 @@ def _verify_signature(raw_body: bytes, signature: str | None, timestamp: str | N
     """
     key = (settings.SENDGRID_WEBHOOK_VERIFICATION_KEY or "").strip()
     if not key:
-        return True
+        # Unsigned events can flip consent and fake bounces: never in production.
+        return (settings.APP_ENV or "").strip().lower() != "production"
     if not signature or not timestamp:
         return False
     try:

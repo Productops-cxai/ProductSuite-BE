@@ -19,12 +19,18 @@ def frontend_base_from_headers(
     origin: str | None,
     referer: str | None,
 ) -> str | None:
+    # Only hosts we serve the frontend from. Anyone can send any Origin header;
+    # using it blindly would put an attacker's host in a victim's reset email.
+    allowed = {o.rstrip("/").lower() for o in settings.cors_allow_origins() if o}
+    allowed.add((settings.FRONTEND_URL or "").rstrip("/").lower())
     for raw in (origin, referer):
         if not raw or not raw.strip():
             continue
         parts = urlsplit(raw.strip())
         if parts.scheme in ("http", "https") and parts.netloc:
-            return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+            base = urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+            if base.lower() in allowed:
+                return base
     return None
 
 

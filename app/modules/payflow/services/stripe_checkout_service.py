@@ -479,6 +479,38 @@ def retrieve_checkout_session(
         return None
 
 
+def expire_checkout_session(session_id: str) -> bool:
+    """Expire an open Checkout Session so it can no longer be paid. Best effort."""
+    secret = (settings.STRIPE_SECRET_KEY or "").strip()
+    sid = (session_id or "").strip()
+    if not secret or not sid:
+        return False
+    try:
+        import stripe
+
+        stripe.api_key = secret
+        stripe.checkout.Session.expire(sid)
+        return True
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("stripe SDK session expire failed session=%s", sid)
+        return False
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            res = client.post(
+                f"https://api.stripe.com/v1/checkout/sessions/{sid}/expire",
+                auth=(secret, ""),
+            )
+        if res.status_code >= 400:
+            logger.warning("stripe session expire HTTP %s: %s", res.status_code, res.text[:200])
+            return False
+        return True
+    except Exception:
+        logger.exception("stripe httpx session expire failed session=%s", sid)
+        return False
+
+
 def retrieve_payment_intent(payment_intent_id: str) -> dict[str, Any] | None:
     secret = (settings.STRIPE_SECRET_KEY or "").strip()
     pi = (payment_intent_id or "").strip()

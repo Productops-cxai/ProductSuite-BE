@@ -11,7 +11,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError
-from app.infrastructure.database.models import PayflowImportJobModel, UserModel
+from app.infrastructure.database.models import (
+    PayflowImportJobModel,
+    PayflowImportRunModel,
+    UserModel,
+)
 from app.infrastructure.database.session import SessionLocal
 from app.modules.payflow.services.ai_suggest_job_service import process_ai_suggest_jobs
 from app.modules.payflow.services.import_progress import make_progress_cb
@@ -62,9 +66,10 @@ class ImportJobService:
         self.db.flush()
         return job
 
-    def get_job(self, job_id: int) -> dict[str, Any]:
+    def get_job(self, job_id: int, *, owner_id: Any = None) -> dict[str, Any]:
+        """``owner_id`` set: only that user's job is found (others look missing)."""
         job = self.db.query(PayflowImportJobModel).filter(PayflowImportJobModel.id == job_id).first()
-        if not job:
+        if not job or (owner_id is not None and job.created_by_user_id != owner_id):
             raise NotFoundError("Import job not found")
         return self.serialize(job)
 
@@ -111,6 +116,7 @@ def run_import_job(job_id: int) -> None:
             return
 
         job.status = "running"
+        job.heartbeat_at = _utcnow()
         db.commit()
 
         user = None
@@ -186,6 +192,11 @@ def run_import_job(job_id: int) -> None:
                 job.status = "failed"
                 job.error_message = str(exc) or "Import job failed"
                 job.completed_at = _utcnow()
+                if job.import_run_id:
+                    run = db.get(PayflowImportRunModel, job.import_run_id)
+                    if run is not None and run.status in ("Uploaded", "Validating", "Processing"):
+                        run.status = "Failed"
+                        run.completed_at = _utcnow()
                 db.commit()
         except Exception:
             logger.exception("import job %s failed to mark failed", job_id)

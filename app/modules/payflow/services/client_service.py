@@ -37,6 +37,7 @@ from app.infrastructure.database.models import (
     PayflowUserMembershipModel,
     UserModel,
 )
+from app.shared.postal import is_valid_postal_code, normalize_postal_code, postal_code_hint
 from app.shared.deletion import record_deletion, snapshot_model
 from app.modules.payflow.crm_catalog import (
     ACCOUNT_IMPORT_CURRENCIES,
@@ -244,21 +245,13 @@ _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _POSTAL_CODE_RE = re.compile(r"^[A-Z]\d[A-Z] \d[A-Z]\d$")
 
 
-def _normalize_postal_code(raw: str | None) -> str:
-    text = (raw or "").strip().upper()
-    if not text:
-        return ""
-    compact = re.sub(r"\s+", "", text)
-    if len(compact) == 6:
-        return f"{compact[:3]} {compact[3:]}"
-    return text
+def _normalize_postal_code(raw: str | None, country: str | None = None) -> str:
+    return normalize_postal_code(raw, country)
 
 
-def _is_valid_postal_code(raw: str | None) -> bool:
-    cleaned = _normalize_postal_code(raw)
-    if not cleaned:
-        return True
-    return bool(_POSTAL_CODE_RE.match(cleaned))
+def _is_valid_postal_code(raw: str | None, country: str | None = None) -> bool:
+    """Checked for the client's country (no country on file = Canada)."""
+    return is_valid_postal_code(raw, country)
 
 
 def _guess_client_import_field(message: str) -> str:
@@ -614,12 +607,31 @@ class PayflowClientService:
             client.updated_at = _utcnow()
             action = "updated"
 
+        self.db.flush()
+        self._sync_compliance_rules(client)
         if commit:
             self.db.commit()
             self.db.refresh(client)
         else:
             self.db.flush()
         return client, action
+
+    def _sync_compliance_rules(self, client: PayflowClientModel) -> None:
+        """Associate the compliance rules of the client's jurisdiction (create, update,
+        import, re-import). Additive and idempotent: optional rules a client switched
+        off stay off, and each client is resolved on its own."""
+        try:
+            from app.modules.payflow.services.compliance.client_mapping import (
+                ClientComplianceService,
+            )
+
+            ClientComplianceService(self.db).sync_client(client)
+        except Exception:  # noqa: BLE001 - never fail a client save over the mapping
+            import logging
+
+            logging.getLogger("app.compliance").exception(
+                "compliance rule mapping failed for client_id=%s", client.id
+            )
 
     def update_client(self, client_id: int, payload: dict[str, Any]) -> dict:
         client = self._get_or_404(client_id)
@@ -731,7 +743,9 @@ class PayflowClientService:
             settings_payload = payload["payment_settings"]
             if not isinstance(settings_payload, dict):
                 raise ValidationAppError("payment_settings must be an object")
-            client.payment_settings = dict(settings_payload)
+            # Merge: the form sends the options it knows; anything else stored here
+            # (set by another screen or a later release) must survive the save.
+            client.payment_settings = {**(client.payment_settings or {}), **settings_payload}
         if "communication_settings" in payload and payload["communication_settings"] is not None:
             comm_payload = payload["communication_settings"]
             if not isinstance(comm_payload, dict):
@@ -746,6 +760,8 @@ class PayflowClientService:
             newly_assigned = self._sync_supervisors(client, payload["supervisor_user_ids"])
 
         client.updated_at = _utcnow()
+        self.db.flush()
+        self._sync_compliance_rules(client)
         self.db.commit()
         self.db.refresh(client)
         if newly_governance:
@@ -1699,11 +1715,9 @@ class PayflowClientService:
         _normalize_import_currency(_row_first(row, "currency__name"))
 
         postal = _row_first(row, "zip_code", "postal_code")
-        if postal and not _is_valid_postal_code(postal):
-            raise ValidationAppError(
-                "Postal code must match format A1A 1A1 "
-                "(letter-number-letter space number-letter-number)"
-            )
+        row_country = _row_first(row, "country__name", "country")
+        if postal and not _is_valid_postal_code(postal, row_country):
+            raise ValidationAppError(postal_code_hint(row_country))
 
         for date_field in _CLIENT_IMPORT_DATE_FIELDS:
             if date_field in row:
@@ -3279,11 +3293,8 @@ class PayflowClientService:
         if not (client.currency_code or "").strip():
             issues.append("Currency is required")
         postal = (client.postal_code or "").strip()
-        if postal and not _is_valid_postal_code(postal):
-            issues.append(
-                "Postal code must match format A1A 1A1 "
-                "(letter-number-letter space number-letter-number)"
-            )
+        if postal and not _is_valid_postal_code(postal, client.country):
+            issues.append(postal_code_hint(client.country))
         return issues
 
     def _onboarding_progress(self, client: PayflowClientModel) -> dict:

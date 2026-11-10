@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -11,14 +11,135 @@ from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowClientModel,
     PayflowCommunicationModel,
+    PayflowPaymentAttemptModel,
+    PayflowPaymentPlanInstallmentModel,
+    PayflowPaymentPlanModel,
     PayflowRuleModel,
 )
 from app.shared.enums import (
     PayflowCollectionStatus,
+    PayflowCommStatus,
+    PayflowPaymentAttemptStatus,
+    PayflowPaymentInstallmentStatus,
+    PayflowPaymentPlanStatus,
     PayflowRuleLogic,
     PayflowRuleStatus,
     PayflowRuleType,
 )
+
+
+# Messages that never left PayFlow (blocked by governance / eligibility, cancelled).
+_NOT_SENT_STATUSES = (
+    PayflowCommStatus.SUPPRESSED.value,
+    PayflowCommStatus.CANCELLED.value,
+    PayflowCommStatus.PREPARED.value,
+    PayflowCommStatus.AWAITING_GOVERNANCE.value,
+)
+_MISSED_INSTALLMENT_STATUSES = (
+    PayflowPaymentInstallmentStatus.OVERDUE.value,
+    PayflowPaymentInstallmentStatus.FAILED.value,
+)
+MESSAGES_SENT_7D_FIELD = "Messages Sent (7 days)"
+
+
+def _db(ctx: dict | None) -> Session | None:
+    return (ctx or {}).get("db")
+
+
+def _unsuccessful_attempts(account: PayflowAccountModel, ctx: dict | None) -> int:
+    """Messages that were attempted but failed (bounce, undelivered, provider error)."""
+    db = _db(ctx)
+    if db is None:
+        return 0
+    return (
+        db.query(PayflowCommunicationModel.id)
+        .filter(
+            PayflowCommunicationModel.account_id == account.id,
+            PayflowCommunicationModel.status == PayflowCommStatus.FAILED.value,
+        )
+        .count()
+    )
+
+
+def _messages_sent_7d(account: PayflowAccountModel, ctx: dict | None) -> int:
+    """Messages that really went out in the last 7 days."""
+    db = _db(ctx)
+    if db is None:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    return (
+        db.query(PayflowCommunicationModel.id)
+        .filter(
+            PayflowCommunicationModel.account_id == account.id,
+            PayflowCommunicationModel.created_at >= cutoff,
+            PayflowCommunicationModel.status.notin_(
+                _NOT_SENT_STATUSES + (PayflowCommStatus.FAILED.value,)
+            ),
+        )
+        .count()
+    )
+
+
+def _failed_payment_attempts(account: PayflowAccountModel, ctx: dict | None) -> int:
+    db = _db(ctx)
+    if db is None:
+        return 0
+    return (
+        db.query(PayflowPaymentAttemptModel.id)
+        .filter(
+            PayflowPaymentAttemptModel.account_id == account.id,
+            PayflowPaymentAttemptModel.status == PayflowPaymentAttemptStatus.FAILED.value,
+        )
+        .count()
+    )
+
+
+def _current_plan(account: PayflowAccountModel, ctx: dict | None) -> PayflowPaymentPlanModel | None:
+    """The account's latest plan that is still running (not completed / cancelled)."""
+    db = _db(ctx)
+    if db is None:
+        return None
+    return (
+        db.query(PayflowPaymentPlanModel)
+        .filter(
+            PayflowPaymentPlanModel.account_id == account.id,
+            PayflowPaymentPlanModel.status.notin_(
+                [
+                    PayflowPaymentPlanStatus.COMPLETED.value,
+                    PayflowPaymentPlanStatus.CANCELLED.value,
+                ]
+            ),
+        )
+        .order_by(PayflowPaymentPlanModel.id.desc())
+        .first()
+    )
+
+
+def _missed_installments(account: PayflowAccountModel, ctx: dict | None) -> int:
+    plan = _current_plan(account, ctx)
+    if plan is None:
+        return 0
+    return (
+        _db(ctx)
+        .query(PayflowPaymentPlanInstallmentModel.id)
+        .filter(
+            PayflowPaymentPlanInstallmentModel.plan_id == plan.id,
+            PayflowPaymentPlanInstallmentModel.status.in_(_MISSED_INSTALLMENT_STATUSES),
+        )
+        .count()
+    )
+
+
+def _payment_plan_status(account: PayflowAccountModel, ctx: dict | None) -> str:
+    """None / On Track / At Risk / Defaulted — the rule builder's options."""
+    plan = _current_plan(account, ctx)
+    if plan is None:
+        return "None"
+    if plan.status == PayflowPaymentPlanStatus.DEFAULTED.value:
+        return "Defaulted"
+    if plan.status == PayflowPaymentPlanStatus.OVERDUE.value or _missed_installments(account, ctx):
+        return "At Risk"
+    return "On Track"
 
 
 FIELD_GETTERS: dict[str, Any] = {
@@ -26,6 +147,11 @@ FIELD_GETTERS: dict[str, Any] = {
     "Original Balance": lambda a, _: float(a.original_balance or 0),
     "Recovered Amount": lambda a, _: float(a.recovered_balance or 0),
     "Channel": lambda _a, ctx: (ctx or {}).get("channel") or "",
+    "Unsuccessful Attempts": _unsuccessful_attempts,
+    "Failed Payment Attempts": _failed_payment_attempts,
+    "Payment Plan Status": _payment_plan_status,
+    "Missed Installments": _missed_installments,
+    MESSAGES_SENT_7D_FIELD: _messages_sent_7d,
 }
 
 
@@ -60,18 +186,8 @@ class RuleRuntimeService:
         ]
 
     def messages_sent_7d(self, account_id: int) -> int:
-        cutoff = datetime.now(timezone.utc).timestamp() - 7 * 86400
-        # Lightweight count — filter in Python if needed for SQLite compat; Postgres OK with created_at.
-        rows = (
-            self.db.query(PayflowCommunicationModel)
-            .filter(PayflowCommunicationModel.account_id == account_id)
-            .all()
-        )
-        count = 0
-        for r in rows:
-            if r.created_at and r.created_at.timestamp() >= cutoff:
-                count += 1
-        return count
+        account = self.db.get(PayflowAccountModel, account_id)
+        return _messages_sent_7d(account, {"db": self.db}) if account else 0
 
     def evaluate(
         self,
@@ -81,10 +197,7 @@ class RuleRuntimeService:
         for_communication: bool = False,
     ) -> list[dict[str, Any]]:
         """Return list of matched rules with action, ordered by id."""
-        ctx = {
-            "channel": channel or "",
-            "messages_7d": self.messages_sent_7d(account.id),
-        }
+        ctx = {"channel": channel or "", "db": self.db}
         matched: list[dict[str, Any]] = []
         for rule in self.active_rules_for_account(account):
             if for_communication and rule.action == "Prevent Communication":
@@ -149,10 +262,7 @@ class RuleRuntimeService:
         channel: str | None = None,
     ) -> bool:
         """Whether a single rule's conditions match the account (current snapshot)."""
-        ctx = {
-            "channel": channel or "",
-            "messages_7d": self.messages_sent_7d(account.id),
-        }
+        ctx = {"channel": channel or "", "db": self.db}
         return self._rule_matches(rule, account, ctx)
 
     def candidate_accounts_for_rule(self, rule: PayflowRuleModel) -> list[PayflowAccountModel]:

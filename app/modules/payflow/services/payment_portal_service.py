@@ -31,6 +31,7 @@ from app.modules.payflow.services.plan_schedule import (
 from app.modules.payflow.services.stripe_checkout_service import (
     create_checkout_session,
     create_setup_checkout_session,
+    expire_checkout_session,
     extract_session_payment_method,
     retrieve_checkout_session,
     retrieve_payment_intent,
@@ -488,6 +489,40 @@ class PayflowPaymentPortalService:
         response_token = (
             f"{self._PREVIEW_TOKEN_PREFIX}{real_token}" if preview_mode else real_token
         )
+        # A link that expired or was revoked no longer identifies the customer:
+        # say why it cannot be used, and nothing about who or how much.
+        withdrawn = row.status in {
+            PayflowPaymentLinkStatus.EXPIRED.value,
+            PayflowPaymentLinkStatus.REVOKED.value,
+        }
+        if withdrawn:
+            return {
+                "usable": False,
+                "status": row.status,
+                "block_reason": block_reason,
+                "expires_at": row.expires_at,
+                "token": response_token,
+                "link_ref": row.token[:8],
+                "customer": {"display_name": "Customer"},
+                "case": {
+                    "account_reference": None,
+                    "account_reference_masked": None,
+                    "original_balance": 0.0,
+                    "outstanding_balance": 0.0,
+                    "recovered_balance": 0.0,
+                    "currency_code": currency,
+                    "collection_status": None,
+                },
+                "brand": self._brand_payload(client),
+                "payment_options": [],
+                "active_payment_plans": [],
+                "preview_mode": preview_mode,
+                "provider": {
+                    "name": "stripe" if stripe_configured() else "mock",
+                    "ready": False,
+                    "message": block_reason,
+                },
+            }
         return {
             "usable": usable and not preview_mode,
             "status": row.status,
@@ -505,7 +540,8 @@ class PayflowPaymentPortalService:
                 or "Customer",
             },
             "case": {
-                "account_reference": account.account_reference,
+                # Only the masked form leaves the server; the page never needs the rest.
+                "account_reference": self._mask_reference(account.account_reference),
                 "account_reference_masked": self._mask_reference(account.account_reference),
                 "original_balance": float(account.original_balance or 0),
                 "outstanding_balance": balance,
@@ -718,9 +754,24 @@ class PayflowPaymentPortalService:
             raise ValidationAppError("Payment amount must be greater than zero")
 
         if idempotency_key:
+            # Same request sent twice (double click, retry): hand back the payment already
+            # started. Only on THIS link, and only while it is still open or paid: a key
+            # is chosen by the browser, so it must never reach another customer's attempt
+            # or revive one that failed or was cancelled.
             existing = (
                 self.db.query(PayflowPaymentAttemptModel)
-                .filter(PayflowPaymentAttemptModel.idempotency_key == idempotency_key)
+                .filter(
+                    PayflowPaymentAttemptModel.idempotency_key == idempotency_key,
+                    PayflowPaymentAttemptModel.payment_link_id == row.id,
+                    PayflowPaymentAttemptModel.status.in_(
+                        [
+                            PayflowPaymentAttemptStatus.INITIATED.value,
+                            PayflowPaymentAttemptStatus.PROCESSING.value,
+                            PayflowPaymentAttemptStatus.SUCCEEDED.value,
+                        ]
+                    ),
+                )
+                .order_by(PayflowPaymentAttemptModel.id.desc())
                 .first()
             )
             if existing:
@@ -1437,6 +1488,82 @@ class PayflowPaymentPortalService:
             attempt.provider_payload = payload
         return extracted
 
+    def _cancel_checkouts_that_would_overpay(
+        self,
+        paid: PayflowPaymentAttemptModel,
+        account: PayflowAccountModel,
+        balance: float,
+    ) -> None:
+        """Close the customer's other open checkouts that no longer fit the balance.
+
+        A customer can open "pay in full" and "pay part" side by side. Once one is
+        paid, the other would collect more than is owed.
+        """
+        others = (
+            self.db.query(PayflowPaymentAttemptModel)
+            .filter(
+                PayflowPaymentAttemptModel.account_id == account.id,
+                PayflowPaymentAttemptModel.id != paid.id,
+                PayflowPaymentAttemptModel.status.in_(
+                    [
+                        PayflowPaymentAttemptStatus.INITIATED.value,
+                        PayflowPaymentAttemptStatus.PROCESSING.value,
+                    ]
+                ),
+            )
+            .all()
+        )
+        for other in others:
+            if _money(other.amount) <= _money(balance) + 0.005:
+                continue
+            payload = other.provider_payload if isinstance(other.provider_payload, dict) else {}
+            if payload.get("auto_charge"):
+                continue  # already with the bank; its own result will settle it
+            if other.stripe_session_id and stripe_configured():
+                # Best effort: an expired session cannot be paid any more.
+                expire_checkout_session(other.stripe_session_id)
+            other.status = PayflowPaymentAttemptStatus.CANCELLED.value
+            other.completed_at = _utcnow()
+            other.error_message = "Cancelled: another payment changed the balance"
+            self._append_attempt_event(
+                other, "Cancelled", "Another payment was confirmed; amount no longer fits the balance"
+            )
+
+    def _flag_overpayment(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        account: PayflowAccountModel,
+        *,
+        overpaid: float,
+        txn: Any,
+    ) -> None:
+        """Put an overpayment in front of staff so the excess is refunded."""
+        try:
+            from app.modules.payflow.services.operational_exception_service import (
+                PayflowOperationalExceptionService,
+            )
+            from app.shared.enums import PayflowOperationalExceptionType
+
+            currency = attempt.currency_code or account.currency_code or ""
+            PayflowOperationalExceptionService(self.db).raise_exception(
+                exception_type=PayflowOperationalExceptionType.PROCESSING_DISCREPANCY.value,
+                reason=(
+                    f"Overpayment: customer paid {overpaid:.2f} {currency} more than was owed. "
+                    "Refund the excess."
+                ).strip(),
+                client_id=account.client_id,
+                account_id=account.id,
+                source_entity_type="payment",
+                source_entity_id=str(getattr(txn, "public_id", None) or attempt.public_id),
+                severity="High",
+                retriable=False,
+                link=f"/payflow/cases/{account.id}",
+                dedupe_key=f"overpayment:{attempt.public_id}",
+                commit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("failed to flag overpayment attempt=%s", attempt.public_id)
+
     def apply_succeeded(
         self,
         attempt: PayflowPaymentAttemptModel,
@@ -1534,10 +1661,15 @@ class PayflowPaymentPortalService:
                 self.db.flush()
             return
 
+        # Money received beyond what was owed (two checkouts paid, balance changed
+        # in between). Only what was owed counts as recovered; the rest must go back.
+        overpaid = _money(max(0.0, amount - prev)) if account else 0.0
         if account and amount > 0:
             new_bal = max(0.0, _money(prev - amount))
             account.outstanding_balance = new_bal
-            account.recovered_balance = _money((account.recovered_balance or 0) + amount)
+            account.recovered_balance = _money(
+                (account.recovered_balance or 0) + min(amount, prev)
+            )
             account.last_payment_amount = amount
             account.last_payment_date = _utcnow().date()
             account.paid_amount = _money((account.paid_amount or 0) + amount)
@@ -1607,6 +1739,11 @@ class PayflowPaymentPortalService:
         # Stop collection links only on full settlement — not on partial/plan first instalment.
         if account and new_bal <= 0:
             self.links.mark_completed_for_account(attempt.account_id, commit=False)
+
+        if account:
+            self._cancel_checkouts_that_would_overpay(attempt, account, new_bal)
+        if account and overpaid > 0:
+            self._flag_overpayment(attempt, account, overpaid=overpaid, txn=txn)
 
         try:
             from app.modules.payflow.services.workflow_execution_service import (

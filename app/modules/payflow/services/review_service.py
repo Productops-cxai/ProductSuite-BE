@@ -89,7 +89,11 @@ REVIEW_REASONS = [
     "High balance treatment",
     "Customer dispute raised",
     "Hardship signal detected",
+    # A compliance rule asked for a person to decide before the message goes out.
+    "Compliance review required",
 ]
+
+COMPLIANCE_REVIEW_REASON = "Compliance review required"
 
 # Lovable: Review Reason is a fixed business catalog; Triggered Rule is separate.
 # Map governance rule category → catalog reason when a rule creates a review.
@@ -158,6 +162,32 @@ def normalize_review_reason(
     if "attempt" in low:
         return "Repeated unsuccessful attempts"
     return _DEFAULT_REVIEW_REASON
+
+# Modify: the only choice that keeps the current workflow going. Every other
+# choice replaces the treatment, so the run stops and the case waits for it.
+CONTINUE_WORKFLOW_ACTION = "Continue current treatment with adjusted communication"
+
+# "Hold until" values the worker can act on (anything else needs a manual release).
+_HOLD_DATE_FORMATS = ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y")
+
+
+def parse_hold_until(value: str | None) -> datetime | None:
+    """Start of the hold-until day (UTC), or None when the text is not a date."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for fmt in _HOLD_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
 
 REJECTION_REASONS = [
     "Not appropriate for customer context",
@@ -885,7 +915,7 @@ class PayflowReviewService:
         return row
 
     def _resume_workflow_after_review(
-        self, review_id: int, *, continue_workflow: bool
+        self, review_id: int, *, continue_workflow: bool, stop_reason: str | None = None
     ) -> None:
         try:
             from app.modules.payflow.services.workflow_execution_service import (
@@ -893,7 +923,7 @@ class PayflowReviewService:
             )
 
             WorkflowExecutionService(self.db).on_human_review_decided(
-                review_id, continue_workflow=continue_workflow
+                review_id, continue_workflow=continue_workflow, stop_reason=stop_reason
             )
         except Exception:
             import logging
@@ -1608,7 +1638,14 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._mark_review_notifications_read(row.id)
         self._notify_decided(row, user)
-        self._resume_workflow_after_review(row.id, continue_workflow=True)
+        # The supervisor's choice decides what the workflow does, not just a label:
+        # only "continue" resumes it; any other treatment ends this run.
+        keep_going = action == CONTINUE_WORKFLOW_ACTION
+        self._resume_workflow_after_review(
+            row.id,
+            continue_workflow=keep_going,
+            stop_reason=None if keep_going else f"Human review changed treatment: {action}",
+        )
         return self._serialize(self._get_row(row.id), user, include_detail=True)
 
     def reject(
@@ -1806,6 +1843,65 @@ class PayflowReviewService:
         self.db.refresh(row)
         self._notify_awaiting(self._get_row(row.id), force=True)
         return self._serialize(self._get_row(row.id), user, include_detail=True)
+
+    def release_due_holds(self, *, now: datetime | None = None) -> int:
+        """Return reviews whose "hold until" date has arrived to the supervisors' queue.
+
+        Called by the workflow worker. Holds without a readable date ("Further
+        review") stay until someone releases them by hand.
+        """
+        now = now or _utcnow()
+        held = (
+            self.db.query(PayflowHumanReviewModel)
+            .filter(PayflowHumanReviewModel.status == PayflowReviewStatus.ON_HOLD.value)
+            .all()
+        )
+        released: list[int] = []
+        for row in held:
+            due = parse_hold_until(row.hold_until)
+            if due is None or due > now:
+                continue
+            was_until = row.hold_until
+            before = self._snapshot(row)
+            row.status = PayflowReviewStatus.AWAITING_REVIEW.value
+            row.hold_until = None
+            row.final_action = None
+            account = self.db.get(PayflowAccountModel, row.account_id)
+            if account:
+                account.human_review = True
+                account.collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
+                account.next_action = "Awaiting human review decision"
+                account.last_action = "Human review hold ended"
+            self._append_history(
+                row,
+                [
+                    {
+                        "at": _stamp(),
+                        "event": "Hold period ended — returned to awaiting review",
+                        "detail": f"Held until {was_until}",
+                        "by": "PayFlow",
+                    }
+                ],
+            )
+            self._bump_version(row)
+            self._record_audit(
+                row,
+                event="Hold period ended",
+                detail=f"Held until {was_until}",
+                actor_name="PayFlow",
+                before_status=PayflowReviewStatus.ON_HOLD.value,
+                after_status=row.status,
+                before_values=before,
+                after_values=self._snapshot(row),
+            )
+            released.append(row.id)
+        self.db.commit()
+        for review_id in released:
+            try:
+                self._notify_awaiting(self._get_row(review_id), force=True)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(released)
 
     def is_action_blocked(self, account_id: int) -> bool:
         """True when mandatory review approval is outstanding for the case."""

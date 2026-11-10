@@ -4,9 +4,10 @@ from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
+from app.core.config import settings
 from app.core.deps import DbSession
 from app.core.exceptions import AppError, ForbiddenError, NotFoundError
-from app.infrastructure.database.models import UserModel
+from app.infrastructure.database.models import PayflowUserClientAssignmentModel, UserModel
 from app.modules.payflow.deps import (
     PayflowAccessContext,
     PayflowCreateClient,
@@ -54,6 +55,8 @@ from app.modules.payflow.schemas import (
     PayflowCommunicationItem,
     PayflowCommunicationsListResponse,
     PayflowAccountPaymentsResponse,
+    PayflowPlanAutoChargeRequest,
+    PayflowPlanCancelRequest,
     PayflowPaymentAttemptItem,
     PayflowPaymentInitiateRequest,
     PayflowPaymentPlanQuoteRequest,
@@ -157,6 +160,17 @@ def _assert_view_client(access: AccessContextService, user: UserModel, client_id
     """List and detail share the same bar: assignment + view_client."""
     if not access.can(user, "view_client", client_id):
         raise ForbiddenError("Client access denied")
+
+
+def _assert_client_permission(
+    db, user: UserModel, client_id: int, permission: str
+) -> None:
+    """The role permission alone is not enough: it must hold for THIS client."""
+    access = AccessContextService(db)
+    if not access.can_see_client(user, client_id) or not access.can(user, permission, client_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Client access denied"
+        )
 
 
 def _assert_client_update_fields(
@@ -456,14 +470,39 @@ def list_clients(
 
 
 @router.post("/clients")
-def create_client(payload: CreatePayflowClientRequest, _: PayflowCreateClient, db: DbSession):
+def create_client(payload: CreatePayflowClientRequest, user: PayflowCreateClient, db: DbSession):
     try:
         data = payload.model_dump()
         # Wizard creates are always "Add Client" (bulk import sets file_upload itself).
         data["added_through"] = "add_client"
-        return PayflowClientService(db).create_client(data)
+        created = PayflowClientService(db).create_client(data)
+        _assign_creator_to_client(db, user, created["id"])
+        return created
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+def _assign_creator_to_client(db, user: UserModel, client_id: int) -> None:
+    """A client-scoped user who creates a client must be able to finish setting it up.
+
+    Their access is per client, and the new client had no assignment: every step
+    after "create" answered "Client access denied" and left an orphan draft.
+    """
+    access = AccessContextService(db)
+    if access.is_operations_admin(user):
+        return
+    membership = access.require_membership(user)
+    already = (
+        db.query(PayflowUserClientAssignmentModel.id)
+        .filter(
+            PayflowUserClientAssignmentModel.membership_id == membership.id,
+            PayflowUserClientAssignmentModel.client_id == client_id,
+        )
+        .first()
+    )
+    if not already:
+        db.add(PayflowUserClientAssignmentModel(membership_id=membership.id, client_id=client_id))
+        db.commit()
 
 
 @router.get("/clients/{client_id}")
@@ -497,10 +536,11 @@ def update_client(
 @router.post("/clients/{client_id}/logo")
 async def upload_client_logo(
     client_id: int,
-    _: PayflowEditClient,
+    user: PayflowEditClient,
     db: DbSession,
     file: UploadFile = File(...),
 ):
+    _assert_client_permission(db, user, client_id, "edit_client")
     try:
         data = await file.read()
         return PayflowClientService(db).update_logo(
@@ -514,7 +554,8 @@ async def upload_client_logo(
 
 
 @router.post("/clients/{client_id}/logo/delete")
-def delete_client_logo(client_id: int, _: PayflowEditClient, db: DbSession):
+def delete_client_logo(client_id: int, user: PayflowEditClient, db: DbSession):
+    _assert_client_permission(db, user, client_id, "edit_client")
     try:
         return PayflowClientService(db).remove_logo(client_id)
     except AppError as exc:
@@ -528,6 +569,7 @@ def activate_client(
     db: DbSession,
     background_tasks: BackgroundTasks,
 ):
+    _assert_client_permission(db, admin, client_id, "edit_client")
     try:
         detail, job_ids = PayflowClientService(db).activate_client(client_id, user=admin)
         schedule_ai_suggest_jobs(background_tasks, job_ids)
@@ -560,9 +602,10 @@ def get_portfolio(client_id: int, portfolio_id: int, user: RequirePayflowProduct
 def create_portfolio(
     client_id: int,
     payload: CreatePortfolioRequest,
-    _: PayflowEditClient,
+    user: PayflowEditClient,
     db: DbSession,
 ):
+    _assert_client_permission(db, user, client_id, "edit_client")
     try:
         return PayflowClientService(db).create_portfolio(client_id, payload.model_dump())
     except AppError as exc:
@@ -578,6 +621,7 @@ def update_portfolio(
     db: DbSession,
     background_tasks: BackgroundTasks,
 ):
+    _assert_client_permission(db, admin, client_id, "edit_client")
     try:
         detail, job_ids = PayflowClientService(db).update_portfolio(
             client_id,
@@ -598,6 +642,7 @@ def delete_client(
     db: DbSession,
     source: str | None = Query(default=None),
 ):
+    _assert_client_permission(db, admin, client_id, "delete_client")
     try:
         return PayflowClientService(db).delete_client(client_id, actor=admin, source=source)
     except AppError as exc:
@@ -612,6 +657,7 @@ def delete_portfolio(
     db: DbSession,
     source: str | None = Query(default=None),
 ):
+    _assert_client_permission(db, admin, client_id, "delete_client")
     try:
         return PayflowClientService(db).delete_portfolio(
             client_id, portfolio_id, actor=admin, source=source
@@ -759,9 +805,14 @@ def get_account_workflow_execution(
 def post_account_payment_workflow_event(
     account_id: int,
     body: PayflowWorkflowPaymentEventRequest,
-    user: RequirePayflowProduct,
+    user: PayflowOpsAdmin,
     db: DbSession,
 ):
+    """Tell the workflow about a payment taken outside PayFlow.
+
+    It moves runs and credits a message with a payment, so it is not for anyone
+    who can merely view the case. Real payments arrive through the Stripe webhook.
+    """
     from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
 
     try:
@@ -871,27 +922,37 @@ async def upload_account_import_start(
     return ImportJobService.serialize(job)
 
 
+def _import_owner_filter(db, user: UserModel):
+    """Import files hold many clients' customers: only the uploader (or an
+    operations admin) may read a run, its errors or its progress."""
+    return None if AccessContextService(db).is_operations_admin(user) else user.id
+
+
 @router.get("/import-jobs/{job_id}", response_model=PayflowImportJobItem)
-def get_import_job(job_id: int, _: RequirePayflowProduct, db: DbSession):
+def get_import_job(job_id: int, user: RequirePayflowProduct, db: DbSession):
     try:
-        return ImportJobService(db).get_job(job_id)
+        return ImportJobService(db).get_job(job_id, owner_id=_import_owner_filter(db, user))
     except AppError as exc:
         raise _map_error(exc) from exc
 
 
 @router.get("/imports", response_model=PayflowImportListResponse)
 def list_imports(
-    _: PayflowViewImports,
+    user: PayflowViewImports,
     db: DbSession,
     type_filter: str | None = Query(default=None, alias="type"),
 ):
-    return PayflowImportService(db).list_imports(kind=type_filter)
+    return PayflowImportService(db).list_imports(
+        kind=type_filter, owner_id=_import_owner_filter(db, user)
+    )
 
 
 @router.get("/imports/{import_id}", response_model=PayflowImportRunItem)
-def get_import(import_id: int, _: PayflowViewImports, db: DbSession):
+def get_import(import_id: int, user: PayflowViewImports, db: DbSession):
     try:
-        return PayflowImportService(db).get_import(import_id)
+        return PayflowImportService(db).get_import(
+            import_id, owner_id=_import_owner_filter(db, user)
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1374,6 +1435,30 @@ def preview_portfolio_segments(
         raise _map_error(exc) from exc
 
 
+@router.get("/ai-suggest-jobs")
+def list_ai_suggest_jobs(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int = Query(...),
+    portfolio_id: int | None = Query(default=None),
+    limit: int = Query(default=5, ge=1, le=20),
+):
+    """Latest AI-suggest runs for a client (optionally one portfolio).
+
+    An import starts these in the background; this is how the people working that
+    client see that the AI is still running, finished, was skipped or failed.
+    """
+    try:
+        _assert_view_client(AccessContextService(db), user, client_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+    return AiSuggestJobService(db).list_jobs(
+        client_id=client_id, portfolio_id=portfolio_id, limit=limit
+    )
+
+
 @router.post("/workflows/suggest", response_model=SuggestWorkflowsResponse)
 def suggest_workflows(
     payload: SuggestWorkflowsRequest, user: PayflowManageWorkflows, db: DbSession
@@ -1629,6 +1714,38 @@ def list_account_payments(account_id: int, user: RequirePayflowProduct, db: DbSe
     """Confirmed payment ledger + attempts + plans for Case detail (backend-verified only)."""
     try:
         return PayflowPaymentOutcomeService(db).list_account_payments(user, account_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/payment-plans/{plan_id}/cancel")
+def cancel_payment_plan(
+    plan_id: str,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    body: PayflowPlanCancelRequest | None = None,
+):
+    """Stop a payment plan: no more automatic charges; unpaid instalments are waived."""
+    try:
+        return PayflowPaymentOutcomeService(db).cancel_plan(
+            user, plan_id, reason=body.reason if body else None
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/payment-plans/{plan_id}/auto-charge")
+def set_payment_plan_auto_charge(
+    plan_id: str,
+    body: PayflowPlanAutoChargeRequest,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    """Pause or resume automatic instalment charges without cancelling the plan."""
+    try:
+        return PayflowPaymentOutcomeService(db).set_plan_auto_charge(
+            user, plan_id, enabled=body.enabled
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -2137,7 +2254,12 @@ def update_user(
 @router.post("/users/{user_id}/resend-invitation", response_model=MessageResponse)
 def resend_invitation(user_id: UUID, _: PayflowManageUsers, db: DbSession):
     try:
-        return PayflowUserService(db).resend_invitation(user_id)
+        result = PayflowUserService(db).resend_invitation(user_id)
+        # The link is a one-time login for the invited person. It goes to their
+        # inbox; handing it to the requester would let them take the account over.
+        if (settings.APP_ENV or "").strip().lower() == "production":
+            result.pop("activation_link", None)
+        return result
     except AppError as exc:
         raise _map_error(exc) from exc
 
