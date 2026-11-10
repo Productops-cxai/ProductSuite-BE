@@ -61,13 +61,15 @@ def _enum(values: list[str]) -> dict[str, Any]:
 def build_output_schema(segment_ids: list[str]) -> dict[str, Any]:
     # Unused config fields and links are left out (not null) to keep replies short.
     # No channel / template: a Communication step contacts the customer, the worker picks email or SMS.
+    # Keys in the order the prompt and examples write them (amount, unit, direction, reference_event):
+    # Together AI only lets the model write keys in schema order, so a later reference_event was dropped.
     config = _object(
         {
             "purpose": _enum(MESSAGE_PURPOSES),
-            "reference_event": _enum([e for e in REFERENCE_EVENTS if e not in CHANNEL_EVENTS]),
             "amount": {"type": "number"},
             "unit": _enum(TIME_UNITS),
             "direction": _enum(TIME_DIRECTIONS),
+            "reference_event": _enum([e for e in REFERENCE_EVENTS if e not in CHANNEL_EVENTS]),
             "attribute": _enum([a for a in CONDITION_ATTRIBUTES if a not in CONTACT_ATTRIBUTES]),
             "operator": _enum(CONDITION_OPERATORS),
             "value": {"type": "string"},
