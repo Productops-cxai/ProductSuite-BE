@@ -92,11 +92,11 @@ def test_suggest_uses_the_clients_reviewed_workflows_and_lessons(db_session, adm
     assert "## Lessons from this client's past reviews (guidance, not rules)" in system
     assert "Only the Limits, Stop when the customer pays and Allowed values above are hard rules." in system
     assert f"[Active · {EARLY} · Never contacted · Under $500] EDITED: " in system
-    assert "Wait 3 days: timing changed from 3 Days After Previous Email to 7 Days After Previous Email" in system
+    assert "Wait 3 days: timing changed from 3 Days After Previous Action to 7 Days After Previous Action" in system
     assert "WHY: SMS was too early" in system
     assert "APPROVED. WHY: Gentle tone fits" in system
     assert (
-        "REJECTED: Email Payment Reminder → wait 3 Days → SMS Payment Link → wait 5 Days → Human Review. "
+        "REJECTED: Contact Payment Reminder → wait 3 Days → Contact Payment Link → wait 5 Days → Human Review. "
         "WHY: Too aggressive"
     ) in system
 

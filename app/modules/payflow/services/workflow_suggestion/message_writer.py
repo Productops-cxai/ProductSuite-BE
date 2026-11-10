@@ -2,6 +2,8 @@
 
 Code decides each message's tone (message_tone.py), the AI writes the text, code checks it
 (message_validator.py) and sends problems back for a fix. Nothing is saved here.
+A step without a channel (AI workflows: the worker picks email or SMS per customer) gets both
+an email (subject + body) and an SMS (sms_body).
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from typing import Any
 
 from app.core.exceptions import ServiceUnavailableError, ValidationAppError
 from app.modules.payflow.services.strategy_service import _timing_label
+from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema, call_llm
 from app.modules.payflow.services.workflow_suggestion.message_prompt import build_message_prompt
 from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
@@ -32,7 +35,7 @@ def write_messages(
     step_ids: list[str] | None = None,
     remarks: str | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """{step_id: {"subject", "body", "tone"}} for the workflow's Communication steps.
+    """{step_id: {"subject", "body", "sms_body", "tone"}} for the workflow's Communication steps.
 
     `segment`: {"label", "segment" (fields), "stats"} — the segmenter's shape.
     `step_ids`: write only these messages (the others are context); default all.
@@ -57,19 +60,15 @@ def write_messages(
         reply = _messages_by_step(call_llm(prompt, build_message_schema(pending)))
 
         feedback = []
-        bodies = [other["body"] for other in others]
+        bodies = [text for other in others for text in (other["body"], other.get("sms_body")) if text]
         for brief in briefs:
             message = _clean(reply.get(brief["step_id"]), brief["channel"])
-            errors = (
-                check_message(message, brief, bodies)
-                if message
-                else [f"{brief['step_id']}: no message was written"]
-            )
+            errors = _check(message, brief, bodies) if message else [f"{brief['step_id']}: no message was written"]
             if errors:
                 feedback.append({"step_id": brief["step_id"], "message": message, "errors": errors})
             else:
                 written[brief["step_id"]] = {**message, "tone": brief["tone"]}
-                bodies.append(message["body"])
+                bodies += [text for text in (message["body"], message.get("sms_body")) if text]
         if not feedback:
             return written
         pending = [item["step_id"] for item in feedback]
@@ -93,11 +92,11 @@ def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any
 def _brief(step: dict[str, Any], tone: dict[str, str], segment: dict[str, Any], english: bool) -> dict[str, Any]:
     cfg = step.get("config") or {}
     situation = (segment.get("segment") or {}).get("situation")
-    current = {key: cfg[key] for key in ("subject", "body") if cfg.get(key)}
+    current = {key: cfg[key] for key in ("subject", "body", "sms_body") if cfg.get(key)}
     return {
         "step_id": step["id"],
         "title": step.get("title"),
-        "channel": cfg.get("channel") or step.get("channel") or "Email",
+        "channel": cfg.get("channel") or step.get("channel") or CONTACT_CHANNEL,
         "purpose": cfg.get("purpose") or step.get("purpose"),
         "timing": _timing_label(step),
         "path_so_far": tone["path"],
@@ -121,19 +120,35 @@ def _other_messages(
             continue
         text = written.get(step_id) or (steps[step_id].get("config") or {})
         if text.get("body"):
-            channel = (steps[step_id].get("config") or {}).get("channel")
-            others.append({"step_id": step_id, "channel": channel, "subject": text.get("subject"), "body": text["body"]})
+            channel = (steps[step_id].get("config") or {}).get("channel") or CONTACT_CHANNEL
+            other = {"step_id": step_id, "channel": channel, "subject": text.get("subject"), "body": text["body"]}
+            if text.get("sms_body"):
+                other["sms_body"] = text["sms_body"]
+            others.append(other)
     return others
+
+
+def _check(message: dict[str, Any], brief: dict[str, Any], bodies: list[str]) -> list[str]:
+    """A contact step's email and SMS are each checked by their own channel's rules."""
+    if brief["channel"] != CONTACT_CHANNEL:
+        return check_message(message, brief, bodies)
+    email = {"subject": message.get("subject"), "body": message["body"]}
+    sms = {"body": message.get("sms_body")}
+    sms_brief = {**brief, "channel": "SMS", "step_id": f"{brief['step_id']} (SMS version, sms_body)"}
+    return check_message(email, {**brief, "channel": "Email"}, bodies) + check_message(sms, sms_brief, bodies)
 
 
 def _clean(message: Any, channel: str) -> dict[str, Any] | None:
     if not isinstance(message, dict) or not str(message.get("body") or "").strip():
         return None
     subject = str(message.get("subject") or "").strip()
-    return {
-        "subject": _fit_subject(subject) if channel == "Email" and subject else None,  # SMS has no subject
+    cleaned = {
+        "subject": _fit_subject(subject) if channel != "SMS" and subject else None,  # SMS has no subject
         "body": str(message["body"]).strip(),
     }
+    if channel == CONTACT_CHANNEL:
+        cleaned["sms_body"] = str(message.get("sms_body") or "").strip() or None
+    return cleaned
 
 
 def _fit_subject(subject: str) -> str:

@@ -516,10 +516,10 @@ def _step_fingerprint(step: dict[str, Any]) -> str:
     return "|".join("" if p is None else str(p) for p in parts)
 
 
-def _message_text(step: dict[str, Any]) -> tuple[str, str]:
-    """A Communication step's own subject + body ("" when it uses its template)."""
+def _message_text(step: dict[str, Any]) -> tuple[str, str, str]:
+    """A Communication step's own subject + body + SMS version ("" when it uses its template)."""
     cfg = _cfg(step)
-    return cfg.get("subject") or "", cfg.get("body") or ""
+    return cfg.get("subject") or "", cfg.get("body") or "", cfg.get("sms_body") or ""
 
 
 def _diff_steps(before: list[dict], after: list[dict]) -> list[str]:

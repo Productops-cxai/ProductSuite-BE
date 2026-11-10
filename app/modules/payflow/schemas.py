@@ -836,9 +836,12 @@ class StrategyNodeConfig(BaseModel):
     # Communication steps: the step's own message text (no text → the template is sent).
     subject: Optional[str] = Field(default=None, max_length=255)
     body: Optional[str] = Field(default=None, max_length=5000)
+    # A step without a channel (AI "contact" step): subject + body are the email, sms_body the SMS;
+    # the worker picks the channel for each customer.
+    sms_body: Optional[str] = Field(default=None, max_length=1000)
     tone: Optional[str] = Field(default=None, max_length=32)
 
-    @field_validator("subject", "body", "tone")
+    @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
     def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
         """An empty text box means "no own text", not a change."""

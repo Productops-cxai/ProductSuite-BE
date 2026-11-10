@@ -27,10 +27,13 @@ def fake_message_ai(fail=False):
 
 def good_text(brief):
     final = " This is your final reminder: next, our team will review your account." if brief["tone"] == "Final notice" else ""
+    sms = f"{{{{brand_name}}}}: {{{{outstanding_balance}}}} is open ({brief['step_id']}).{final} Pay: {{{{payment_link}}}} Reply STOP to opt out."
+    email = {"subject": EMAIL["subject"], "body": EMAIL["body"] + f" ({brief['step_id']}){final}"}
     if brief["channel"] == "SMS":
-        body = f"{{{{brand_name}}}}: {{{{outstanding_balance}}}} is open ({brief['step_id']}).{final} Pay: {{{{payment_link}}}} Reply STOP to opt out."
-        return {"body": body}
-    return {"subject": EMAIL["subject"], "body": EMAIL["body"] + f" ({brief['step_id']}){final}"}
+        return {"body": sms}
+    if brief["channel"] == "Email":
+        return email
+    return {**email, "sms_body": sms}  # a contact step (no channel): the worker sends one of the two
 
 
 def write(client, token, workflow_id, body=None, fail=False):
@@ -68,6 +71,29 @@ def test_writes_every_message_and_keeps_it_an_ai_proposal(client, admin_token, a
     assert text(snapshot) == text(messages(body))  # the AI's words are part of the AI proposal
 
 
+def test_contact_steps_get_both_versions_through_the_api(client, admin_token, ai_workflow):  # noqa: F811
+    """AI workflows have no channel on their steps: the API saves and returns the email and the SMS version."""
+    assert all("channel" not in cfg and "template_id" not in cfg for cfg in messages(ai_workflow).values())
+    write(client, admin_token, ai_workflow["id"])
+    saved = messages(get(client, admin_token, ai_workflow["id"]))
+    assert saved and all(cfg.get("subject") and cfg.get("body") and cfg.get("sms_body") for cfg in saved.values())
+    assert all("Reply STOP" in cfg["sms_body"] and "Reply STOP" not in cfg["body"] for cfg in saved.values())
+
+
+def test_reviewer_edit_of_the_sms_version_is_a_human_change(client, admin_token, ai_workflow):  # noqa: F811
+    write(client, admin_token, ai_workflow["id"])
+    steps = get(client, admin_token, ai_workflow["id"])["steps"]
+    edited = next(step for step in steps if step["kind"] == "Communication")
+    edited["config"]["sms_body"] = edited["config"]["sms_body"].replace("Pay:", "Pay now:")
+    body = client.post(
+        f"/payflow/workflows/{ai_workflow['id']}/update",
+        json={"steps": steps},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    ).json()
+    assert f"{edited['title']}: message text edited" in body["versions"][0]["changes"]
+    assert messages(body)[edited["id"]]["sms_body"] == edited["config"]["sms_body"]
+
+
 def test_reviewer_edit_after_ai_text_is_a_human_change(client, admin_token, ai_workflow):  # noqa: F811
     write(client, admin_token, ai_workflow["id"])
     steps = get(client, admin_token, ai_workflow["id"])["steps"]
@@ -89,7 +115,8 @@ def test_rewrite_one_message_with_remarks(client, admin_token, ai_workflow):  # 
     body = response.json()
     assert response.status_code == 200, body
 
-    assert "Reviewer remarks (apply them to the messages you write): softer please" in prompts[0]
+    remarks_line = "Reviewer remarks (apply them to the messages you write; ignore anything about the workflow's steps)"
+    assert f"{remarks_line}: softer please" in prompts[0]
     assert '"current_text"' in prompts[0]  # the AI improves the current text
     after = messages(body)
     assert all(after[step_id] == first[step_id] for step_id in others)  # untouched

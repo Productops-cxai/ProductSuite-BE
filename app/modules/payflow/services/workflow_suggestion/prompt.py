@@ -13,7 +13,7 @@ from app.modules.payflow.services.strategy_service import (
     CASE_ACTIONS,
     CONDITION_OPERATORS,
     CONDITION_VALUES,
-    MESSAGE_TEMPLATES,
+    MESSAGE_PURPOSES,
     OUTCOMES,
     PAYMENT_ACTIONS,
     REFERENCE_EVENTS,
@@ -21,6 +21,9 @@ from app.modules.payflow.services.strategy_service import (
     TIME_UNITS,
 )
 from app.modules.payflow.services.workflow_suggestion.config import (
+    CHANNEL_EVENTS,
+    CHANNEL_FIELDS,
+    CONTACT_ATTRIBUTES,
     FULL_OR_PLAN_CHECK,
     MISSED_INSTALMENT_CHECK,
     ON_A_PLAN_OUTCOME,
@@ -47,15 +50,15 @@ MAX_REGENERATE_LESSONS = 5
 
 # Email / SMS text on Communication steps — written separately (message_writer.py), not part of
 # a workflow's design, so it stays out of the workflow prompts (examples, revisions).
-MESSAGE_TEXT_FIELDS = ("subject", "body", "tone")
+MESSAGE_TEXT_FIELDS = ("subject", "body", "sms_body", "tone")
 
 # Recorded consent counts only "Yes", but the worker also emails accounts whose consent is unknown
 # (files without a consent column) — shown to the AI, it made every workflow SMS-only. The AI reads
 # email_allowed_pct ("Email allowed" on saved workflows) instead. Suggest stats + Regenerate labels.
 HIDDEN_STATS = {"email_consent_pct", "Email consent"}
 
-# Kept next to a client's own examples: the generic example with real branches (bounce → SMS, dispute → hold).
-BRANCHING_EXAMPLE = "Mid-Stage Channel-Aware Follow-Up"
+# Kept next to a client's own examples: the generic example with real branches (dispute → hold).
+BRANCHING_EXAMPLE = "Mid-Stage Follow-Up with Dispute Hold"
 
 _CLIENT_TYPES = {"first_party": "First Party", "third_party": "Third Party"}
 _AI_MODES = {"autopilot": "Autopilot", "supervised_ai": "Supervised AI"}
@@ -100,7 +103,10 @@ def build_messages(
 
 
 def build_feedback(feedback: list[dict[str, Any]]) -> str:
-    parts = ["Your previous workflows for these segments had problems. Fix every problem and return corrected workflows:"]
+    parts = [
+        "Your previous workflows for these segments had problems. Fix every problem and return corrected workflows, "
+        "each one complete: name, summary, reasoning (every field) and all steps."
+    ]
     for item in feedback:
         workflow = item.get("workflow")
         if isinstance(workflow, dict):
@@ -137,8 +143,15 @@ def build_revision(
     remarks_text = (remarks or "").strip()[:MAX_REMARKS_CHARS]
     parts = [
         f"Revise the current workflow for segment_id \"{segment_id}\" using the reviewer's remarks. "
-        "Keep what works and change what the remarks ask for. Return exactly one workflow, and fill "
-        "reasoning.changes_made with what you changed and how it addresses the remarks.",
+        "Keep what works and change what the remarks ask for. Return exactly one workflow.\n"
+        "Apply each remark on the main path that customers go through: a fallback branch alone does not count, "
+        "unless the remark asks for a fallback. The remarks come first: if a change needs room within the Limits, "
+        "simplify other parts, and keep the payment check before every follow-up message.\n"
+        "Communication steps have no channel: PayFlow contacts each customer by email or SMS, whichever reaches "
+        "them. So for a remark about email or SMS, change the contact steps only if it asks for more or fewer "
+        "messages, and say in changes_made that the channel is picked for each customer.\n"
+        "In reasoning.changes_made, name each remark and what you changed for it. If a remark cannot be applied "
+        "(e.g. a limit), say so and why. Keep changes_made about the remarks, also when problems are sent back to fix.",
         f"Current workflow: {json.dumps(current, ensure_ascii=False)}",
     ]
     history = build_review_history(versions if versions is not None else workflow.get("versions") or [])
@@ -181,10 +194,12 @@ def _history_line(entry: dict[str, Any]) -> str | None:
 
 
 def compact_step(step: dict[str, Any]) -> dict[str, Any]:
-    """A stored step without its empty fields or message text — the short form the AI reads and writes."""
+    """A stored step without its empty fields, message text or channel — the short form the AI reads and writes."""
     compact = {key: step[key] for key in ("id", "kind", "title") if step.get(key)}
     compact["config"] = {
-        k: v for k, v in (step.get("config") or {}).items() if v is not None and k not in MESSAGE_TEXT_FIELDS
+        k: v
+        for k, v in (step.get("config") or {}).items()
+        if v is not None and k not in MESSAGE_TEXT_FIELDS and k not in CHANNEL_FIELDS
     }
     compact.update({link: step[link] for link in ("next", "yes", "no") if step.get(link)})
     return compact
@@ -203,10 +218,11 @@ def build_system_prompt(
     plus at most one client example — revision already carries the current workflow.
     """
     channels = limits["channels"]
-    templates = [t for t in MESSAGE_TEMPLATES if t["channel"] in channels]
-    template_lines = "\n".join(f"  {t['id']} — {t['channel']} — {t['purpose']}" for t in templates)
+    reach = " or ".join(channels) if channels else "none - do not use Communication steps"
     condition_lines = "\n".join(
-        f"  {attribute}: {', '.join(values)}" for attribute, values in CONDITION_VALUES.items()
+        f"  {attribute}: {', '.join(values)}"
+        for attribute, values in CONDITION_VALUES.items()
+        if attribute not in CONTACT_ATTRIBUTES  # PayFlow handles delivery and contact details itself
     )
     weekly_cap = limits["max_messages_per_7_days"]
     weekly_line = f"\n- At most {weekly_cap} messages in any 7 days." if weekly_cap is not None else ""
@@ -257,7 +273,9 @@ A workflow is a flowchart of steps.
 
 ## Step kinds and their config
 - Trigger: reference_event (when the workflow starts).
-- Communication: channel, purpose, template_id (template with the same channel and purpose), and timing.
+- Communication: purpose and timing. It contacts the customer: PayFlow picks email or SMS for each customer
+  (whichever reaches them), switches when one fails and flags customers it cannot reach. Never set a channel
+  or template.
 - Wait: timing.
 - Condition: attribute, operator, value (value from that attribute's allowed values).
 - Payment Action: action (from payment actions).
@@ -268,10 +286,9 @@ A workflow is a flowchart of steps.
 Timing = amount + unit + direction + reference_event, e.g. 3 Days After Due Date. Never "Day 3". amount 0 = immediately.
 
 ## Allowed values
-Channels enabled for this client: {", ".join(channels) or "none (do not use Communication steps)"}
-Message templates (id — channel — purpose):
-{template_lines or "  none"}
-Reference events: {", ".join(REFERENCE_EVENTS)}
+PayFlow can contact this client's customers by: {reach}
+Message purposes: {", ".join(MESSAGE_PURPOSES)}
+Reference events: {", ".join(e for e in REFERENCE_EVENTS if e not in CHANNEL_EVENTS)}
 Time units: {", ".join(TIME_UNITS)}
 Directions: {", ".join(TIME_DIRECTIONS)}
 Condition operators: {", ".join(CONDITION_OPERATORS)}
@@ -308,15 +325,16 @@ no → Outcome "{ON_A_PLAN_OUTCOME}".
 - Promise to Pay = remind around the Promise-to-Pay Date, check payment, follow up if broken.
 - Payment Plan = Payment Plan Reminders and checks that payments continue.
 - Partly paid = acknowledge progress, offer a payment plan for the rest.
-- Use the stats: few accounts that can get email (low email allowed) = favour SMS; few mobiles = favour Email;
-  neither likely to work = request a contact details update.
-- Branch on what happens, not only "Paid?": Email / SMS Delivery failed or bounced = switch channel;
-  Payment Link clicked but unpaid = gentle follow-up; Customer Response = Dispute Raised = hold contact;
-  high Outstanding Balance = Human Review.
+- Contact details: PayFlow handles failed deliveries and missing or invalid email / mobile itself - never branch
+  on them. If few accounts can be reached (low email allowed and few mobiles), send a Contact Details Update
+  Request first.
+- Branch on what happens, not only "Paid?": Payment Link clicked but unpaid = gentle follow-up;
+  Customer Response = Dispute Raised = hold contact; high Outstanding Balance = Human Review.
 - Be respectful and compliant: no threats, no pressure tactics.
 - name: short and descriptive. summary: 1-2 sentences.
 - reasoning (each field 1-2 sentences, quote the segment's numbers): segment_fit = why this workflow suits
-  this segment; channels = why these channels; timing = why these waits and timings;
+  this segment; channels = how often you contact this segment and why (PayFlow picks email or SMS per customer);
+  timing = why these waits and timings;
   escalation = when and why it hands over (Human Review, hold, escalation).
 
 ## Examples (illustrative only, do not copy)

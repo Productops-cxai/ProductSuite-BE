@@ -122,6 +122,19 @@ def test_worker_sends_the_steps_own_text(db_session):
     assert sent["body"] == "Hi Ali, $120.00 is still open. Pay here: https://pay.example/abc\nMaple Energy"
 
 
+def test_worker_sends_a_contact_step_as_email_until_it_picks_the_channel(db_session):
+    """AI contact steps have no channel. Today's worker sends their email version; picking email or SMS
+    (sms_body) per customer, and the fallback, belong to the worker."""
+    step = {
+        "kind": "Communication",
+        "config": {"purpose": "Payment Reminder", "subject": SUBJECT, "body": BODY,
+                   "sms_body": "{{brand_name}}: please pay {{payment_link}} Reply STOP to opt out."},
+    }
+    sent = _send(db_session, step)
+    assert sent["channel"] == "Email" and sent["subject"] == "About account ACC-991"
+    assert "Reply STOP" not in sent["body"]
+
+
 def test_worker_without_own_text_still_sends_the_template(db_session):
     step = {"kind": "Communication", "config": {"channel": "Email", "purpose": "Payment Reminder",
                                                 "template_id": "em-reminder"}}
