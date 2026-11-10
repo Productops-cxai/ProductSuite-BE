@@ -96,8 +96,12 @@ def test_message_text_stays_out_of_workflow_design_prompts():
         "id": "s2",
         "kind": "Communication",
         "title": "Friendly email",
-        "config": {"channel": "Email", "purpose": "Payment Reminder", "subject": "Hello", "body": "LONG TEXT", "tone": "Friendly"},
+        "config": {
+            "channel": "Email", "template_id": "em-reminder", "purpose": "Payment Reminder",
+            "subject": "Hello", "body": "LONG TEXT", "sms_body": "SHORT TEXT", "tone": "Friendly",
+        },
     }
-    assert compact_step(step)["config"] == {"channel": "Email", "purpose": "Payment Reminder"}
+    # No text, and no channel: the design AI only designs contact steps (the worker picks email or SMS).
+    assert compact_step(step)["config"] == {"purpose": "Payment Reminder"}
     revision = build_revision("A", {"name": "W", "entry_node_id": "s2", "steps": [step]}, "remarks")
-    assert "LONG TEXT" not in revision and "Friendly email" in revision
+    assert "LONG TEXT" not in revision and "SHORT TEXT" not in revision and "Friendly email" in revision

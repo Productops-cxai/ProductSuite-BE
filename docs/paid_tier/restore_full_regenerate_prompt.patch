@@ -1,8 +1,8 @@
 diff --git a/app/modules/payflow/services/workflow_suggestion/prompt.py b/app/modules/payflow/services/workflow_suggestion/prompt.py
-index f26ca1b..a8af1ba 100644
+index 8108985..1f62747 100644
 --- a/app/modules/payflow/services/workflow_suggestion/prompt.py
 +++ b/app/modules/payflow/services/workflow_suggestion/prompt.py
-@@ -27,14 +27,7 @@ EXAMPLES_PATH = Path(__file__).parent / "prompts" / "workflow_examples.json"
+@@ -39,14 +39,7 @@ EXAMPLES_PATH = Path(__file__).parent / "prompts" / "workflow_examples.json"
  END_STEP_KINDS = ("Outcome", "Human Review", "Case Action")
  
  # Regenerate sends at most this many review-history entries (keeps prompts small on the free tier).
@@ -18,7 +18,7 @@ index f26ca1b..a8af1ba 100644
  
  # Email / SMS text on Communication steps — written separately (message_writer.py), not part of
  # a workflow's design, so it stays out of the workflow prompts (examples, revisions).
-@@ -74,18 +67,8 @@ def build_messages(
+@@ -86,18 +79,8 @@ def build_messages(
          user_prompt += "\n\n" + revision
      if feedback:
          user_prompt += "\n\n" + build_feedback(feedback)
@@ -38,9 +38,9 @@ index f26ca1b..a8af1ba 100644
          {"role": "user", "content": user_prompt},
      ]
  
-@@ -93,17 +76,8 @@ def build_messages(
- def build_feedback(feedback: list[dict[str, Any]]) -> str:
-     parts = ["Your previous workflows for these segments had problems. Fix every problem and return corrected workflows:"]
+@@ -108,17 +91,8 @@ def build_feedback(feedback: list[dict[str, Any]]) -> str:
+         "each one complete: name, summary, reasoning (every field) and all steps."
+     ]
      for item in feedback:
 -        workflow = item.get("workflow")
 -        if isinstance(workflow, dict):
@@ -58,15 +58,15 @@ index f26ca1b..a8af1ba 100644
          parts.append("Problems:\n" + "\n".join(f"- {error}" for error in item["errors"]))
      return "\n".join(parts)
  
-@@ -125,7 +99,6 @@ def build_revision(
+@@ -140,7 +114,6 @@ def build_revision(
          "entry_node_id": workflow.get("entry_node_id"),
          "steps": [compact_step(step) for step in workflow.get("steps") or []],
      }
 -    remarks_text = (remarks or "").strip()[:MAX_REMARKS_CHARS]
      parts = [
          f"Revise the current workflow for segment_id \"{segment_id}\" using the reviewer's remarks. "
-         "Keep what works and change what the remarks ask for. Return exactly one workflow, and fill "
-@@ -135,7 +108,7 @@ def build_revision(
+         "Keep what works and change what the remarks ask for. Return exactly one workflow.\n"
+@@ -157,7 +130,7 @@ def build_revision(
      history = build_review_history(versions if versions is not None else workflow.get("versions") or [])
      if history:
          parts.append(history)
@@ -75,7 +75,7 @@ index f26ca1b..a8af1ba 100644
      return "\n".join(parts)
  
  
-@@ -154,21 +127,18 @@ def build_review_history(versions: list[dict[str, Any]]) -> str:
+@@ -176,21 +149,18 @@ def build_review_history(versions: list[dict[str, Any]]) -> str:
  
  
  def _history_line(entry: dict[str, Any]) -> str | None:
@@ -101,7 +101,7 @@ index f26ca1b..a8af1ba 100644
  
  
  def compact_step(step: dict[str, Any]) -> dict[str, Any]:
-@@ -185,14 +155,8 @@ def build_system_prompt(
+@@ -209,14 +179,8 @@ def build_system_prompt(
      limits: dict[str, Any],
      client_examples: list[dict[str, Any]] | None = None,
      lessons: list[str] | None = None,
@@ -115,9 +115,9 @@ index f26ca1b..a8af1ba 100644
 -    """
 +    """Without client_examples / lessons the prompt is exactly the generic one."""
      channels = limits["channels"]
-     templates = [t for t in MESSAGE_TEMPLATES if t["channel"] in channels]
-     template_lines = "\n".join(f"  {t['id']} — {t['channel']} — {t['purpose']}" for t in templates)
-@@ -202,22 +166,10 @@ def build_system_prompt(
+     reach = " or ".join(channels) if channels else "none - do not use Communication steps"
+     condition_lines = "\n".join(
+@@ -227,22 +191,10 @@ def build_system_prompt(
      weekly_cap = limits["max_messages_per_7_days"]
      weekly_line = f"\n- At most {weekly_cap} messages in any 7 days." if weekly_cap is not None else ""
      generic = load_examples()
@@ -142,7 +142,7 @@ index f26ca1b..a8af1ba 100644
          free_slots = max(0, len(generic) - len(branching) - len(client_examples))
          fillers = [e for e in generic if e["name"] != BRANCHING_EXAMPLE][:free_slots]
          examples_intro = (
-@@ -225,11 +177,10 @@ def build_system_prompt(
+@@ -250,11 +202,10 @@ def build_system_prompt(
              "learn from their choices, but design for each segment's own situation and stats.\n"
          )
          example_list = client_examples + fillers + branching
@@ -157,7 +157,7 @@ index f26ca1b..a8af1ba 100644
      return f"""You design debt-collection workflows for PayFlow, a collections platform.
  You receive a client, one of its portfolios, and segments of that portfolio's accounts.
 diff --git a/app/modules/payflow/services/workflow_suggestion/service.py b/app/modules/payflow/services/workflow_suggestion/service.py
-index 2a46042..1175852 100644
+index 023e626..7f7406f 100644
 --- a/app/modules/payflow/services/workflow_suggestion/service.py
 +++ b/app/modules/payflow/services/workflow_suggestion/service.py
 @@ -28,12 +28,7 @@ from app.modules.payflow.services.workflow_suggestion.learning import (
@@ -192,5 +192,5 @@ index 2a46042..1175852 100644
 +            client_examples=[item["example"] for item in examples],
 +            lessons=lessons,
          )["A"]
-         # The new version gets fresh email / SMS text (its steps are new).
+         # The new version gets fresh email / SMS text (its steps are new), following the same remarks.
          workflow, messages_note = _with_messages(

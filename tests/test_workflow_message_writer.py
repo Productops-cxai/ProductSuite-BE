@@ -17,7 +17,7 @@ from app.modules.payflow.services.workflow_suggestion.message_writer import (
     write_messages,
 )
 from app.modules.payflow.services.workflow_suggestion.prompt import load_examples
-from tests.test_workflow_message_validator import EMAIL, FINAL_SMS
+from tests.test_workflow_message_validator import EMAIL, FINAL_SMS, SMS
 
 CLIENT = {
     "name": "Maple Energy (Demo)",
@@ -32,10 +32,21 @@ SEGMENT = {
     "stats": {"accounts": 40, "avg_outstanding": 2300.0, "avg_days_past_due": 71},
 }
 BAD_SMS = {"body": "You owe $120. Pay: {{payment_link}}"}  # typed amount, no brand, no STOP
+FINAL_EMAIL = {**EMAIL, "body": EMAIL["body"] + " This is your final reminder: next, our team will review your account."}
+
+
+def contact_workflow():
+    """An AI workflow: its Communication steps have no channel (the worker picks email or SMS)."""
+    return copy.deepcopy(next(e for e in load_examples() if e["name"] == "Early Stage Friendly Reminder"))
 
 
 def workflow():
-    return copy.deepcopy(next(e for e in load_examples() if e["name"] == "Early Stage Friendly Reminder"))
+    """An older / hand-made workflow: s2 is an Email step, s5 an SMS step."""
+    flow = contact_workflow()
+    for step in flow["steps"]:
+        if step["id"] in ("s2", "s5"):
+            step["config"]["channel"] = "Email" if step["id"] == "s2" else "SMS"
+    return flow
 
 
 def fake_ai(*replies):
@@ -70,12 +81,33 @@ def test_prompt_carries_tone_segment_client_and_rules():
     assert '"tone": "Final notice"' in prompt and "next step hands the case over" in prompt
     assert SEGMENT["label"] in prompt and '"avg_days_past_due": 71' in prompt
     assert "These customers have no payment arrangement yet." in prompt  # what the situation means
-    path = "Case received → Friendly email reminder → Wait 3 days → Any payment or plan? = no"
+    path = "Case received → Friendly reminder → Wait 3 days → Any payment or plan? = no"
     assert f'"path_so_far": "{path}"' in prompt
     assert "on behalf of Maple Energy (Demo)" in prompt  # third-party client
     assert "the customer can: pay in full, set up a payment plan" in prompt
     assert "Write in English" in prompt
     assert "Never threaten" in system and "Reply STOP to opt out" in system
+
+
+def test_contact_steps_get_an_email_and_an_sms():
+    """AI workflows: the step has no channel and the worker sends the email or the SMS - so both are written."""
+    replies = {"s2": {**EMAIL, "sms_body": SMS["body"]}, "s5": {**FINAL_EMAIL, "sms_body": FINAL_SMS["body"]}}
+    written, calls = write(contact_workflow(), replies)
+    assert written["s2"] == {**EMAIL, "sms_body": SMS["body"], "tone": "Firm"}
+    assert written["s5"] == {**FINAL_EMAIL, "sms_body": FINAL_SMS["body"], "tone": "Final notice"}
+    assert '"channel": "Email + SMS"' in calls[0]["prompt"]
+    assert 'Channel "Email + SMS"' in calls[0]["system"] and "sms_body" in calls[0]["system"]
+
+
+def test_a_contact_step_needs_both_versions_each_by_its_own_rules():
+    broken = {"s2": dict(EMAIL), "s5": {**FINAL_EMAIL, "sms_body": "Pay {{payment_link}}"}}
+    fixed = {"s2": {**EMAIL, "sms_body": SMS["body"]}, "s5": {**FINAL_EMAIL, "sms_body": FINAL_SMS["body"]}}
+    written, calls = write(contact_workflow(), broken, fixed)
+    assert len(calls) == 2 and set(written) == {"s2", "s5"}
+    retry = calls[1]["prompt"]
+    assert "s2 (SMS version, sms_body): the message has no text" in retry
+    assert "s5 (SMS version, sms_body): SMS must end with 'Reply STOP to opt out.'" in retry
+    assert "s5: email body" not in retry  # the email version was fine
 
 
 def test_problems_go_back_and_only_failing_messages_are_retried():
@@ -98,7 +130,8 @@ def test_rewrite_one_message_with_remarks():
     written, calls = write(flow, {"s5": FINAL_SMS}, step_ids=["s5"], remarks="mention the payment plan")
     assert list(written) == ["s5"] and calls[0]["asked"] == ["s5"]
     prompt = calls[0]["prompt"]
-    assert "Reviewer remarks (apply them to the messages you write): mention the payment plan" in prompt
+    remarks_line = "Reviewer remarks (apply them to the messages you write; ignore anything about the workflow's steps)"
+    assert f"{remarks_line}: mention the payment plan" in prompt
     assert '"current_text": {"body": "{{brand_name}}: old text' in prompt  # improve, not start over
     assert "Other messages in this workflow" in prompt and EMAIL["subject"] in prompt
 
@@ -140,6 +173,7 @@ def test_message_schema_asks_only_for_the_given_steps():
     schema = build_message_schema(["s2", "s5"])
     item = schema["properties"]["messages"]["items"]
     assert item["properties"]["step_id"]["enum"] == ["s2", "s5"] and item["required"] == ["step_id", "body"]
+    assert "sms_body" in item["properties"]  # the SMS version of a step without a channel
 
 
 def test_payment_options_follow_the_client_settings(db_session):

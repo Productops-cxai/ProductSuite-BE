@@ -65,19 +65,29 @@ def test_link_clicked_gets_help_not_pressure():
     assert tones(workflow, LATE_IGNORED) == {"s2": "Firm", "s4": "Clear", "s5": "Final notice"}
 
 
+def bounce_flow():
+    """Older workflows can still branch on a bounce: email → bounced? → SMS : email → review."""
+    return flow(
+        message("s2", "s3"),
+        condition("s3", "Email Delivery", "Bounced", yes="s4", no="s5"),
+        message("s4", "s6"),
+        message("s5", "s6"),
+        end("s6", "Human Review"),
+    )
+
+
 def test_first_message_is_never_a_final_notice():
     workflow = flow(message("s2", "s3"), end("s3", "Human Review"))
     assert tones(workflow, LATE_IGNORED) == {"s2": "Firm"}
-    late_mid = tones(example("Mid-Stage Channel-Aware Follow-Up"), LATE_IGNORED)
-    assert late_mid["s5"] == "Firm"  # the email bounced: this SMS is the first one that arrives
-    assert late_mid["s6"] == "Final notice"
+    late = tones(bounce_flow(), LATE_IGNORED)
+    assert late["s4"] == "Firm"  # the email bounced: this SMS is the first one that arrives
+    assert late["s5"] == "Final notice"
 
 
 def test_message_after_a_bounce_counts_as_the_first_one():
-    workflow = example("Mid-Stage Channel-Aware Follow-Up")  # firm email → bounced? → SMS : email
-    result = tones(workflow, EARLY_NEW)
-    assert result["s5"] == "Friendly"  # the email never arrived: the SMS is the first contact
-    assert result["s6"] == "Clear"  # the email did arrive: second message
+    result = tones(bounce_flow(), EARLY_NEW)
+    assert result["s4"] == "Friendly"  # the email never arrived: the SMS is the first contact
+    assert result["s5"] == "Clear"  # the email did arrive: second message
 
 
 def test_firm_reminder_is_one_step_firmer_than_the_segment():
@@ -137,10 +147,8 @@ def test_all_stages_segment_uses_the_average_but_never_starts_above_clear():
 
 
 def test_each_message_knows_what_happened_before_it():
-    result = message_tones(example("Mid-Stage Channel-Aware Follow-Up"), EARLY_NEW)
-    start = "Case received → Firm email reminder → Wait 2 days → Any payment or plan? = no"
-    assert result["s5"]["path"] == f"{start} → Email bounced? = yes"
-    assert result["s6"]["path"] == f"{start} → Email bounced? = no"
+    result = message_tones(example("Mid-Stage Follow-Up with Dispute Hold"), EARLY_NEW)
+    assert result["s5"]["path"] == "Case received → Firm reminder → Wait 2 days → Any payment or plan? = no"
 
 
 def test_part_payment_review_is_not_a_hand_over_of_the_message_before_it():

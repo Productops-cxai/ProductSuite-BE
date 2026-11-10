@@ -169,7 +169,7 @@ def _workflow_for(segment_id, broken=False, situation=None):
             if step["id"] in PLAN_CHECKS:
                 step["config"] = dict(PLAN_CHECKS[step["id"]])
     if broken:
-        workflow["steps"][1]["config"]["template_id"] = "em-nope"
+        workflow["steps"][1]["config"]["purpose"] = "Nope"  # not a message purpose
     return workflow
 
 
@@ -218,6 +218,27 @@ def _suggest(client, token, client_id, portfolio_id):
     )
 
 
+def test_suggest_drops_a_channel_the_ai_sets_anyway(client, admin_token, portfolio):
+    """Contact steps: the worker picks email or SMS, so a channel / template from the AI is removed (no retry)."""
+    call, calls = fake_llm()
+
+    def with_channels(messages, schema):
+        reply = call(messages, schema)
+        for workflow in reply["workflows"]:
+            workflow["steps"][1]["config"].update(channel="SMS", template_id="sms-reminder")
+            workflow["steps"][1]["channel"] = "SMS"
+        return reply
+
+    with patch.object(suggestion_service, "call_llm", side_effect=with_channels):
+        response = _suggest(client, admin_token, portfolio["client_id"], portfolio["portfolio_id"])
+    assert response.status_code == 200, response.json()
+    assert len(calls) == 1
+    [workflow] = response.json()["workflows"]
+    contact = next(s for s in workflow["steps"] if s["id"] == "s2")
+    assert contact["channel"] is None and contact["config"].get("channel") is None
+    assert contact["config"].get("template_id") is None
+
+
 def test_suggest_saves_ai_proposed_workflows(client, admin_token, portfolio):
     call, calls = fake_llm()
     with patch.object(suggestion_service, "call_llm", side_effect=call):
@@ -246,7 +267,7 @@ def test_suggest_retries_with_errors_then_saves(client, admin_token, portfolio):
     assert response.status_code == 200, response.json()
     assert len(calls) == 2
     retry_prompt = calls[1][1]["content"]
-    assert "template 'em-nope' does not exist" in retry_prompt
+    assert "purpose 'Nope' is not allowed" in retry_prompt
 
 
 def test_suggest_sends_back_a_workflow_that_keeps_reminding_after_a_payment(client, admin_token, portfolio):

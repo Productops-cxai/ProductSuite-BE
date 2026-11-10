@@ -7,7 +7,7 @@ from app.core.exceptions import ServiceUnavailableError
 from app.modules.payflow.services.strategy_service import (
     CASE_ACTIONS,
     CONDITION_VALUES,
-    MESSAGE_TEMPLATES,
+    MESSAGE_PURPOSES,
     OUTCOMES,
     PAYMENT_ACTIONS,
     REFERENCE_EVENTS,
@@ -67,14 +67,14 @@ def test_prompt_has_limits_catalog_and_segments_but_no_rule_text():
     limits["max_messages_per_7_days"] = 3
     system, user = (m["content"] for m in build_messages(CLIENT, "Residential", SEGMENTS, limits))
     assert "At most 3 messages in any 7 days" in system
-    assert "Channels enabled for this client: Email" in system
-    assert "sms-link" not in system.split("## Examples")[0]  # SMS templates hidden when SMS is off
+    assert "PayFlow can contact this client's customers by: Email" in system
+    catalog = system.split("## Examples")[0]
+    assert "sms-link" not in catalog and "em-reminder" not in catalog  # no templates: contact steps have no channel
     assert '"segment_id": "A"' in user and '"segment_id": "B"' in user
     assert "Portfolio: Residential" in user and "First Party" in user
 
 
 def test_examples_only_use_catalog_values():
-    templates = {t["id"]: t for t in MESSAGE_TEMPLATES}
     for example in load_examples():
         steps = {s["id"]: s for s in example["steps"]}
         assert steps[example["entry_node_id"]]["kind"] == "Trigger"
@@ -87,9 +87,8 @@ def test_examples_only_use_catalog_values():
                 assert step["kind"] in END_STEP_KINDS
             if "reference_event" in cfg:
                 assert cfg["reference_event"] in REFERENCE_EVENTS
-            if step["kind"] == "Communication":
-                template = templates[cfg["template_id"]]
-                assert (template["channel"], template["purpose"]) == (cfg["channel"], cfg["purpose"])
+            if step["kind"] == "Communication":  # contact steps: no channel / template, the worker picks
+                assert "channel" not in cfg and "template_id" not in cfg and cfg["purpose"] in MESSAGE_PURPOSES
             if step["kind"] == "Condition":
                 assert cfg["value"] in CONDITION_VALUES[cfg["attribute"]]
             if "action" in cfg:
@@ -138,8 +137,8 @@ def _assert_closed_objects(node):
             _assert_closed_objects(value)
 
 
-def test_output_schema_is_compact_and_limited_to_segments_and_channels():
-    schema = llm.build_output_schema(["A", "B"], ["Email"])
+def test_output_schema_is_compact_and_limited_to_segments():
+    schema = llm.build_output_schema(["A", "B"])
     _assert_closed_objects(schema)
     workflow = schema["properties"]["workflows"]["items"]
     assert workflow["properties"]["segment_id"]["enum"] == ["A", "B"]
@@ -147,8 +146,9 @@ def test_output_schema_is_compact_and_limited_to_segments_and_channels():
     assert step["required"] == ["id", "kind", "title", "config"]
     config = step["properties"]["config"]
     assert config["required"] == []  # unused fields are left out
-    assert config["properties"]["channel"]["enum"] == ["Email"]
-    assert "sms-link" not in config["properties"]["template_id"]["enum"]
+    assert "channel" not in config["properties"] and "template_id" not in config["properties"]
+    assert "Email Delivery" not in config["properties"]["attribute"]["enum"]  # the worker handles delivery
+    assert "Previous Email" not in config["properties"]["reference_event"]["enum"]
 
 
 class FakeResponse:
@@ -288,7 +288,7 @@ def test_governing_rules_text():
 
 
 def test_schema_asks_for_structured_reasoning():
-    workflow = llm.build_output_schema(["A"], ["Email"])["properties"]["workflows"]["items"]
+    workflow = llm.build_output_schema(["A"])["properties"]["workflows"]["items"]
     assert "reasoning" in workflow["required"] and "rationale" not in workflow["properties"]
     reasoning = workflow["properties"]["reasoning"]
     assert reasoning["required"] == ["segment_fit", "channels", "timing", "escalation"]

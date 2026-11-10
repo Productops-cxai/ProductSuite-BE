@@ -15,7 +15,6 @@ from app.modules.payflow.services.strategy_service import (
     CONDITION_ATTRIBUTES,
     CONDITION_OPERATORS,
     MESSAGE_PURPOSES,
-    MESSAGE_TEMPLATES,
     OUTCOMES,
     PAYMENT_ACTIONS,
     REFERENCE_EVENTS,
@@ -23,7 +22,12 @@ from app.modules.payflow.services.strategy_service import (
     TIME_DIRECTIONS,
     TIME_UNITS,
 )
-from app.modules.payflow.services.workflow_suggestion.config import REASONING_FIELDS
+from app.modules.payflow.services.workflow_suggestion.config import (
+    CHANNEL_EVENTS,
+    CONTACT_ATTRIBUTES,
+    REASONING_FIELDS,
+)
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TOGETHER_URL = "https://api.together.ai/v1/chat/completions"
 # LLM_PROVIDER → where to call and which settings hold its key, model and max_tokens.
@@ -54,18 +58,17 @@ def _enum(values: list[str]) -> dict[str, Any]:
     return {"type": "string", "enum": values}
 
 
-def build_output_schema(segment_ids: list[str], channels: list[str]) -> dict[str, Any]:
+def build_output_schema(segment_ids: list[str]) -> dict[str, Any]:
     # Unused config fields and links are left out (not null) to keep replies short.
+    # No channel / template: a Communication step contacts the customer, the worker picks email or SMS.
     config = _object(
         {
-            "channel": _enum(channels),
             "purpose": _enum(MESSAGE_PURPOSES),
-            "template_id": _enum([t["id"] for t in MESSAGE_TEMPLATES if t["channel"] in channels]),
-            "reference_event": _enum(REFERENCE_EVENTS),
+            "reference_event": _enum([e for e in REFERENCE_EVENTS if e not in CHANNEL_EVENTS]),
             "amount": {"type": "number"},
             "unit": _enum(TIME_UNITS),
             "direction": _enum(TIME_DIRECTIONS),
-            "attribute": _enum(CONDITION_ATTRIBUTES),
+            "attribute": _enum([a for a in CONDITION_ATTRIBUTES if a not in CONTACT_ATTRIBUTES]),
             "operator": _enum(CONDITION_OPERATORS),
             "value": {"type": "string"},
             "action": _enum(CASE_ACTIONS + PAYMENT_ACTIONS),
@@ -106,9 +109,11 @@ def build_output_schema(segment_ids: list[str], channels: list[str]) -> dict[str
 
 
 def build_message_schema(step_ids: list[str]) -> dict[str, Any]:
-    """Reply of the message writer: one subject (emails only) + body per step."""
+    """Reply of the message writer, per step: subject (emails) + body; sms_body for a step without a channel."""
     text = {"type": "string"}
-    message = _object({"step_id": _enum(step_ids), "subject": text, "body": text}, required=["step_id", "body"])
+    message = _object(
+        {"step_id": _enum(step_ids), "subject": text, "body": text, "sms_body": text}, required=["step_id", "body"]
+    )
     return _object({"messages": {"type": "array", "items": message}}, required=["messages"])
 
 

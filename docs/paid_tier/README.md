@@ -29,7 +29,8 @@ venv\Scripts\python -m pytest tests/test_workflow_*.py -q                 # chec
 It changes only `workflow_suggestion/prompt.py` and `workflow_suggestion/service.py`.
 
 **If the patch no longer applies** (the files changed since), the original code is at commit `6694269`
-(the commit before `d413b49`):
+(the commit before `d413b49`). Copy back only the parts in the table above - do not replace the whole files,
+they have newer changes (e.g. the "stop when the customer pays" rule):
 
 ```bash
 git show 6694269:app/modules/payflow/services/workflow_suggestion/prompt.py

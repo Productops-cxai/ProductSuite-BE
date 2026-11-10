@@ -108,7 +108,7 @@ def _add_orphan(workflow):
         ),
         # Step config
         (_drop("s3", "amount", in_config=True), "step s3 (Wait): missing amount"),
-        (_drop("s2", "template_id", in_config=True), "step s2 (Communication): missing template_id"),
+        (_drop("s2", "purpose", in_config=True), "step s2 (Communication): missing purpose"),
         # Timing without a reference_event (rejected by the save step)
         (_set_config("s4", unit="Days"), "step s4 (Condition): has timing (amount / unit) but no reference_event"),
         (_set_config("s8", amount=2), "step s8 (Human Review): has timing (amount / unit) but no reference_event"),
@@ -124,7 +124,7 @@ def test_each_check_reports_a_clear_error(change, expected):
 @pytest.mark.parametrize(
     "limits, expected",
     [
-        ({"channels": ["Email"]}, "step s5: channel 'SMS' is not enabled for this client"),
+        ({"channels": []}, "step s2: this client has no email or SMS enabled - do not use Communication steps"),
         ({"max_steps": 5}, "has 11 steps (allowed 3-5)"),
         ({"max_communications": 1}, "has 2 Communication steps (max 1)"),
         ({"max_messages_per_7_days": 1}, "steps s2, s5 send more than 1 messages within 7 days"),
@@ -205,6 +205,27 @@ def test_unknown_segments_are_not_checked_for_stopping_on_payment():
     _set("s4", config=dict(OLD_PAID_CHECK))(workflow)
     assert validate_all([workflow], ACTIVE, LIMITS) != []
     assert validate_all([workflow], SEGMENTS, LIMITS) == []
+
+
+def test_contact_steps_need_no_channel_and_never_branch_on_delivery():
+    """The worker picks email or SMS per customer, switches when one fails and flags who it cannot reach."""
+    assert validate_all([valid_workflow()], SEGMENTS, {**LIMITS, "channels": ["Email"]}) == []  # no channel needed
+    for attribute, value in (("Email Delivery", "Bounced"), ("SMS Delivery", "Failed"), ("Email Address", "Invalid"),
+                             ("Mobile Number", "Missing")):
+        workflow = valid_workflow()
+        _set("s7", config={"attribute": attribute, "operator": "Equals", "value": value})(workflow)
+        errors = validate_all([workflow], SEGMENTS, LIMITS)
+        assert any(f"step s7: do not branch on {attribute} - PayFlow switches between email and SMS" in e
+                   for e in errors), errors
+
+
+def test_a_step_that_still_has_a_channel_is_checked_as_before():
+    """Older / hand-made workflows keep their channel: it must be enabled for the client."""
+    workflow = valid_workflow()
+    _set_config("s5", channel="SMS", template_id="sms-link")(workflow)
+    assert validate_all([workflow], SEGMENTS, LIMITS) == []
+    errors = validate_all([workflow], SEGMENTS, {**LIMITS, "channels": ["Email"]})
+    assert any("step s5: channel 'SMS' is not enabled for this client" in e for e in errors), errors
 
 
 def test_missing_reference_event_is_reported_once():

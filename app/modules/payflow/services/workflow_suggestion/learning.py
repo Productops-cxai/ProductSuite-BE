@@ -26,6 +26,7 @@ from app.modules.payflow.services.workflow_suggestion.prompt import compact_step
 from app.modules.payflow.services.workflow_suggestion.segmenter import CONTACT_STATES
 from app.modules.payflow.services.workflow_suggestion.validator import (
     validate_catalog_values,
+    validate_contact_steps,
     validate_flowchart,
     validate_limits,
     validate_step_config,
@@ -97,12 +98,13 @@ def learned_from(examples: list[dict], lessons: list[str]) -> list[dict[str, str
 
 
 def _valid_today(row: PayflowStrategyModel, limits: dict[str, Any]) -> bool:
-    """Old-format workflows, ones using e.g. a channel the client turned off, or ones that keep sending
-    reminders after the customer paid or set up a plan, are not shown."""
+    """Old-format workflows, ones using e.g. a channel the client turned off, branching on email / SMS
+    delivery, or that keep sending reminders after the customer paid or set up a plan, are not shown."""
     workflow = {"segment_id": f"#{row.id}", "entry_node_id": row.entry_node_id, "steps": list(row.steps or [])}
     if not workflow["steps"] or validate_flowchart(workflow):
         return False
     errors = validate_catalog_values(workflow, limits) + validate_step_config(workflow) + validate_limits(workflow, limits)
+    errors += validate_contact_steps(workflow, limits)
     errors += validate_stop_when_paid(workflow, (row.segment or {}).get("situation"))
     return not errors
 
@@ -196,7 +198,7 @@ def _flow_summary(steps: list[dict]) -> str:
         cfg = step.get("config") or {}
         kind = step.get("kind")
         if kind == "Communication":
-            parts.append(f"{cfg.get('channel')} {cfg.get('purpose')}")
+            parts.append(f"{cfg.get('channel') or 'Contact'} {cfg.get('purpose')}")  # no channel: email or SMS
         elif kind == "Wait" and isinstance(cfg.get("amount"), (int, float)):
             parts.append(f"wait {cfg['amount']:g} {cfg.get('unit') or 'Days'}")
         elif kind in ("Payment Action", "Case Action"):
