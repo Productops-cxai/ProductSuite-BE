@@ -138,8 +138,27 @@ def test_all_stages_segment_uses_the_average_but_never_starts_above_clear():
 
 def test_each_message_knows_what_happened_before_it():
     result = message_tones(example("Mid-Stage Channel-Aware Follow-Up"), EARLY_NEW)
-    assert result["s5"]["path"] == "Case received → Firm email reminder → Wait 2 days → Email bounced? = yes"
-    assert result["s6"]["path"] == "Case received → Firm email reminder → Wait 2 days → Email bounced? = no"
+    start = "Case received → Firm email reminder → Wait 2 days → Any payment or plan? = no"
+    assert result["s5"]["path"] == f"{start} → Email bounced? = yes"
+    assert result["s6"]["path"] == f"{start} → Email bounced? = no"
+
+
+def test_part_payment_review_is_not_a_hand_over_of_the_message_before_it():
+    """The stop branch (customer paid part) ends in a Human Review — the next reminder is still coming."""
+    paid_or_plan = condition("s3", "Payment Status", "Unpaid", yes="s8", no="s4", operator="Not Equals")
+    workflow = flow(
+        message("s2", "s3"),
+        paid_or_plan,
+        message("s4", "s5"),
+        {**paid_or_plan, "id": "s5", "no": "s6"},
+        message("s6", "s7"),
+        {**paid_or_plan, "id": "s7", "no": "s10"},
+        condition("s8", "Payment Status", "Partial Payment", yes="s9", no="s11", operator="Not Equals"),
+        end("s9"),
+        end("s10", "Human Review"),
+        end("s11", "Human Review"),
+    )
+    assert tones(workflow, LATE_IGNORED) == {"s2": "Firm", "s4": "Firm", "s6": "Final notice"}
 
 
 def test_broken_workflow_does_not_crash():

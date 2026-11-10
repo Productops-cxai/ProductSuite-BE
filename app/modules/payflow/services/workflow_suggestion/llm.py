@@ -1,4 +1,4 @@
-"""LLM call (Groq, OpenAI-compatible) with a JSON schema built from the catalog."""
+"""LLM call (Groq or Together AI, both OpenAI-compatible) with a JSON schema built from the catalog."""
 
 from __future__ import annotations
 
@@ -25,6 +25,18 @@ from app.modules.payflow.services.strategy_service import (
 )
 from app.modules.payflow.services.workflow_suggestion.config import REASONING_FIELDS
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+TOGETHER_URL = "https://api.together.ai/v1/chat/completions"
+# LLM_PROVIDER → where to call and which settings hold its key, model and max_tokens.
+# Groq gets no max_tokens: its free tier counts it against the 8k tokens-per-minute limit.
+PROVIDERS: dict[str, dict[str, str | None]] = {
+    "groq": {"url": GROQ_URL, "key": "GROQ_API_KEY", "model": "GROQ_MODEL", "max_tokens": None},
+    "together": {
+        "url": TOGETHER_URL,
+        "key": "TOGETHER_API_KEY",
+        "model": "TOGETHER_MODEL",
+        "max_tokens": "TOGETHER_MAX_TOKENS",
+    },
+}
 RATE_LIMIT_RETRIES = 5
 MAX_RATE_LIMIT_WAIT_SECONDS = 60
 
@@ -101,10 +113,12 @@ def build_message_schema(step_ids: list[str]) -> dict[str, Any]:
 
 
 def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
-    if not settings.GROQ_API_KEY:
-        raise ServiceUnavailableError("AI workflow suggestions are not configured (GROQ_API_KEY is missing)")
+    provider = _provider()
+    api_key = getattr(settings, provider["key"])
+    if not api_key:
+        raise ServiceUnavailableError(f"AI workflow suggestions are not configured ({provider['key']} is missing)")
     payload = {
-        "model": settings.GROQ_MODEL,
+        "model": getattr(settings, provider["model"]),
         "messages": messages,
         "temperature": 0.3,
         "reasoning_effort": settings.GROQ_REASONING_EFFORT,
@@ -113,7 +127,9 @@ def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str
             "json_schema": {"name": "workflow_suggestions", "strict": False, "schema": schema},
         },
     }
-    response = _post_with_rate_limit_wait(payload)
+    if provider["max_tokens"]:
+        payload["max_tokens"] = getattr(settings, provider["max_tokens"])
+    response = _post_with_rate_limit_wait(provider["url"], api_key, payload)
     if response.status_code != 200:
         raise ServiceUnavailableError(f"AI service error ({response.status_code}): {_error_message(response)}")
     choice = response.json()["choices"][0]
@@ -125,14 +141,21 @@ def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str
         raise ServiceUnavailableError("AI service returned invalid JSON") from exc
 
 
-def _post_with_rate_limit_wait(payload: dict[str, Any]) -> httpx.Response:
-    """POST to Groq; on 429 (rate limit) wait as told by `retry-after`, then retry."""
+def _provider() -> dict[str, str | None]:
+    name = (settings.LLM_PROVIDER or "groq").strip().lower()
+    if name not in PROVIDERS:
+        raise ServiceUnavailableError(f"Unknown LLM_PROVIDER '{name}' (use {' or '.join(PROVIDERS)})")
+    return PROVIDERS[name]
+
+
+def _post_with_rate_limit_wait(url: str, api_key: str, payload: dict[str, Any]) -> httpx.Response:
+    """POST to the AI service; on 429 (rate limit) wait as told by `retry-after`, then retry."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             response = httpx.post(
-                GROQ_URL,
+                url,
                 json=payload,
-                headers={"Authorization": f"Bearer {settings.GROQ_API_KEY}"},
+                headers={"Authorization": f"Bearer {api_key}"},
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:

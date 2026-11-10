@@ -70,7 +70,8 @@ def test_prompt_carries_tone_segment_client_and_rules():
     assert '"tone": "Final notice"' in prompt and "next step hands the case over" in prompt
     assert SEGMENT["label"] in prompt and '"avg_days_past_due": 71' in prompt
     assert "These customers have no payment arrangement yet." in prompt  # what the situation means
-    assert '"path_so_far": "Case received → Friendly email reminder → Wait 3 days → Paid? = no"' in prompt
+    path = "Case received → Friendly email reminder → Wait 3 days → Any payment or plan? = no"
+    assert f'"path_so_far": "{path}"' in prompt
     assert "on behalf of Maple Energy (Demo)" in prompt  # third-party client
     assert "the customer can: pay in full, set up a payment plan" in prompt
     assert "Write in English" in prompt

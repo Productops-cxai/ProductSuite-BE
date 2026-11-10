@@ -90,7 +90,7 @@ def test_suggest_uses_the_clients_reviewed_workflows_and_lessons(db_session, adm
 
     # Lessons: guidance, not rules — with where + what + why.
     assert "## Lessons from this client's past reviews (guidance, not rules)" in system
-    assert "Only the Limits and Allowed values above are hard rules." in system
+    assert "Only the Limits, Stop when the customer pays and Allowed values above are hard rules." in system
     assert f"[Active · {EARLY} · Never contacted · Under $500] EDITED: " in system
     assert "Wait 3 days: timing changed from 3 Days After Previous Email to 7 Days After Previous Email" in system
     assert "WHY: SMS was too early" in system
@@ -164,6 +164,18 @@ def test_lessons_for_similar_segments_come_first():
         "not similar",  # the rest, newest first
         "no segment",
     ]
+
+
+def test_workflows_that_keep_reminding_after_a_payment_are_not_examples():
+    steps = copy.deepcopy(load_examples()[0]["steps"])
+
+    def row(situation):
+        return SimpleNamespace(id=1, entry_node_id="s1", steps=steps, segment={"situation": situation})
+
+    assert learning._valid_today(row("Active"), LIMITS)
+    assert not learning._valid_today(row("Payment Plan"), LIMITS)  # already on a plan: would stop at once
+    steps[3]["config"] = {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}
+    assert not learning._valid_today(row("Active"), LIMITS)  # would remind after a part payment or a plan
 
 
 def test_lessons_are_short_deduplicated_and_capped():
