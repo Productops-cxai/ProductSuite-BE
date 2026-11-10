@@ -28,11 +28,13 @@ def process_job(job_id: int) -> None:
         elif job_type == PayflowWorkflowJobType.EXECUTE_STEP.value:
             if not job.run_id or not job.step_id:
                 raise ValueError("execute_step missing run_id/step_id")
+            payload = job.payload or {}
             svc.execute_step(
                 job.run_id,
                 job.step_id,
                 job_id=job.id,
-                after_human_review=bool((job.payload or {}).get("after_human_review")),
+                after_human_review=bool(payload.get("after_human_review")),
+                after_comm_delay=bool(payload.get("after_comm_delay")),
             )
         elif job_type == PayflowWorkflowJobType.RESUME_RUN.value:
             if not job.run_id:

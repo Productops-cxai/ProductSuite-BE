@@ -27,6 +27,13 @@ from app.infrastructure.database.models import (
 from app.modules.payflow.services.communication_service import PayflowCommunicationService
 from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
+from app.modules.payflow.services.workflow_condition_runtime import (
+    apply_outcome_to_account,
+    compare_values,
+    resolve_condition_actual,
+    resolve_reference_anchor,
+    timedelta_for_unit,
+)
 from app.modules.payflow.services.workflow_queue import (
     cancel_pending_jobs_for_run,
     enqueue_enroll_strategy,
@@ -579,6 +586,7 @@ class WorkflowExecutionService:
         strategy = self.db.get(PayflowStrategyModel, run.strategy_id)
         if not strategy:
             return
+        account = self.db.get(PayflowAccountModel, run.account_id)
         step_id = from_step_id or run.current_step_id
         steps = {s.get("id"): s for s in (strategy.steps or []) if isinstance(s, dict) and s.get("id")}
         step = steps.get(step_id or "")
@@ -586,14 +594,15 @@ class WorkflowExecutionService:
         # After human review:
         # - Human Review *step*: supervisor already decided → advance to .next
         #   (re-running the step would create another Awaiting review).
+        # - Terminal Human Review (no next): complete the run.
         # - Communication (or other) paused by a governance rule: re-execute that
         #   step so the email/SMS actually sends — do not jump to Wait.
         reexecute_paused = False
+        complete_run = False
+        target_id: str | None = None
         if after_human_review:
             if step_kind == "Human Review":
                 target_id = (step.get("next") or _cfg(step).get("next")) if step else None
-                if not target_id:
-                    target_id = step_id
                 # Close the paused HR step so activity no longer shows Awaiting Review.
                 paused_sr = (
                     self.db.query(PayflowWorkflowStepRunModel)
@@ -608,17 +617,37 @@ class WorkflowExecutionService:
                 if paused_sr:
                     paused_sr.status = "done"
                     paused_sr.finished_at = _utcnow()
+                if not target_id:
+                    complete_run = True
             else:
                 target_id = step_id
                 reexecute_paused = True
         else:
-            target_id = None
             if step:
                 target_id = step.get("next") or _cfg(step).get("next")
             if not target_id:
                 target_id = step_id
-        run.status = PayflowWorkflowRunStatus.ACTIVE.value
+
         run.human_review_id = None
+        if complete_run:
+            run.status = PayflowWorkflowRunStatus.COMPLETED.value
+            run.completed_at = _utcnow()
+            if account:
+                account.next_action = None
+                account.last_action = f"Human Review completed: {step.get('title') or step_id}"
+            self.log_event(
+                event_type="run_completed",
+                message=f"Run {run_id} completed after terminal Human Review",
+                run_id=run.id,
+                account_id=run.account_id,
+                strategy_id=run.strategy_id,
+                job_id=job_id,
+                step_id=step_id,
+            )
+            self.db.commit()
+            return
+
+        run.status = PayflowWorkflowRunStatus.ACTIVE.value
         self.db.flush()
         if target_id:
             enqueue_execute_step(
@@ -657,6 +686,7 @@ class WorkflowExecutionService:
         *,
         job_id: int | None = None,
         after_human_review: bool = False,
+        after_comm_delay: bool = False,
     ) -> None:
         run = self.db.get(PayflowWorkflowRunModel, run_id)
         if not run or run.status in _TERMINAL:
@@ -684,6 +714,8 @@ class WorkflowExecutionService:
         # Scheduled post-Wait job: close the Wait row so the timeline no longer
         # shows "Waiting" after the wait window has elapsed.
         self._close_waits_targeting_step(run.id, step_id)
+        if after_comm_delay:
+            self._close_deferred_communication(run.id, step_id)
 
         # Idempotency: do not re-execute a step that already completed successfully.
         # Exception: after supervisor approve, re-run the step that was only paused
@@ -701,6 +733,11 @@ class WorkflowExecutionService:
         if prior_ok is not None:
             allow_resume = (
                 after_human_review and prior_ok.status == "paused_human_review"
+            ) or (
+                after_comm_delay
+                and prior_ok.status in {"scheduled", "waiting", "done"}
+                and isinstance(prior_ok.result_json, dict)
+                and prior_ok.result_json.get("deferred_send")
             )
             if not allow_resume:
                 self.log_event(
@@ -837,8 +874,22 @@ class WorkflowExecutionService:
                     self.db.commit()
                     return
 
-            next_id = self._dispatch_kind(run, account, strategy, step, step_run, steps)
+            next_id = self._dispatch_kind(
+                run,
+                account,
+                strategy,
+                step,
+                step_run,
+                steps,
+                after_comm_delay=after_comm_delay,
+            )
             if run.status == PayflowWorkflowRunStatus.PAUSED_HUMAN_REVIEW.value:
+                self.db.commit()
+                return
+            # Deferred Communication send: wait window in progress.
+            if step_run.status in {"scheduled", "waiting"} and run.status == (
+                PayflowWorkflowRunStatus.WAITING.value
+            ):
                 self.db.commit()
                 return
 
@@ -1100,6 +1151,7 @@ class WorkflowExecutionService:
         steps: dict[str, dict],
         *,
         event_context: dict[str, Any] | None = None,
+        after_comm_delay: bool = False,
     ) -> str | None:
         kind = step.get("kind") or ""
         cfg = _cfg(step)
@@ -1109,7 +1161,7 @@ class WorkflowExecutionService:
             return step.get("next") or cfg.get("next")
 
         if kind == "Wait":
-            when = self._wait_until(cfg, step, strategy)
+            when = self._wait_until(cfg, step, strategy, account=account, run=run)
             next_id = step.get("next") or cfg.get("next")
             run.status = PayflowWorkflowRunStatus.WAITING.value
             # Not "done" — wait is in progress until scheduled_at elapses.
@@ -1118,6 +1170,8 @@ class WorkflowExecutionService:
                 "wait_until": when.isoformat(),
                 "next": next_id,
                 "timezone": self._wait_timezone_name(cfg, step, strategy),
+                "reference_event": cfg.get("reference_event") or step.get("reference_event"),
+                "direction": cfg.get("direction") or step.get("direction"),
             }
             if next_id:
                 enqueue_execute_step(
@@ -1133,6 +1187,33 @@ class WorkflowExecutionService:
             return None
 
         if kind == "Communication":
+            if not after_comm_delay:
+                deferred_until = self._communication_defer_until(
+                    cfg, step, strategy, account=account, run=run
+                )
+                if deferred_until is not None:
+                    run.status = PayflowWorkflowRunStatus.WAITING.value
+                    step_run.status = "scheduled"
+                    step_run.result_json = {
+                        "wait_until": deferred_until.isoformat(),
+                        "deferred_send": True,
+                        "next": step.get("id"),
+                        "timezone": self._wait_timezone_name(cfg, step, strategy),
+                    }
+                    enqueue_execute_step(
+                        self.db,
+                        run_id=run.id,
+                        step_id=step.get("id") or "",
+                        account_id=account.id,
+                        strategy_id=strategy.id,
+                        scheduled_at=deferred_until,
+                        payload={"after_comm_delay": True},
+                        commit=False,
+                    )
+                    account.next_action = (
+                        f"Scheduled communication {deferred_until.isoformat()}"
+                    )
+                    return None
             self._send_communication(run, account, strategy, step, step_run)
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
             return step.get("next") or cfg.get("next")
@@ -1142,7 +1223,24 @@ class WorkflowExecutionService:
             yes_id = step.get("yes") or cfg.get("yes")
             no_id = step.get("no") or cfg.get("no")
             matched = self._eval_condition(account, cfg, step, ctx)
-            step_run.result_json = {"condition_matched": matched, "context_keys": list(ctx.keys())}
+            attr = (
+                cfg.get("attribute")
+                or step.get("attribute")
+                or cfg.get("field")
+                or step.get("field")
+            )
+            step_run.result_json = {
+                "condition_matched": matched,
+                "attribute": attr,
+                "operator": cfg.get("operator") or step.get("operator"),
+                "value": cfg.get("value", step.get("value")),
+                "actual": resolve_condition_actual(
+                    self.db, account, str(attr or ""), ctx=ctx
+                )
+                if attr
+                else None,
+                "context_keys": list(ctx.keys()),
+            }
             return yes_id if matched else no_id
 
         if kind == "Human Review":
@@ -1188,8 +1286,11 @@ class WorkflowExecutionService:
             run.status = PayflowWorkflowRunStatus.COMPLETED.value
             run.completed_at = _utcnow()
             account.next_action = None
-            account.last_action = f"{kind}: {step.get('title') or 'done'}"
-            step_run.result_json = {"outcome": step.get("title") or kind}
+            outcome_label = (
+                cfg.get("outcome") or step.get("outcome") or step.get("title") or kind
+            )
+            applied = apply_outcome_to_account(account, str(outcome_label))
+            step_run.result_json = {"outcome": outcome_label, **applied}
             return None
 
         run.status = PayflowWorkflowRunStatus.ACTIVE.value
@@ -1234,8 +1335,40 @@ class WorkflowExecutionService:
             closed += 1
         return closed
 
+    def _close_deferred_communication(self, run_id: int, step_id: str) -> int:
+        """Close Communication rows that were waiting for a timed send."""
+        rows = (
+            self.db.query(PayflowWorkflowStepRunModel)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run_id,
+                PayflowWorkflowStepRunModel.step_id == step_id,
+                PayflowWorkflowStepRunModel.kind == "Communication",
+                PayflowWorkflowStepRunModel.status.in_(["scheduled", "waiting"]),
+            )
+            .all()
+        )
+        closed = 0
+        now = _utcnow()
+        for row in rows:
+            result = row.result_json if isinstance(row.result_json, dict) else {}
+            if not result.get("deferred_send"):
+                continue
+            row.status = "done"
+            row.finished_at = now
+            merged = dict(result)
+            merged["closed_reason"] = "comm_delay_elapsed"
+            row.result_json = merged
+            closed += 1
+        return closed
+
     def _wait_until(
-        self, cfg: dict, step: dict, strategy: PayflowStrategyModel
+        self,
+        cfg: dict,
+        step: dict,
+        strategy: PayflowStrategyModel,
+        *,
+        account: PayflowAccountModel | None = None,
+        run: PayflowWorkflowRunModel | None = None,
     ) -> datetime:
         amount = cfg.get("amount")
         if amount is None:
@@ -1245,21 +1378,63 @@ class WorkflowExecutionService:
         except (TypeError, ValueError):
             amount = 3
         amount = max(amount, 0)
-        unit = (cfg.get("unit") or step.get("unit") or "Days").lower()
+        unit = cfg.get("unit") or step.get("unit") or "Days"
+        direction = (cfg.get("direction") or step.get("direction") or "After").strip().lower()
+        reference_event = cfg.get("reference_event") or step.get("reference_event")
         tz_name = self._wait_timezone_name(cfg, step, strategy)
         try:
             tz = ZoneInfo(tz_name)
         except Exception:  # noqa: BLE001
             tz = timezone.utc
-            tz_name = "UTC"
-        now_local = datetime.now(tz)
-        if unit.startswith("hour"):
-            local_when = now_local + timedelta(hours=amount)
-        elif unit.startswith("minute"):
-            local_when = now_local + timedelta(minutes=amount)
+        now_utc = _utcnow()
+        delta = timedelta_for_unit(amount, str(unit))
+
+        anchor = None
+        if account is not None:
+            anchor = resolve_reference_anchor(
+                self.db,
+                account,
+                str(reference_event) if reference_event else None,
+                run_started_at=getattr(run, "started_at", None) if run else None,
+            )
+        if anchor is None:
+            anchor = now_utc
+
+        if direction.startswith("before"):
+            when = anchor - delta
         else:
-            local_when = now_local + timedelta(days=amount)
-        return local_when.astimezone(timezone.utc)
+            when = anchor + delta
+
+        # Never schedule in the past — fire as soon as the worker can.
+        if when < now_utc:
+            when = now_utc
+        # Convert through client timezone for day-boundary consistency, then UTC.
+        return when.astimezone(tz).astimezone(timezone.utc)
+
+    def _communication_defer_until(
+        self,
+        cfg: dict,
+        step: dict,
+        strategy: PayflowStrategyModel,
+        *,
+        account: PayflowAccountModel,
+        run: PayflowWorkflowRunModel,
+    ) -> datetime | None:
+        """If Communication has a meaningful delay, return when to send; else None."""
+        amount = cfg.get("amount")
+        if amount is None:
+            amount = step.get("amount", 0)
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            amount = 0
+        if amount <= 0:
+            return None
+        when = self._wait_until(cfg, step, strategy, account=account, run=run)
+        # Ignore tiny "now" schedules (amount resolved against a past/now anchor).
+        if when <= _utcnow() + timedelta(seconds=2):
+            return None
+        return when
 
     def _eval_condition(
         self,
@@ -1268,74 +1443,27 @@ class WorkflowExecutionService:
         step: dict,
         ctx: dict[str, Any],
     ) -> bool:
-        field = (cfg.get("field") or step.get("field") or "").strip()
-        operator = (cfg.get("operator") or step.get("operator") or "eq").strip().lower()
+        # AI / FE catalog uses `attribute`; older steps may still use `field`.
+        attribute = (
+            cfg.get("attribute")
+            or step.get("attribute")
+            or cfg.get("field")
+            or step.get("field")
+            or ""
+        )
+        attribute = str(attribute).strip()
+        operator = cfg.get("operator") or step.get("operator") or "Equals"
         expected = cfg.get("value", step.get("value"))
 
-        if not field:
-            # Default: payment / arrangement progress.
-            return float(account.outstanding_balance or 0) <= 0 or (
-                account.collection_status or ""
-            ).lower() in {
-                "resolved",
-                "promise to pay",
-                "payment plan",
-            }
+        if not attribute:
+            # Default stop-when-paid/plan heuristic aligned with Payment Status catalog.
+            status = resolve_condition_actual(
+                self.db, account, "Payment Status", ctx=ctx
+            )
+            return status in {"Paid In Full", "Payment Plan Active", "Partial Payment"}
 
-        # Event context wins for payment/communication outcomes.
-        if field in ctx:
-            actual: Any = ctx.get(field)
-        else:
-            actual = getattr(account, field, None)
-            if actual is None and field in {
-                "paid",
-                "has_payment",
-                "payment_received",
-            }:
-                actual = bool(account.last_payment_date) or float(
-                    account.outstanding_balance or 0
-                ) < float(account.original_balance or 0)
-            if field == "outstanding_balance":
-                actual = float(account.outstanding_balance or 0)
-            if field == "collection_status":
-                actual = account.collection_status
-            if field == "provincial_hold":
-                actual = bool(account.provincial_hold)
-            if field in {"comm_status", "communication_status"}:
-                actual = ctx.get("comm_status") or ctx.get("status")
-
-        if operator in {"eq", "=", "==", "equals"}:
-            return str(actual).strip().lower() == str(expected).strip().lower()
-        if operator in {"neq", "!=", "not_equals"}:
-            return str(actual).strip().lower() != str(expected).strip().lower()
-        if operator in {"gt", ">"}:
-            try:
-                return float(actual or 0) > float(expected or 0)
-            except (TypeError, ValueError):
-                return False
-        if operator in {"gte", ">="}:
-            try:
-                return float(actual or 0) >= float(expected or 0)
-            except (TypeError, ValueError):
-                return False
-        if operator in {"lt", "<"}:
-            try:
-                return float(actual or 0) < float(expected or 0)
-            except (TypeError, ValueError):
-                return False
-        if operator in {"lte", "<="}:
-            try:
-                return float(actual or 0) <= float(expected or 0)
-            except (TypeError, ValueError):
-                return False
-        if operator in {"truthy", "true", "is_true"}:
-            return bool(actual)
-        if operator in {"falsy", "false", "is_false"}:
-            return not bool(actual)
-        if operator in {"in", "one_of"}:
-            options = expected if isinstance(expected, (list, tuple, set)) else str(expected).split(",")
-            return str(actual).strip().lower() in {str(o).strip().lower() for o in options}
-        return bool(actual)
+        actual = resolve_condition_actual(self.db, account, attribute, ctx=ctx)
+        return compare_values(actual, str(operator), expected)
 
     def _append_timeline(self, account: PayflowAccountModel, label: str, detail: str = "") -> None:
         timeline = list(account.timeline or [])
