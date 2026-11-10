@@ -76,9 +76,15 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SMTP_USE_TLS: bool = True
 
-    # AI workflow suggestion — Groq (OpenAI-compatible API).
+    # AI workflow suggestion — an OpenAI-compatible chat API, chosen by LLM_PROVIDER.
+    LLM_PROVIDER: str = "groq"  # groq | together
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "openai/gpt-oss-120b"
+    TOGETHER_API_KEY: str = ""
+    TOGETHER_MODEL: str = "openai/gpt-oss-120b"
+    # Together counts the model's reasoning in max_tokens: too small and the JSON reply is cut off.
+    TOGETHER_MAX_TOKENS: int = 16000
+    # The GROQ_* settings below apply to both providers (names kept so existing .env files still work).
     GROQ_TIMEOUT_SECONDS: int = 60
     GROQ_REASONING_EFFORT: str = "low"  # low | medium | high
     # FREE-TIER BATCHING: free tier allows 8k tokens/min, so send 3 segments per call.

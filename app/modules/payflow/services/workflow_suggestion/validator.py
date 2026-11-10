@@ -1,7 +1,8 @@
 """Check AI-suggested workflows before saving — returns plain error messages.
 
 Only checks what can be checked on a design: structure, flowchart, catalog values,
-step config and limits (including design limits derived from rules).
+step config, limits (including design limits derived from rules) and that the reminders
+stop once the customer pays or sets up a plan.
 An empty list means the workflows are valid.
 """
 
@@ -23,8 +24,17 @@ from app.modules.payflow.services.strategy_service import (
     TIME_DIRECTIONS,
     TIME_UNITS,
 )
-from app.modules.payflow.services.workflow_suggestion.config import REASONING_FIELDS
-from app.modules.payflow.services.workflow_suggestion.prompt import END_STEP_KINDS
+from app.modules.payflow.services.workflow_suggestion.config import (
+    FULL_OR_PLAN_CHECK,
+    MISSED_INSTALMENT_CHECK,
+    ON_A_PLAN_SITUATION,
+    PAID_OR_PLAN_CHECK,
+    PAID_OUTCOME,
+    REASONING_FIELDS,
+    STOP_WHEN_PAID_SITUATIONS,
+)
+from app.modules.payflow.services.workflow_suggestion.message_tone import HAND_OVER_ACTIONS, HAND_OVER_KINDS
+from app.modules.payflow.services.workflow_suggestion.prompt import END_STEP_KINDS, check_text
 
 REQUIRED_REASONING = [f for f in REASONING_FIELDS if f != "changes_made"]  # changes_made: regenerate only
 
@@ -61,6 +71,7 @@ def validate_all(
     limits: dict[str, Any],
 ) -> list[str]:
     errors = validate_structure(workflows, [s["segment_id"] for s in segments])
+    situations = {s["segment_id"]: (s.get("segment") or {}).get("situation") for s in segments}
     for workflow in workflows:
         if not isinstance(workflow.get("steps"), list) or not workflow["steps"]:
             continue  # reported by validate_structure
@@ -69,6 +80,8 @@ def validate_all(
         errors += validate_catalog_values(workflow, limits)
         errors += validate_step_config(workflow)
         errors += validate_limits(workflow, limits, check_paths=not flowchart_errors)
+        if not flowchart_errors:  # paths are unreliable while the flowchart itself is broken
+            errors += validate_stop_when_paid(workflow, situations.get(workflow.get("segment_id")))
     return errors
 
 
@@ -213,6 +226,43 @@ def validate_limits(workflow: dict[str, Any], limits: dict[str, Any], *, check_p
     return errors
 
 
+def validate_stop_when_paid(workflow: dict[str, Any], situation: str | None) -> list[str]:
+    """Active / Promise to Pay: once the customer pays in full, pays part or sets up a plan, the reminders stop.
+
+    Every follow-up message and every hand-over after a message comes after PAID_OR_PLAN_CHECK, whose yes
+    goes to FULL_OR_PLAN_CHECK → Outcome PAID_OUTCOME | Human Review. Payment Plan customers are already on
+    a plan: both checks are always yes for them, so their workflows must not use them. A workflow without a
+    known segment is not checked.
+    """
+    if situation == ON_A_PLAN_SITUATION:
+        return [
+            f'{_where(workflow, step["id"])}: the customer is already on a payment plan, so "{check_text(check)}" is '
+            f'always yes and would end the workflow at once - check for a missed instalment '
+            f'("{check_text(MISSED_INSTALMENT_CHECK)}") instead, as described for Payment Plan workflows'
+            for step in workflow["steps"]
+            for check in (PAID_OR_PLAN_CHECK, FULL_OR_PLAN_CHECK)
+            if _is_check(step, check)
+        ]
+    if situation not in STOP_WHEN_PAID_SITUATIONS:
+        return []
+    errors: list[str] = []
+    steps = _steps_by_id(workflow)
+    unchecked: dict[str, str] = {}  # step id → the message it comes after without the check
+    for message in (s for s in workflow["steps"] if s.get("kind") == "Communication"):
+        for step_id in _reached_without_paid_check(steps, message):
+            unchecked.setdefault(step_id, message["id"])
+    for step_id, message_id in unchecked.items():
+        what = "sends a follow-up message" if steps[step_id].get("kind") == "Communication" else "hands the case over"
+        errors.append(
+            f'{_where(workflow, step_id)}: {what} after step {message_id} without the check '
+            f'"{check_text(PAID_OR_PLAN_CHECK)}" in between (the customer may have paid or set up a plan)'
+        )
+    for step in workflow["steps"]:
+        if _is_check(step, PAID_OR_PLAN_CHECK):
+            errors += _stop_branch_errors(workflow, steps, step)
+    return list(dict.fromkeys(errors))  # checks that share one stop branch would repeat its errors
+
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -279,6 +329,55 @@ def _next_message_without_wait(steps: dict[str, dict], message: dict[str, Any]) 
         if step.get("kind") != "Wait":
             stack.extend(_links(step))
     return None
+
+
+def _is_check(step: dict[str, Any], check: dict[str, str]) -> bool:
+    cfg = _cfg(step)
+    return step.get("kind") == "Condition" and all(cfg.get(key) == value for key, value in check.items())
+
+
+def _reached_without_paid_check(steps: dict[str, dict], message: dict[str, Any]) -> list[str]:
+    """Messages and hand-overs reachable from `message` without passing PAID_OR_PLAN_CHECK."""
+    found: list[str] = []
+    stack, seen = _links(message), set()
+    while stack:
+        step_id = stack.pop()
+        if step_id in seen or step_id not in steps:
+            continue
+        seen.add(step_id)
+        step = steps[step_id]
+        if _is_check(step, PAID_OR_PLAN_CHECK):
+            continue  # no = still unpaid, carry on; yes = the stop branch (checked on its own)
+        if step.get("kind") == "Communication" or (
+            step.get("kind") in HAND_OVER_KINDS or _cfg(step).get("action") in HAND_OVER_ACTIONS
+        ):
+            found.append(step_id)
+            continue
+        stack.extend(_links(step))
+    return found
+
+
+def _stop_branch_errors(workflow: dict[str, Any], steps: dict[str, dict], check: dict[str, Any]) -> list[str]:
+    """yes of PAID_OR_PLAN_CHECK → FULL_OR_PLAN_CHECK: yes → Outcome PAID_OUTCOME, no (part paid) → Human Review."""
+    full_or_plan = steps.get(check.get("yes")) or {}
+    if not _is_check(full_or_plan, FULL_OR_PLAN_CHECK):
+        return [
+            f'{_where(workflow, check["id"])}: yes (the customer paid or set up a plan) must go to the Condition '
+            f'"{check_text(FULL_OR_PLAN_CHECK)}"'
+        ]
+    errors = []
+    paid = steps.get(full_or_plan.get("yes")) or {}
+    if paid.get("kind") != "Outcome" or _cfg(paid).get("outcome") != PAID_OUTCOME:
+        errors.append(
+            f'{_where(workflow, full_or_plan["id"])}: yes (paid in full or on a plan) must end in an Outcome '
+            f'"{PAID_OUTCOME}"'
+        )
+    if (steps.get(full_or_plan.get("no")) or {}).get("kind") != "Human Review":
+        errors.append(
+            f'{_where(workflow, full_or_plan["id"])}: no (paid part only) must go to a Human Review '
+            "to decide on the rest"
+        )
+    return errors
 
 
 def _days(step: dict[str, Any]) -> float:

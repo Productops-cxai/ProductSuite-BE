@@ -30,3 +30,9 @@ def test_limits_are_sane():
 def test_groq_settings_have_defaults():
     assert settings.GROQ_MODEL
     assert settings.GROQ_TIMEOUT_SECONDS > 0
+
+
+def test_together_settings_have_defaults():
+    assert settings.LLM_PROVIDER in {"groq", "together"}
+    assert settings.TOGETHER_MODEL
+    assert settings.TOGETHER_MAX_TOKENS > 0

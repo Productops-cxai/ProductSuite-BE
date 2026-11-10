@@ -85,6 +85,19 @@ MIN_STEPS = 3
 MAX_STEPS = 15  # room for real branches (raised from 12 — the AI often needed 13–15)
 MAX_COMMUNICATIONS = 5
 
+# Stop when the customer acts: on the payment page they can pay in full, pay part or set up a plan.
+# Before every follow-up message, PAID_OR_PLAN_CHECK — yes = they acted → FULL_OR_PLAN_CHECK:
+# yes → Outcome "Paid In Full", no (paid part only) → Human Review. Payment Plan customers are already on
+# a plan: for them both checks are always yes, so their workflows check MISSED_INSTALMENT_CHECK instead.
+# Stated in the prompt (prompt.py), checked by validator.py.
+PAID_OR_PLAN_CHECK = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}
+FULL_OR_PLAN_CHECK = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}
+MISSED_INSTALMENT_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"}
+PAID_OUTCOME = "Paid In Full"
+ON_A_PLAN_OUTCOME = "Payment Plan Active"
+STOP_WHEN_PAID_SITUATIONS = ("Active", "Promise to Pay")
+ON_A_PLAN_SITUATION = "Payment Plan"
+
 # Why the AI chose a workflow — one short text per field, saved as ai_context lines.
 # changes_made is only filled on regenerate.
 REASONING_LABELS: dict[str, str] = {

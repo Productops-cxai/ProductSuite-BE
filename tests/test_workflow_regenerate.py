@@ -20,7 +20,12 @@ from app.modules.payflow.services.workflow_suggestion import service as suggesti
 from app.modules.payflow.services.workflow_suggestion.prompt import load_examples
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
 from app.shared.enums import PayflowRoleCode, PlatformRole, UserStatus
-from tests.test_workflow_suggestion_api import fake_llm, portfolio, supervisor_token  # noqa: F401 (fixtures)
+from tests.test_workflow_suggestion_api import (  # noqa: F401 (fixtures)
+    fake_llm,
+    fake_llm_without_payment_check,
+    portfolio,
+    supervisor_token,
+)
 
 REMARKS = "Less aggressive: no SMS in the first week"
 
@@ -83,6 +88,15 @@ def test_regenerate_retries_with_validator_errors(db_session, admin, ai_workflow
     assert len(calls) == 2
     retry_prompt = calls[1][1]["content"]
     assert REMARKS in retry_prompt and "template 'em-nope' does not exist" in retry_prompt
+
+
+def test_regenerate_sends_back_a_workflow_that_keeps_reminding_after_a_payment(db_session, admin, ai_workflow):
+    call, calls = fake_llm_without_payment_check()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        new = WorkflowSuggestionService(db_session).regenerate_workflow(admin, ai_workflow["id"], REMARKS)
+    assert new["status"] == "AI Proposed"
+    assert len(calls) == 2  # the original's segment (Active) is checked too
+    assert 'without the check "Payment Status Not Equals Unpaid"' in calls[1][1]["content"]
 
 
 def test_regenerate_gives_up_and_saves_nothing(db_session, admin, ai_workflow):

@@ -1,4 +1,5 @@
 import copy
+import json
 from unittest.mock import patch
 
 import pytest
@@ -151,13 +152,32 @@ def test_preview_segments_requires_login(client, portfolio):
 # --------------------------------------------------------------------------- suggest
 
 
-def _workflow_for(segment_id, broken=False):
+# A Payment Plan customer is already on a plan: their workflow checks for a missed instalment instead.
+PLAN_CHECKS = {
+    "s4": {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"},
+    "s7": {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"},
+    "s10": {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"},
+}
+
+
+def _workflow_for(segment_id, broken=False, situation=None):
     workflow = copy.deepcopy(load_examples()[0])
     workflow.pop("for_segment")
     workflow["segment_id"] = segment_id
+    if situation == "Payment Plan":
+        for step in workflow["steps"]:
+            if step["id"] in PLAN_CHECKS:
+                step["config"] = dict(PLAN_CHECKS[step["id"]])
     if broken:
         workflow["steps"][1]["config"]["template_id"] = "em-nope"
     return workflow
+
+
+def _situations(messages):
+    """segment_id → situation, read from the segment lines of the user prompt."""
+    lines = [json.loads(line) for line in messages[1]["content"].splitlines() if line.startswith('{"segment_id"')]
+    # A retry also lists the rejected workflows as JSON - they have no "segment" label.
+    return {line["segment_id"]: line["segment"].split(" · ")[0] for line in lines if "segment" in line}
 
 
 def fake_llm(broken_calls=0):
@@ -168,7 +188,24 @@ def fake_llm(broken_calls=0):
         calls.append(messages)
         ids = schema["properties"]["workflows"]["items"]["properties"]["segment_id"]["enum"]
         broken = len(calls) <= broken_calls
-        return {"workflows": [_workflow_for(i, broken) for i in ids]}
+        situations = _situations(messages)
+        return {"workflows": [_workflow_for(i, broken, situations.get(i)) for i in ids]}
+
+    return _call, calls
+
+
+def fake_llm_without_payment_check(times=1):
+    """Fake AI whose first `times` replies keep reminding after a part payment or a plan (old "Paid?" check)."""
+    calls = []
+
+    def _call(messages, schema):
+        calls.append(messages)
+        ids = schema["properties"]["workflows"]["items"]["properties"]["segment_id"]["enum"]
+        workflows = [_workflow_for(i) for i in ids]
+        if len(calls) <= times:
+            for workflow in workflows:  # s4: "Payment Status Equals Paid In Full" instead of "Not Equals Unpaid"
+                workflow["steps"][3]["config"] = {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}
+        return {"workflows": workflows}
 
     return _call, calls
 
@@ -210,6 +247,21 @@ def test_suggest_retries_with_errors_then_saves(client, admin_token, portfolio):
     assert len(calls) == 2
     retry_prompt = calls[1][1]["content"]
     assert "template 'em-nope' does not exist" in retry_prompt
+
+
+def test_suggest_sends_back_a_workflow_that_keeps_reminding_after_a_payment(client, admin_token, portfolio):
+    call, calls = fake_llm_without_payment_check()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
+        response = _suggest(client, admin_token, portfolio["client_id"], portfolio["portfolio_id"])
+    assert response.status_code == 200, response.json()
+    assert len(calls) == 2
+    retry_prompt = calls[1][1]["content"]
+    assert 'step s5: sends a follow-up message after step s2 without the check "Payment Status Not Equals Unpaid"' in (
+        retry_prompt
+    )
+    [workflow] = response.json()["workflows"]
+    checks = {s["config"]["value"] for s in workflow["steps"] if s["config"].get("attribute") == "Payment Status"}
+    assert checks == {"Unpaid", "Partial Payment"}  # the saved workflow stops on any payment or plan
 
 
 def test_suggest_fixes_timing_without_reference_event(client, admin_token, portfolio):

@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
-from app.modules.payflow.services.workflow_suggestion.config import DELINQUENCY_RANGES
+from app.modules.payflow.services.workflow_suggestion.config import DELINQUENCY_RANGES, PAID_OR_PLAN_CHECK
 from app.shared.enums import PayflowCollectionStatus
 
 FRIENDLY, CLEAR, FIRM, FINAL_NOTICE = "Friendly", "Clear", "Firm", "Final notice"
@@ -234,9 +234,17 @@ def _hands_over_next(steps: dict[str, dict], step_id: str) -> bool:
         action = (target.get("config") or {}).get("action")
         if target.get("kind") in HAND_OVER_KINDS or action in HAND_OVER_ACTIONS:
             return True
-        if target.get("kind") != "Communication":
+        if _is_paid_or_plan_check(target):
+            # Its yes branch = the customer paid or set up a plan: the reminders stop, nobody takes over.
+            stack.extend([target["no"]] if target.get("no") else [])
+        elif target.get("kind") != "Communication":
             stack.extend(_links(target))
     return False
+
+
+def _is_paid_or_plan_check(step: dict[str, Any]) -> bool:
+    cfg = step.get("config") or {}
+    return step.get("kind") == "Condition" and all(cfg.get(key) == value for key, value in PAID_OR_PLAN_CHECK.items())
 
 
 def _links(step: dict[str, Any]) -> list[str]:
