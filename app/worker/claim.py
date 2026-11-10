@@ -137,13 +137,15 @@ def mark_job_done(db: Session, job_id: int) -> None:
     db.commit()
 
 
-def mark_job_failed(db: Session, job_id: int, error: str) -> None:
+def mark_job_failed(db: Session, job_id: int, error: str) -> bool:
+    """Record a failure. Returns True when no attempts are left (failed for good)."""
     row = db.get(PayflowWorkflowJobModel, job_id)
     if not row:
-        return
+        return False
     row.last_error = error[:2000]
     max_attempts = int(row.max_attempts or 5)
-    if int(row.attempts or 0) >= max_attempts:
+    final = int(row.attempts or 0) >= max_attempts
+    if final:
         row.status = PayflowWorkflowJobStatus.FAILED.value
         row.locked_by = None
     else:
@@ -154,3 +156,4 @@ def mark_job_failed(db: Session, job_id: int, error: str) -> None:
         row.locked_by = None
         row.scheduled_at = _utcnow() + timedelta(seconds=60 * int(row.attempts or 1))
     db.commit()
+    return final

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 from app.infrastructure.database.models import PayflowImportJobModel, PayflowImportRunModel
 from app.infrastructure.database.session import SessionLocal
@@ -40,6 +41,7 @@ def report_import_progress(
             job = db.query(PayflowImportJobModel).filter(PayflowImportJobModel.id == job_id).first()
             if job:
                 job.processed_count = max(0, int(processed))
+                job.heartbeat_at = datetime.now(timezone.utc)
                 if total is not None and int(total) >= 0:
                     job.total_count = int(total)
                 if job.status == "queued":

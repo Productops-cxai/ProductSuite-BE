@@ -2,11 +2,13 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.core import rate_limit
 from app.core.config import settings
 from app.core.openapi_tags import OPENAPI_TAGS, apply_openapi_tags
 from app.core.request_context import (
@@ -16,6 +18,7 @@ from app.core.request_context import (
 )
 from app.infrastructure.database.seeder import run_seeder
 from app.modules.identity.routes import router as identity_router
+from app.modules.payflow.compliance_routes import router as compliance_router
 from app.modules.payflow.routes import router as payflow_router
 from app.modules.payflow.sendgrid_webhook import router as sendgrid_webhook_router
 from app.modules.payflow.stripe_webhook import router as stripe_webhook_router
@@ -76,6 +79,30 @@ app.add_middleware(
 )
 
 
+def _client_address(request: Request) -> str:
+    """Caller's address for throttling. Behind a trusted proxy, the address it reports."""
+    if settings.TRUST_FORWARDED_FOR:
+        forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def throttle_guessable_endpoints(request: Request, call_next):
+    """Sign-in, password reset and public token pages: a few tries per address."""
+    bucket = rate_limit.bucket_for(request.method, request.url.path)
+    if bucket:
+        wait = rate_limit.check(bucket, _client_address(request))
+        if wait is not None:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many attempts. Please wait a moment and try again."},
+                headers={"Retry-After": str(wait)},
+            )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def capture_frontend_origin(request: Request, call_next):
     """Use browser Origin/Referer so invite links match localhost vs ngrok."""
@@ -98,11 +125,30 @@ uploads_dir.mkdir(parents=True, exist_ok=True)
 (uploads_dir / "avatars").mkdir(parents=True, exist_ok=True)
 (uploads_dir / "client-logos").mkdir(parents=True, exist_ok=True)
 (uploads_dir / "imports").mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+
+
+class PublicUploads(StaticFiles):
+    """Serve only the folders meant for browsers (avatars, client logos).
+
+    Import files (customer names, emails, balances) live under the same
+    ``uploads`` root and must never be downloadable by URL.
+    """
+
+    PUBLIC_FOLDERS = ("avatars/", "client-logos/")
+
+    async def get_response(self, path: str, scope):
+        normalized = path.replace("\\", "/").lstrip("/")
+        if not normalized.startswith(self.PUBLIC_FOLDERS):
+            raise HTTPException(status_code=404)
+        return await super().get_response(path, scope)
+
+
+app.mount("/uploads", PublicUploads(directory=str(uploads_dir)), name="uploads")
 
 app.include_router(identity_router)
 app.include_router(platform_router)
 app.include_router(payflow_router)
+app.include_router(compliance_router)
 app.include_router(sendgrid_webhook_router)
 app.include_router(twilio_webhook_router)
 app.include_router(stripe_webhook_router)

@@ -233,3 +233,13 @@ def user_token(client):
     )
     assert response.status_code == 200
     return response.json()["access_token"]
+
+
+@pytest.fixture(autouse=True)
+def fresh_rate_limits():
+    """Every test starts with empty throttle counters (they are per process)."""
+    from app.core import rate_limit
+
+    rate_limit.reset()
+    yield
+    rate_limit.reset()

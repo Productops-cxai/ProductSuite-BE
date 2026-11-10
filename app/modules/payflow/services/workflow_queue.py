@@ -44,7 +44,8 @@ def enqueue_job(
     )
     db.add(row)
     db.flush()
-    if notify:
+    # NOTIFY is PostgreSQL-only; other engines rely on the worker's periodic sweep.
+    if notify and db.get_bind().dialect.name == "postgresql":
         channel = settings.WORKFLOW_JOB_NOTIFY_CHANNEL or "workflow_jobs"
         db.execute(text(f"NOTIFY {channel}, :payload"), {"payload": str(row.id)})
     if commit:
@@ -71,6 +72,26 @@ def enqueue_gap_fill(db: Session, *, commit: bool = True) -> PayflowWorkflowJobM
         priority=60,
         commit=commit,
     )
+
+
+def enqueue_gap_fill_once(db: Session) -> PayflowWorkflowJobModel | None:
+    """Queue a gap-fill pass unless one is already waiting or running."""
+    waiting = (
+        db.query(PayflowWorkflowJobModel.id)
+        .filter(
+            PayflowWorkflowJobModel.job_type == PayflowWorkflowJobType.GAP_FILL.value,
+            PayflowWorkflowJobModel.status.in_(
+                [
+                    PayflowWorkflowJobStatus.PENDING.value,
+                    PayflowWorkflowJobStatus.RUNNING.value,
+                ]
+            ),
+        )
+        .first()
+    )
+    if waiting:
+        return None
+    return enqueue_gap_fill(db, commit=True)
 
 
 def enqueue_execute_step(

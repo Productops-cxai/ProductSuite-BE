@@ -19,6 +19,7 @@ from app.infrastructure.database.models import (
     PayflowHumanReviewModel,
     PayflowPortfolioModel,
     PayflowStrategyModel,
+    PayflowStrategyVersionModel,
     PayflowWorkflowJobModel,
     PayflowWorkflowRunModel,
     PayflowWorkflowStepRunModel,
@@ -48,7 +49,9 @@ from app.modules.payflow.services.workflow_queue import (
     enqueue_execute_step,
     enqueue_resume_run,
 )
-from app.modules.payflow.services.workflow_suggestion.segmenter import account_fits_segment
+from app.modules.payflow.services.workflow_suggestion.segmenter import (
+    match_account_to_segment,
+)
 from app.shared.enums import (
     PayflowCollectionStatus,
     PayflowCommStatus,
@@ -128,6 +131,39 @@ def _account_execution_block_reason(account: PayflowAccountModel) -> str | None:
     if status.lower() in {"on hold", "hold"}:
         return "Case is on hold"
     return None
+
+
+# Enroll: commit progress and refresh the job lock every N accounts.
+ENROLL_COMMIT_EVERY = 100
+
+# Run.last_error marker: a supervisor stopped the run from a review (rejected it, or
+# chose a different treatment), so the same workflow version must not pick the
+# account up again on the next import.
+REVIEW_STOPPED_PREFIX = "Human review"
+REVIEW_REJECTED_REASON = f"{REVIEW_STOPPED_PREFIX} rejected"
+
+
+def _account_enroll_block_reason(account: PayflowAccountModel) -> str | None:
+    """Accounts that must not start a workflow (same exclusions as AI segmenting)."""
+    if (account.account_status or "").strip().upper() == "CLOSED":
+        return "Account is closed — not enrolled"
+    if float(account.outstanding_balance or 0) <= 0:
+        return "Nothing owed — not enrolled"
+    if (account.collection_status or "") == PayflowCollectionStatus.HUMAN_REVIEW.value:
+        return "Case is in Human Review — not enrolled"
+    return None
+
+
+def _is_resumable_block(step_run: PayflowWorkflowStepRunModel) -> bool:
+    """A step stopped by a hold has not run yet, so it may run once the hold lifts.
+
+    "Prevent Communication" is different: that message is dropped for good and the
+    workflow already moved on.
+    """
+    if step_run.status != "blocked":
+        return False
+    result = step_run.result_json if isinstance(step_run.result_json, dict) else {}
+    return result.get("reason") != "Prevent Communication"
 
 
 # Headline ranking for grouped list rows (higher = more important to show).
@@ -253,6 +289,11 @@ class WorkflowExecutionService:
             run.status = PayflowWorkflowRunStatus.CANCELLED.value
             run.completed_at = _utcnow()
             cancel_pending_jobs_for_run(self.db, run.id)
+            if run.human_review_id:
+                # Nothing is left to approve: do not leave it in the supervisors' queue.
+                self._close_superseded_review(
+                    run.human_review_id, event="Workflow deactivated — review closed"
+                )
             cancelled += 1
             self.log_event(
                 event_type="run_cancelled",
@@ -339,27 +380,48 @@ class WorkflowExecutionService:
         keys = ("situation", "delinquency", "contact_state", "balance_band")
         return all((a.get(k) or "") == (b.get(k) or "") for k in keys)
 
-    def _close_superseded_review(self, review_id: int) -> None:
+    def _close_superseded_review(
+        self, review_id: int, *, event: str = "Superseded by regenerated workflow"
+    ) -> None:
         from app.infrastructure.database.models import PayflowHumanReviewModel
         from app.shared.enums import PayflowReviewStatus
 
         review = self.db.get(PayflowHumanReviewModel, review_id)
         if not review:
             return
-        if review.status in {
+        open_statuses = {
             PayflowReviewStatus.AWAITING_REVIEW.value,
             PayflowReviewStatus.ON_HOLD.value,
-        }:
-            review.status = PayflowReviewStatus.REJECTED.value
-            history = list(review.history or [])
-            history.append(
-                {
-                    "at": _utcnow().isoformat(),
-                    "event": "Superseded by regenerated workflow",
-                    "by": "Workflow worker",
-                }
+        }
+        if review.status not in open_statuses:
+            return
+        review.status = PayflowReviewStatus.REJECTED.value
+        history = list(review.history or [])
+        history.append({"at": _utcnow().isoformat(), "event": event, "by": "Workflow worker"})
+        review.history = history
+        self.db.flush()
+        # The review blocked the case; with it closed the case must be workable again,
+        # unless another review on the same account is still open.
+        if not review.account_id:
+            return
+        still_open = (
+            self.db.query(PayflowHumanReviewModel.id)
+            .filter(
+                PayflowHumanReviewModel.account_id == review.account_id,
+                PayflowHumanReviewModel.id != review.id,
+                PayflowHumanReviewModel.status.in_(list(open_statuses)),
             )
-            review.history = history
+            .first()
+        )
+        if still_open:
+            return
+        account = self.db.get(PayflowAccountModel, review.account_id)
+        if account is None:
+            return
+        account.human_review = False
+        if account.collection_status == PayflowCollectionStatus.HUMAN_REVIEW.value:
+            account.collection_status = PayflowCollectionStatus.ACTIVE.value
+        account.next_action = None
 
     def _notify_superseded(self, run: PayflowWorkflowRunModel, new_strategy: PayflowStrategyModel) -> None:
         try:
@@ -399,11 +461,34 @@ class WorkflowExecutionService:
             q = q.filter(PayflowAccountModel.portfolio_id.is_(None))
         accounts = q.all()
 
+        # Every Active workflow of this scope: an account belongs to the most
+        # specific one it fits, so overlapping workflows never fight over it.
+        scope_q = self.db.query(PayflowStrategyModel).filter(
+            PayflowStrategyModel.client_id == strategy.client_id,
+            PayflowStrategyModel.status == "Active",
+        )
+        if strategy.portfolio_id is not None:
+            scope_q = scope_q.filter(PayflowStrategyModel.portfolio_id == strategy.portfolio_id)
+        else:
+            scope_q = scope_q.filter(PayflowStrategyModel.portfolio_id.is_(None))
+        active_in_scope = scope_q.order_by(PayflowStrategyModel.id.asc()).all()
+        candidates = [{"id": s.id, "segment": s.segment or {}} for s in active_in_scope]
+        active_ids = {s.id for s in active_in_scope}
+
         enrolled = 0
         skipped = 0
         today = datetime.now(timezone.utc).date()
-        for account in accounts:
-            block = _account_execution_block_reason(account)
+        self._touch_job(job_id)
+        for index, account in enumerate(accounts, start=1):
+            # Save progress and keep the job lock fresh: a large portfolio can take
+            # longer than the stale window, and a reclaimed copy of this job must
+            # see the runs already created instead of creating them again.
+            if index % ENROLL_COMMIT_EVERY == 0:
+                self._touch_job(job_id)
+                self.db.commit()
+            block = _account_execution_block_reason(account) or _account_enroll_block_reason(
+                account
+            )
             if block:
                 skipped += 1
                 self.log_event(
@@ -417,23 +502,11 @@ class WorkflowExecutionService:
                     job_id=job_id,
                 )
                 continue
-            if strategy.segment and not account_fits_segment(account, strategy.segment, today):
+            best = match_account_to_segment(account, candidates, today)
+            if not best or best["id"] != strategy.id:
                 skipped += 1
                 continue
-            existing = (
-                self.db.query(PayflowWorkflowRunModel)
-                .filter(
-                    PayflowWorkflowRunModel.account_id == account.id,
-                    PayflowWorkflowRunModel.strategy_id == strategy.id,
-                    PayflowWorkflowRunModel.status.notin_(list(_TERMINAL)),
-                )
-                .first()
-            )
-            if existing:
-                skipped += 1
-                continue
-            # Cancel other active runs on this account for same portfolio scope.
-            other = (
+            open_runs = (
                 self.db.query(PayflowWorkflowRunModel)
                 .filter(
                     PayflowWorkflowRunModel.account_id == account.id,
@@ -441,10 +514,45 @@ class WorkflowExecutionService:
                 )
                 .all()
             )
-            for r in other:
+            # A run in flight on an Active workflow is never restarted: neither by
+            # this workflow again nor because the account drifted into another segment.
+            if any(r.strategy_id in active_ids for r in open_runs):
+                skipped += 1
+                continue
+            # This workflow version already ran to an end for the account: wait for
+            # a new version instead of starting again from the first message.
+            finished = (
+                self.db.query(PayflowWorkflowRunModel)
+                .filter(
+                    PayflowWorkflowRunModel.account_id == account.id,
+                    PayflowWorkflowRunModel.strategy_id == strategy.id,
+                    PayflowWorkflowRunModel.strategy_version == int(strategy.version or 1),
+                    or_(
+                        PayflowWorkflowRunModel.status.in_(
+                            [
+                                PayflowWorkflowRunStatus.COMPLETED.value,
+                                PayflowWorkflowRunStatus.FAILED.value,
+                            ]
+                        ),
+                        and_(
+                            PayflowWorkflowRunModel.status
+                            == PayflowWorkflowRunStatus.CANCELLED.value,
+                            PayflowWorkflowRunModel.last_error.like(f"{REVIEW_STOPPED_PREFIX}%"),
+                        ),
+                    ),
+                )
+                .first()
+            )
+            if finished:
+                skipped += 1
+                continue
+            # Left-over runs on workflows that are no longer Active.
+            for r in open_runs:
                 r.status = PayflowWorkflowRunStatus.SUPERSEDED.value
                 r.completed_at = _utcnow()
                 cancel_pending_jobs_for_run(self.db, r.id)
+                if r.human_review_id:
+                    self._close_superseded_review(r.human_review_id)
 
             entry = strategy.entry_node_id or (
                 (strategy.steps or [{}])[0].get("id") if strategy.steps else None
@@ -504,7 +612,53 @@ class WorkflowExecutionService:
         )
         return {"enrolled": enrolled, "skipped": skipped}
 
-    def gap_fill_active_strategies(self) -> dict[str, Any]:
+    def _touch_job(self, job_id: int | None) -> None:
+        """Heartbeat: tell the worker this job is alive so it is not reclaimed."""
+        if job_id is None:
+            return
+        job = self.db.get(PayflowWorkflowJobModel, job_id)
+        if job is not None:
+            job.locked_at = _utcnow()
+
+    def on_job_failed_for_good(self, job_id: int, error: str) -> None:
+        """A job used its last attempt: surface it and close the run it belonged to."""
+        job = self.db.get(PayflowWorkflowJobModel, job_id)
+        if not job:
+            return
+        self.log_event(
+            event_type="job_failed",
+            message=f"{job.job_type} job failed after {job.attempts} attempts: {error}"[:500],
+            level="error",
+            detail=error[:2000],
+            run_id=job.run_id,
+            account_id=job.account_id,
+            strategy_id=job.strategy_id,
+            job_id=job.id,
+            step_id=job.step_id,
+        )
+        run = self.db.get(PayflowWorkflowRunModel, job.run_id) if job.run_id else None
+        if run is not None and run.status not in _TERMINAL:
+            run.status = PayflowWorkflowRunStatus.FAILED.value
+            run.last_error = error[:1000]
+            run.completed_at = _utcnow()
+            cancel_pending_jobs_for_run(self.db, run.id)
+            account = self.db.get(PayflowAccountModel, run.account_id)
+            if account is not None:
+                account.next_action = "Workflow failed - needs attention"
+            self.log_event(
+                event_type="run_failed",
+                message=f"Run failed: step {job.step_id or 'unknown'} could not be executed",
+                level="error",
+                run_id=run.id,
+                account_id=run.account_id,
+                strategy_id=run.strategy_id,
+                job_id=job.id,
+                step_id=job.step_id,
+            )
+            self._notify_step_failed(run, error[:200])
+        self.db.commit()
+
+    def gap_fill_active_strategies(self, *, job_id: int | None = None) -> dict[str, Any]:
         """Enroll accounts that match Active strategies but have no open run."""
         strategies = (
             self.db.query(PayflowStrategyModel)
@@ -513,7 +667,7 @@ class WorkflowExecutionService:
         )
         totals = {"enrolled": 0, "skipped": 0}
         for s in strategies:
-            result = self.enroll_strategy(s.id)
+            result = self.enroll_strategy(s.id, job_id=job_id)
             totals["enrolled"] += int(result.get("enrolled") or 0)
             totals["skipped"] += int(result.get("skipped") or 0)
         return totals
@@ -580,6 +734,120 @@ class WorkflowExecutionService:
         return jobs
 
     # ------------------------------------------------------------------ execute / resume
+    def _run_steps(
+        self, run: PayflowWorkflowRunModel, strategy: PayflowStrategyModel
+    ) -> list[dict]:
+        """Steps of the workflow version this run was enrolled on.
+
+        Editing an Active workflow moves it to Under Review with a new version.
+        Runs already in flight keep the approved steps that were archived at that
+        moment, so unapproved edits (or AI rewrites) never reach a customer.
+        """
+        live = list(strategy.steps or [])
+        run_version = int(run.strategy_version or 1)
+        if strategy.status == "Active" and int(strategy.version or 1) == run_version:
+            return live
+        cached = getattr(self, "_steps_cache", None)
+        if cached is None:
+            cached = self._steps_cache = {}
+        key = (strategy.id, run_version)
+        if key not in cached:
+            snapshot = (
+                self.db.query(PayflowStrategyVersionModel)
+                .filter(
+                    PayflowStrategyVersionModel.strategy_id == strategy.id,
+                    PayflowStrategyVersionModel.version == run_version,
+                    PayflowStrategyVersionModel.status.in_(["Active", "Approved"]),
+                    PayflowStrategyVersionModel.steps.isnot(None),
+                )
+                .order_by(PayflowStrategyVersionModel.id.desc())
+                .first()
+            )
+            cached[key] = list(snapshot.steps or []) if snapshot else None
+        return cached[key] if cached[key] is not None else live
+
+    def resume_released_holds(self, *, limit: int = 200) -> dict[str, Any]:
+        """Wake runs whose hold has lifted (worker sweep).
+
+        A run parked by a case hold or a "Hold Action" rule has no scheduled job.
+        Rule edits, rule deactivation and balance changes raise no event, so the
+        worker re-checks parked runs and resumes those that are free to continue.
+        """
+        busy = (
+            self.db.query(PayflowWorkflowJobModel.id)
+            .filter(
+                PayflowWorkflowJobModel.run_id == PayflowWorkflowRunModel.id,
+                PayflowWorkflowJobModel.status.in_(
+                    [
+                        PayflowWorkflowJobStatus.PENDING.value,
+                        PayflowWorkflowJobStatus.RUNNING.value,
+                    ]
+                ),
+            )
+            .exists()
+        )
+        runs = (
+            self.db.query(PayflowWorkflowRunModel)
+            .filter(
+                PayflowWorkflowRunModel.status == PayflowWorkflowRunStatus.WAITING.value,
+                ~busy,
+            )
+            .order_by(PayflowWorkflowRunModel.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        resumed = 0
+        for run in runs:
+            last_sr = (
+                self.db.query(PayflowWorkflowStepRunModel)
+                .filter(PayflowWorkflowStepRunModel.run_id == run.id)
+                .order_by(PayflowWorkflowStepRunModel.id.desc())
+                .first()
+            )
+            if last_sr is None or not _is_resumable_block(last_sr):
+                continue
+            account = self.db.get(PayflowAccountModel, run.account_id)
+            strategy = self.db.get(PayflowStrategyModel, run.strategy_id)
+            if not account or not strategy:
+                continue
+            if _account_execution_block_reason(account):
+                continue
+            step = next(
+                (
+                    s
+                    for s in self._run_steps(run, strategy)
+                    if isinstance(s, dict) and s.get("id") == last_sr.step_id
+                ),
+                None,
+            )
+            channel = (_cfg(step).get("channel") or step.get("channel")) if step else None
+            blocking = self.rules.first_blocking_action(
+                account,
+                channel=channel if isinstance(channel, str) else None,
+                for_communication=(last_sr.kind == "Communication"),
+            )
+            if blocking and blocking.get("action") == "Hold Action":
+                continue
+            run.last_error = None
+            enqueue_resume_run(
+                self.db,
+                run_id=run.id,
+                step_id=run.current_step_id,
+                account_id=run.account_id,
+                commit=False,
+            )
+            self.log_event(
+                event_type="run_resumed",
+                message="Hold released — resume queued",
+                run_id=run.id,
+                account_id=run.account_id,
+                strategy_id=run.strategy_id,
+                step_id=last_sr.step_id,
+            )
+            resumed += 1
+        self.db.commit()
+        return {"examined": len(runs), "resumed": resumed}
+
     def resume_run(
         self,
         run_id: int,
@@ -596,7 +864,7 @@ class WorkflowExecutionService:
             return
         account = self.db.get(PayflowAccountModel, run.account_id)
         step_id = from_step_id or run.current_step_id
-        steps = {s.get("id"): s for s in (strategy.steps or []) if isinstance(s, dict) and s.get("id")}
+        steps = {s.get("id"): s for s in self._run_steps(run, strategy) if isinstance(s, dict) and s.get("id")}
         step = steps.get(step_id or "")
         step_kind = (step.get("kind") or "") if step else ""
         # After human review:
@@ -631,7 +899,19 @@ class WorkflowExecutionService:
                 target_id = step_id
                 reexecute_paused = True
         else:
-            if step:
+            last_sr = (
+                self.db.query(PayflowWorkflowStepRunModel)
+                .filter(
+                    PayflowWorkflowStepRunModel.run_id == run.id,
+                    PayflowWorkflowStepRunModel.step_id == step_id,
+                )
+                .order_by(PayflowWorkflowStepRunModel.id.desc())
+                .first()
+            )
+            if last_sr is not None and _is_resumable_block(last_sr):
+                # The step never ran (hold / governance): run it now.
+                target_id = step_id
+            elif step:
                 target_id = step.get("next") or _cfg(step).get("next")
             if not target_id:
                 target_id = step_id
@@ -739,7 +1019,7 @@ class WorkflowExecutionService:
             .first()
         )
         if prior_ok is not None:
-            allow_resume = (
+            allow_resume = _is_resumable_block(prior_ok) or (
                 after_human_review and prior_ok.status == "paused_human_review"
             ) or (
                 after_comm_delay
@@ -804,7 +1084,7 @@ class WorkflowExecutionService:
                             next(
                                 (
                                     s.get("kind") or ""
-                                    for s in (strategy.steps or [])
+                                    for s in self._run_steps(run, strategy)
                                     if isinstance(s, dict) and s.get("id") == step_id
                                 ),
                                 "",
@@ -822,7 +1102,7 @@ class WorkflowExecutionService:
             self.db.commit()
             return
 
-        steps = {s.get("id"): s for s in (strategy.steps or []) if isinstance(s, dict) and s.get("id")}
+        steps = {s.get("id"): s for s in self._run_steps(run, strategy) if isinstance(s, dict) and s.get("id")}
         step = steps.get(step_id)
         if not step:
             self._fail_run(run, f"Unknown step {step_id}", job_id=job_id)
@@ -890,6 +1170,7 @@ class WorkflowExecutionService:
                 step_run,
                 steps,
                 after_comm_delay=after_comm_delay,
+                after_human_review=after_human_review,
             )
             if run.status == PayflowWorkflowRunStatus.PAUSED_HUMAN_REVIEW.value:
                 self.db.commit()
@@ -1043,6 +1324,19 @@ class WorkflowExecutionService:
                     strategy_id=strategy.id,
                     commit=False,
                 )
+            else:
+                run.status = PayflowWorkflowRunStatus.COMPLETED.value
+                run.completed_at = _utcnow()
+                account.next_action = None
+                self.log_event(
+                    event_type="run_completed",
+                    message="Run completed — last message was prevented by a governance rule",
+                    run_id=run.id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    job_id=job_id,
+                    step_id=step.get("id"),
+                )
             return True
 
         if action == "Hold Action":
@@ -1177,6 +1471,7 @@ class WorkflowExecutionService:
         *,
         event_context: dict[str, Any] | None = None,
         after_comm_delay: bool = False,
+        after_human_review: bool = False,
     ) -> str | None:
         kind = step.get("kind") or ""
         cfg = _cfg(step)
@@ -1212,34 +1507,67 @@ class WorkflowExecutionService:
             return None
 
         if kind == "Communication":
+            deferred_until = None
             if not after_comm_delay:
                 deferred_until = self._communication_defer_until(
                     cfg, step, strategy, account=account, run=run
                 )
-                if deferred_until is not None:
-                    run.status = PayflowWorkflowRunStatus.WAITING.value
-                    step_run.status = "scheduled"
-                    step_run.result_json = {
-                        "wait_until": deferred_until.isoformat(),
-                        "deferred_send": True,
-                        "next": step.get("id"),
-                        "timezone": self._wait_timezone_name(cfg, step, strategy),
-                    }
-                    enqueue_execute_step(
-                        self.db,
-                        run_id=run.id,
-                        step_id=step.get("id") or "",
-                        account_id=account.id,
-                        strategy_id=strategy.id,
-                        scheduled_at=deferred_until,
-                        payload={"after_comm_delay": True},
-                        commit=False,
-                    )
-                    account.next_action = (
-                        f"Scheduled communication {deferred_until.isoformat()}"
-                    )
-                    return None
-            self._send_communication(run, account, strategy, step, step_run)
+            # Outside the client's send window: hold the message until the window
+            # opens instead of logging it as skipped and moving on without it.
+            window_opens = self._send_window_opens_at(account)
+            if window_opens is not None and (
+                deferred_until is None or window_opens > deferred_until
+            ):
+                deferred_until = window_opens
+            # Jurisdiction compliance rules, asked before the message is prepared.
+            verdict, permitted_at = self._compliance_gate(
+                account, cfg, step, review_approved=after_human_review
+            )
+            if verdict == "review":
+                from app.modules.payflow.services.review_service import (
+                    COMPLIANCE_REVIEW_REASON,
+                )
+
+                self._pause_for_human_review(
+                    run,
+                    account,
+                    strategy,
+                    step,
+                    step_run,
+                    rule_id=None,
+                    reason=COMPLIANCE_REVIEW_REASON,
+                )
+                return None
+            if verdict == "defer" and permitted_at is not None and (
+                deferred_until is None or permitted_at > deferred_until
+            ):
+                deferred_until = permitted_at
+            if deferred_until is not None:
+                run.status = PayflowWorkflowRunStatus.WAITING.value
+                step_run.status = "scheduled"
+                step_run.result_json = {
+                    "wait_until": deferred_until.isoformat(),
+                    "deferred_send": True,
+                    "next": step.get("id"),
+                    "timezone": self._wait_timezone_name(cfg, step, strategy),
+                }
+                enqueue_execute_step(
+                    self.db,
+                    run_id=run.id,
+                    step_id=step.get("id") or "",
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    scheduled_at=deferred_until,
+                    payload={"after_comm_delay": True},
+                    commit=False,
+                )
+                account.next_action = (
+                    f"Scheduled communication {deferred_until.isoformat()}"
+                )
+                return None
+            self._send_communication(
+                run, account, strategy, step, step_run, review_approved=after_human_review
+            )
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
             return step.get("next") or cfg.get("next")
 
@@ -1320,6 +1648,63 @@ class WorkflowExecutionService:
 
         run.status = PayflowWorkflowRunStatus.ACTIVE.value
         return step.get("next") or cfg.get("next")
+
+    def _compliance_gate(
+        self,
+        account: PayflowAccountModel,
+        cfg: dict,
+        step: dict,
+        *,
+        review_approved: bool,
+    ) -> tuple[str, datetime | None]:
+        """Ask the compliance engine before a message is prepared.
+
+        Returns ("ok", None), ("defer", when it is next permitted) or ("review", None).
+        A block is "ok" here on purpose: the send itself refuses it and records the
+        suppressed message, so the audit trail shows what was not sent and why.
+        """
+        from app.modules.payflow.services.compliance.evaluation_service import (
+            ComplianceEvaluationService,
+        )
+
+        service = ComplianceEvaluationService(self.db)
+        if not service.has_active_rules(account.client_id):
+            return "ok", None
+        if is_contact_step(cfg, step):
+            channels = ["Email", "SMS"]
+        else:
+            channels = [(cfg.get("channel") or step.get("channel") or "Email").strip()]
+        results = [
+            service.evaluate_account(account, channel=channel, record=False) for channel in channels
+        ]
+        if any(
+            r.decision == "ALLOW" or (r.decision == "REVIEW_REQUIRED" and review_approved)
+            for r in results
+        ):
+            return "ok", None
+        times = [
+            r.next_permitted_at
+            for r in results
+            if r.decision == "RESCHEDULE" and r.next_permitted_at is not None
+        ]
+        if times:
+            return "defer", min(times)
+        # Needs a person: a review was asked for, or no permitted time could be found.
+        if any(r.decision in {"REVIEW_REQUIRED", "RESCHEDULE"} for r in results):
+            return ("ok", None) if review_approved else ("review", None)
+        return "ok", None
+
+    def _send_window_opens_at(self, account: PayflowAccountModel) -> datetime | None:
+        """When the client's send window next opens, or None while it is open."""
+        from app.modules.payflow.services.communication_service import _evaluate_send_window
+
+        client = account.client
+        if client is None and account.client_id:
+            client = self.db.get(PayflowClientModel, account.client_id)
+        window = _evaluate_send_window(client)
+        if window.get("ok"):
+            return None
+        return window.get("next_eligible_at")
 
     def _wait_timezone_name(
         self, cfg: dict, step: dict, strategy: PayflowStrategyModel
@@ -1620,6 +2005,8 @@ class WorkflowExecutionService:
         strategy: PayflowStrategyModel,
         step: dict,
         step_run: PayflowWorkflowStepRunModel,
+        *,
+        review_approved: bool = False,
     ) -> None:
         cfg = _cfg(step)
         purpose = cfg.get("purpose") or step.get("purpose") or "Payment Reminder"
@@ -1635,6 +2022,7 @@ class WorkflowExecutionService:
                 step_run,
                 purpose=str(purpose),
                 payment_link=payment_link,
+                review_approved=review_approved,
             )
             return
 
@@ -1652,6 +2040,7 @@ class WorkflowExecutionService:
             payment_link=payment_link,
             run_id=run.id,
             client_id=run.client_id,
+            compliance_review_approved=review_approved,
         )
         self._record_send_result(run, account, strategy, step_run, channel=channel, result=result)
 
@@ -1665,6 +2054,7 @@ class WorkflowExecutionService:
         *,
         purpose: str,
         payment_link: str,
+        review_approved: bool = False,
     ) -> None:
         cfg = _cfg(step)
         channels = preferred_contact_channels(self.db, account)
@@ -1691,6 +2081,7 @@ class WorkflowExecutionService:
                 payment_link=payment_link,
                 run_id=run.id,
                 client_id=run.client_id,
+                compliance_review_approved=review_approved,
             )
             attempt = {**result, "attempt_channel": channel}
             attempts.append(attempt)
@@ -2490,7 +2881,7 @@ class WorkflowExecutionService:
         strategy = self.db.get(PayflowStrategyModel, run.strategy_id)
         steps_by_id = {
             s.get("id"): s
-            for s in ((strategy.steps if strategy else None) or [])
+            for s in (self._run_steps(run, strategy) if strategy else [])
             if isinstance(s, dict) and s.get("id")
         }
         step_rows = (
@@ -2666,6 +3057,25 @@ class WorkflowExecutionService:
             except Exception:  # noqa: BLE001
                 logger.exception("payment failure exception raise failed")
             return {"advanced": 0, "exception": "payment_processing_issue"}
+        if status_raw in {"plan_missed", "auto_charge_paused"}:
+            # A missed instalment is the opposite of a payment: let conditions and
+            # held runs react, but record no money and credit no message with it.
+            ctx = {**payload, "has_payment": False, "payment_received": False, "plan_missed": True}
+            advanced = 0
+            for run in self._open_runs_for_account(account_id):
+                if self._advance_run_from_event(run, event="payment", context=ctx):
+                    advanced += 1
+                self.log_event(
+                    event_type="payment_event",
+                    message="Payment plan instalment missed — workflow reassessed",
+                    level="warn",
+                    run_id=run.id,
+                    account_id=account_id,
+                    strategy_id=run.strategy_id,
+                )
+            if commit:
+                self.db.commit()
+            return {"advanced": advanced, "plan_missed": True}
         if payload.get("amount") is not None:
             try:
                 account.last_payment_amount = float(payload["amount"])
@@ -2790,6 +3200,11 @@ class WorkflowExecutionService:
                     strategy_id=run.strategy_id,
                 )
                 affected += 1
+            elif block and run.status == PayflowWorkflowRunStatus.PAUSED_HUMAN_REVIEW.value:
+                # Still the supervisor's call. Their decision resumes the run, and the
+                # resumed step then stops on the hold until it is released.
+                run.last_error = block
+                affected += 1
             elif block:
                 run.status = PayflowWorkflowRunStatus.WAITING.value
                 run.last_error = block
@@ -2882,7 +3297,7 @@ class WorkflowExecutionService:
             return False
         steps = {
             s.get("id"): s
-            for s in (strategy.steps or [])
+            for s in self._run_steps(run, strategy)
             if isinstance(s, dict) and s.get("id")
         }
         step = steps.get(run.current_step_id)
@@ -2978,7 +3393,13 @@ class WorkflowExecutionService:
             return True
         return False
 
-    def on_human_review_decided(self, review_id: int, *, continue_workflow: bool) -> None:
+    def on_human_review_decided(
+        self,
+        review_id: int,
+        *,
+        continue_workflow: bool,
+        stop_reason: str | None = None,
+    ) -> None:
         run = (
             self.db.query(PayflowWorkflowRunModel)
             .filter(
@@ -3007,6 +3428,9 @@ class WorkflowExecutionService:
             else:
                 run.status = PayflowWorkflowRunStatus.CANCELLED.value
                 run.completed_at = _utcnow()
+                # Marker read by enroll: this workflow version is done for the account.
+                run.last_error = (stop_reason or REVIEW_REJECTED_REASON)[:1000]
+                run.human_review_id = None
                 cancel_pending_jobs_for_run(self.db, run.id)
                 self.log_event(
                     event_type="human_review_cancelled_run",

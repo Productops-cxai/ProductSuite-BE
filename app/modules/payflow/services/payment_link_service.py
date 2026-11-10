@@ -60,7 +60,10 @@ class PayflowPaymentLinkService:
         row.events = events[-60:]
 
     def _refresh_expiry(self, row: PayflowPaymentLinkModel) -> PayflowPaymentLinkModel:
-        if row.status == PayflowPaymentLinkStatus.ACTIVE.value and row.expires_at <= _utcnow():
+        expires_at = row.expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)  # driver returned it without a zone
+        if row.status == PayflowPaymentLinkStatus.ACTIVE.value and expires_at <= _utcnow():
             row.status = PayflowPaymentLinkStatus.EXPIRED.value
             self._append_event(row, "Expired", "Past expiry window")
         return row

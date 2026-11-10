@@ -468,6 +468,18 @@ class PayflowAccountModel(Base):
     hold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     email_consent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     sms_opt_out: Mapped[bool | None] = mapped_column(Boolean, default=False, nullable=True)
+    # CRM vs PayFlow balance reconciliation (see import_service._reconcile_balance):
+    # the outstanding balance the CRM file last reported, and the moment up to which
+    # the CRM's number is known to include payments taken through PayFlow.
+    # Compliance (jurisdiction rules): the customer's own time zone when known, and
+    # the suppression / consent record an operator keeps (cease-communication,
+    # attorney, dispute, workplace, SMS consent, inconvenient times, notices …).
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    compliance_profile: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    crm_outstanding_balance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    crm_posted_through: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # AI case reassessment history: recommendations + HR decisions (additive JSON).
     ai_decision_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
     source_updated_at: Mapped[datetime | None] = mapped_column(
@@ -552,6 +564,8 @@ class PayflowImportJobModel(Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
     )
+    # Last sign of life (start + every progress report); stale = cut off by a restart.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
@@ -1630,6 +1644,205 @@ class SmsLogModel(Base):
     client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compliance rules (jurisdiction-based): catalogue, versions, calendar, audit,
+# client mapping, counted contact events.
+# ---------------------------------------------------------------------------
+
+
+class PayflowComplianceRuleModel(Base):
+    """One jurisdiction-specific compliance rule (current version)."""
+
+    __tablename__ = "payflow_compliance_rules"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_payflow_compliance_rule_code"),
+        Index("ix_payflow_compliance_rules_scope", "status", "country", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # UI group (9) and the story's rule category / type (JUR-01 … JUR-25).
+    category: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    rule_type: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    # Classification: Mandatory | Client Configurable | Advisory.
+    enforcement: Mapped[str] = mapped_column(String(32), nullable=False, default="Mandatory")
+    regulatory_authority: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    legal_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    jurisdiction_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    country: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    state: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    region: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    city: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    postal: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    collector_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    debt_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="All Channels")
+    logic: Mapped[str] = mapped_column(String(8), nullable=False, default="AND")
+    conditions: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, default="Block")
+    override_policy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    effective_from: Mapped[date | None] = mapped_column(Date, nullable=True)
+    effective_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Draft", index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Null = applies to every client; set = an extra rule for that client only.
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    is_library: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    submitted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    version_rows = relationship(
+        "PayflowComplianceRuleVersionModel",
+        back_populates="rule",
+        cascade="all, delete-orphan",
+        order_by="PayflowComplianceRuleVersionModel.id.desc()",
+    )
+
+
+class PayflowComplianceRuleVersionModel(Base):
+    """Immutable snapshot of a rule at one version (history is never overwritten)."""
+
+    __tablename__ = "payflow_compliance_rule_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rule_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("payflow_compliance_rules.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    event: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    change_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    rule = relationship("PayflowComplianceRuleModel", back_populates="version_rows")
+
+
+class PayflowComplianceHolidayModel(Base):
+    """Blackout date for a country (optionally one state / province)."""
+
+    __tablename__ = "payflow_compliance_holidays"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    holiday_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    recurring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    country: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PayflowComplianceAuditModel(Base):
+    """Who changed or evaluated what, with before / after values."""
+
+    __tablename__ = "payflow_compliance_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # rule | holiday | client_mapping | account_profile | evaluation
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    entity_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    rule_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    rule_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    account_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    event: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    before: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    approval: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    actor_name: Mapped[str] = mapped_column(String(255), nullable=False, default="PayFlow")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+class PayflowClientComplianceRuleModel(Base):
+    """A compliance rule associated with a client; optional rules can be switched off."""
+
+    __tablename__ = "payflow_client_compliance_rules"
+    __table_args__ = (
+        UniqueConstraint("client_id", "rule_id", name="uq_payflow_client_compliance_rule"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    rule_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("payflow_compliance_rules.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="auto")
+    updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PayflowComplianceEventModel(Base):
+    """A counted contact (attempt, completed contact, conversation).
+
+    ``event_key`` is unique: the same provider event delivered twice is stored
+    once, so it is never counted twice toward a frequency limit.
+    """
+
+    __tablename__ = "payflow_compliance_events"
+    __table_args__ = (
+        UniqueConstraint("event_key", name="uq_payflow_compliance_event_key"),
+        Index("ix_payflow_compliance_events_account", "account_id", "occurred_at"),
+        Index("ix_payflow_compliance_events_debtor", "client_id", "debtor_ref", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    client_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    debtor_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="attempted")
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 

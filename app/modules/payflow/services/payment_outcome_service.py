@@ -21,6 +21,7 @@ from app.infrastructure.database.models import (
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
 from app.shared.enums import (
+    PayflowCollectionStatus,
     PayflowPaymentInstallmentStatus,
     PayflowPaymentOptionType,
     PayflowPaymentPlanStatus,
@@ -341,8 +342,35 @@ class PayflowPaymentOutcomeService:
         detail: str | None = None,
     ) -> None:
         plan.consecutive_charge_failures = int(plan.consecutive_charge_failures or 0) + 1
+        first_failure = (
+            installment is not None
+            and installment.status != PayflowPaymentInstallmentStatus.FAILED.value
+        )
         if installment is not None:
             installment.status = PayflowPaymentInstallmentStatus.FAILED.value
+        # An instalment that could not be collected is a missed instalment: the plan
+        # is behind and the workflow must hear about it (once, not on every retry).
+        if plan.status == PayflowPaymentPlanStatus.ACTIVE.value:
+            plan.status = PayflowPaymentPlanStatus.OVERDUE.value
+        if first_failure:
+            try:
+                from app.modules.payflow.services.workflow_execution_service import (
+                    WorkflowExecutionService,
+                )
+
+                WorkflowExecutionService(self.db).on_payment_event(
+                    plan.account_id,
+                    {
+                        "status": "plan_missed",
+                        "completed": False,
+                        "payment_plan": True,
+                        "plan_id": plan.public_id,
+                        "reason": "Payment plan instalment could not be collected",
+                    },
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("workflow missed-instalment event failed plan=%s", plan.public_id)
         events = list(plan.events or [])
         events.append(
             {
@@ -467,6 +495,98 @@ class PayflowPaymentOutcomeService:
         )
         plan.events = events[-60:]
 
+    def _plan_for_staff(self, user: UserModel, plan_public_id: str) -> PayflowPaymentPlanModel:
+        plan = (
+            self.db.query(PayflowPaymentPlanModel)
+            .filter(PayflowPaymentPlanModel.public_id == plan_public_id)
+            .first()
+        )
+        if not plan:
+            raise NotFoundError("Payment plan not found")
+        self._assert_case_view(user, plan.client_id)
+        if not self.access.is_operations_admin(user) and not self.access.can(
+            user, "send_communications", plan.client_id
+        ):
+            raise ForbiddenError("Not authorized to change payment plans")
+        return plan
+
+    def cancel_plan(
+        self, user: UserModel, plan_public_id: str, *, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Stop a payment plan: no more automatic charges, remaining instalments waived."""
+        plan = self._plan_for_staff(user, plan_public_id)
+        if plan.status in {
+            PayflowPaymentPlanStatus.COMPLETED.value,
+            PayflowPaymentPlanStatus.CANCELLED.value,
+        }:
+            raise ValidationAppError(f"Payment plan is already {plan.status}")
+        now = _utcnow()
+        plan.status = PayflowPaymentPlanStatus.CANCELLED.value
+        plan.cancelled_at = now
+        plan.auto_charge_enabled = False
+        plan.next_due_date = None
+        for inst in plan.installments:
+            if inst.status != PayflowPaymentInstallmentStatus.PAID.value:
+                inst.status = PayflowPaymentInstallmentStatus.WAIVED.value
+        detail = f"Cancelled by {user.full_name}" + (f": {reason.strip()}" if reason else "")
+        events = list(plan.events or [])
+        events.append({"at": now.isoformat(), "label": "Plan Cancelled", "detail": detail[:240]})
+        plan.events = events[-60:]
+        account = self.db.get(PayflowAccountModel, plan.account_id)
+        if account is not None:
+            previous = account.collection_status
+            if (
+                previous == PayflowCollectionStatus.PAYMENT_PLAN.value
+                and float(account.outstanding_balance or 0) > 0
+            ):
+                account.collection_status = PayflowCollectionStatus.ACTIVE.value
+            self._append_account_timeline(account, "Payment Plan Cancelled", detail[:240])
+            if account.collection_status != previous:
+                try:
+                    from app.modules.payflow.services.workflow_execution_service import (
+                        WorkflowExecutionService,
+                    )
+
+                    WorkflowExecutionService(self.db).on_case_status_changed(
+                        account.id,
+                        previous=previous,
+                        new=account.collection_status,
+                        commit=False,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("workflow event failed after plan cancel plan=%s", plan.public_id)
+        self.db.commit()
+        self.db.refresh(plan)
+        return self.serialize_plan(plan)
+
+    def set_plan_auto_charge(
+        self, user: UserModel, plan_public_id: str, *, enabled: bool
+    ) -> dict[str, Any]:
+        """Pause or resume automatic instalment charges without cancelling the plan."""
+        plan = self._plan_for_staff(user, plan_public_id)
+        if plan.status in {
+            PayflowPaymentPlanStatus.COMPLETED.value,
+            PayflowPaymentPlanStatus.CANCELLED.value,
+        }:
+            raise ValidationAppError(f"Payment plan is {plan.status}")
+        if enabled and not (plan.stripe_customer_id and plan.stripe_payment_method_id):
+            raise ValidationAppError("No saved payment method on this plan")
+        plan.auto_charge_enabled = bool(enabled)
+        if enabled:
+            plan.consecutive_charge_failures = 0
+        events = list(plan.events or [])
+        events.append(
+            {
+                "at": _utcnow().isoformat(),
+                "label": "Auto-charge Resumed" if enabled else "Auto-charge Paused",
+                "detail": f"By {user.full_name}",
+            }
+        )
+        plan.events = events[-60:]
+        self.db.commit()
+        self.db.refresh(plan)
+        return self.serialize_plan(plan)
+
     def refresh_overdue_plans(self, account_id: int | None = None) -> int:
         """Mark missed instalments Overdue; emit workflow event. No auto-charge."""
         today = _utcnow().date()
@@ -550,9 +670,26 @@ class PayflowPaymentOutcomeService:
         if existing_adj:
             return existing_adj
 
-        amt = _money(amount if amount is not None else original.amount)
-        if amt <= 0 or amt > _money(original.amount) + 0.001:
-            raise ValidationAppError("Invalid refund/reversal amount")
+        already_returned = _money(
+            sum(
+                float(row.amount or 0)
+                for row in self.db.query(PayflowPaymentTransactionModel)
+                .filter(
+                    PayflowPaymentTransactionModel.related_transaction_public_id
+                    == original.public_id,
+                    PayflowPaymentTransactionModel.direction
+                    != PayflowPaymentTxnDirection.PAYMENT.value,
+                )
+                .all()
+            )
+        )
+        refundable = _money(_money(original.amount) - already_returned)
+        amt = _money(amount if amount is not None else refundable)
+        if amt <= 0 or amt > refundable + 0.001:
+            raise ValidationAppError(
+                "Invalid refund/reversal amount: more than is left of the original payment"
+            )
+        fully_returned = amt >= refundable - 0.001
 
         account = self.db.get(PayflowAccountModel, original.account_id)
         if not account:
@@ -575,11 +712,13 @@ class PayflowPaymentOutcomeService:
             if direction_norm == PayflowPaymentTxnDirection.REFUND.value
             else PayflowPaymentTxnStatus.REVERSED.value
         )
-        # Mark original as refunded/reversed for display (keep amount history).
-        if direction_norm == PayflowPaymentTxnDirection.REFUND.value:
-            original.status = PayflowPaymentTxnStatus.REFUNDED.value
-        else:
-            original.status = PayflowPaymentTxnStatus.REVERSED.value
+        # Mark the original refunded/reversed only once all of it went back; a part
+        # refund leaves it a (smaller) successful payment.
+        if fully_returned:
+            if direction_norm == PayflowPaymentTxnDirection.REFUND.value:
+                original.status = PayflowPaymentTxnStatus.REFUNDED.value
+            else:
+                original.status = PayflowPaymentTxnStatus.REVERSED.value
 
         adj = PayflowPaymentTransactionModel(
             public_id=f"txn_{uuid.uuid4().hex[:20]}",

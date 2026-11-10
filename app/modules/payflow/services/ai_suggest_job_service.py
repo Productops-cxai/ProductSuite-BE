@@ -219,9 +219,24 @@ class AiSuggestJobService:
             logger.info("AI suggest job=%s not pending (%s)", job_id, job.status)
             return
 
-        job.status = STATUS_RUNNING
-        job.started_at = _utcnow()
+        # Claim in one statement: the API process and the worker's recovery sweep
+        # may both pick the same pending job; only one may run it.
+        claimed = (
+            self.db.query(PayflowAiSuggestJobModel)
+            .filter(
+                PayflowAiSuggestJobModel.id == job_id,
+                PayflowAiSuggestJobModel.status == STATUS_PENDING,
+            )
+            .update(
+                {"status": STATUS_RUNNING, "started_at": _utcnow()},
+                synchronize_session=False,
+            )
+        )
         self.db.commit()
+        if not claimed:
+            logger.info("AI suggest job=%s already claimed elsewhere", job_id)
+            return
+        self.db.refresh(job)
 
         t0 = time.perf_counter()
         try:
