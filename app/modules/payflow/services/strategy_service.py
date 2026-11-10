@@ -40,6 +40,10 @@ STRATEGY_STEP_KINDS = [
     "Outcome",
 ]
 
+# Fixed channels for manual steps. AI contact steps leave channel unset (worker picks).
+# Keep the string in sync with workflow_suggestion.config.CONTACT_CHANNEL (cannot import —
+# config.py imports this module).
+CONTACT_CHANNEL = "Email + SMS"
 CHANNELS = ["Email", "SMS"]
 MESSAGE_PURPOSES = [
     "Payment Reminder",
@@ -164,6 +168,16 @@ MESSAGE_TEMPLATES = [
         ),
     },
     {
+        "id": "sms-firm",
+        "name": "SMS — Firm Reminder",
+        "channel": "SMS",
+        "purpose": "Firm Reminder",
+        "body": (
+            "{{brand_name}}: {{outstanding_balance}} on {{account_reference}} is still unpaid. "
+            "Pay or set up a plan now: {{payment_link}}. Reply STOP to opt out."
+        ),
+    },
+    {
         "id": "em-plan",
         "name": "Email — Payment Plan Option",
         "channel": "Email",
@@ -205,6 +219,18 @@ MESSAGE_TEMPLATES = [
         "body": (
             "{{brand_name}}: a reminder that {{outstanding_balance}} is outstanding. "
             "Pay or set up a plan: {{payment_link}}. Reply STOP to opt out."
+        ),
+    },
+    {
+        "id": "em-promise",
+        "name": "Email — Promise-to-Pay Reminder",
+        "channel": "Email",
+        "purpose": "Promise-to-Pay Reminder",
+        "subject": "Reminder: your promised payment is due",
+        "body": (
+            "Hi {{first_name}},\n\nThis is a reminder that your promised payment of "
+            "{{promise_amount}} for account {{account_reference}} is due on {{promise_date}}.\n\n"
+            "Pay securely here: {{payment_link}}\n\n{{brand_name}}"
         ),
     },
     {
@@ -323,6 +349,10 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         "note",
         "review_reason",
         "template_id",
+        "subject",
+        "body",
+        "sms_body",
+        "tone",
     ):
         if key in raw and raw[key] is not None and key not in cfg:
             cfg[key] = raw[key]
@@ -330,6 +360,8 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     aliases = {
         "referenceEvent": "reference_event",
         "templateId": "template_id",
+        "smsBody": "sms_body",
+        "reviewReason": "review_reason",
     }
     for camel, snake in aliases.items():
         if camel in raw and raw[camel] is not None and snake not in cfg:
@@ -346,6 +378,31 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
                 "(e.g. 3 Days After Due Date), not Day N wording"
             )
 
+    # Contact-step contract: "Email + SMS" (or empty) means no fixed channel / template.
+    # Prefer explicit config.channel (including null) over a stale top-level channel.
+    if kind == "Communication":
+        if "channel" in cfg:
+            channel_val = cfg.get("channel")
+        else:
+            channel_val = raw.get("channel")
+        channel_norm = str(channel_val or "").strip()
+        if (not channel_norm) or channel_norm == CONTACT_CHANNEL:
+            cfg.pop("channel", None)
+            cfg.pop("template_id", None)
+            channel_val = None
+        else:
+            cfg["channel"] = channel_norm
+            channel_val = channel_norm
+    else:
+        channel_val = cfg.get("channel") or raw.get("channel")
+
+    if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
+        note = (cfg.get("note") or raw.get("detail") or "").strip()
+        if note:
+            from app.modules.payflow.services.review_service import normalize_review_reason
+
+            cfg["review_reason"] = normalize_review_reason(note)
+
     origin = (raw.get("origin") or default_origin or PayflowStrategyOrigin.HUMAN_CREATED.value).strip()
     step: dict[str, Any] = {
         "id": step_id,
@@ -357,7 +414,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         "next": raw.get("next"),
         "yes": raw.get("yes"),
         "no": raw.get("no"),
-        "channel": cfg.get("channel") or raw.get("channel"),
+        "channel": channel_val,
         "purpose": cfg.get("purpose") or raw.get("purpose"),
         "detail": raw.get("detail"),
     }
@@ -395,6 +452,13 @@ def _normalize_steps(
 
 
 def _step_stats(steps: list[dict]) -> dict[str, int]:
+    def _comm_channel(step: dict) -> str:
+        return str(_cfg(step).get("channel") or step.get("channel") or "").strip()
+
+    def _is_contact(step: dict) -> bool:
+        ch = _comm_channel(step)
+        return step.get("kind") == "Communication" and (not ch or ch == CONTACT_CHANNEL)
+
     return {
         "steps": len(steps),
         "branches": sum(1 for s in steps if s.get("kind") == "Condition"),
@@ -402,13 +466,13 @@ def _step_stats(steps: list[dict]) -> dict[str, int]:
             1
             for s in steps
             if s.get("kind") == "Communication"
-            and ((_cfg(s).get("channel") or s.get("channel")) == "Email")
+            and (_is_contact(s) or _comm_channel(s) == "Email")
         ),
         "sms": sum(
             1
             for s in steps
             if s.get("kind") == "Communication"
-            and ((_cfg(s).get("channel") or s.get("channel")) == "SMS")
+            and (_is_contact(s) or _comm_channel(s) == "SMS")
         ),
         "payment_actions": sum(1 for s in steps if s.get("kind") == "Payment Action"),
         "case_actions": sum(1 for s in steps if s.get("kind") == "Case Action"),
@@ -473,7 +537,7 @@ def _clean_note(note: str | None) -> str | None:
 
 def _catalog() -> dict[str, Any]:
     return {
-        "channels": CHANNELS,
+        "channels": [CONTACT_CHANNEL, *CHANNELS],
         "message_purposes": MESSAGE_PURPOSES,
         "reference_events": REFERENCE_EVENTS,
         "time_units": TIME_UNITS,

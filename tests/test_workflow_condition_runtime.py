@@ -169,6 +169,44 @@ def test_outcome_paid_in_full_updates_account(db_session):
     assert applied["outcome"] == "Paid In Full"
 
 
+def test_path_ending_without_outcome_completes_run(db_session):
+    """Case Action / Communication with no next must complete the run (not leave it Active)."""
+    client, account = _client_account(db_session)
+    strategy = PayflowStrategyModel(
+        code="wf-end",
+        name="End WF",
+        client_id=client.id,
+        status="Active",
+        steps=[
+            {
+                "id": "s1",
+                "kind": "Case Action",
+                "title": "Close Case",
+                "config": {"action": "Close Case"},
+                "next": None,
+            }
+        ],
+        entry_node_id="s1",
+    )
+    db_session.add(strategy)
+    db_session.flush()
+    run = PayflowWorkflowRunModel(
+        account_id=account.id,
+        strategy_id=strategy.id,
+        client_id=client.id,
+        status=PayflowWorkflowRunStatus.ACTIVE.value,
+        current_step_id="s1",
+        strategy_version=1,
+    )
+    db_session.add(run)
+    db_session.commit()
+
+    WorkflowExecutionService(db_session).execute_step(run.id, "s1")
+    db_session.refresh(run)
+    assert run.status == PayflowWorkflowRunStatus.COMPLETED.value
+    assert run.completed_at is not None
+
+
 def test_terminal_human_review_completes_run(db_session):
     client, account = _client_account(db_session)
     strategy = PayflowStrategyModel(

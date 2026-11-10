@@ -34,6 +34,14 @@ from app.modules.payflow.services.workflow_condition_runtime import (
     resolve_reference_anchor,
     timedelta_for_unit,
 )
+from app.modules.payflow.services.workflow_contact_runtime import (
+    flag_unreachable,
+    is_contact_step,
+    message_for_channel,
+    preferred_contact_channels,
+    send_succeeded,
+    should_flag_unreachable,
+)
 from app.modules.payflow.services.workflow_queue import (
     cancel_pending_jobs_for_run,
     enqueue_enroll_strategy,
@@ -918,6 +926,23 @@ class WorkflowExecutionService:
                     strategy_id=strategy.id,
                     commit=False,
                 )
+            elif (
+                run.status == PayflowWorkflowRunStatus.ACTIVE.value
+                and step_run.status == "done"
+            ):
+                # Path ended on a non-Outcome leaf (Case Action / Communication / …).
+                run.status = PayflowWorkflowRunStatus.COMPLETED.value
+                run.completed_at = _utcnow()
+                account.next_action = None
+                self.log_event(
+                    event_type="run_completed",
+                    message=f"Run completed — path ended at {kind} ({step_id})",
+                    run_id=run.id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    job_id=job_id,
+                    step_id=step_id,
+                )
 
             self.db.commit()
         except Exception as exc:  # noqa: BLE001
@@ -1597,21 +1622,26 @@ class WorkflowExecutionService:
         step_run: PayflowWorkflowStepRunModel,
     ) -> None:
         cfg = _cfg(step)
-        channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
         purpose = cfg.get("purpose") or step.get("purpose") or "Payment Reminder"
-        template_id = cfg.get("template_id") or step.get("template_id")
-        template = next((t for t in MESSAGE_TEMPLATES if t.get("id") == template_id), None)
-        if template is None and (channel or "").strip().lower() == "email":
-            # Step saved without template_id/body → still send a usable reminder.
-            template = next(
-                (t for t in MESSAGE_TEMPLATES if t.get("id") == "em-reminder"),
-                None,
-            )
-        subject = cfg.get("subject") or (template or {}).get("subject") or f"{purpose}"
-        body = cfg.get("body") or (template or {}).get("body") or ""
-        subject = self._render(subject, account, strategy)
-        body = self._render(body, account, strategy)
+        payment_link = self._payment_link(account)
 
+        # AI contact steps: no fixed channel — pick Email/SMS, failover, flag unreachable.
+        if is_contact_step(cfg, step):
+            self._send_contact_communication(
+                run,
+                account,
+                strategy,
+                step,
+                step_run,
+                purpose=str(purpose),
+                payment_link=payment_link,
+            )
+            return
+
+        channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
+        subject, body = self._render_channel_message(
+            cfg, step, channel=channel, purpose=str(purpose), account=account, strategy=strategy
+        )
         result = PayflowCommunicationService(self.db).send_workflow_step(
             account=account,
             strategy=strategy,
@@ -1619,12 +1649,179 @@ class WorkflowExecutionService:
             purpose=purpose,
             subject=subject,
             body=body,
-            payment_link=self._payment_link(account),
+            payment_link=payment_link,
             run_id=run.id,
             client_id=run.client_id,
         )
-        step_run.result_json = result
-        if result.get("skipped"):
+        self._record_send_result(run, account, strategy, step_run, channel=channel, result=result)
+
+    def _send_contact_communication(
+        self,
+        run: PayflowWorkflowRunModel,
+        account: PayflowAccountModel,
+        strategy: PayflowStrategyModel,
+        step: dict,
+        step_run: PayflowWorkflowStepRunModel,
+        *,
+        purpose: str,
+        payment_link: str,
+    ) -> None:
+        cfg = _cfg(step)
+        channels = preferred_contact_channels(self.db, account)
+        attempts: list[dict[str, Any]] = []
+        chosen: str | None = None
+        final: dict[str, Any] = {}
+
+        for channel in channels:
+            subject, body = self._render_channel_message(
+                cfg,
+                step,
+                channel=channel,
+                purpose=purpose,
+                account=account,
+                strategy=strategy,
+            )
+            result = PayflowCommunicationService(self.db).send_workflow_step(
+                account=account,
+                strategy=strategy,
+                channel=channel,
+                purpose=purpose,
+                subject=subject,
+                body=body,
+                payment_link=payment_link,
+                run_id=run.id,
+                client_id=run.client_id,
+            )
+            attempt = {**result, "attempt_channel": channel}
+            attempts.append(attempt)
+            if send_succeeded(result):
+                chosen = channel
+                final = result
+                break
+            # Log the failed/skipped attempt, then failover to the next channel.
+            self._record_send_result(
+                run,
+                account,
+                strategy,
+                step_run,
+                channel=channel,
+                result=result,
+                persist_result=False,
+            )
+            if len(channels) > 1 and channel != channels[-1]:
+                self.log_event(
+                    event_type="contact_failover",
+                    message=(
+                        f"Contact step failover: {channel} did not send "
+                        f"({result.get('skipped') or result.get('provider_error') or result.get('status')})"
+                        f" — trying next channel"
+                    ),
+                    level="warn",
+                    run_id=run.id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    step_id=step.get("id"),
+                )
+
+        if chosen:
+            merged = {
+                **final,
+                "chosen_channel": chosen,
+                "contact_step": True,
+                "contact_attempts": [
+                    {
+                        "channel": a.get("attempt_channel"),
+                        "status": a.get("status"),
+                        "skipped": a.get("skipped"),
+                        "provider_error": a.get("provider_error"),
+                        "restriction_reason": a.get("restriction_reason"),
+                        "code": a.get("code"),
+                    }
+                    for a in attempts
+                ],
+            }
+            self._record_send_result(
+                run, account, strategy, step_run, channel=chosen, result=merged
+            )
+            return
+
+        # Nothing reached the customer.
+        unreachable = should_flag_unreachable(attempts)
+        flagged = flag_unreachable(account) if unreachable else {}
+        step_run.result_json = {
+            "skipped": "unreachable" if unreachable else "all_channels_blocked",
+            "contact_step": True,
+            "contact_attempts": attempts,
+            "flagged_unreachable": unreachable,
+            **flagged,
+        }
+        self.log_event(
+            event_type="contact_unreachable" if unreachable else "contact_blocked",
+            message=(
+                "Contact step could not reach customer on Email or SMS"
+                if unreachable
+                else "Contact step blocked on all channels (temporary / governance)"
+            ),
+            level="warn",
+            run_id=run.id,
+            account_id=account.id,
+            strategy_id=strategy.id,
+            step_id=step.get("id"),
+        )
+        if unreachable:
+            self._append_timeline(
+                account,
+                "No contactable channel",
+                "Email and SMS both unavailable for this customer",
+            )
+
+    def _render_channel_message(
+        self,
+        cfg: dict[str, Any],
+        step: dict,
+        *,
+        channel: str,
+        purpose: str,
+        account: PayflowAccountModel,
+        strategy: PayflowStrategyModel,
+    ) -> tuple[str, str]:
+        """Build rendered subject/body for a fixed channel or contact-step channel pick."""
+        if is_contact_step(cfg, step):
+            subject, body = message_for_channel(cfg, channel=channel, purpose=purpose)
+        else:
+            template_id = cfg.get("template_id") or step.get("template_id")
+            template = next((t for t in MESSAGE_TEMPLATES if t.get("id") == template_id), None)
+            if template is None:
+                # Purpose-matched fallback, then generic reminder.
+                from app.modules.payflow.services.workflow_contact_runtime import (
+                    template_for,
+                )
+
+                template = template_for(purpose, channel)
+            if channel.strip().lower() == "sms":
+                subject, body = "", (cfg.get("body") or (template or {}).get("body") or "")
+            else:
+                subject = cfg.get("subject") or (template or {}).get("subject") or purpose
+                body = cfg.get("body") or (template or {}).get("body") or ""
+        return (
+            self._render(str(subject or ""), account, strategy),
+            self._render(str(body or ""), account, strategy),
+        )
+
+    def _record_send_result(
+        self,
+        run: PayflowWorkflowRunModel,
+        account: PayflowAccountModel,
+        strategy: PayflowStrategyModel,
+        step_run: PayflowWorkflowStepRunModel,
+        *,
+        channel: str,
+        result: dict[str, Any],
+        persist_result: bool = True,
+    ) -> None:
+        if persist_result:
+            step_run.result_json = result
+        if result.get("skipped") and not result.get("chosen_channel"):
             event = "sms_skipped" if channel == "SMS" else "email_skipped"
             self.log_event(
                 event_type=event,
@@ -1635,11 +1832,11 @@ class WorkflowExecutionService:
                 strategy_id=strategy.id,
             )
             return
-        if result.get("provider_error"):
+        if result.get("provider_error") and not send_succeeded(result):
             self._notify_provider_failed(
                 run, channel, str(result.get("provider_error"))
             )
-        elif result.get("status") in {"sent", "logged", "queued"}:
+        elif send_succeeded(result):
             self._notify_comm_sent(
                 run,
                 account,

@@ -451,17 +451,35 @@ def _stored_segment(workflow: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("label")
     }
     days = str(context.get("Avg days past due") or "")
-    stats = {
-        "accounts": context.get("Accounts"),
-        "avg_outstanding": context.get("Avg outstanding"),
+    accounts_raw = str(context.get("Accounts") or "").replace(",", "").strip()
+    outstanding_raw = str(context.get("Avg outstanding") or "").replace(",", "").strip()
+    # "1,234.50 CAD" → leading number
+    outstanding_token = outstanding_raw.split()[0] if outstanding_raw else ""
+    stats: dict[str, Any] = {
+        "accounts": int(accounts_raw) if accounts_raw.isdigit() else None,
+        "avg_outstanding": float(outstanding_token) if _is_float(outstanding_token) else None,
         "avg_days_past_due": int(days) if days.isdigit() else None,
-        "email_consent": context.get("Email consent"),
+        "email_consent_pct": _pct_number(context.get("Email consent")),
+        "email_allowed_pct": _pct_number(context.get("Email allowed")),
     }
     return {
         "label": context.get("Segment") or "Custom segment",
         "segment": workflow.get("segment") or {},
         "stats": {key: value for key, value in stats.items() if value is not None},
     }
+
+
+def _pct_number(raw: Any) -> int | None:
+    text = str(raw or "").strip().rstrip("%").replace(",", "")
+    return int(text) if text.isdigit() else None
+
+
+def _is_float(raw: str) -> bool:
+    try:
+        float(raw)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:
