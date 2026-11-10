@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
+from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
     EMAIL_WORDS,
     MAX_SMS_CHARS,
@@ -54,7 +55,11 @@ def build_message_prompt(
             + "\n".join(json.dumps(other, ensure_ascii=False) for other in others)
         )
     if remarks:
-        parts.append(f"Reviewer remarks (apply them to the messages you write): {remarks}")
+        # Regenerate passes its workflow remarks too: only what they say about the wording applies here.
+        parts.append(
+            f"Reviewer remarks (apply them to the messages you write; ignore anything about the workflow's steps): "
+            f"{remarks}"
+        )
     if feedback:
         parts.append(_feedback_lines(feedback))
     return [
@@ -115,6 +120,9 @@ no "to avoid further action", no service being cut or interrupted - only the Fin
   {{{{brand_name}}}}.
 - SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in. Start with "{{{{brand_name}}}}:"
   and end with "Reply STOP to opt out."
+- Channel "{CONTACT_CHANNEL}": PayFlow sends each customer either the email or the SMS (whichever reaches them),
+  so write both - the email in subject + body, and the same message as an SMS in sms_body (the SMS rules above).
+  Never mention the other channel (no "we also sent you an email").
 - If a message shows its current text, improve that text (and apply the reviewer remarks) instead of starting over.
 
 ## Style examples (illustrative only, do not copy)

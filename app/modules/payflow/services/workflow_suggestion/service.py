@@ -13,7 +13,7 @@ from app.modules.payflow.services.strategy_service import (
     PayflowStrategyService,
     read_strategy_versions,
 )
-from app.modules.payflow.services.workflow_suggestion.config import REASONING_LABELS
+from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
     load_payment_options,
@@ -225,11 +225,12 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
-        # The new version gets fresh email / SMS text (its steps are new).
+        # The new version gets fresh email / SMS text (its steps are new), following the same remarks.
         workflow, messages_note = _with_messages(
             {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
             workflow,
             _stored_segment(original),
+            remarks=remarks,
         )
 
         ai_context = kept + _reasoning_context(workflow) + [
@@ -317,7 +318,7 @@ class WorkflowSuggestionService:
             messages = build_messages(
                 client, portfolio_name, pending, limits, feedback, revision, client_examples, lessons
             )
-            schema = build_output_schema([s["segment_id"] for s in pending], limits["channels"])
+            schema = build_output_schema([s["segment_id"] for s in pending])
             reply = _workflows_by_segment(call_llm(messages, schema))
 
             feedback = []
@@ -387,7 +388,22 @@ def _workflows_by_segment(reply: Any) -> dict[str, dict]:
     items = reply.get("workflows") if isinstance(reply, dict) else None
     if not isinstance(items, list):
         return {}
-    return {w["segment_id"]: w for w in items if isinstance(w, dict) and w.get("segment_id")}
+    return {w["segment_id"]: _without_channels(w) for w in items if isinstance(w, dict) and w.get("segment_id")}
+
+
+def _without_channels(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Communication steps contact the customer: any channel / template the AI set anyway is dropped,
+    because the worker picks email or SMS for each customer."""
+    if not isinstance(workflow.get("steps"), list):
+        return workflow
+    steps = []
+    for step in workflow["steps"]:
+        if isinstance(step, dict) and step.get("kind") == "Communication":
+            config = step.get("config") if isinstance(step.get("config"), dict) else {}
+            step = {key: value for key, value in step.items() if key not in CHANNEL_FIELDS}
+            step["config"] = {key: value for key, value in config.items() if key not in CHANNEL_FIELDS}
+        steps.append(step)
+    return {**workflow, "steps": steps}
 
 
 def _ai_context(
@@ -410,9 +426,9 @@ def _ai_context(
 
 
 def _with_messages(
-    client: dict[str, Any], workflow: dict[str, Any], segment: dict[str, Any]
+    client: dict[str, Any], workflow: dict[str, Any], segment: dict[str, Any], *, remarks: str | None = None
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """The workflow with its email / SMS text written in.
+    """The workflow with its email / SMS text written in (`remarks`: the reviewer's, on Regenerate).
 
     Writing never blocks a save: if it fails, the workflow is kept as it is (its templates
     are sent) and a "Messages" ai_context line tells reviewers to write them later.
@@ -420,7 +436,7 @@ def _with_messages(
     if not any(step.get("kind") == "Communication" for step in workflow.get("steps") or []):
         return workflow, []
     try:
-        written = write_messages(client, workflow, segment)
+        written = write_messages(client, workflow, segment, remarks=remarks)
     except AppError as exc:
         note = f"Not written, so the templates will be sent. Use Write messages to try again. ({exc.message})"
         return workflow, [{"label": "Messages", "value": note}]
@@ -435,17 +451,35 @@ def _stored_segment(workflow: dict[str, Any]) -> dict[str, Any]:
         if isinstance(item, dict) and item.get("label")
     }
     days = str(context.get("Avg days past due") or "")
-    stats = {
-        "accounts": context.get("Accounts"),
-        "avg_outstanding": context.get("Avg outstanding"),
+    accounts_raw = str(context.get("Accounts") or "").replace(",", "").strip()
+    outstanding_raw = str(context.get("Avg outstanding") or "").replace(",", "").strip()
+    # "1,234.50 CAD" → leading number
+    outstanding_token = outstanding_raw.split()[0] if outstanding_raw else ""
+    stats: dict[str, Any] = {
+        "accounts": int(accounts_raw) if accounts_raw.isdigit() else None,
+        "avg_outstanding": float(outstanding_token) if _is_float(outstanding_token) else None,
         "avg_days_past_due": int(days) if days.isdigit() else None,
-        "email_consent": context.get("Email consent"),
+        "email_consent_pct": _pct_number(context.get("Email consent")),
+        "email_allowed_pct": _pct_number(context.get("Email allowed")),
     }
     return {
         "label": context.get("Segment") or "Custom segment",
         "segment": workflow.get("segment") or {},
         "stats": {key: value for key, value in stats.items() if value is not None},
     }
+
+
+def _pct_number(raw: Any) -> int | None:
+    text = str(raw or "").strip().rstrip("%").replace(",", "")
+    return int(text) if text.isdigit() else None
+
+
+def _is_float(raw: str) -> bool:
+    try:
+        float(raw)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _reasoning_context(workflow: dict[str, Any]) -> list[dict[str, str]]:

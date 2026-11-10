@@ -16,6 +16,7 @@ from app.infrastructure.database.models import (
     UserProductModel,
 )
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
+from app.modules.payflow.services.workflow_suggestion import message_writer
 from app.modules.payflow.services.workflow_suggestion import service as suggestion_service
 from app.modules.payflow.services.workflow_suggestion.prompt import load_examples
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
@@ -87,7 +88,7 @@ def test_regenerate_retries_with_validator_errors(db_session, admin, ai_workflow
     assert new["status"] == "AI Proposed"
     assert len(calls) == 2
     retry_prompt = calls[1][1]["content"]
-    assert REMARKS in retry_prompt and "template 'em-nope' does not exist" in retry_prompt
+    assert REMARKS in retry_prompt and "purpose 'Nope' is not allowed" in retry_prompt
 
 
 def test_regenerate_sends_back_a_workflow_that_keeps_reminding_after_a_payment(db_session, admin, ai_workflow):
@@ -97,6 +98,28 @@ def test_regenerate_sends_back_a_workflow_that_keeps_reminding_after_a_payment(d
     assert new["status"] == "AI Proposed"
     assert len(calls) == 2  # the original's segment (Active) is checked too
     assert 'without the check "Payment Status Not Equals Unpaid"' in calls[1][1]["content"]
+
+
+def test_regenerate_asks_to_apply_each_remark_on_the_main_path(db_session, admin, ai_workflow):
+    _, calls = regenerate(db_session, admin, ai_workflow["id"])
+    prompt = calls[0][1]["content"]
+    assert "Apply each remark on the main path that customers go through" in prompt
+    assert "a fallback branch alone does not count" in prompt
+    assert "Communication steps have no channel: PayFlow contacts each customer by email or SMS" in prompt
+    assert "name each remark and what you changed for it. If a remark cannot be applied" in prompt
+    assert f"Reviewer remarks: {REMARKS}" in prompt
+
+
+def test_regenerate_writes_the_messages_with_the_same_remarks(db_session, admin, ai_workflow):
+    from tests.test_workflow_message_api import fake_message_ai  # that module imports this one's fixtures
+
+    call, _ = fake_llm()
+    writer, prompts = fake_message_ai()
+    with patch.object(suggestion_service, "call_llm", side_effect=call), \
+            patch.object(message_writer, "call_llm", side_effect=writer):
+        new = WorkflowSuggestionService(db_session).regenerate_workflow(admin, ai_workflow["id"], REMARKS)
+    assert len(prompts) == 1 and f"ignore anything about the workflow's steps): {REMARKS}" in prompts[0]
+    assert all(s["config"].get("body") for s in new["steps"] if s["kind"] == "Communication")
 
 
 def test_regenerate_gives_up_and_saves_nothing(db_session, admin, ai_workflow):
@@ -118,7 +141,7 @@ def test_regenerate_sends_review_history_to_the_ai(db_session, admin, ai_workflo
     _, calls = regenerate(db_session, admin, ai_workflow["id"])
     prompt = calls[0][1]["content"]
     assert "Review history (oldest first)" in prompt
-    assert "timing changed from 3 Days After Previous Email to 7 Days After Previous Email" in prompt
+    assert "timing changed from 3 Days After Previous Action to 7 Days After Previous Action" in prompt
     assert "Reason: SMS was too early" in prompt
     assert "- Rejected. Reason: Too aggressive for this segment" in prompt
     assert prompt.index("Review history") < prompt.index("Reviewer remarks")

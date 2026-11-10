@@ -82,7 +82,9 @@ BAND_DEFINITIONS: dict[str, dict] = {
 
 # Workflow limits — stated in the prompt and enforced by the validator.
 MIN_STEPS = 3
-MAX_STEPS = 15  # room for real branches (raised from 12 — the AI often needed 13–15)
+# Raised from 12, then 15: stopping when the customer pays adds a check before every follow-up and a 3-step stop
+# branch, so 5 messages need ~19 steps. With 15 the AI often failed Regenerate remarks such as "add an SMS route".
+MAX_STEPS = 18
 MAX_COMMUNICATIONS = 5
 
 # Stop when the customer acts: on the payment page they can pay in full, pay part or set up a plan.
@@ -97,6 +99,14 @@ PAID_OUTCOME = "Paid In Full"
 ON_A_PLAN_OUTCOME = "Payment Plan Active"
 STOP_WHEN_PAID_SITUATIONS = ("Active", "Promise to Pay")
 ON_A_PLAN_SITUATION = "Payment Plan"
+
+# AI workflows contact the customer with Communication steps that have NO channel: the worker picks email or
+# SMS for each customer, switches when one fails and flags customers it cannot reach. So the AI never sets a
+# channel or template (removed from its reply) and never branches on delivery or contact details.
+CONTACT_CHANNEL = "Email + SMS"  # a channel-free step's messages: an email (subject + body) and an SMS (sms_body)
+CHANNEL_FIELDS = ("channel", "template_id")
+CONTACT_ATTRIBUTES = ("Email Delivery", "SMS Delivery", "Email Address", "Mobile Number")
+CHANNEL_EVENTS = ("Previous Email", "Previous SMS")  # timing after a contact step: "Previous Action"
 
 # Why the AI chose a workflow — one short text per field, saved as ai_context lines.
 # changes_made is only filled on regenerate.

@@ -41,7 +41,7 @@ def test_design_ai_sees_email_allowed_not_recorded_consent():
     prompt = build_user_prompt(CLIENT, "Residential", [segment])
     assert '"email_allowed_pct": 100' in prompt and '"with_email_pct": 100' in prompt
     assert "email_consent_pct" not in prompt
-    assert "few accounts that can get email (low email allowed) = favour SMS" in build_system_prompt(LIMITS)
+    assert "If few accounts can be reached (low email allowed and few mobiles)" in build_system_prompt(LIMITS)
 
 
 def test_regenerate_stats_drop_the_consent_line_too():

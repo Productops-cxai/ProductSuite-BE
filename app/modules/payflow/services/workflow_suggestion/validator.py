@@ -25,6 +25,7 @@ from app.modules.payflow.services.strategy_service import (
     TIME_UNITS,
 )
 from app.modules.payflow.services.workflow_suggestion.config import (
+    CONTACT_ATTRIBUTES,
     FULL_OR_PLAN_CHECK,
     MISSED_INSTALMENT_CHECK,
     ON_A_PLAN_SITUATION,
@@ -41,7 +42,7 @@ REQUIRED_REASONING = [f for f in REASONING_FIELDS if f != "changes_made"]  # cha
 TIMING = ["reference_event", "amount", "unit", "direction"]
 REQUIRED_CONFIG: dict[str, list[str]] = {
     "Trigger": ["reference_event"],
-    "Communication": ["channel", "purpose", "template_id", *TIMING],
+    "Communication": ["purpose", *TIMING],  # no channel: the worker picks email or SMS for each customer
     "Wait": TIMING,
     "Condition": ["attribute", "operator", "value"],
     "Payment Action": ["action"],
@@ -80,6 +81,7 @@ def validate_all(
         errors += validate_catalog_values(workflow, limits)
         errors += validate_step_config(workflow)
         errors += validate_limits(workflow, limits, check_paths=not flowchart_errors)
+        errors += validate_contact_steps(workflow, limits)
         if not flowchart_errors:  # paths are unreliable while the flowchart itself is broken
             errors += validate_stop_when_paid(workflow, situations.get(workflow.get("segment_id")))
     return errors
@@ -179,6 +181,24 @@ def validate_catalog_values(workflow: dict[str, Any], limits: dict[str, Any]) ->
             )
         if "action" in cfg and cfg["action"] not in ACTIONS_BY_KIND.get(kind, []):
             errors.append(f"{where}: action '{cfg['action']}' is not allowed for a {kind} step")
+    return errors
+
+
+def validate_contact_steps(workflow: dict[str, Any], limits: dict[str, Any]) -> list[str]:
+    """Communication steps contact the customer: the worker picks email or SMS, switches when one fails and
+    flags customers it cannot reach - so no branches on delivery or contact details, and no contact steps
+    for a client without any channel."""
+    errors: list[str] = []
+    for step in workflow["steps"]:
+        where = _where(workflow, step.get("id"))
+        if step.get("kind") == "Communication" and not limits["channels"]:
+            errors.append(f"{where}: this client has no email or SMS enabled - do not use Communication steps")
+        attribute = _cfg(step).get("attribute")
+        if step.get("kind") == "Condition" and attribute in CONTACT_ATTRIBUTES:
+            errors.append(
+                f"{where}: do not branch on {attribute} - PayFlow switches between email and SMS "
+                "and flags customers it cannot reach"
+            )
     return errors
 
 
