@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-be-production
+  group: deploy-be-production-v2
   cancel-in-progress: true
 
 jobs:
