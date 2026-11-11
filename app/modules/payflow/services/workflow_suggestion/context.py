@@ -16,6 +16,8 @@ from app.infrastructure.database.models import (
     PayflowRuleModel,
 )
 from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
+from app.modules.payflow.services.workflow_suggestion.languages import accounts_languages
+from app.modules.payflow.services.workflow_suggestion.segmenter import account_fits_segment, filter_eligible
 from app.shared.enums import PayflowPortfolioStatus, PayflowRuleStatus, PayflowRuleType
 
 
@@ -154,3 +156,15 @@ def load_suggest_scope(
         client_id=client_id,
     )
     return scope, accounts
+
+
+def load_segment_languages(db: Session, workflow: dict[str, Any]) -> list[str]:
+    """Language codes of the accounts a saved workflow is for: the eligible accounts of its scope (portfolio,
+    or the client's parent accounts) that fit its segment, most accounts first."""
+    try:
+        _, accounts = load_suggest_scope(db, workflow["client_id"], workflow.get("portfolio_id"))
+    except NotFoundError:
+        return []
+    eligible, _ = filter_eligible(accounts)
+    segment = workflow.get("segment") or {}
+    return accounts_languages(eligible, lambda account: account_fits_segment(account, segment))

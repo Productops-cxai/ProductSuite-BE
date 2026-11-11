@@ -1,0 +1,46 @@
+{
+  "FR": {
+    "em-reminder": {
+      "subject": "Rappel amical concernant votre solde",
+      "body": "Bonjour {{first_name}},\n\nNos dossiers indiquent un solde impayé de {{outstanding_balance}} sur le compte {{account_reference}}. Vous pouvez le régler en toute sécurité en ligne à tout moment.\n\n{{payment_link}}\n\nSi vous avez déjà payé, veuillez ignorer ce message.\n\n{{brand_name}}"
+    },
+    "em-firm": {
+      "subject": "Action requise sur le compte {{account_reference}}",
+      "body": "Bonjour {{first_name}},\n\nVotre solde de {{outstanding_balance}} reste impayé. Veuillez effectuer le paiement ou mettre en place un plan de paiement en utilisant le lien sécurisé ci‑dessous.\n\n{{payment_link}}\n\nSi vous avez besoin d’aide pour la capacité de paiement, répondez à cet e‑mail et nous vous assisterons.\n\n{{brand_name}}"
+    },
+    "sms-firm": {
+      "body": "{{brand_name}} : {{outstanding_balance}} sur {{account_reference}} est toujours impayé. Payez ou créez un plan maintenant : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "em-plan": {
+      "subject": "Échelonnez votre solde dans le temps",
+      "body": "Bonjour {{first_name}},\n\nVous pouvez régler {{outstanding_balance}} en versements quotidiens, hebdomadaires ou mensuels selon vos besoins.\n\nConfigurez votre plan : {{payment_link}}\n\n{{brand_name}}"
+    },
+    "em-link": {
+      "subject": "Votre lien de paiement sécurisé",
+      "body": "Bonjour {{first_name}},\n\nVoici votre lien sécurisé pour régler {{outstanding_balance}} :\n\n{{payment_link}}\n\nCe lien est unique au compte {{account_reference}}.\n\n{{brand_name}}"
+    },
+    "sms-link": {
+      "body": "{{brand_name}} : solde {{outstanding_balance}} sur {{account_reference}}. Payez en toute sécurité : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "sms-reminder": {
+      "body": "{{brand_name}} : rappel que {{outstanding_balance}} est impayé. Payez ou créez un plan : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "em-promise": {
+      "subject": "Rappel : votre paiement promis est dû",
+      "body": "Bonjour {{first_name}},\n\nCeci est un rappel que votre paiement promis de {{promise_amount}} pour le compte {{account_reference}} est dû le {{promise_date}}.\n\nPayez en toute sécurité ici : {{payment_link}}\n\n{{brand_name}}"
+    },
+    "sms-promise": {
+      "body": "{{brand_name}} : votre paiement promis de {{promise_amount}} est dû le {{promise_date}}. Payez maintenant : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "sms-plan": {
+      "body": "{{brand_name}} : vous pouvez répartir {{outstanding_balance}} en versements. Choisissez un plan : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "sms-contact": {
+      "body": "{{brand_name}} : nous n’avons pas pu vous joindre par e‑mail concernant {{account_reference}}. Mettez à jour vos coordonnées : {{payment_link}}. Répondez STOP pour vous désabonner."
+    },
+    "em-contact": {
+      "subject": "Veuillez confirmer vos coordonnées",
+      "body": "Bonjour {{first_name}},\n\nNous n’avons pas pu vous joindre au sujet du compte {{account_reference}}. Veuillez confirmer votre adresse e‑mail et votre numéro de mobile afin que nous puissions vous tenir informé.\n\n{{payment_link}}\n\n{{brand_name}}"
+    }
+  }
+}

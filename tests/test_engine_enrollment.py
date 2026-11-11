@@ -170,3 +170,36 @@ def test_run_on_inactive_workflow_is_replaced_by_active_one(db_session):
 
     runs = _open_runs(db_session, account)
     assert [r.strategy_id for r in runs] == [new.id]
+
+
+def test_enrollment_records_what_was_already_recovered(db_session):
+    """Condition "Payment Status" counts only payments made after this (workflow_condition_runtime)."""
+    client = _client(db_session)
+    account = _account(db_session, client)
+    account.recovered_balance = 120.0
+    strategy = _strategy(db_session, client, "enr-baseline")
+    WorkflowExecutionService(db_session).enroll_strategy(strategy.id)
+    [run] = _open_runs(db_session, account)
+    assert run.recovered_at_start == 120.0
+
+
+def test_accounts_that_fit_no_active_workflow_are_reported_not_silently_skipped(db_session):
+    from app.infrastructure.database.models import PayflowWorkflowWorkerLogModel
+
+    client = _client(db_session)
+    small = _account(db_session, client, outstanding=300.0)  # fits no workflow of this scope
+    big = _account(db_session, client, outstanding=8000.0)
+    specific = _strategy(db_session, client, "enr-only-big", segment={"balance_band": "$5,000 and over"})
+    db_session.commit()
+
+    result = WorkflowExecutionService(db_session).enroll_strategy(specific.id)
+
+    assert result == {"enrolled": 1, "skipped": 1, "unmatched": 1}
+    assert [r.strategy_id for r in _open_runs(db_session, big)] == [specific.id]
+    assert _open_runs(db_session, small) == []
+    warning = (
+        db_session.query(PayflowWorkflowWorkerLogModel)
+        .filter_by(event_type="enroll_unmatched", strategy_id=specific.id)
+        .one()
+    )
+    assert warning.level == "warn" and warning.message.startswith("1 account in this scope fit no Active workflow")

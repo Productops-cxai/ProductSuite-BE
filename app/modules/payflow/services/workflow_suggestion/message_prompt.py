@@ -88,7 +88,8 @@ Reply with JSON only, matching the provided schema.
 - {{{{payment_link}}}}: the customer's own secure payment page
 - {{{{brand_name}}}}: who is sending the message
 - {{{{promise_amount}}}}, {{{{promise_date}}}}: what the customer promised to pay and when (Promise-to-Pay messages only)
-Never type an amount, a date, a phone number or an email address - use the variables.
+Never type an amount, a date, a phone number, an email address or a web address - use the variables
+({{{{payment_link}}}} is the only link).
 Never use placeholders like [Name] or <date>.
 
 ## Tones
@@ -100,9 +101,10 @@ Each message has a tone that was decided for you (with the reason). Write in exa
   for review. Nothing else is threatened.
 - Supportive: encouraging. Thank the customer for their arrangement or progress; make the next step easy.
 - Neutral: calm and factual. No push for payment (contact details update, or a dispute is open).
-Firm is never rude. Never threaten, shame or blame. Never mention courts, lawyers, police, credit bureaus,
-fees or deadlines, and never guess at the customer's personal situation. Never hint at consequences either:
-no "to avoid further action", no service being cut or interrupted - only the Final notice line above.
+Firm is never rude. Never threaten, shame or blame. Never mention courts, lawyers, legal proceedings, police,
+credit bureaus, fees or deadlines (no "within 48 hours"), and never guess at the customer's personal situation.
+Never hint at consequences either: no "to avoid further action", no service being cut or interrupted, no
+account being sent to a collection agency - only the Final notice line above.
 
 ## Writing rules
 - Plain words and short sentences (easy to read). Talk to the customer as "you".
@@ -174,3 +176,38 @@ def _feedback_lines(feedback: list[dict[str, Any]]) -> str:
             parts.append(json.dumps({"step_id": item["step_id"], **item["message"]}, ensure_ascii=False))
         parts.append("Problems:\n" + "\n".join(f"- {error}" for error in item["errors"]))
     return "\n".join(parts)
+
+
+def build_translation_prompt(
+    client: dict[str, Any],
+    language: str,
+    messages: list[dict[str, Any]],
+    feedback: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """Translate a workflow's checked messages into `language` (a name, e.g. "French").
+
+    `messages`: [{"step_id", "channel", "tone", "subject", "body", "sms_body"}] — the main text.
+    `feedback` (on a retry): [{"step_id", "message", "errors"}] from message_validator.check_translation.
+    """
+    source = client.get("language") or "English"
+    system = f"""You translate the emails and SMS messages of a debt-collection workflow for PayFlow into {language}.
+They were written and checked in {source}; customers who read {language} get your version instead.
+Reply with JSON only, matching the provided schema: one entry per step_id, with the same parts as the original
+(subject and body for an email, sms_body for the SMS of a message that has one).
+
+## Rules
+- Translate faithfully: the same meaning and the same tone (given per message). Add nothing, leave nothing out.
+- Keep every {{{{variable}}}} exactly as written - never translate, rename, add or remove one.
+- Do not add numbers, amounts, dates, deadlines, links, phone numbers or email addresses.
+- Write naturally for the customer, in the polite form of address (e.g. "vous" in French).
+- Email subject: one line, at most {MAX_SUBJECT_CHARS} characters with the values filled in.
+- SMS: at most {MAX_SMS_CHARS} characters with the values filled in. Translate the opt-out sentence too,
+  keeping the word STOP as it is (e.g. French: "Répondez STOP pour vous désabonner.")."""
+    parts = [
+        f"Client: {client['name']}",
+        "Messages to translate (one per step_id):\n"
+        + "\n".join(json.dumps(message, ensure_ascii=False) for message in messages),
+    ]
+    if feedback:
+        parts.append(_feedback_lines(feedback).replace("Your previous messages", "Your previous translations"))
+    return [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]

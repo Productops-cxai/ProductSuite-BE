@@ -13,12 +13,17 @@ from typing import Any
 from app.core.exceptions import ServiceUnavailableError, ValidationAppError
 from app.modules.payflow.services.strategy_service import _timing_label
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
+from app.modules.payflow.services.workflow_suggestion.languages import language_name
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema, call_llm
-from app.modules.payflow.services.workflow_suggestion.message_prompt import build_message_prompt
+from app.modules.payflow.services.workflow_suggestion.message_prompt import (
+    build_message_prompt,
+    build_translation_prompt,
+)
 from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
     MAX_SUBJECT_CHARS,
     check_message,
+    check_translation,
     render_sample,
 )
 from app.shared.enums import PayflowCollectionStatus
@@ -78,15 +83,77 @@ def write_messages(
 
 
 def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """Copy of the steps with the written text in their config (other steps unchanged)."""
+    """Copy of the steps with the written text in their config (other steps unchanged).
+
+    A rewritten message keeps only the language versions written with it: older ones are outdated.
+    """
     result = []
     for step in steps:
         message = written.get(step.get("id"))
         if message:
             text = {key: value for key, value in message.items() if value}
-            step = {**step, "config": {**(step.get("config") or {}), **text}}
+            config = {**(step.get("config") or {}), **text}
+            if not message.get("translations"):
+                config.pop("translations", None)
+            step = {**step, "config": config}
         result.append(step)
     return result
+
+
+def translate_messages(
+    client: dict[str, Any], workflow: dict[str, Any], written: dict[str, dict[str, Any]], language: str
+) -> dict[str, dict[str, str]]:
+    """{step_id: {"subject", "body", "sms_body"}}: the `written` messages (checked main text) in `language`
+    (an account language code) — one AI call, failing ones sent back up to MAX_FIX_ATTEMPTS times.
+
+    All or nothing: when a message cannot be translated, ServiceUnavailableError (a customer gets every
+    message of the workflow in the same language).
+    """
+    channels = {
+        step["id"]: (step.get("config") or {}).get("channel") or step.get("channel") or CONTACT_CHANNEL
+        for step in workflow.get("steps") or []
+        if step.get("id") in written
+    }
+    sources = {
+        step_id: {key: message[key] for key in ("subject", "body", "sms_body") if message.get(key)}
+        for step_id, message in written.items()
+    }
+    translated: dict[str, dict[str, str]] = {}
+    pending = list(sources)
+    feedback: list[dict[str, Any]] = []
+    for _ in range(1 + MAX_FIX_ATTEMPTS):
+        briefs = [
+            {"step_id": step_id, "channel": channels.get(step_id), "tone": written[step_id].get("tone"),
+             **sources[step_id]}
+            for step_id in pending
+        ]
+        prompt = build_translation_prompt(client, language_name(language), briefs, feedback)
+        reply = _messages_by_step(call_llm(prompt, build_message_schema(pending)))
+
+        feedback = []
+        for step_id in pending:
+            version = _clean_version(reply.get(step_id))
+            errors = check_translation(step_id, version, sources[step_id], channels.get(step_id) or CONTACT_CHANNEL)
+            if errors:
+                feedback.append({"step_id": step_id, "message": version, "errors": errors})
+            else:
+                translated[step_id] = version
+        if not feedback:
+            return translated
+        pending = [item["step_id"] for item in feedback]
+
+    problems = [error for item in feedback for error in item["errors"]]
+    raise ServiceUnavailableError(f"AI could not translate the messages into {language_name(language)}: "
+                                  + "; ".join(problems[:5]))
+
+
+def _clean_version(message: Any) -> dict[str, str]:
+    if not isinstance(message, dict):
+        return {}
+    version = {key: str(message[key]).strip() for key in ("subject", "body", "sms_body") if str(message.get(key) or "").strip()}
+    if version.get("subject"):
+        version["subject"] = _fit_subject(version["subject"])
+    return version
 
 
 def _brief(step: dict[str, Any], tone: dict[str, str], segment: dict[str, Any], english: bool) -> dict[str, Any]:

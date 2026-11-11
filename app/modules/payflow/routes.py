@@ -1326,7 +1326,8 @@ def update_workflow(
                 s.model_dump(exclude_none=True) if hasattr(s, "model_dump") else s
                 for s in payload.steps or []
             ]
-        return PayflowStrategyService(db).update_strategy(user, strategy_id, data)
+        # The existing update; messages whose text changed are then translated again (other languages).
+        return WorkflowSuggestionService(db).update_workflow(user, strategy_id, data)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1457,6 +1458,46 @@ def list_ai_suggest_jobs(
     return AiSuggestJobService(db).list_jobs(
         client_id=client_id, portfolio_id=portfolio_id, limit=limit
     )
+
+
+@router.post("/workflows/suggest-jobs")
+def start_suggest_workflows_job(
+    payload: SuggestWorkflowsRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+):
+    """ "Suggest with AI" in the background: answers at once with the job.
+
+    The AI takes minutes; a request held open that long is dropped by proxies and browsers.
+    The page follows the job with GET /ai-suggest-jobs (or /ai-suggest-jobs/{id}).
+    `started` is false when a run for this scope was already waiting or running.
+    """
+    from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+    try:
+        PayflowStrategyService(db)._assert_manage(user, payload.client_id)
+        service = AiSuggestJobService(db)
+        job, started = service.start_manual(user, payload.client_id, payload.portfolio_id)
+        if started:
+            schedule_ai_suggest_jobs(background_tasks, [job.id])
+        return {"started": started, "job": service.get_job(job.id)}
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/ai-suggest-jobs/{job_id}")
+def get_ai_suggest_job(job_id: int, user: RequirePayflowProduct, db: DbSession):
+    from app.modules.payflow.services.ai_suggest_job_service import AiSuggestJobService
+
+    job = AiSuggestJobService(db).get_job(job_id)
+    try:
+        if job is None:
+            raise NotFoundError("AI suggest job not found")
+        _assert_view_client(AccessContextService(db), user, job["client_id"])
+    except AppError as exc:
+        raise _map_error(exc) from exc
+    return job
 
 
 @router.post("/workflows/suggest", response_model=SuggestWorkflowsResponse)

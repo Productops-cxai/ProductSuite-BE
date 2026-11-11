@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -20,7 +21,50 @@ from app.shared.enums import (
     PayflowReviewStatus,
 )
 
+from app.modules.payflow.services.workflow_condition_runtime import (
+    payment_status,
+    promise_to_pay_status,
+)
+from app.modules.payflow.services.workflow_suggestion.llm import call_llm
+
 logger = logging.getLogger("app.payflow.case_reassess")
+
+# What a reassessment may recommend. The first three are the treatments the fixed rules also give
+# (kept word for word: a rejected recommendation is recognised by its text).
+ESCALATE_ACTION = "Escalate for supervisor review"
+REASSESS_ACTIONS = [
+    "Friendly payment reminder",
+    "Payment reminder with payment link",
+    "Firm reminder with payment link",
+    "Offer a payment plan",
+    ESCALATE_ACTION,
+]
+NO_CHANNEL = "None"
+REASSESS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["action", "channel", "rationale", "confidence"],
+    "properties": {
+        "action": {"type": "string", "enum": REASSESS_ACTIONS},
+        "channel": {"type": "string", "enum": ["Email", "SMS", NO_CHANNEL]},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+}
+REASSESS_SYSTEM_PROMPT = f"""You reassess one overdue account for PayFlow, a collections platform, and recommend
+its next treatment. A supervisor reads your recommendation; nothing is sent because of it alone.
+
+Choose exactly one action: {", ".join(f'"{a}"' for a in REASSESS_ACTIONS)}.
+- Earlier, lightly overdue accounts get the friendly reminder; later stages get firmer ones.
+- "Offer a payment plan" fits a customer who shows they want to pay but cannot pay at once (part payments,
+  a broken promise, a high balance) - never when a plan is already running.
+- "{ESCALATE_ACTION}" when a person must decide: a dispute, repeated contact without any result, a plan that
+  broke down, or when you are not sure.
+- Never repeat a treatment a supervisor rejected for this account (see human_decisions).
+- channel: "Email" or "SMS" - only one the account can be reached on - or "{NO_CHANNEL}" for an escalation.
+- rationale: one or two plain sentences with the facts that decided it. No threats, no legal language.
+- confidence: 0-100, how sure you are. Be honest: below 60 when the facts are thin or point both ways.
+Answer with JSON only."""
 
 
 def _utcnow() -> datetime:
@@ -177,6 +221,78 @@ class CaseReassessmentService:
                 "channel": None,
                 "rationale": "Outstanding balance is zero or negative.",
             }
+        recommended = self._ai_propose(account)
+        if recommended is not None:
+            return recommended
+        # The AI could not be asked (not configured, down, an unusable answer): the fixed rules.
+        return {**self._rule_action(account, balance, dpd), "source": "rules"}
+
+    def _ai_propose(self, account: PayflowAccountModel) -> dict[str, Any] | None:
+        """Ask the AI for the next treatment of this one case; None when it cannot be used."""
+        facts = self._case_facts(account)
+        try:
+            answer = call_llm(
+                [
+                    {"role": "system", "content": REASSESS_SYSTEM_PROMPT},
+                    {"role": "user", "content": "Account:\n" + json.dumps(facts, ensure_ascii=False)},
+                ],
+                REASSESS_SCHEMA,
+                quick=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure falls back to the rules
+            logger.warning("AI case reassessment unavailable for account_id=%s: %s", account.id, exc)
+            return None
+        action = str((answer or {}).get("action") or "").strip()
+        rationale = str((answer or {}).get("rationale") or "").strip()
+        if action not in REASSESS_ACTIONS or not rationale:
+            logger.warning("AI case reassessment gave an unusable answer for account_id=%s", account.id)
+            return None
+        reachable = [name for name, ok in (("Email", facts["has_email"]), ("SMS", facts["has_mobile"])) if ok]
+        channel = (answer.get("channel") or "").strip()
+        if action == ESCALATE_ACTION:
+            channel = None
+        elif channel not in reachable:
+            channel = reachable[0] if reachable else None
+        try:
+            confidence = max(0.0, min(100.0, float(answer.get("confidence"))))
+        except (TypeError, ValueError):
+            confidence = None
+        return {
+            "action": action,
+            "channel": channel,
+            "rationale": rationale[:500],
+            "confidence": confidence,
+            "source": "ai",
+        }
+
+    def _case_facts(self, account: PayflowAccountModel) -> dict[str, Any]:
+        """What the AI is told about the case - no name, address, email or phone number."""
+        decisions = [
+            {
+                "decision": h.get("decision"),
+                "proposed_action": h.get("proposed_action"),
+                "final_action": h.get("final_action"),
+            }
+            for h in list(account.ai_decision_context or [])
+            if h.get("kind") == "human_decision"
+        ][-5:]
+        return {
+            "days_past_due": int(account.days_past_due or 0),
+            "outstanding_balance": round(float(account.outstanding_balance or 0), 2),
+            "original_balance": round(float(account.original_balance or 0), 2),
+            "recovered_balance": round(float(account.recovered_balance or 0), 2),
+            "collection_status": account.collection_status,
+            "payment_status": payment_status(self.db, account),
+            "promise_to_pay": promise_to_pay_status(account),
+            "last_payment_date": account.last_payment_date.isoformat() if account.last_payment_date else None,
+            "last_contact_date": account.last_contact_date.isoformat() if account.last_contact_date else None,
+            "has_email": bool((account.email or "").strip()),
+            "has_mobile": bool((account.phone_mobile or "").strip()),
+            "human_decisions": decisions,
+        }
+
+    @staticmethod
+    def _rule_action(account: PayflowAccountModel, balance: float, dpd: int) -> dict[str, Any]:
         if dpd >= 60:
             return {
                 "action": "Firm reminder with payment link",
@@ -290,6 +406,7 @@ class CaseReassessmentService:
             status=PayflowReviewStatus.AWAITING_REVIEW.value,
             reason="AI reassessment",
             proposed_action=str(rec.get("action") or "Reassess collection treatment"),
+            confidence=rec.get("confidence"),
             explanation=[f"Why: {rationale}"],
             history=[
                 {

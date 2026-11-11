@@ -24,10 +24,13 @@ from app.modules.payflow.services.workflow_suggestion.config import (
     CHANNEL_EVENTS,
     CHANNEL_FIELDS,
     CONTACT_ATTRIBUTES,
-    FULL_OR_PLAN_CHECK,
+    CUSTOMER_RESPONSE_VALUE,
+    FIXED_DATE_EVENTS,
     MISSED_INSTALMENT_CHECK,
+    ON_A_PLAN_CHECK,
     ON_A_PLAN_OUTCOME,
     ON_A_PLAN_SITUATION,
+    PAID_IN_FULL_CHECK,
     PAID_OR_PLAN_CHECK,
     PAID_OUTCOME,
     STOP_WHEN_PAID_SITUATIONS,
@@ -284,6 +287,9 @@ A workflow is a flowchart of steps.
 - AI Reassessment: note (what to reassess).
 - Outcome: outcome.
 Timing = amount + unit + direction + reference_event, e.g. 3 Days After Due Date. Never "Day 3". amount 0 = immediately.
+PayFlow waits until that date + amount. After the first message, time every Wait from "Previous Action" (or
+Payment Link Sent / Promise-to-Pay Date), never from {" or ".join(FIXED_DATE_EVENTS)}: those dates are in the past for
+most accounts, so the wait would end at once and the next message would follow right away.
 
 ## Allowed values
 PayFlow can contact this client's customers by: {reach}
@@ -305,19 +311,26 @@ Outcomes: {", ".join(OUTCOMES)}
 
 ## Stop when the customer pays
 On the payment page the customer can pay in full, pay part, or set up a payment plan. Once they do any of these,
-the reminders must stop. In {" and ".join(STOP_WHEN_PAID_SITUATIONS)} workflows:
+the reminders must stop. Payment Status counts what happens during the workflow: "Partial Payment" = paid part
+since it started (a part payment from before does not count); for a customer on a plan, "Unpaid" = an instalment
+is missed and "Payment Plan Active" = the plan is on track.
+In {" and ".join(STOP_WHEN_PAID_SITUATIONS)} workflows:
 - Before every follow-up message (every Communication after the first), and before handing an unpaid case to
   Human Review or escalation, add the Condition "{check_text(PAID_OR_PLAN_CHECK)}" (any payment or plan?).
   no = nothing paid yet, continue. yes = the customer acted, stop.
-- The stop branch: Condition "{check_text(FULL_OR_PLAN_CHECK)}" (paid in full or on a plan?):
-  yes → Outcome "{PAID_OUTCOME}"; no (paid part only) → Human Review to decide on the rest.
+- The stop branch: Condition "{check_text(PAID_IN_FULL_CHECK)}" (paid in full?): yes → Outcome "{PAID_OUTCOME}";
+  no → Condition "{check_text(ON_A_PLAN_CHECK)}" (on a plan?): yes → Outcome "{ON_A_PLAN_OUTCOME}";
+  no (paid part only) → Human Review to decide on the rest.
   Build the stop branch once; the yes of every check points to it.
-- Never use "Payment Status Equals Paid In Full" as the check: it misses part payments and plans.
-{ON_A_PLAN_SITUATION} workflows (the customer is already on a plan): never use these two checks - for them they are
-always yes, so the workflow would stop at once. Check for a missed instalment instead, with no loops:
+- Never use "{check_text(PAID_IN_FULL_CHECK)}" as the check before a follow-up: it misses part payments and plans.
+{ON_A_PLAN_SITUATION} workflows (the customer is already on a plan): never use "{check_text(PAID_OR_PLAN_CHECK)}" or
+"{check_text(ON_A_PLAN_CHECK)}" - for them both are always yes, so the workflow would stop at once.
+Check for a missed instalment instead, with no loops:
 reminder → Wait → Condition "{check_text(MISSED_INSTALMENT_CHECK)}" (instalment missed?): no → Outcome
 "{ON_A_PLAN_OUTCOME}"; yes → follow-up reminder → Wait → the same check again: yes → Human Review,
 no → Outcome "{ON_A_PLAN_OUTCOME}".
+In every workflow, Outcome "{PAID_OUTCOME}" closes the case and clears the balance: only the yes of
+"{check_text(PAID_IN_FULL_CHECK)}" may lead to it, never a customer who is on a plan or paid only part.
 
 ## Strategy guidance
 - Match intensity to the stage: early stage = friendly reminders and an easy way to pay;
@@ -330,6 +343,7 @@ no → Outcome "{ON_A_PLAN_OUTCOME}".
   Request first.
 - Branch on what happens, not only "Paid?": Payment Link clicked but unpaid = gentle follow-up;
   Customer Response = Dispute Raised = hold contact; high Outstanding Balance = Human Review.
+  Only check Customer Response for "{CUSTOMER_RESPONSE_VALUE}": "Received" and "None" also count PayFlow's own messages.
 - Be respectful and compliant: no threats, no pressure tactics.
 - name: short and descriptive. summary: 1-2 sentences.
 - reasoning (each field 1-2 sentences, quote the segment's numbers): segment_fit = why this workflow suits

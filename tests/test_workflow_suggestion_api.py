@@ -152,11 +152,12 @@ def test_preview_segments_requires_login(client, portfolio):
 # --------------------------------------------------------------------------- suggest
 
 
-# A Payment Plan customer is already on a plan: their workflow checks for a missed instalment instead.
+# A Payment Plan customer is already on a plan: their workflow checks for a missed instalment instead,
+# and never asks "on a plan?" (always yes for them).
 PLAN_CHECKS = {
     "s4": {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"},
     "s7": {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"},
-    "s10": {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"},
+    "s12": {"attribute": "Payment Status", "operator": "Equals", "value": "Partial Payment"},
 }
 
 
@@ -282,7 +283,8 @@ def test_suggest_sends_back_a_workflow_that_keeps_reminding_after_a_payment(clie
     )
     [workflow] = response.json()["workflows"]
     checks = {s["config"]["value"] for s in workflow["steps"] if s["config"].get("attribute") == "Payment Status"}
-    assert checks == {"Unpaid", "Partial Payment"}  # the saved workflow stops on any payment or plan
+    # The saved workflow stops on any payment or plan, keeping paid in full / on a plan / part paid apart.
+    assert checks == {"Unpaid", "Paid In Full", "Payment Plan Active"}
 
 
 def test_suggest_fixes_timing_without_reference_event(client, admin_token, portfolio):

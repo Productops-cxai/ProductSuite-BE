@@ -29,7 +29,9 @@ from app.modules.payflow.services.communication_service import PayflowCommunicat
 from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
 from app.modules.payflow.services.workflow_condition_runtime import (
+    FIXED_DATE_REFERENCE_EVENTS,
     apply_outcome_to_account,
+    channel_delivery,
     compare_values,
     resolve_condition_actual,
     resolve_reference_anchor,
@@ -38,6 +40,8 @@ from app.modules.payflow.services.workflow_condition_runtime import (
 from app.modules.payflow.services.workflow_contact_runtime import (
     flag_unreachable,
     is_contact_step,
+    localized_message_config,
+    localized_template,
     message_for_channel,
     preferred_contact_channels,
     send_succeeded,
@@ -110,6 +114,43 @@ def _utcnow() -> datetime:
 def _cfg(step: dict) -> dict:
     cfg = step.get("config")
     return cfg if isinstance(cfg, dict) else {}
+
+
+# Case Actions that hand the case to a person: the run pauses on a human review, which also
+# keeps other workflows from picking the account up (collection status "Human Review").
+# The supervisor's decision releases it: continue -> the workflow goes on, reject -> the run ends.
+CASE_ACTION_HOLD = "hold automated contact"
+CASE_ACTION_ESCALATE = "move case to escalated treatment"
+CASE_ACTION_CONTACT_UPDATE = "request contact details update"
+CASE_ACTION_CLOSE = "close case"
+_REVIEW_CASE_ACTIONS = {
+    CASE_ACTION_HOLD: "Automated contact is on hold - release it to continue the workflow",
+    CASE_ACTION_ESCALATE: "Case moved to escalated treatment - decide the next step",
+}
+PAYMENT_ACTION_RECORD_PTP = "record promise to pay"
+PAYMENT_ACTION_SEND_LINK = "send secure payment link"
+PAYMENT_ACTION_OFFER_PLAN = "offer payment plan"
+# What "Offer Payment Plan" found (step result "plan_offer"):
+PLAN_OFFER_AVAILABLE = "available"  # the customer can set up a plan on their payment page
+PLAN_OFFER_ALREADY_ON_PLAN = "already_on_plan"
+PLAN_OFFER_NOT_ALLOWED = "not_allowed"  # the client's payment page does not offer plans
+PLAN_OFFER_NO_PAGE = "no_payment_page"  # the customer's payment page could not be prepared
+PLAN_OFFER_NOT_POSSIBLE = "Payment plan offer not possible - needs review"
+# A Condition on "Email Delivery" / "SMS Delivery" right after a send: the provider's delivery
+# report arrives seconds to minutes later. Until then the message is neither delivered nor failed,
+# so the Condition waits for the report - at most this long, then it decides on what is known.
+DELIVERY_REPORT_WAIT = timedelta(minutes=10)
+_DELIVERY_ATTRIBUTES = {"email delivery": "Email", "sms delivery": "SMS"}
+_IN_TRANSIT_COMM_STATUSES = (PayflowCommStatus.QUEUED.value, PayflowCommStatus.SENT.value)
+# Outcomes that only confirm a case that is already Resolved: they may still run for it.
+_CLOSING_OUTCOMES = {"case closed", "paid in full"}
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """Datetimes read back from the database may have lost their timezone (they are UTC)."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def _account_execution_block_reason(account: PayflowAccountModel) -> str | None:
@@ -477,6 +518,7 @@ class WorkflowExecutionService:
 
         enrolled = 0
         skipped = 0
+        unmatched = 0  # eligible accounts that fit no Active workflow of this scope
         today = datetime.now(timezone.utc).date()
         self._touch_job(job_id)
         for index, account in enumerate(accounts, start=1):
@@ -505,6 +547,8 @@ class WorkflowExecutionService:
             best = match_account_to_segment(account, candidates, today)
             if not best or best["id"] != strategy.id:
                 skipped += 1
+                if not best:
+                    unmatched += 1
                 continue
             open_runs = (
                 self.db.query(PayflowWorkflowRunModel)
@@ -571,6 +615,8 @@ class WorkflowExecutionService:
                 current_step_id=entry,
                 segment=strategy.segment,
                 started_at=_utcnow(),
+                # "Payment Status" counts payments made from here on (workflow_condition_runtime).
+                recovered_at_start=float(account.recovered_balance or 0),
             )
             self.db.add(run)
             self.db.flush()
@@ -610,7 +656,24 @@ class WorkflowExecutionService:
             job_id=job_id,
             commit=True,
         )
-        return {"enrolled": enrolled, "skipped": skipped}
+        if unmatched:
+            # Not silent any more: these accounts moved into (or arrived in) a segment that no
+            # Active workflow covers, so nothing contacts them until a workflow is added.
+            plural = "" if unmatched == 1 else "s"
+            self.log_event(
+                event_type="enroll_unmatched",
+                message=(
+                    f"{unmatched} account{plural} in this scope fit no Active workflow - "
+                    "no workflow is running for them"
+                ),
+                level="warn",
+                strategy_id=strategy_id,
+                client_id=strategy.client_id,
+                portfolio_id=strategy.portfolio_id,
+                job_id=job_id,
+                commit=True,
+            )
+        return {"enrolled": enrolled, "skipped": skipped, "unmatched": unmatched}
 
     def _touch_job(self, job_id: int | None) -> None:
         """Heartbeat: tell the worker this job is alive so it is not reclaimed."""
@@ -1004,6 +1067,7 @@ class WorkflowExecutionService:
         self._close_waits_targeting_step(run.id, step_id)
         if after_comm_delay:
             self._close_deferred_communication(run.id, step_id)
+            self._close_awaiting_delivery(run.id, step_id, reason="delivery_report_wait_elapsed")
 
         # Idempotency: do not re-execute a step that already completed successfully.
         # Exception: after supervisor approve, re-run the step that was only paused
@@ -1025,7 +1089,10 @@ class WorkflowExecutionService:
                 after_comm_delay
                 and prior_ok.status in {"scheduled", "waiting", "done"}
                 and isinstance(prior_ok.result_json, dict)
-                and prior_ok.result_json.get("deferred_send")
+                and (
+                    prior_ok.result_json.get("deferred_send")
+                    or prior_ok.result_json.get("awaiting_delivery_report")
+                )
             )
             if not allow_resume:
                 self.log_event(
@@ -1042,6 +1109,9 @@ class WorkflowExecutionService:
                 return
 
         block = _account_execution_block_reason(account)
+        if block and self._is_closing_outcome(run, strategy, step_id, account):
+            # "Close Case" -> Outcome "Case Closed": the Outcome only confirms the closed case.
+            block = None
         if block:
             if account.collection_status == PayflowCollectionStatus.RESOLVED.value or (
                 account.collection_status or ""
@@ -1247,6 +1317,29 @@ class WorkflowExecutionService:
             self.db.commit()
             raise
 
+    def _is_closing_outcome(
+        self,
+        run: PayflowWorkflowRunModel,
+        strategy: PayflowStrategyModel,
+        step_id: str,
+        account: PayflowAccountModel,
+    ) -> bool:
+        """True for an Outcome "Case Closed" / "Paid In Full" step on a case that is already Resolved.
+
+        Such an Outcome sends nothing and changes nothing; letting it run ends the run as
+        Completed instead of Cancelled ("Case is Resolved").
+        """
+        if account.collection_status != PayflowCollectionStatus.RESOLVED.value:
+            return False
+        step = next(
+            (s for s in self._run_steps(run, strategy) if isinstance(s, dict) and s.get("id") == step_id),
+            None,
+        )
+        if not step or step.get("kind") not in {"Outcome", "End"}:
+            return False
+        label = _cfg(step).get("outcome") or step.get("outcome") or ""
+        return str(label).strip().lower() in _CLOSING_OUTCOMES
+
     def _next_attempt(self, run_id: int, step_id: str) -> int:
         last = (
             self.db.query(PayflowWorkflowStepRunModel)
@@ -1417,6 +1510,7 @@ class WorkflowExecutionService:
         *,
         rule_id: int | None,
         reason: str,
+        proposed_action: str = "Continue workflow after supervisor review",
     ) -> None:
         from app.modules.payflow.services.review_service import PayflowReviewService
 
@@ -1436,7 +1530,7 @@ class WorkflowExecutionService:
             review = review_svc.create_review(
                 account_id=account.id,
                 reason=reason,
-                proposed_action="Continue workflow after supervisor review",
+                proposed_action=proposed_action,
                 strategy_id=strategy.id,
                 workflow_version=run.strategy_version,
                 exception_step_id=step.get("id"),
@@ -1572,10 +1666,35 @@ class WorkflowExecutionService:
             return step.get("next") or cfg.get("next")
 
         if kind == "Condition":
+            report_due = (
+                None if ctx or after_comm_delay else self._delivery_report_due_at(account, cfg, step)
+            )
+            if report_due is not None:
+                # Checked again when the report arrives (on_communication_event) or, without
+                # one, when the wait is over.
+                run.status = PayflowWorkflowRunStatus.WAITING.value
+                step_run.status = "scheduled"
+                step_run.result_json = {
+                    "wait_until": report_due.isoformat(),
+                    "awaiting_delivery_report": True,
+                    "next": step.get("id"),
+                }
+                enqueue_execute_step(
+                    self.db,
+                    run_id=run.id,
+                    step_id=step.get("id") or "",
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    scheduled_at=report_due,
+                    payload={"after_comm_delay": True},
+                    commit=False,
+                )
+                account.next_action = "Waiting for the delivery report"
+                return None
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
             yes_id = step.get("yes") or cfg.get("yes")
             no_id = step.get("no") or cfg.get("no")
-            matched = self._eval_condition(account, cfg, step, ctx)
+            matched = self._eval_condition(account, cfg, step, ctx, run=run)
             attr = (
                 cfg.get("attribute")
                 or step.get("attribute")
@@ -1626,9 +1745,40 @@ class WorkflowExecutionService:
             return step.get("next") or cfg.get("next")
 
         if kind == "Case Action":
+            next_id = step.get("next") or cfg.get("next")
+            action_key = str(cfg.get("action") or step.get("action") or "").strip().lower()
+            if action_key in _REVIEW_CASE_ACTIONS:
+                if after_human_review:
+                    # The supervisor released the hold / decided on the escalation: go on.
+                    self._append_timeline(account, "Released after review", str(cfg.get("action") or ""))
+                    step_run.result_json = {"action": cfg.get("action"), "released_after_review": True}
+                    run.status = PayflowWorkflowRunStatus.ACTIVE.value
+                    return next_id
+                self._apply_case_action(account, cfg, step, step_run)
+                if (steps.get(next_id) or {}).get("kind") == "Human Review":
+                    # The next step opens the review itself: one review, not two in a row.
+                    run.status = PayflowWorkflowRunStatus.ACTIVE.value
+                    return next_id
+                from app.modules.payflow.services.review_service import normalize_review_reason
+
+                applied = dict(step_run.result_json or {})
+                self._pause_for_human_review(
+                    run,
+                    account,
+                    strategy,
+                    step,
+                    step_run,
+                    rule_id=None,
+                    reason=normalize_review_reason(
+                        cfg.get("review_reason") or cfg.get("note") or step.get("title")
+                    ),
+                    proposed_action=_REVIEW_CASE_ACTIONS[action_key],
+                )
+                step_run.result_json = {**applied, **(step_run.result_json or {})}
+                return None
             self._apply_case_action(account, cfg, step, step_run)
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
-            return step.get("next") or cfg.get("next")
+            return next_id
 
         if kind == "AI Reassessment":
             self._queue_ai_reassessment(account, strategy, step_run)
@@ -1644,6 +1794,16 @@ class WorkflowExecutionService:
             )
             applied = apply_outcome_to_account(account, str(outcome_label))
             step_run.result_json = {"outcome": outcome_label, **applied}
+            if applied.get("applied") is False:
+                self.log_event(
+                    event_type="outcome_not_applied",
+                    message=str(applied.get("reason") or f"Outcome {outcome_label} not applied"),
+                    level="warn",
+                    run_id=run.id,
+                    account_id=account.id,
+                    strategy_id=strategy.id,
+                    step_id=step.get("id"),
+                )
             return None
 
         run.status = PayflowWorkflowRunStatus.ACTIVE.value
@@ -1745,6 +1905,68 @@ class WorkflowExecutionService:
             closed += 1
         return closed
 
+    def _delivery_report_due_at(
+        self, account: PayflowAccountModel, cfg: dict, step: dict
+    ) -> datetime | None:
+        """Until when a delivery Condition waits for the provider's report; None = decide now.
+
+        Only while the channel's latest message is still in transit (Queued / Sent) and was
+        sent less than DELIVERY_REPORT_WAIT ago.
+        """
+        attribute = cfg.get("attribute") or step.get("attribute") or cfg.get("field") or step.get("field")
+        channel = _DELIVERY_ATTRIBUTES.get(str(attribute or "").strip().lower())
+        if not channel:
+            return None
+        row = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(
+                PayflowCommunicationModel.account_id == account.id,
+                PayflowCommunicationModel.channel == channel,
+            )
+            .order_by(PayflowCommunicationModel.id.desc())
+            .first()
+        )
+        if row is None or row.status not in _IN_TRANSIT_COMM_STATUSES:
+            return None
+        sent_at = _aware(row.sent_at or row.created_at)
+        if sent_at is None:
+            return None
+        due = sent_at + DELIVERY_REPORT_WAIT
+        return due if due > _utcnow() else None
+
+    def _awaiting_delivery_row(
+        self, run_id: int, step_id: str
+    ) -> PayflowWorkflowStepRunModel | None:
+        """The Condition step-run that is waiting for a delivery report, if there is one."""
+        rows = (
+            self.db.query(PayflowWorkflowStepRunModel)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run_id,
+                PayflowWorkflowStepRunModel.step_id == step_id,
+                PayflowWorkflowStepRunModel.kind == "Condition",
+                PayflowWorkflowStepRunModel.status == "scheduled",
+            )
+            .order_by(PayflowWorkflowStepRunModel.id.desc())
+            .all()
+        )
+        return next(
+            (
+                row
+                for row in rows
+                if isinstance(row.result_json, dict) and row.result_json.get("awaiting_delivery_report")
+            ),
+            None,
+        )
+
+    def _close_awaiting_delivery(self, run_id: int, step_id: str, *, reason: str) -> bool:
+        row = self._awaiting_delivery_row(run_id, step_id)
+        if row is None:
+            return False
+        row.status = "done"
+        row.finished_at = _utcnow()
+        row.result_json = {**row.result_json, "closed_reason": reason}
+        return True
+
     def _close_deferred_communication(self, run_id: int, step_id: str) -> int:
         """Close Communication rows that were waiting for a timed send."""
         rows = (
@@ -1799,16 +2021,33 @@ class WorkflowExecutionService:
         now_utc = _utcnow()
         delta = timedelta_for_unit(amount, str(unit))
 
+        reference = str(reference_event or "").strip().lower()
+        started_at = _aware(getattr(run, "started_at", None)) if run else None
         anchor = None
         if account is not None:
             anchor = resolve_reference_anchor(
                 self.db,
                 account,
                 str(reference_event) if reference_event else None,
-                run_started_at=getattr(run, "started_at", None) if run else None,
+                run_started_at=started_at,
+                previous_action_at=(
+                    self._previous_action_at(run) if run and reference == "previous action" else None
+                ),
             )
         if anchor is None:
             anchor = now_utc
+        elif (
+            reference in FIXED_DATE_REFERENCE_EVENTS
+            and not direction.startswith("before")
+            and started_at is not None
+            and anchor < started_at
+            and self._run_has_sent_message(run)
+        ):
+            # "7 days after Case Received" on an account received months ago is already over, so
+            # every later message would follow the first one within seconds. Once the run has
+            # sent a message, such a date counts from the run's start: the workflow keeps its
+            # spacing. The first message is not affected (an overdue account gets it at once).
+            anchor = started_at
 
         if direction.startswith("before"):
             when = anchor - delta
@@ -1820,6 +2059,36 @@ class WorkflowExecutionService:
             when = now_utc
         # Convert through client timezone for day-boundary consistency, then UTC.
         return when.astimezone(tz).astimezone(timezone.utc)
+
+    def _previous_action_at(self, run: PayflowWorkflowRunModel) -> datetime | None:
+        """When the run's previous step finished - the anchor of "Previous Action"."""
+        if run is None or run.id is None:
+            return None
+        row = (
+            self.db.query(PayflowWorkflowStepRunModel.finished_at)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run.id,
+                PayflowWorkflowStepRunModel.status == "done",
+                PayflowWorkflowStepRunModel.finished_at.isnot(None),
+            )
+            .order_by(PayflowWorkflowStepRunModel.finished_at.desc())
+            .first()
+        )
+        return _aware(row[0]) if row else None
+
+    def _run_has_sent_message(self, run: PayflowWorkflowRunModel | None) -> bool:
+        if run is None or run.id is None:
+            return False
+        return (
+            self.db.query(PayflowWorkflowStepRunModel.id)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run.id,
+                PayflowWorkflowStepRunModel.kind == "Communication",
+                PayflowWorkflowStepRunModel.status == "done",
+            )
+            .first()
+            is not None
+        )
 
     def _communication_defer_until(
         self,
@@ -1852,7 +2121,9 @@ class WorkflowExecutionService:
         cfg: dict,
         step: dict,
         ctx: dict[str, Any],
+        run: PayflowWorkflowRunModel | None = None,
     ) -> bool:
+        """`run`: the run checking it — "Payment Status" counts payments made since it started."""
         # AI / FE catalog uses `attribute`; older steps may still use `field`.
         attribute = (
             cfg.get("attribute")
@@ -1868,11 +2139,11 @@ class WorkflowExecutionService:
         if not attribute:
             # Default stop-when-paid/plan heuristic aligned with Payment Status catalog.
             status = resolve_condition_actual(
-                self.db, account, "Payment Status", ctx=ctx
+                self.db, account, "Payment Status", ctx=ctx, run=run
             )
             return status in {"Paid In Full", "Payment Plan Active", "Partial Payment"}
 
-        actual = resolve_condition_actual(self.db, account, attribute, ctx=ctx)
+        actual = resolve_condition_actual(self.db, account, attribute, ctx=ctx, run=run)
         return compare_values(actual, str(operator), expected)
 
     def _append_timeline(self, account: PayflowAccountModel, label: str, detail: str = "") -> None:
@@ -1915,24 +2186,71 @@ class WorkflowExecutionService:
             account.last_payment_date = _utcnow().date()
         if "is_ptp" in cfg or "is_ptp" in ctx:
             account.last_payment_is_ptp = bool(cfg.get("is_ptp", ctx.get("is_ptp")))
+        action_key = str(action).strip().lower()
         status_hint = cfg.get("collection_status") or step.get("collection_status")
         if status_hint:
             account.collection_status = str(status_hint)
-        elif account.last_payment_is_ptp:
+        elif account.last_payment_is_ptp or action_key == PAYMENT_ACTION_RECORD_PTP:
+            # "Record Promise To Pay": the case is now a promise (same as Outcome "Promise To Pay Recorded").
             account.collection_status = PayflowCollectionStatus.PROMISE_TO_PAY.value
+        # "Send Secure Payment Link": make sure the customer's payment page exists. The message that
+        # carries the link is a Communication step - it alone passes the compliance checks.
+        link_ready = bool(self._payment_link(account)) if action_key == PAYMENT_ACTION_SEND_LINK else None
+        plan_offer = self._offer_payment_plan(account) if action_key == PAYMENT_ACTION_OFFER_PLAN else None
         detail = f"{action}"
         if account.last_payment_amount is not None:
             detail = f"{action} · {account.last_payment_amount}"
+        if plan_offer is not None:
+            detail = f"{action} · {plan_offer.replace('_', ' ')}"
         self._append_timeline(account, action, detail)
         account.last_action = action
         step_run.result_json = {
             "action": action,
+            **({"plan_offer": plan_offer} if plan_offer is not None else {}),
             "amount": account.last_payment_amount,
             "payment_date": account.last_payment_date.isoformat()
             if account.last_payment_date
             else None,
             "is_ptp": account.last_payment_is_ptp,
+            "collection_status": account.collection_status,
+            **({"payment_link_ready": link_ready} if link_ready is not None else {}),
         }
+
+    def _offer_payment_plan(self, account: PayflowAccountModel) -> str:
+        """ "Offer Payment Plan": make the offer real, or say why it cannot be made.
+
+        A plan is set up by the customer on their payment page, so the offer exists when the
+        client's page allows plans and the customer's page is ready. The message that tells the
+        customer about it is a Communication step ("Payment Plan Reminder") - it alone passes
+        the compliance checks. When no plan can be offered a person looks at the case, instead
+        of the timeline claiming an offer that was never possible.
+        """
+        from app.modules.payflow.services.workflow_condition_runtime import _current_plan
+        from app.modules.payflow.services.workflow_suggestion.context import load_payment_options
+
+        if _current_plan(self.db, account.id) is not None:
+            return PLAN_OFFER_ALREADY_ON_PLAN
+        try:
+            allowed = "set up a payment plan" in load_payment_options(self.db, account.client_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read payment options for client_id=%s", account.client_id)
+            allowed = False
+        if not allowed:
+            outcome = PLAN_OFFER_NOT_ALLOWED
+        elif not self._payment_link(account):
+            outcome = PLAN_OFFER_NO_PAGE
+        else:
+            return PLAN_OFFER_AVAILABLE
+        account.human_review = True
+        account.next_action = PLAN_OFFER_NOT_POSSIBLE
+        self.log_event(
+            event_type="plan_offer_not_possible",
+            message=f"Offer Payment Plan: {outcome.replace('_', ' ')}",
+            level="warn",
+            account_id=account.id,
+            client_id=account.client_id,
+        )
+        return outcome
 
     def _apply_case_action(
         self,
@@ -1942,10 +2260,22 @@ class WorkflowExecutionService:
         step_run: PayflowWorkflowStepRunModel,
     ) -> None:
         action = cfg.get("action") or step.get("action") or "Case action"
+        action_key = str(action).strip().lower()
         if cfg.get("collection_status") or step.get("collection_status"):
             account.collection_status = str(
                 cfg.get("collection_status") or step.get("collection_status")
             )
+        elif action_key == CASE_ACTION_CLOSE:
+            # Same as Outcome "Case Closed": no further collection action on this case.
+            account.collection_status = PayflowCollectionStatus.RESOLVED.value
+            account.next_action = None
+        elif action_key in _REVIEW_CASE_ACTIONS:
+            # Held / escalated: a person decides. Other workflows do not enrol the account meanwhile.
+            account.human_review = True
+            account.collection_status = PayflowCollectionStatus.HUMAN_REVIEW.value
+        elif action_key == CASE_ACTION_CONTACT_UPDATE:
+            # Flagged for staff (the case's review flag + its timeline); the workflow itself goes on.
+            account.human_review = True
         if "provincial_hold" in cfg:
             account.provincial_hold = bool(cfg.get("provincial_hold"))
         if "hold_days" in cfg:
@@ -2177,8 +2507,11 @@ class WorkflowExecutionService:
         strategy: PayflowStrategyModel,
     ) -> tuple[str, str]:
         """Build rendered subject/body for a fixed channel or contact-step channel pick."""
+        # The step's text (or its template) in the customer's language when there is a version for it.
+        language = getattr(account, "language", None)
+        cfg = localized_message_config(cfg, language)
         if is_contact_step(cfg, step):
-            subject, body = message_for_channel(cfg, channel=channel, purpose=purpose)
+            subject, body = message_for_channel(cfg, channel=channel, purpose=purpose, language=language)
         else:
             template_id = cfg.get("template_id") or step.get("template_id")
             template = next((t for t in MESSAGE_TEMPLATES if t.get("id") == template_id), None)
@@ -2189,6 +2522,7 @@ class WorkflowExecutionService:
                 )
 
                 template = template_for(purpose, channel)
+            template = localized_template(template, language)
             if channel.strip().lower() == "sms":
                 subject, body = "", (cfg.get("body") or (template or {}).get("body") or "")
             else:
@@ -3311,11 +3645,30 @@ class WorkflowExecutionService:
             account = self.db.get(PayflowAccountModel, run.account_id)
             if not account:
                 return False
+            if self._awaiting_delivery_row(run.id, run.current_step_id) is not None:
+                # Waiting for a delivery report: only the report itself (Delivered / Failed /
+                # Bounced for that channel) decides now. Anything else - "Sent", a payment, a
+                # status change - leaves it to the scheduled check, so the branch is never
+                # taken twice.
+                attribute = cfg.get("attribute") or step.get("attribute") or ""
+                channel = _DELIVERY_ATTRIBUTES.get(str(attribute).strip().lower())
+                if (
+                    event != "communication"
+                    or not channel
+                    or str(context.get("channel") or "").strip().lower() != channel.lower()
+                    or channel_delivery(self.db, account, channel, context) is None
+                ):
+                    return False
+                cancel_pending_jobs_for_run(self.db, run.id)  # the scheduled check
+                self._close_awaiting_delivery(
+                    run.id, run.current_step_id, reason="delivery_report_received"
+                )
             matched = self._eval_condition(
                 account,
                 cfg,
                 step,
                 context,
+                run=run,
             )
             next_id = (step.get("yes") or cfg.get("yes")) if matched else (
                 step.get("no") or cfg.get("no")

@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationAppError
@@ -396,6 +397,12 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     else:
         channel_val = cfg.get("channel") or raw.get("channel")
 
+    # Other-language versions of a message step's text (see _clean_translations).
+    raw_translations = cfg.pop("translations", None)
+    translations = _clean_translations(raw_translations) if kind == "Communication" else {}
+    if translations:
+        cfg["translations"] = translations
+
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
         if note:
@@ -423,6 +430,52 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         # Conditions should branch; allow incomplete drafts but prefer yes/no when provided
         pass
     return step
+
+
+MESSAGE_TEXT_KEYS = ("subject", "body", "sms_body")
+
+
+def _clean_translations(raw: Any) -> dict[str, dict[str, str]]:
+    """{"FR": {"subject", "body", "sms_body"}, ...}: the step's text in other languages, keyed by the
+    account language code (PayflowAccountModel.language). The worker sends the version matching the
+    customer's language, else the step's main text. Entries without any text are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, str]] = {}
+    for code, text in raw.items():
+        if not isinstance(text, dict) or not str(code or "").strip():
+            continue
+        version = {key: str(text[key]).strip() for key in MESSAGE_TEXT_KEYS if str(text.get(key) or "").strip()}
+        if version.get("body") or version.get("sms_body"):
+            cleaned[str(code).strip().upper()] = version
+    return cleaned
+
+
+def _carry_translations(before: list[dict], after: list[dict]) -> list[dict]:
+    """A step's other-language versions follow its main text.
+
+    - Main text edited or cleared, and the versions sent back as they were (or not sent) → they are
+      outdated and dropped; the update route then asks the AI to write them again.
+    - Main text edited together with new versions → the new versions are kept.
+    - Main text unchanged and no versions sent (a client that does not know about them) → the stored
+      versions stay.
+    """
+    stored = {step.get("id"): step for step in before}
+    result = []
+    for step in after:
+        old = stored.get(step.get("id"))
+        if old is not None:
+            cfg = _cfg(step)
+            old_versions = _cfg(old).get("translations") or {}
+            new_versions = cfg.get("translations") or {}
+            if _message_text(old) != _message_text(step):
+                if not new_versions or new_versions == old_versions:
+                    cfg.pop("translations", None)
+            elif not new_versions and old_versions:
+                cfg["translations"] = copy.deepcopy(old_versions)
+            step = {**step, "config": cfg}
+        result.append(step)
+    return result
 
 
 def _normalize_steps(
@@ -829,7 +882,10 @@ class PayflowStrategyService:
             ),
         )
 
-    def _serialize(self, row: PayflowStrategyModel) -> dict[str, Any]:
+    def _serialize(
+        self, row: PayflowStrategyModel, *, replaced_by: dict[int, int] | None = None
+    ) -> dict[str, Any]:
+        """`replaced_by`: {id: replaced_by_id} already loaded for a list (else one query for this row)."""
         steps = list(row.steps or [])
         # Ensure timing labels present for older rows
         for step in steps:
@@ -863,6 +919,10 @@ class PayflowStrategyService:
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
             "revision_of_id": row.revision_of_id,
+            # The newest version regenerated from this one (it is then Rejected).
+            "replaced_by_id": (
+                replaced_by.get(row.id) if replaced_by is not None else self._replaced_by_map([row.id]).get(row.id)
+            ),
             "versions": self._list_versions(row),
             "approved_by": row.approved_by,
             "approval_date": row.approval_date,
@@ -912,8 +972,9 @@ class PayflowStrategyService:
             return sum(1 for r in rows if r.status == status_value)
 
         awaiting = sum(1 for r in rows if _awaiting_review(r.status))
+        replaced_by = self._replaced_by_map([r.id for r in rows])
         return {
-            "strategies": [self._serialize(r) for r in rows],
+            "strategies": [self._serialize(r, replaced_by=replaced_by) for r in rows],
             "summary": {
                 "total": len(rows),
                 "ai_proposed": count(PayflowStrategyStatus.AI_PROPOSED.value),
@@ -922,6 +983,7 @@ class PayflowStrategyService:
                 "approved": count(PayflowStrategyStatus.APPROVED.value),
                 "active": count(PayflowStrategyStatus.ACTIVE.value),
                 "inactive": count(PayflowStrategyStatus.INACTIVE.value),
+                "rejected": count(PayflowStrategyStatus.REJECTED.value),
                 "awaiting_review": awaiting,
             },
             "statuses": [s.value for s in PayflowStrategyStatus],
@@ -937,14 +999,21 @@ class PayflowStrategyService:
         return self._serialize(row)
 
     def create_strategy(
-        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True, version: int = 1
+        self,
+        user: UserModel,
+        payload: dict[str, Any],
+        *,
+        commit: bool = True,
+        version: int = 1,
+        history_note: str | None = None,
     ) -> dict[str, Any]:
         """commit=False only flushes and skips the notification: the caller saves several
         workflows together, commits once, then calls notify_awaiting for each.
 
         `version`: the starting version number — 1, except for AI Regenerate, whose new workflow
         continues the number of the one it replaces (v2 → v3). A keyword, not a payload field,
-        so the create API cannot set it."""
+        so the create API cannot set it.
+        `history_note`: the first history entry's note instead of the default (Regenerate: where it came from)."""
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Strategy name is required")
@@ -1055,11 +1124,8 @@ class PayflowStrategyService:
             row,
             self._version_entry(
                 version=version,
-                note=(
-                    "Proposed by PayFlow AI"
-                    if ai_generated
-                    else f"Created by {user.full_name}"
-                ),
+                note=history_note
+                or ("Proposed by PayFlow AI" if ai_generated else f"Created by {user.full_name}"),
                 steps=steps,
                 segment=segment,
                 status=status,
@@ -1084,6 +1150,7 @@ class PayflowStrategyService:
     def begin_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.AI_PROPOSED.value:
             raise ValidationAppError("Only AI Proposed workflows can begin review this way")
         row.status = PayflowStrategyStatus.UNDER_REVIEW.value
@@ -1107,6 +1174,7 @@ class PayflowStrategyService:
     ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
 
         before_steps = copy.deepcopy(list(row.steps or []))
         was_ai_proposed = row.status == PayflowStrategyStatus.AI_PROPOSED.value
@@ -1147,7 +1215,9 @@ class PayflowStrategyService:
                 if source == PayflowStrategySource.AI_GENERATED.value
                 else PayflowStrategyOrigin.HUMAN_CREATED.value
             )
-            new_steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            new_steps = _carry_translations(
+                before_steps, _normalize_steps(payload["steps"], default_origin=default_origin)
+            )
             steps_changed = _steps_changed(before_steps, new_steps)
             # Same steps sent back: keep the stored ones, so step origins are not re-stamped.
             if steps_changed:
@@ -1210,16 +1280,26 @@ class PayflowStrategyService:
         return self._serialize(self._get_row(row.id))
 
     def save_ai_messages(
-        self, user: UserModel, strategy_id: int, steps: list[dict[str, Any]], *, remarks: str | None = None
+        self,
+        user: UserModel,
+        strategy_id: int,
+        steps: list[dict[str, Any]],
+        *,
+        remarks: str | None = None,
+        note: str | None = None,
+        ai_context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Save email / SMS text the AI wrote for a workflow's steps.
 
         An AI change, not a human one: status and origin stay as they are ("Human Modified" is
         not set). While no human has changed the workflow, the AI proposal snapshot gets the
         text too, so later reviewer edits to it count as changes to the AI's words.
+        `note`: the history note to record instead of the default one (e.g. for translations).
+        `ai_context`: the workflow's new ai_context lines (e.g. an updated "Languages" line); None = unchanged.
         """
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         before = {step.get("id"): step for step in row.steps or []}
         written = [
             step.get("title") or step.get("id")
@@ -1227,14 +1307,17 @@ class PayflowStrategyService:
             if _message_text(step) != _message_text(before.get(step.get("id")) or {})
         ]
         row.steps = copy.deepcopy(steps)
+        if ai_context is not None:
+            row.ai_context = copy.deepcopy(ai_context)
         if row.origin == PayflowStrategyOrigin.AI_PROPOSED.value and row.ai_proposal_snapshot:
             row.ai_proposal_snapshot = {**row.ai_proposal_snapshot, "steps": copy.deepcopy(steps)}
 
         # No change list: reviewer-feedback readers (Regenerate history, Suggest lessons)
         # must not take the AI's own writing for a reviewer's edit.
-        note = f"Message text written by AI for {user.full_name}: {', '.join(written) or 'no change'}"
-        if remarks:
-            note += f" (remarks: {remarks})"
+        if note is None:
+            note = f"Message text written by AI for {user.full_name}: {', '.join(written) or 'no change'}"
+            if remarks:
+                note += f" (remarks: {remarks})"
         self._prepend_version(
             row,
             {
@@ -1253,6 +1336,7 @@ class PayflowStrategyService:
     def save_draft(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
 
         if row.status in {
             PayflowStrategyStatus.APPROVED.value,
@@ -1302,6 +1386,7 @@ class PayflowStrategyService:
     def submit_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.DRAFT.value:
             raise ValidationAppError("Only Draft workflows can be submitted for review")
         if not row.steps:
@@ -1327,6 +1412,7 @@ class PayflowStrategyService:
     def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         # Reviewer can approve from AI Proposed or Under Review; Active still requires a separate activate.
         if row.status not in {
             PayflowStrategyStatus.AI_PROPOSED.value,
@@ -1370,6 +1456,9 @@ class PayflowStrategyService:
         self._assert_manage(user, row.client_id)
         # Lovable: Reject / Request Regeneration is available for AI workflows in any
         # reviewable state including Active (returns to AI Proposed for regeneration).
+        if row.status == PayflowStrategyStatus.REJECTED.value:
+            # Already rejected (Regenerate did it): nothing to change - the frontend rejects right after it.
+            return self._serialize(row)
         if row.status not in {
             PayflowStrategyStatus.DRAFT.value,
             PayflowStrategyStatus.UNDER_REVIEW.value,
@@ -1433,6 +1522,7 @@ class PayflowStrategyService:
     ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status in {
             PayflowStrategyStatus.AI_PROPOSED.value,
             PayflowStrategyStatus.DRAFT.value,
@@ -1483,6 +1573,7 @@ class PayflowStrategyService:
     def deactivate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.ACTIVE.value:
             raise ValidationAppError("Only Active workflows can be deactivated")
         row.status = PayflowStrategyStatus.INACTIVE.value
@@ -1578,6 +1669,26 @@ class PayflowStrategyService:
         except Exception:
             pass
 
+    def _replaced_by_map(self, strategy_ids: list[int]) -> dict[int, int]:
+        """{id: newest workflow regenerated from it} for the given workflows (one query)."""
+        if not strategy_ids:
+            return {}
+        rows = (
+            self.db.query(PayflowStrategyModel.revision_of_id, func.max(PayflowStrategyModel.id))
+            .filter(PayflowStrategyModel.revision_of_id.in_(strategy_ids))
+            .group_by(PayflowStrategyModel.revision_of_id)
+            .all()
+        )
+        return {original_id: newest_id for original_id, newest_id in rows}
+
+    def _assert_open(self, row: PayflowStrategyModel) -> None:
+        """A Rejected workflow is closed: it was replaced by a regenerated version."""
+        if row.status != PayflowStrategyStatus.REJECTED.value:
+            return
+        replaced_by = self._replaced_by_map([row.id]).get(row.id)
+        where = f" by #{replaced_by}" if replaced_by else ""
+        raise ValidationAppError(f"This workflow was rejected and replaced{where} - use the new version")
+
     def _get_row(self, strategy_id: int) -> PayflowStrategyModel:
         row = (
             self.db.query(PayflowStrategyModel)
@@ -1611,6 +1722,7 @@ class PayflowStrategyService:
                 "approved": 0,
                 "active": 0,
                 "inactive": 0,
+                "rejected": 0,
                 "awaiting_review": 0,
             },
             "statuses": [s.value for s in PayflowStrategyStatus],

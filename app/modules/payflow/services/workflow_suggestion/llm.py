@@ -43,6 +43,9 @@ PROVIDERS: dict[str, dict[str, str | None]] = {
 }
 RATE_LIMIT_RETRIES = 5
 MAX_RATE_LIMIT_WAIT_SECONDS = 60
+# The service is briefly down (timeout, connection error, 5xx): wait this long, then try again —
+# one wait per retry. Without it one hiccup failed the whole Suggest (all-or-nothing).
+SERVER_ERROR_WAITS_SECONDS = (2, 5)
 
 
 def _object(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -119,7 +122,9 @@ def build_message_schema(step_ids: list[str]) -> dict[str, Any]:
     return _object({"messages": {"type": "array", "items": message}}, required=["messages"])
 
 
-def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
+def call_llm(messages: list[dict[str, str]], schema: dict[str, Any], *, quick: bool = False) -> dict[str, Any]:
+    """`quick`: for a call made while a workflow step or a page is waiting (one case, a short
+    answer): no waiting out a rate limit and one retry only - the caller has a fallback."""
     provider = _provider()
     api_key = getattr(settings, provider["key"])
     if not api_key:
@@ -136,7 +141,13 @@ def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str
     }
     if provider["max_tokens"]:
         payload["max_tokens"] = getattr(settings, provider["max_tokens"])
-    response = _post_with_rate_limit_wait(provider["url"], api_key, payload)
+    response = _post_with_retries(
+        provider["url"],
+        api_key,
+        payload,
+        rate_limit_retries=0 if quick else RATE_LIMIT_RETRIES,
+        server_error_waits=SERVER_ERROR_WAITS_SECONDS[:1] if quick else SERVER_ERROR_WAITS_SECONDS,
+    )
     if response.status_code != 200:
         raise ServiceUnavailableError(f"AI service error ({response.status_code}): {_error_message(response)}")
     choice = response.json()["choices"][0]
@@ -155,9 +166,21 @@ def _provider() -> dict[str, str | None]:
     return PROVIDERS[name]
 
 
-def _post_with_rate_limit_wait(url: str, api_key: str, payload: dict[str, Any]) -> httpx.Response:
-    """POST to the AI service; on 429 (rate limit) wait as told by `retry-after`, then retry."""
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+def _post_with_retries(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    rate_limit_retries: int = RATE_LIMIT_RETRIES,
+    server_error_waits: tuple[int, ...] = SERVER_ERROR_WAITS_SECONDS,
+) -> httpx.Response:
+    """POST to the AI service and retry what is temporary.
+
+    429 (rate limit): wait as told by `retry-after`, up to `rate_limit_retries` times.
+    Timeout, connection error or 5xx: wait `server_error_waits`, one wait per retry.
+    """
+    rate_limited = server_errors = 0
+    while True:
         try:
             response = httpx.post(
                 url,
@@ -165,12 +188,20 @@ def _post_with_rate_limit_wait(url: str, api_key: str, payload: dict[str, Any]) 
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
             )
-        except httpx.HTTPError as exc:
-            raise ServiceUnavailableError("AI service could not be reached") from exc
-        if response.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+        except httpx.HTTPError as exc:  # timeouts and connection errors
+            if server_errors == len(server_error_waits):
+                raise ServiceUnavailableError("AI service could not be reached") from exc
+            time.sleep(server_error_waits[server_errors])
+            server_errors += 1
+            continue
+        if response.status_code == 429 and rate_limited < rate_limit_retries:
+            time.sleep(_retry_after_seconds(response))
+            rate_limited += 1
+        elif response.status_code >= 500 and server_errors < len(server_error_waits):
+            time.sleep(server_error_waits[server_errors])
+            server_errors += 1
+        else:
             return response
-        time.sleep(_retry_after_seconds(response))
-    return response
 
 
 def _retry_after_seconds(response: httpx.Response) -> float:

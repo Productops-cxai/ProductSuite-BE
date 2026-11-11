@@ -27,10 +27,13 @@ from app.modules.payflow.services.workflow_suggestion.segmenter import CONTACT_S
 from app.modules.payflow.services.workflow_suggestion.validator import (
     validate_catalog_values,
     validate_contact_steps,
+    validate_customer_response,
     validate_flowchart,
     validate_limits,
+    validate_paid_in_full_outcome,
     validate_step_config,
     validate_stop_when_paid,
+    validate_timing_anchors,
 )
 from app.shared.enums import PayflowStrategyOrigin, PayflowStrategyStatus
 
@@ -99,13 +102,17 @@ def learned_from(examples: list[dict], lessons: list[str]) -> list[dict[str, str
 
 def _valid_today(row: PayflowStrategyModel, limits: dict[str, Any]) -> bool:
     """Old-format workflows, ones using e.g. a channel the client turned off, branching on email / SMS
-    delivery, or that keep sending reminders after the customer paid or set up a plan, are not shown."""
+    delivery, that keep sending reminders after the customer paid or set up a plan, that can mark a
+    customer who did not pay in full as "Paid In Full", that time a wait after a message from a past date,
+    or that check an untrustworthy Customer Response, are not shown."""
     workflow = {"segment_id": f"#{row.id}", "entry_node_id": row.entry_node_id, "steps": list(row.steps or [])}
     if not workflow["steps"] or validate_flowchart(workflow):
         return False
     errors = validate_catalog_values(workflow, limits) + validate_step_config(workflow) + validate_limits(workflow, limits)
     errors += validate_contact_steps(workflow, limits)
     errors += validate_stop_when_paid(workflow, (row.segment or {}).get("situation"))
+    errors += validate_paid_in_full_outcome(workflow) + validate_timing_anchors(workflow)
+    errors += validate_customer_response(workflow)
     return not errors
 
 

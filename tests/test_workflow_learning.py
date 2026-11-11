@@ -203,3 +203,12 @@ def test_lessons_are_short_deduplicated_and_capped(db_session, portfolio):  # no
     assert len(lines) == learning.MAX_LESSONS
     assert lines[0] == f"- [Active · {EARLY}] EDITED: change 0; change 1; change 2 (+2 more). WHY: why"
     assert lines[1] == f"- [Active · {EARLY}] EDITED: same change" and lines[2] != lines[1]
+
+
+def test_workflows_that_wait_from_a_past_date_or_trust_customer_response_are_not_examples():
+    for step_id, change in (("s3", {"reference_event": "Case Received"}),  # Wait after the first message
+                            ("s4", {"attribute": "Customer Response", "operator": "Equals", "value": "Received"})):
+        steps = copy.deepcopy(load_examples()[0]["steps"])
+        next(s for s in steps if s["id"] == step_id)["config"].update(change)
+        row = SimpleNamespace(id=1, entry_node_id="s1", steps=steps, segment={})
+        assert not learning._valid_today(row, LIMITS), step_id
