@@ -835,6 +835,16 @@ class CreatePayflowRuleRequest(BaseModel):
     status: str = "Draft"
 
 
+class StrategyMessageText(BaseModel):
+    """A message step's text in one other language (StrategyNodeConfig.translations)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    subject: Optional[str] = Field(default=None, max_length=255)
+    body: Optional[str] = Field(default=None, max_length=5000)
+    sms_body: Optional[str] = Field(default=None, max_length=1000)
+
+
 class StrategyNodeConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -860,6 +870,9 @@ class StrategyNodeConfig(BaseModel):
     # the worker picks the channel for each customer.
     sms_body: Optional[str] = Field(default=None, max_length=1000)
     tone: Optional[str] = Field(default=None, max_length=32)
+    # The same message in other languages, keyed by account language code: {"FR": {subject, body, sms_body}}.
+    # The worker sends the customer's language when there is a version for it, else the text above.
+    translations: Optional[dict[str, StrategyMessageText]] = None
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod

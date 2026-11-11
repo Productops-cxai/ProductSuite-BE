@@ -38,6 +38,8 @@ from app.modules.payflow.services.workflow_condition_runtime import (
 from app.modules.payflow.services.workflow_contact_runtime import (
     flag_unreachable,
     is_contact_step,
+    localized_message_config,
+    localized_template,
     message_for_channel,
     preferred_contact_channels,
     send_succeeded,
@@ -571,6 +573,8 @@ class WorkflowExecutionService:
                 current_step_id=entry,
                 segment=strategy.segment,
                 started_at=_utcnow(),
+                # "Payment Status" counts payments made from here on (workflow_condition_runtime).
+                recovered_at_start=float(account.recovered_balance or 0),
             )
             self.db.add(run)
             self.db.flush()
@@ -1575,7 +1579,7 @@ class WorkflowExecutionService:
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
             yes_id = step.get("yes") or cfg.get("yes")
             no_id = step.get("no") or cfg.get("no")
-            matched = self._eval_condition(account, cfg, step, ctx)
+            matched = self._eval_condition(account, cfg, step, ctx, run=run)
             attr = (
                 cfg.get("attribute")
                 or step.get("attribute")
@@ -1852,7 +1856,9 @@ class WorkflowExecutionService:
         cfg: dict,
         step: dict,
         ctx: dict[str, Any],
+        run: PayflowWorkflowRunModel | None = None,
     ) -> bool:
+        """`run`: the run checking it — "Payment Status" counts payments made since it started."""
         # AI / FE catalog uses `attribute`; older steps may still use `field`.
         attribute = (
             cfg.get("attribute")
@@ -1868,11 +1874,11 @@ class WorkflowExecutionService:
         if not attribute:
             # Default stop-when-paid/plan heuristic aligned with Payment Status catalog.
             status = resolve_condition_actual(
-                self.db, account, "Payment Status", ctx=ctx
+                self.db, account, "Payment Status", ctx=ctx, run=run
             )
             return status in {"Paid In Full", "Payment Plan Active", "Partial Payment"}
 
-        actual = resolve_condition_actual(self.db, account, attribute, ctx=ctx)
+        actual = resolve_condition_actual(self.db, account, attribute, ctx=ctx, run=run)
         return compare_values(actual, str(operator), expected)
 
     def _append_timeline(self, account: PayflowAccountModel, label: str, detail: str = "") -> None:
@@ -2177,8 +2183,11 @@ class WorkflowExecutionService:
         strategy: PayflowStrategyModel,
     ) -> tuple[str, str]:
         """Build rendered subject/body for a fixed channel or contact-step channel pick."""
+        # The step's text (or its template) in the customer's language when there is a version for it.
+        language = getattr(account, "language", None)
+        cfg = localized_message_config(cfg, language)
         if is_contact_step(cfg, step):
-            subject, body = message_for_channel(cfg, channel=channel, purpose=purpose)
+            subject, body = message_for_channel(cfg, channel=channel, purpose=purpose, language=language)
         else:
             template_id = cfg.get("template_id") or step.get("template_id")
             template = next((t for t in MESSAGE_TEMPLATES if t.get("id") == template_id), None)
@@ -2189,6 +2198,7 @@ class WorkflowExecutionService:
                 )
 
                 template = template_for(purpose, channel)
+            template = localized_template(template, language)
             if channel.strip().lower() == "sms":
                 subject, body = "", (cfg.get("body") or (template or {}).get("body") or "")
             else:
@@ -3316,6 +3326,7 @@ class WorkflowExecutionService:
                 cfg,
                 step,
                 context,
+                run=run,
             )
             next_id = (step.get("yes") or cfg.get("yes")) if matched else (
                 step.get("no") or cfg.get("no")

@@ -19,9 +19,11 @@
       {"id": "s6", "kind": "Wait", "title": "Wait 5 days", "config": {"amount": 5, "unit": "Days", "direction": "After", "reference_event": "Payment Link Sent"}, "next": "s7"},
       {"id": "s7", "kind": "Condition", "title": "Any payment or plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}, "yes": "s10", "no": "s8"},
       {"id": "s8", "kind": "Human Review", "title": "Supervisor review", "config": {"note": "Two reminders without payment - choose next treatment (plan offer or firmer contact)."}},
-      {"id": "s9", "kind": "Outcome", "title": "Paid or on a plan", "config": {"outcome": "Paid In Full"}},
-      {"id": "s10", "kind": "Condition", "title": "Paid in full or on a plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}, "yes": "s9", "no": "s11"},
-      {"id": "s11", "kind": "Human Review", "title": "Part payment review", "config": {"note": "Customer paid part of the balance - agree how to collect the rest (payment plan or follow-up)."}}
+      {"id": "s9", "kind": "Outcome", "title": "Paid in full", "config": {"outcome": "Paid In Full"}},
+      {"id": "s10", "kind": "Condition", "title": "Paid in full?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}, "yes": "s9", "no": "s12"},
+      {"id": "s11", "kind": "Human Review", "title": "Part payment review", "config": {"note": "Customer paid part of the balance - agree how to collect the rest (payment plan or follow-up)."}},
+      {"id": "s12", "kind": "Condition", "title": "On a payment plan?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Payment Plan Active"}, "yes": "s13", "no": "s11"},
+      {"id": "s13", "kind": "Outcome", "title": "Payment plan set up", "config": {"outcome": "Payment Plan Active"}}
     ]
   },
   {
@@ -43,10 +45,12 @@
       {"id": "s5", "kind": "Communication", "title": "Payment link", "config": {"purpose": "Payment Link", "amount": 0, "unit": "Days", "direction": "After", "reference_event": "Broken Promise-to-Pay"}, "next": "s6"},
       {"id": "s6", "kind": "Wait", "title": "Wait 5 days", "config": {"amount": 5, "unit": "Days", "direction": "After", "reference_event": "Payment Link Sent"}, "next": "s7"},
       {"id": "s7", "kind": "Condition", "title": "Any payment or plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}, "yes": "s10", "no": "s9"},
-      {"id": "s8", "kind": "Outcome", "title": "Paid or on a plan", "config": {"outcome": "Paid In Full"}},
+      {"id": "s8", "kind": "Outcome", "title": "Paid in full", "config": {"outcome": "Paid In Full"}},
       {"id": "s9", "kind": "Human Review", "title": "Supervisor review", "config": {"note": "Promise broken and payment link not used - review before escalating."}},
-      {"id": "s10", "kind": "Condition", "title": "Paid in full or on a plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}, "yes": "s8", "no": "s11"},
-      {"id": "s11", "kind": "Human Review", "title": "Part payment review", "config": {"note": "Customer paid part of the balance - agree how to collect the rest (payment plan or follow-up)."}}
+      {"id": "s10", "kind": "Condition", "title": "Paid in full?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}, "yes": "s8", "no": "s12"},
+      {"id": "s11", "kind": "Human Review", "title": "Part payment review", "config": {"note": "Customer paid part of the balance - agree how to collect the rest (payment plan or follow-up)."}},
+      {"id": "s12", "kind": "Condition", "title": "On a payment plan?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Payment Plan Active"}, "yes": "s13", "no": "s11"},
+      {"id": "s13", "kind": "Outcome", "title": "Payment plan set up", "config": {"outcome": "Payment Plan Active"}}
     ]
   },
   {
@@ -70,9 +74,11 @@
       {"id": "s7", "kind": "Condition", "title": "Any payment or plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}, "yes": "s12", "no": "s8"},
       {"id": "s8", "kind": "Condition", "title": "Dispute raised?", "config": {"attribute": "Customer Response", "operator": "Equals", "value": "Dispute Raised"}, "yes": "s9", "no": "s11"},
       {"id": "s9", "kind": "Case Action", "title": "Hold contact during dispute", "config": {"action": "Hold Automated Contact"}},
-      {"id": "s10", "kind": "Outcome", "title": "Paid or on a plan", "config": {"outcome": "Paid In Full"}},
+      {"id": "s10", "kind": "Outcome", "title": "Paid in full", "config": {"outcome": "Paid In Full"}},
       {"id": "s11", "kind": "Human Review", "title": "Supervisor review", "config": {"note": "Unpaid or only part paid after the firm reminder and payment link - offer a payment plan for the rest or escalate."}},
-      {"id": "s12", "kind": "Condition", "title": "Paid in full or on a plan?", "config": {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}, "yes": "s10", "no": "s11"}
+      {"id": "s12", "kind": "Condition", "title": "Paid in full?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}, "yes": "s10", "no": "s13"},
+      {"id": "s13", "kind": "Condition", "title": "On a payment plan?", "config": {"attribute": "Payment Status", "operator": "Equals", "value": "Payment Plan Active"}, "yes": "s14", "no": "s11"},
+      {"id": "s14", "kind": "Outcome", "title": "Payment plan set up", "config": {"outcome": "Payment Plan Active"}}
     ]
   }
 ]

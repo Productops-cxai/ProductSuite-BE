@@ -7,6 +7,9 @@ accounts it cannot reach ("No contactable channel").
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -15,6 +18,10 @@ from app.infrastructure.database.models import PayflowAccountModel
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
 from app.modules.payflow.services.workflow_condition_runtime import apply_outcome_to_account
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
+
+# The message templates in other languages: {"FR": {template_id: {"subject", "body"}}}. Written by
+# workflow_suggestion/template_translations.py (AI-translated and checked); read once per process.
+TEMPLATE_TRANSLATIONS_PATH = Path(__file__).with_name("message_template_translations.json")
 
 # Soft blocks: temporary / governance — do not mark the customer unreachable.
 _SOFT_REASON_HINTS = (
@@ -77,15 +84,49 @@ def template_for(purpose: str | None, channel: str) -> dict[str, Any] | None:
     return next((t for t in MESSAGE_TEMPLATES if t.get("id") == "em-reminder"), None)
 
 
+@lru_cache(maxsize=1)
+def template_translations() -> dict[str, dict[str, dict[str, str]]]:
+    try:
+        return json.loads(TEMPLATE_TRANSLATIONS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def localized_template(template: dict[str, Any] | None, language: str | None) -> dict[str, Any] | None:
+    """The template in the customer's language when there is a translation for it, else as it is."""
+    if not template:
+        return template
+    version = template_translations().get((language or "").strip().upper(), {}).get(template.get("id"))
+    if not isinstance(version, dict):
+        return template
+    return {**template, **{key: version[key] for key in ("subject", "body") if version.get(key)}}
+
+
+def localized_message_config(cfg: dict[str, Any], language: str | None) -> dict[str, Any]:
+    """The step's config with its text in the customer's language, when the step has a version for it.
+
+    `cfg["translations"]`: {"FR": {"subject", "body", "sms_body"}, ...} keyed by account language code.
+    No version for the language → the step's main text. A version missing a part (e.g. no SMS text)
+    keeps the main text for that part.
+    """
+    versions = cfg.get("translations")
+    version = versions.get((language or "").strip().upper()) if isinstance(versions, dict) else None
+    if not isinstance(version, dict):
+        return cfg
+    return {**cfg, **{key: version[key] for key in ("subject", "body", "sms_body") if version.get(key)}}
+
+
 def message_for_channel(
     cfg: dict[str, Any],
     *,
     channel: str,
     purpose: str | None,
+    language: str | None = None,
 ) -> tuple[str, str]:
-    """Return (subject, body) for the chosen channel — contact steps use sms_body for SMS."""
+    """Return (subject, body) for the chosen channel — contact steps use sms_body for SMS.
+    `language`: the customer's, for the template used when the step has no text of its own."""
     channel_norm = (channel or "Email").strip()
-    template = template_for(purpose, channel_norm)
+    template = localized_template(template_for(purpose, channel_norm), language)
     if channel_norm == "SMS":
         body = (cfg.get("sms_body") or (template or {}).get("body") or "").strip()
         return "", body

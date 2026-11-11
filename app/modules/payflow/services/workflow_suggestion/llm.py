@@ -43,6 +43,9 @@ PROVIDERS: dict[str, dict[str, str | None]] = {
 }
 RATE_LIMIT_RETRIES = 5
 MAX_RATE_LIMIT_WAIT_SECONDS = 60
+# The service is briefly down (timeout, connection error, 5xx): wait this long, then try again —
+# one wait per retry. Without it one hiccup failed the whole Suggest (all-or-nothing).
+SERVER_ERROR_WAITS_SECONDS = (2, 5)
 
 
 def _object(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -136,7 +139,7 @@ def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str
     }
     if provider["max_tokens"]:
         payload["max_tokens"] = getattr(settings, provider["max_tokens"])
-    response = _post_with_rate_limit_wait(provider["url"], api_key, payload)
+    response = _post_with_retries(provider["url"], api_key, payload)
     if response.status_code != 200:
         raise ServiceUnavailableError(f"AI service error ({response.status_code}): {_error_message(response)}")
     choice = response.json()["choices"][0]
@@ -155,9 +158,14 @@ def _provider() -> dict[str, str | None]:
     return PROVIDERS[name]
 
 
-def _post_with_rate_limit_wait(url: str, api_key: str, payload: dict[str, Any]) -> httpx.Response:
-    """POST to the AI service; on 429 (rate limit) wait as told by `retry-after`, then retry."""
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+def _post_with_retries(url: str, api_key: str, payload: dict[str, Any]) -> httpx.Response:
+    """POST to the AI service and retry what is temporary.
+
+    429 (rate limit): wait as told by `retry-after`, up to RATE_LIMIT_RETRIES times.
+    Timeout, connection error or 5xx: wait SERVER_ERROR_WAITS_SECONDS, one wait per retry.
+    """
+    rate_limited = server_errors = 0
+    while True:
         try:
             response = httpx.post(
                 url,
@@ -165,12 +173,20 @@ def _post_with_rate_limit_wait(url: str, api_key: str, payload: dict[str, Any]) 
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
             )
-        except httpx.HTTPError as exc:
-            raise ServiceUnavailableError("AI service could not be reached") from exc
-        if response.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+        except httpx.HTTPError as exc:  # timeouts and connection errors
+            if server_errors == len(SERVER_ERROR_WAITS_SECONDS):
+                raise ServiceUnavailableError("AI service could not be reached") from exc
+            time.sleep(SERVER_ERROR_WAITS_SECONDS[server_errors])
+            server_errors += 1
+            continue
+        if response.status_code == 429 and rate_limited < RATE_LIMIT_RETRIES:
+            time.sleep(_retry_after_seconds(response))
+            rate_limited += 1
+        elif response.status_code >= 500 and server_errors < len(SERVER_ERROR_WAITS_SECONDS):
+            time.sleep(SERVER_ERROR_WAITS_SECONDS[server_errors])
+            server_errors += 1
+        else:
             return response
-        time.sleep(_retry_after_seconds(response))
-    return response
 
 
 def _retry_after_seconds(response: httpx.Response) -> float:

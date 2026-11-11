@@ -178,6 +178,25 @@ def test_workflows_that_keep_reminding_after_a_payment_are_not_examples():
     assert not learning._valid_today(row("Active"), LIMITS)  # would remind after a part payment or a plan
 
 
+def test_workflows_with_the_old_stop_branch_are_not_examples():
+    """Old branch: paid in full OR on a plan → Outcome "Paid In Full", which clears a plan customer's balance."""
+    steps = copy.deepcopy(load_examples()[0]["steps"])
+    row = SimpleNamespace(id=1, entry_node_id="s1", steps=steps, segment={"situation": "Active"})
+    assert learning._valid_today(row, LIMITS)
+
+    old_check = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}
+    next(s for s in steps if s["id"] == "s10").update(config=old_check, yes="s9", no="s11")
+    row.steps = [s for s in steps if s["id"] not in ("s12", "s13")]
+    assert not learning._valid_today(row, LIMITS)
+
+
+def test_workflows_that_can_mark_an_unpaid_customer_paid_in_full_are_not_examples():
+    steps = copy.deepcopy(load_examples()[0]["steps"])
+    next(s for s in steps if s["id"] == "s4")["yes"] = "s9"  # "any payment or plan?" yes → "Paid In Full"
+    row = SimpleNamespace(id=1, entry_node_id="s1", steps=steps, segment={})  # segment not known
+    assert not learning._valid_today(row, LIMITS)
+
+
 def test_lessons_are_short_deduplicated_and_capped():
     row = SimpleNamespace(
         segment={"situation": "Active", "delinquency": EARLY},
@@ -191,9 +210,20 @@ def test_lessons_are_short_deduplicated_and_capped():
             *[{"note": "Updated by Ali", "changes": [f"c{i}"]} for i in range(20)],
         ],
     )
-    lessons = learning._lessons([row])
+    # History now comes from the versions table: hand the test row's own list to the reader.
+    with patch.object(learning, "read_strategy_versions", side_effect=lambda db, r: r.versions):
+        lessons = learning._lessons(None, [row])
     assert len(lessons) == 1 + 1 + 20  # the repeat and the no-feedback entry are dropped
     lines = learning.pick_lessons(lessons, [{"segment": row.segment}])
     assert len(lines) == learning.MAX_LESSONS
     assert lines[0] == f"- [Active · {EARLY}] EDITED: change 0; change 1; change 2 (+2 more). WHY: why"
     assert lines[1] == f"- [Active · {EARLY}] EDITED: same change" and lines[2] != lines[1]
+
+
+def test_workflows_that_wait_from_a_past_date_or_trust_customer_response_are_not_examples():
+    for step_id, change in (("s3", {"reference_event": "Case Received"}),  # Wait after the first message
+                            ("s4", {"attribute": "Customer Response", "operator": "Equals", "value": "Received"})):
+        steps = copy.deepcopy(load_examples()[0]["steps"])
+        next(s for s in steps if s["id"] == step_id)["config"].update(change)
+        row = SimpleNamespace(id=1, entry_node_id="s1", steps=steps, segment={})
+        assert not learning._valid_today(row, LIMITS), step_id

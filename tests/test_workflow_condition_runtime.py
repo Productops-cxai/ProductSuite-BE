@@ -254,3 +254,84 @@ def test_terminal_human_review_completes_run(db_session):
     db_session.refresh(run)
     assert run.status == PayflowWorkflowRunStatus.COMPLETED.value
     assert run.completed_at is not None
+
+
+# --------------------------------------------------------------------------- Payment Status for workflows
+
+
+def _plan(db, account, plan_status, instalment_statuses):
+    from datetime import date
+
+    from app.infrastructure.database.models import PayflowPaymentPlanInstallmentModel, PayflowPaymentPlanModel
+
+    plan = PayflowPaymentPlanModel(
+        public_id=f"plan-{account.id}",
+        client_id=account.client_id,
+        account_id=account.id,
+        status=plan_status,
+        installments_total=len(instalment_statuses),
+        installment_amount=100.0,
+        total_payable=100.0 * len(instalment_statuses),
+        start_date=date.today(),
+    )
+    db.add(plan)
+    db.flush()
+    for sequence, status in enumerate(instalment_statuses, start=1):
+        db.add(
+            PayflowPaymentPlanInstallmentModel(
+                plan_id=plan.id,
+                sequence=sequence,
+                amount=100.0,
+                due_date=date.today() + timedelta(days=30 * (sequence - 2)),
+                status=status,
+            )
+        )
+    db.flush()
+    return plan
+
+
+def test_plan_customers_are_unpaid_while_an_instalment_is_missed(db_session):
+    """A Payment Plan workflow checks "Payment Status Equals Unpaid" to find a missed instalment."""
+    cases = [
+        ("Active", ("Paid", "Pending"), "Payment Plan Active"),  # on track
+        ("Overdue", ("Paid", "Overdue"), "Unpaid"),  # due date passed without payment
+        ("Active", ("Failed", "Pending"), "Unpaid"),  # a charge failed (plan set back to Active by another payment)
+        ("Defaulted", ("Overdue", "Overdue"), "Unpaid"),  # the plan broke down
+    ]
+    for plan_status, instalments, expected in cases:
+        _, account = _client_account(
+            db_session, outstanding=400.0, original=500.0, recovered=100.0, status="Payment Plan"
+        )
+        _plan(db_session, account, plan_status, instalments)
+        assert payment_status(db_session, account) == expected, (plan_status, instalments)
+
+    # A plan set up while the account is still "Active" (status not updated yet) counts too.
+    _, account = _client_account(db_session, outstanding=500.0, original=500.0)
+    _plan(db_session, account, "Active", ("Pending",))
+    assert payment_status(db_session, account) == "Payment Plan Active"
+
+
+def test_partial_payment_counts_only_payments_since_the_workflow_started(db_session):
+    """A part payment made before the workflow is not the customer acting on it."""
+    _, account = _client_account(db_session, outstanding=300.0, original=500.0, recovered=200.0)
+    run = PayflowWorkflowRunModel(recovered_at_start=200.0)  # enrolled after paying 200
+
+    assert payment_status(db_session, account, run=run) == "Unpaid"  # nothing paid since the start
+    account.recovered_balance, account.outstanding_balance = 250.0, 250.0  # pays 50 during the workflow
+    assert payment_status(db_session, account, run=run) == "Partial Payment"
+
+    # No baseline (no run, or a run from before it was recorded): any part payment counts, as before.
+    assert payment_status(db_session, account) == "Partial Payment"
+    assert payment_status(db_session, account, run=PayflowWorkflowRunModel()) == "Partial Payment"
+
+
+def test_the_workers_condition_check_uses_the_runs_start(db_session):
+    """_eval_condition passes the run on: the AI's "any payment or plan?" check, as the engine runs it."""
+    _, account = _client_account(db_session, outstanding=300.0, original=500.0, recovered=200.0)
+    run = PayflowWorkflowRunModel(recovered_at_start=200.0)
+    check = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}
+    engine = WorkflowExecutionService(db_session)
+
+    assert engine._eval_condition(account, check, {"kind": "Condition"}, {}, run=run) is False  # keep reminding
+    account.recovered_balance, account.outstanding_balance = 250.0, 250.0
+    assert engine._eval_condition(account, check, {"kind": "Condition"}, {}, run=run) is True  # stop: paid part

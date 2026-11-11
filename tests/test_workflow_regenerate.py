@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ServiceUnavailableError, ValidationAppError
+from app.core.exceptions import ForbiddenError, NotFoundError, ServiceUnavailableError
 from app.core.security import hash_password
 from app.infrastructure.database.models import (
     OrganizationModel,
@@ -326,7 +326,8 @@ def test_approved_can_be_regenerated(db_session, admin, ai_workflow):
     assert new["id"] != ai_workflow["id"]
 
 
-def test_human_workflow_cannot_be_regenerated(db_session, admin, portfolio):  # noqa: F811
+def test_human_workflow_can_be_regenerated(db_session, admin, portfolio):  # noqa: F811
+    """Human Created workflows regenerate too (a rejected one is back in Draft): the new one is an AI proposal."""
     human = PayflowStrategyService(db_session).create_strategy(
         admin,
         {
@@ -336,8 +337,10 @@ def test_human_workflow_cannot_be_regenerated(db_session, admin, portfolio):  # 
             "steps": load_examples()[0]["steps"],
         },
     )
-    with pytest.raises(ValidationAppError, match="Only AI-generated"):
-        regenerate(db_session, admin, human["id"])
+    assert human["status"] == "Draft" and human["source"] == "Human Created"
+    new, calls = regenerate(db_session, admin, human["id"])
+    assert new["source"] == "AI Generated" and new["status"] == "AI Proposed"
+    assert new["revision_of_id"] == human["id"] and len(calls) == 1
 
 
 def test_unknown_workflow(db_session, admin):
@@ -414,8 +417,8 @@ def test_api_approved_workflow_can_be_regenerated(client, admin_token, admin, db
     assert body["id"] != ai_workflow["id"]
 
 
-def test_api_workflow_without_portfolio_is_refused(client, admin_token, db_session, portfolio):  # noqa: F811
-    """Old workflows (before the rework) may have no portfolio — refused before the AI is called."""
+def test_api_client_level_workflow_can_be_regenerated(client, admin_token, db_session, portfolio):  # noqa: F811
+    """No portfolio = a client-level workflow (parent accounts): it regenerates as one."""
     old = PayflowStrategyModel(
         code="old-ai-workflow",
         name="Old AI workflow",
@@ -429,13 +432,13 @@ def test_api_workflow_without_portfolio_is_refused(client, admin_token, db_sessi
     )
     db_session.add(old)
     db_session.commit()
-    count = db_session.query(PayflowStrategyModel).count()
-    with patch.object(suggestion_service, "call_llm") as call:
+    call, calls = fake_llm()
+    with patch.object(suggestion_service, "call_llm", side_effect=call):
         response = _post(client, admin_token, old.id)
-    assert response.status_code == 400
-    assert response.json()["detail"] == "This workflow has no portfolio, so it cannot be regenerated"
-    call.assert_not_called()
-    assert db_session.query(PayflowStrategyModel).count() == count
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["portfolio_id"] is None and body["revision_of_id"] == old.id
+    assert body["status"] == "AI Proposed" and len(calls) == 1
 
 
 def test_api_needs_workflow_permission(client, supervisor_token, ai_workflow):  # noqa: F811

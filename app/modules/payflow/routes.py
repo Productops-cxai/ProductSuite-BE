@@ -1326,7 +1326,8 @@ def update_workflow(
                 s.model_dump(exclude_none=True) if hasattr(s, "model_dump") else s
                 for s in payload.steps or []
             ]
-        return PayflowStrategyService(db).update_strategy(user, strategy_id, data)
+        # The existing update; messages whose text changed are then translated again (other languages).
+        return WorkflowSuggestionService(db).update_workflow(user, strategy_id, data)
     except AppError as exc:
         raise _map_error(exc) from exc
 

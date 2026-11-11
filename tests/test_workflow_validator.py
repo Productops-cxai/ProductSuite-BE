@@ -125,7 +125,7 @@ def test_each_check_reports_a_clear_error(change, expected):
     "limits, expected",
     [
         ({"channels": []}, "step s2: this client has no email or SMS enabled - do not use Communication steps"),
-        ({"max_steps": 5}, "has 11 steps (allowed 3-5)"),
+        ({"max_steps": 5}, "has 13 steps (allowed 3-5)"),
         ({"max_communications": 1}, "has 2 Communication steps (max 1)"),
         ({"max_messages_per_7_days": 1}, "steps s2, s5 send more than 1 messages within 7 days"),
     ],
@@ -137,6 +137,12 @@ def test_limits(limits, expected):
 
 ACTIVE = [{"segment_id": "A", "segment": {"situation": "Active"}}]
 OLD_PAID_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}
+
+
+def _skip_the_plan_check(workflow):
+    """Stop branch without "on a plan?" (s12 / s13): not paid in full goes straight to the part-payment review."""
+    step(workflow, "s10")["no"] = "s11"
+    workflow["steps"] = [s for s in workflow["steps"] if s["id"] not in ("s12", "s13")]
 
 
 def test_prompt_examples_stop_when_the_customer_pays():
@@ -160,15 +166,23 @@ def test_prompt_examples_stop_when_the_customer_pays():
         (
             _set("s4", yes="s9"),
             'step s4: yes (the customer paid or set up a plan) must go to the Condition '
-            '"Payment Status Not Equals Partial Payment"',
+            '"Payment Status Equals Paid In Full"',
         ),
         (
             _set_config("s9", outcome="Case Closed"),
-            'step s10: yes (paid in full or on a plan) must end in an Outcome "Paid In Full"',
+            'step s10: yes (paid in full) must end in an Outcome "Paid In Full"',
+        ),
+        (
+            _skip_the_plan_check,  # a plan customer would go to review, not to their plan
+            'step s10: no (not paid in full) must go to the Condition "Payment Status Equals Payment Plan Active"',
+        ),
+        (
+            _set_config("s13", outcome="Paid In Full"),  # would close the case and clear a plan customer's balance
+            'step s12: yes (on a payment plan) must end in an Outcome "Payment Plan Active"',
         ),
         (
             _set("s11", kind="Outcome", config={"outcome": "Case Closed"}),
-            "step s10: no (paid part only) must go to a Human Review to decide on the rest",
+            "step s12: no (paid part only) must go to a Human Review to decide on the rest",
         ),
     ],
 )
@@ -177,6 +191,36 @@ def test_reminders_stop_once_the_customer_pays_in_full_pays_part_or_sets_up_a_pl
     change(workflow)
     errors = validate_all([workflow], ACTIVE, LIMITS)
     assert any(expected in e for e in errors), errors
+
+
+def test_only_customers_who_paid_in_full_reach_the_paid_in_full_outcome():
+    """Every workflow type: at run time Outcome "Paid In Full" closes the case and clears the balance."""
+    workflow = valid_workflow()
+    _set("s4", yes="s9")(workflow)  # "any payment or plan?" yes → straight to "Paid In Full"
+    expected = 'step s4: leads to Outcome "Paid In Full" (step s9) without "Payment Status Equals Paid In Full" = yes'
+    no_segment = [{"segment_id": "A", "segment": {}}]  # a workflow whose segment is not known
+    for segments in (ACTIVE, PLAN, no_segment):
+        errors = validate_all([copy.deepcopy(workflow)], segments, LIMITS)
+        assert any(expected in e for e in errors), (segments, errors)
+
+    workflow = valid_workflow()
+    step(workflow, "s10").update(yes="s12", no="s9")  # "paid in full?" no → "Paid In Full"
+    errors = validate_all([workflow], ACTIVE, LIMITS)
+    assert any('step s10: leads to Outcome "Paid In Full" (step s9)' in e for e in errors), errors
+
+
+def test_the_old_stop_branch_that_marks_plan_customers_paid_in_full_is_rejected():
+    """Old branch: "Paid in full or on a plan?" yes → Outcome "Paid In Full" — the worker then clears the balance."""
+    workflow = valid_workflow()
+    _set("s10", config={"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"},
+         yes="s9", no="s11")(workflow)
+    workflow["steps"] = [s for s in workflow["steps"] if s["id"] not in ("s12", "s13")]
+    errors = validate_all([workflow], ACTIVE, LIMITS)
+    assert any(
+        'step s4: yes (the customer paid or set up a plan) must go to the Condition "Payment Status Equals Paid In Full"'
+        in e
+        for e in errors
+    ), errors
 
 
 PLAN = [{"segment_id": "A", "segment": {"situation": "Payment Plan"}}]
@@ -190,11 +234,15 @@ def test_payment_plan_workflows_check_for_a_missed_instalment_instead():
         'step s4: the customer is already on a payment plan, so "Payment Status Not Equals Unpaid" is always yes' in e
         for e in errors
     ), errors
-    assert any('step s10: the customer is already on a payment plan, so "Payment Status Not Equals Partial' in e
-               for e in errors), errors
+    assert any(
+        'step s12: the customer is already on a payment plan, so "Payment Status Equals Payment Plan Active" is always'
+        in e
+        for e in errors
+    ), errors
 
     workflow = valid_workflow()
-    for step_id, check in (("s4", MISSED_INSTALMENT), ("s7", MISSED_INSTALMENT), ("s10", OLD_PAID_CHECK)):
+    part_paid = {"attribute": "Payment Status", "operator": "Equals", "value": "Partial Payment"}
+    for step_id, check in (("s4", MISSED_INSTALMENT), ("s7", MISSED_INSTALMENT), ("s12", part_paid)):
         _set(step_id, config=dict(check))(workflow)
     assert validate_all([workflow], PLAN, LIMITS) == []
     assert validate_all([workflow], ACTIVE, LIMITS) != []  # an Active customer would not be stopped
@@ -248,3 +296,29 @@ def test_reasoning_is_required():
     assert validate_all([{**valid_workflow(), "reasoning": None}], SEGMENTS, LIMITS) == [
         "Workflow A: reasoning is missing segment_fit, channels, timing, escalation"
     ]
+
+
+def test_waits_after_a_message_are_not_timed_from_a_past_date():
+    """PayFlow waits until date + amount: Case Received / Due Date are in the past for most accounts."""
+    for event in ("Case Received", "Due Date"):
+        errors = errors_for(_set_config("s3", reference_event=event))  # s3: the Wait after the first message
+        assert any(f'step s3: comes after a message but is timed from "{event}"' in e for e in errors), errors
+    errors = errors_for(_set_config("s5", amount=2, reference_event="Case Received"))  # a message sent 2 days "later"
+    assert any('step s5: comes after a message but is timed from "Case Received"' in e for e in errors), errors
+
+
+def test_the_first_message_and_sends_without_delay_may_use_a_past_date():
+    assert errors_for(lambda w: None) == []  # s2, the first message: "0 Days After Case Received"
+    assert errors_for(_set_config("s5", reference_event="Case Received")) == []  # amount 0: sent when its turn comes
+
+
+def test_customer_response_is_only_checked_for_a_dispute():
+    """PayFlow counts its own messages as contact: "Received" / "None" say nothing about the customer."""
+    workflow = {**copy.deepcopy(load_examples()[2]), "segment_id": "A"}  # s8: "Dispute raised?"
+    assert validate_all([workflow], ACTIVE, LIMITS) == []
+    for value in ("Received", "None"):
+        _set_config("s8", value=value)(workflow)
+        assert validate_all([workflow], ACTIVE, LIMITS) == [
+            f'Workflow A, step s8: "Customer Response {value}" cannot be trusted - PayFlow counts its own messages '
+            'as contact; only check "Dispute Raised"'
+        ]
