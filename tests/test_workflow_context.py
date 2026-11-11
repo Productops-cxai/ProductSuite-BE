@@ -82,8 +82,21 @@ def test_load_client_context_unknown_client(db_session):
 
 
 def test_load_rules_only_active_system_and_own_client(db_session, seeded):
+    # A system rule applies to a client only once it is assigned in the client's
+    # governance settings (the worker enforces the same thing at run time).
+    seeded["client"].governance_rules = ["system-active", "system-draft"]
+    db_session.commit()
+
     rules = load_rules(db_session, seeded["client"].id)
-    assert [r["name"] for r in rules["system"]] == ["system-active"]
+
+    assert [r["name"] for r in rules["system"]] == ["system-active"]  # the Draft one is skipped
+    assert [r["name"] for r in rules["client"]] == ["client-active"]
+
+
+def test_system_rule_not_assigned_to_the_client_is_not_loaded(db_session, seeded):
+    rules = load_rules(db_session, seeded["client"].id)  # only "High Balance Human Review" assigned
+
+    assert rules["system"] == []
     assert [r["name"] for r in rules["client"]] == ["client-active"]
 
 

@@ -178,8 +178,12 @@ def test_workflows_that_keep_reminding_after_a_payment_are_not_examples():
     assert not learning._valid_today(row("Active"), LIMITS)  # would remind after a part payment or a plan
 
 
-def test_lessons_are_short_deduplicated_and_capped():
-    row = SimpleNamespace(
+def test_lessons_are_short_deduplicated_and_capped(db_session, portfolio):  # noqa: F811
+    row = PayflowStrategyModel(
+        code="lessons-history",
+        name="Lessons history",
+        client_id=portfolio["client_id"],
+        portfolio_id=portfolio["portfolio_id"],
         segment={"situation": "Active", "delinquency": EARLY},
         steps=[],
         ai_context=[],
@@ -191,7 +195,9 @@ def test_lessons_are_short_deduplicated_and_capped():
             *[{"note": "Updated by Ali", "changes": [f"c{i}"]} for i in range(20)],
         ],
     )
-    lessons = learning._lessons([row])
+    db_session.add(row)
+    db_session.commit()
+    lessons = learning._lessons(db_session, [row])
     assert len(lessons) == 1 + 1 + 20  # the repeat and the no-feedback entry are dropped
     lines = learning.pick_lessons(lessons, [{"segment": row.segment}])
     assert len(lines) == learning.MAX_LESSONS
