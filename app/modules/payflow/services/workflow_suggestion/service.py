@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -50,6 +51,9 @@ REGENERATE_STATUSES = {
     PayflowStrategyStatus.UNDER_REVIEW.value,
     PayflowStrategyStatus.APPROVED.value,
 }
+# Status of the history row Regenerate writes on the original (the workflow's own status is set by reject).
+# Workflows only run from "Active" / "Approved" history rows, so this row never changes what runs.
+REJECTED_HISTORY_STATUS = "Rejected"
 # Message text is written before approval only — approved text must not change without a review.
 WRITE_MESSAGES_STATUSES = {
     PayflowStrategyStatus.DRAFT.value,
@@ -173,7 +177,9 @@ class WorkflowSuggestionService:
 
         Works for AI Generated and Human Created sources. The original workflow is
         not replaced; the new one records revision_of_id (plus a "Revision of #id"
-        line for reviewers).
+        line for reviewers) and continues its version number (v2 → v3). The original
+        only gets a "Rejected" history row (who, when, remarks, new version), saved in
+        the same commit as the new workflow.
         """
         original = self.strategies.get_strategy(user, strategy_id)
         if original["source"] not in {
@@ -249,15 +255,48 @@ class WorkflowSuggestionService:
             )
         ai_context += [{"label": "Governed by", "value": line} for line in governing_rules(client, rules)]
         ai_context += messages_note
-        return self._save(
-            user,
-            original["client_id"],
-            original["portfolio_id"],
-            workflow,
-            segment=original["segment"],
-            cases_covered=original["cases_covered"],
-            ai_context=ai_context,
-            revision_of_id=original["id"],
+        # The new workflow and the original's "Rejected" history row are saved together: both or nothing.
+        try:
+            new = self._save(
+                user,
+                original["client_id"],
+                original["portfolio_id"],
+                workflow,
+                segment=original["segment"],
+                cases_covered=original["cases_covered"],
+                ai_context=ai_context,
+                revision_of_id=original["id"],
+                commit=False,
+                version=int(original["version"] or 1) + 1,  # continues the number: v2 → v3
+            )
+            self._record_rejection(user, original["id"], new, remarks)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        # Notifications commit on their own, so they are sent only after the save.
+        self.strategies.notify_awaiting(user, new["id"])
+        return self.strategies.get_strategy(user, new["id"])
+
+    def _record_rejection(self, user: UserModel, original_id: int, new: dict[str, Any], remarks: str) -> None:
+        """History row on the original: who rejected it, when (date and time), why, and its new version.
+
+        Kept out of AI learning on purpose (no reviewer_note, no changes): the remarks already reach
+        the AI through the reject note and the new workflow's "Reviewer remarks" line.
+        """
+        row = self.db.get(PayflowStrategyModel, original_id)
+        self.strategies._prepend_version(
+            row,
+            {
+                "version": int(row.version or 1),
+                "date": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+                "note": (
+                    f"Rejected / regeneration requested by {user.full_name or user.email}. "
+                    f"New version: #{new['id']} (v{new['version']}). Remarks: {remarks}"
+                ),
+                "status": REJECTED_HISTORY_STATUS,
+                "changes": [],
+            },
         )
 
     def write_workflow_messages(
@@ -352,9 +391,11 @@ class WorkflowSuggestionService:
         ai_context: list[dict[str, str]],
         commit: bool = True,
         revision_of_id: int | None = None,
+        version: int = 1,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
+        # version: 1 on Suggest; Regenerate continues the original's number.
         return self.strategies.create_strategy(
             user,
             {
@@ -371,6 +412,7 @@ class WorkflowSuggestionService:
                 "revision_of_id": revision_of_id,
             },
             commit=commit,
+            version=version,
         )
 
 
