@@ -995,6 +995,7 @@ class PayflowStrategyItem(BaseModel):
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
     ai_proposal_snapshot: Optional[dict] = None
     revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
+    replaced_by_id: Optional[int] = None  # Regenerate: the newest version made from this one (it is then Rejected)
     versions: List[StrategyVersionItem] = Field(default_factory=list)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None

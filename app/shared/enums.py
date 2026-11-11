@@ -150,6 +150,8 @@ class PayflowStrategyStatus(str, Enum):
     APPROVED = "Approved"
     ACTIVE = "Active"
     INACTIVE = "Inactive"
+    # Replaced by a regenerated version (revision_of_id points back to it): closed, never runs.
+    REJECTED = "Rejected"
 
 
 class PayflowStrategyOrigin(str, Enum):
