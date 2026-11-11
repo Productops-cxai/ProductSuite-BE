@@ -937,10 +937,14 @@ class PayflowStrategyService:
         return self._serialize(row)
 
     def create_strategy(
-        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True
+        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True, version: int = 1
     ) -> dict[str, Any]:
         """commit=False only flushes and skips the notification: the caller saves several
-        workflows together, commits once, then calls notify_awaiting for each."""
+        workflows together, commits once, then calls notify_awaiting for each.
+
+        `version`: the starting version number — 1, except for AI Regenerate, whose new workflow
+        continues the number of the one it replaces (v2 → v3). A keyword, not a payload field,
+        so the create API cannot set it."""
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Strategy name is required")
@@ -1032,7 +1036,7 @@ class PayflowStrategyService:
             status=status,
             origin=origin,
             source=source,
-            version=1,
+            version=version,
             summary=summary,
             coverage=coverage,
             segment=segment,
@@ -1050,7 +1054,7 @@ class PayflowStrategyService:
         self._prepend_version(
             row,
             self._version_entry(
-                version=1,
+                version=version,
                 note=(
                     "Proposed by PayFlow AI"
                     if ai_generated
