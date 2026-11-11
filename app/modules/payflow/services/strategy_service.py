@@ -396,6 +396,12 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     else:
         channel_val = cfg.get("channel") or raw.get("channel")
 
+    # Other-language versions of a message step's text (see _clean_translations).
+    raw_translations = cfg.pop("translations", None)
+    translations = _clean_translations(raw_translations) if kind == "Communication" else {}
+    if translations:
+        cfg["translations"] = translations
+
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
         if note:
@@ -423,6 +429,52 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         # Conditions should branch; allow incomplete drafts but prefer yes/no when provided
         pass
     return step
+
+
+MESSAGE_TEXT_KEYS = ("subject", "body", "sms_body")
+
+
+def _clean_translations(raw: Any) -> dict[str, dict[str, str]]:
+    """{"FR": {"subject", "body", "sms_body"}, ...}: the step's text in other languages, keyed by the
+    account language code (PayflowAccountModel.language). The worker sends the version matching the
+    customer's language, else the step's main text. Entries without any text are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, str]] = {}
+    for code, text in raw.items():
+        if not isinstance(text, dict) or not str(code or "").strip():
+            continue
+        version = {key: str(text[key]).strip() for key in MESSAGE_TEXT_KEYS if str(text.get(key) or "").strip()}
+        if version.get("body") or version.get("sms_body"):
+            cleaned[str(code).strip().upper()] = version
+    return cleaned
+
+
+def _carry_translations(before: list[dict], after: list[dict]) -> list[dict]:
+    """A step's other-language versions follow its main text.
+
+    - Main text edited or cleared, and the versions sent back as they were (or not sent) → they are
+      outdated and dropped; the update route then asks the AI to write them again.
+    - Main text edited together with new versions → the new versions are kept.
+    - Main text unchanged and no versions sent (a client that does not know about them) → the stored
+      versions stay.
+    """
+    stored = {step.get("id"): step for step in before}
+    result = []
+    for step in after:
+        old = stored.get(step.get("id"))
+        if old is not None:
+            cfg = _cfg(step)
+            old_versions = _cfg(old).get("translations") or {}
+            new_versions = cfg.get("translations") or {}
+            if _message_text(old) != _message_text(step):
+                if not new_versions or new_versions == old_versions:
+                    cfg.pop("translations", None)
+            elif not new_versions and old_versions:
+                cfg["translations"] = copy.deepcopy(old_versions)
+            step = {**step, "config": cfg}
+        result.append(step)
+    return result
 
 
 def _normalize_steps(
@@ -1147,7 +1199,9 @@ class PayflowStrategyService:
                 if source == PayflowStrategySource.AI_GENERATED.value
                 else PayflowStrategyOrigin.HUMAN_CREATED.value
             )
-            new_steps = _normalize_steps(payload["steps"], default_origin=default_origin)
+            new_steps = _carry_translations(
+                before_steps, _normalize_steps(payload["steps"], default_origin=default_origin)
+            )
             steps_changed = _steps_changed(before_steps, new_steps)
             # Same steps sent back: keep the stored ones, so step origins are not re-stamped.
             if steps_changed:
@@ -1210,13 +1264,22 @@ class PayflowStrategyService:
         return self._serialize(self._get_row(row.id))
 
     def save_ai_messages(
-        self, user: UserModel, strategy_id: int, steps: list[dict[str, Any]], *, remarks: str | None = None
+        self,
+        user: UserModel,
+        strategy_id: int,
+        steps: list[dict[str, Any]],
+        *,
+        remarks: str | None = None,
+        note: str | None = None,
+        ai_context: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Save email / SMS text the AI wrote for a workflow's steps.
 
         An AI change, not a human one: status and origin stay as they are ("Human Modified" is
         not set). While no human has changed the workflow, the AI proposal snapshot gets the
         text too, so later reviewer edits to it count as changes to the AI's words.
+        `note`: the history note to record instead of the default one (e.g. for translations).
+        `ai_context`: the workflow's new ai_context lines (e.g. an updated "Languages" line); None = unchanged.
         """
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
@@ -1227,14 +1290,17 @@ class PayflowStrategyService:
             if _message_text(step) != _message_text(before.get(step.get("id")) or {})
         ]
         row.steps = copy.deepcopy(steps)
+        if ai_context is not None:
+            row.ai_context = copy.deepcopy(ai_context)
         if row.origin == PayflowStrategyOrigin.AI_PROPOSED.value and row.ai_proposal_snapshot:
             row.ai_proposal_snapshot = {**row.ai_proposal_snapshot, "steps": copy.deepcopy(steps)}
 
         # No change list: reviewer-feedback readers (Regenerate history, Suggest lessons)
         # must not take the AI's own writing for a reviewer's edit.
-        note = f"Message text written by AI for {user.full_name}: {', '.join(written) or 'no change'}"
-        if remarks:
-            note += f" (remarks: {remarks})"
+        if note is None:
+            note = f"Message text written by AI for {user.full_name}: {', '.join(written) or 'no change'}"
+            if remarks:
+                note += f" (remarks: {remarks})"
         self._prepend_version(
             row,
             {

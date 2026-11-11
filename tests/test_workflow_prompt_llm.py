@@ -103,26 +103,48 @@ def test_prompt_says_stop_when_the_customer_pays_in_full_pays_part_or_sets_up_a_
     ]
     rule_text = system.split("## Stop when the customer pays")[1].split("## Strategy guidance")[0]
     assert "pay in full, pay part, or set up a payment plan" in rule_text
+    # What the worker's Payment Status means (workflow_condition_runtime.payment_status).
+    assert '"Partial Payment" = paid part\nsince it started (a part payment from before does not count)' in rule_text
+    assert '"Unpaid" = an instalment\nis missed and "Payment Plan Active" = the plan is on track' in rule_text
     assert "In Active and Promise to Pay workflows" in rule_text
     assert '"Payment Status Not Equals Unpaid"' in rule_text  # any payment or plan? yes = stop
-    assert '"Payment Status Not Equals Partial Payment"' in rule_text  # full or plan → Paid In Full, part → review
-    assert 'Outcome "Paid In Full"' in rule_text and "Human Review to decide on the rest" in rule_text
-    assert "Payment Plan workflows (the customer is already on a plan): never use these two checks" in rule_text
+    # Stop branch: paid in full / on a plan / part paid are kept apart.
+    assert 'Condition "Payment Status Equals Paid In Full" (paid in full?): yes → Outcome "Paid In Full"' in rule_text
+    assert 'Condition "Payment Status Equals Payment Plan Active" (on a plan?): yes → Outcome "Payment Plan Active"' in (
+        rule_text
+    )
+    assert "no (paid part only) → Human Review to decide on the rest" in rule_text
+    assert 'In every workflow, Outcome "Paid In Full" closes the case and clears the balance' in rule_text
+    assert 'never use "Payment Status Not Equals Unpaid" or\n"Payment Status Equals Payment Plan Active"' in rule_text
     assert 'Condition "Payment Status Equals Unpaid" (instalment missed?)' in rule_text  # instead, with no loops
     assert 'no → Outcome\n"Payment Plan Active"' in rule_text
+    assert "Not Equals Partial Payment" not in rule_text  # the old branch sent plan customers to "Paid In Full"
 
 
-def test_examples_stop_on_any_payment_or_plan_and_send_part_payments_to_review():
+def test_prompt_explains_how_payflow_times_waits_and_reads_customer_responses():
+    system = build_messages(CLIENT, "Residential", SEGMENTS, design_limits(CLIENT, {"system": [], "client": []}))[0][
+        "content"
+    ]
+    assert 'After the first message, time every Wait from "Previous Action"' in system
+    assert "never from Case Received or Due Date: those dates are in the past for\nmost accounts" in system
+    assert 'Only check Customer Response for "Dispute Raised"' in system
+
+
+def test_examples_keep_paid_in_full_plans_and_part_payments_apart():
     for example in load_examples():
         steps = {s["id"]: s for s in example["steps"]}
         checks = [s for s in example["steps"] if s["config"].get("attribute") == "Payment Status"]
         assert checks and {(c["config"]["operator"], c["config"]["value"]) for c in checks} == {
             ("Not Equals", "Unpaid"),
-            ("Not Equals", "Partial Payment"),
-        }, example["name"]  # never the old "Equals Paid In Full" check
-        stop = next(c for c in checks if c["config"]["value"] == "Partial Payment")
-        assert steps[stop["yes"]]["config"]["outcome"] == "Paid In Full"
-        assert steps[stop["no"]]["kind"] == "Human Review"
+            ("Equals", "Paid In Full"),
+            ("Equals", "Payment Plan Active"),
+        }, example["name"]
+        paid_in_full = next(c for c in checks if c["config"]["value"] == "Paid In Full")
+        assert steps[paid_in_full["yes"]]["config"]["outcome"] == "Paid In Full"
+        on_a_plan = steps[paid_in_full["no"]]
+        assert on_a_plan["config"]["value"] == "Payment Plan Active"
+        assert steps[on_a_plan["yes"]]["config"]["outcome"] == "Payment Plan Active"
+        assert steps[on_a_plan["no"]]["kind"] == "Human Review"
 
 
 def _assert_closed_objects(node):
@@ -193,15 +215,48 @@ def test_call_llm_returns_parsed_json(groq_key):
     ],
 )
 def test_call_llm_errors(groq_key, response, message):
-    with patch.object(llm.httpx, "post", return_value=response):
+    with patch.object(llm.httpx, "post", return_value=response), patch.object(llm.time, "sleep"):
         with pytest.raises(ServiceUnavailableError, match=message):
             llm.call_llm([], {})
 
 
 def test_call_llm_network_error(groq_key):
-    with patch.object(llm.httpx, "post", side_effect=httpx.ConnectError("down")):
+    with patch.object(llm.httpx, "post", side_effect=httpx.ConnectError("down")) as post, \
+            patch.object(llm.time, "sleep") as sleep:
         with pytest.raises(ServiceUnavailableError, match="could not be reached"):
             llm.call_llm([], {})
+    assert post.call_count == len(llm.SERVER_ERROR_WAITS_SECONDS) + 1  # tried again before giving up
+    assert [c.args[0] for c in sleep.call_args_list] == list(llm.SERVER_ERROR_WAITS_SECONDS)
+
+
+@pytest.mark.parametrize(
+    "first",
+    [httpx.ReadTimeout("slow"), httpx.ConnectError("down"), FakeResponse(status_code=503), FakeResponse(status_code=500)],
+    ids=["timeout", "connection error", "503", "500"],
+)
+def test_call_llm_tries_again_when_the_service_is_briefly_down(groq_key, first):
+    with patch.object(llm.httpx, "post", side_effect=[first, FakeResponse()]) as post, \
+            patch.object(llm.time, "sleep") as sleep:
+        assert llm.call_llm([], {}) == {"workflows": []}
+    assert post.call_count == 2
+    sleep.assert_called_once_with(llm.SERVER_ERROR_WAITS_SECONDS[0])
+
+
+def test_call_llm_gives_up_after_server_error_retries(groq_key):
+    with patch.object(llm.httpx, "post", return_value=FakeResponse(status_code=502)) as post, \
+            patch.object(llm.time, "sleep"):
+        with pytest.raises(ServiceUnavailableError, match=r"AI service error \(502\)"):
+            llm.call_llm([], {})
+    assert post.call_count == len(llm.SERVER_ERROR_WAITS_SECONDS) + 1
+
+
+def test_call_llm_does_not_retry_a_bad_request(groq_key):
+    """4xx (other than 429) will fail the same way again: no retry."""
+    with patch.object(llm.httpx, "post", return_value=FakeResponse(status_code=400)) as post, \
+            patch.object(llm.time, "sleep") as sleep:
+        with pytest.raises(ServiceUnavailableError, match=r"AI service error \(400\)"):
+            llm.call_llm([], {})
+    assert post.call_count == 1 and not sleep.called
 
 
 def test_call_llm_without_key():

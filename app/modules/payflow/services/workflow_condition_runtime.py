@@ -19,15 +19,31 @@ from app.infrastructure.database.models import (
     PayflowCommunicationModel,
     PayflowHumanReviewModel,
     PayflowPaymentLinkModel,
+    PayflowPaymentPlanInstallmentModel,
     PayflowPaymentPlanModel,
+    PayflowWorkflowRunModel,
 )
 from app.shared.enums import (
     PayflowCollectionStatus,
     PayflowCommStatus,
+    PayflowPaymentInstallmentStatus,
     PayflowPaymentPlanStatus,
 )
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# A plan the customer is on (Defaulted too: the plan broke down, but it is still their arrangement).
+_CURRENT_PLAN_STATUSES = (
+    PayflowPaymentPlanStatus.ACTIVE.value,
+    PayflowPaymentPlanStatus.OVERDUE.value,
+    PayflowPaymentPlanStatus.DEFAULTED.value,
+)
+# The plan is behind: a missed instalment (same meaning as rule_runtime_service's "Missed Installments").
+_BEHIND_PLAN_STATUSES = (PayflowPaymentPlanStatus.OVERDUE.value, PayflowPaymentPlanStatus.DEFAULTED.value)
+_MISSED_INSTALMENT_STATUSES = (
+    PayflowPaymentInstallmentStatus.OVERDUE.value,
+    PayflowPaymentInstallmentStatus.FAILED.value,
+)
+_EPSILON = 0.0001
 _BOUNCE_HINTS = ("bounce", "bounced", "dropped", "invalid", "blocked", "undeliverable")
 
 # Catalog operators (and aliases) → comparable form with spaces.
@@ -103,8 +119,12 @@ def resolve_condition_actual(
     attribute_or_field: str,
     *,
     ctx: dict[str, Any] | None = None,
+    run: PayflowWorkflowRunModel | None = None,
 ) -> Any:
-    """Map catalog `attribute` (or legacy `field`) to a comparable runtime value."""
+    """Map catalog `attribute` (or legacy `field`) to a comparable runtime value.
+
+    `run`: the workflow run checking the Condition ("Payment Status" counts payments since it started).
+    """
     ctx = ctx or {}
     key = (attribute_or_field or "").strip()
     if not key:
@@ -116,7 +136,7 @@ def resolve_condition_actual(
 
     lowered = key.lower()
     catalog = {
-        "payment status": lambda: payment_status(db, account),
+        "payment status": lambda: payment_status(db, account, run=run),
         "email delivery": lambda: channel_delivery(db, account, "Email", ctx),
         "sms delivery": lambda: channel_delivery(db, account, "SMS", ctx),
         "email address": lambda: contact_quality(account.email, kind="email"),
@@ -149,21 +169,33 @@ def resolve_condition_actual(
     return getattr(account, key, None)
 
 
-def payment_status(db: Session, account: PayflowAccountModel) -> str:
+def payment_status(
+    db: Session, account: PayflowAccountModel, *, run: PayflowWorkflowRunModel | None = None
+) -> str:
+    """The catalog's Payment Status: Paid In Full / Payment Plan Active / Partial Payment / Unpaid.
+
+    - On a plan: "Payment Plan Active" while it is on track, "Unpaid" while an instalment is missed
+      (so a Payment Plan workflow's "Payment Status Equals Unpaid" finds missed instalments).
+    - "Partial Payment" counts payments made since `run` started (its recovered_at_start): a part
+      payment from before the workflow is not the customer acting on it. Without that baseline
+      (no run, or a run from before it was recorded) any part payment counts, as before.
+    """
     outstanding = float(account.outstanding_balance or 0)
     original = float(account.original_balance or 0)
     recovered = float(account.recovered_balance or 0)
     status = (account.collection_status or "").strip().lower()
 
-    if outstanding <= 0.0001 or status in {"resolved", "closed", "paid"}:
+    if outstanding <= _EPSILON or status in {"resolved", "closed", "paid"}:
         return "Paid In Full"
 
-    if status == PayflowCollectionStatus.PAYMENT_PLAN.value.lower() or _has_open_plan(
-        db, account.id
-    ):
-        return "Payment Plan Active"
+    plan = _current_plan(db, account.id)
+    if status == PayflowCollectionStatus.PAYMENT_PLAN.value.lower() or plan is not None:
+        return "Unpaid" if plan is not None and _plan_is_behind(db, plan) else "Payment Plan Active"
 
-    if recovered > 0.0001 or (original > 0 and outstanding + 0.0001 < original):
+    baseline = run.recovered_at_start if run is not None else None
+    if baseline is not None:
+        return "Partial Payment" if recovered > float(baseline) + _EPSILON else "Unpaid"
+    if recovered > _EPSILON or (original > 0 and outstanding + _EPSILON < original):
         return "Partial Payment"
 
     return "Unpaid"
@@ -297,22 +329,38 @@ def customer_response(
     return "None"
 
 
-def _has_open_plan(db: Session, account_id: int) -> bool:
-    row = (
-        db.query(PayflowPaymentPlanModel.id)
+def _current_plan(db: Session, account_id: int | None) -> PayflowPaymentPlanModel | None:
+    """The customer's latest plan that is not completed or cancelled."""
+    if account_id is None:
+        return None
+    return (
+        db.query(PayflowPaymentPlanModel)
         .filter(
             PayflowPaymentPlanModel.account_id == account_id,
-            PayflowPaymentPlanModel.status.in_(
-                [
-                    PayflowPaymentPlanStatus.ACTIVE.value,
-                    PayflowPaymentPlanStatus.OVERDUE.value,
-                ]
-            ),
+            PayflowPaymentPlanModel.status.in_(_CURRENT_PLAN_STATUSES),
         )
         .order_by(PayflowPaymentPlanModel.id.desc())
         .first()
     )
-    return row is not None
+
+
+def _plan_is_behind(db: Session, plan: PayflowPaymentPlanModel) -> bool:
+    """A missed instalment: the plan is Overdue / Defaulted, or an instalment is Overdue / Failed.
+
+    Instalments are checked too: paying one missed instalment sets the plan back to Active even
+    when another one is still unpaid.
+    """
+    if plan.status in _BEHIND_PLAN_STATUSES:
+        return True
+    missed = (
+        db.query(PayflowPaymentPlanInstallmentModel.id)
+        .filter(
+            PayflowPaymentPlanInstallmentModel.plan_id == plan.id,
+            PayflowPaymentPlanInstallmentModel.status.in_(_MISSED_INSTALMENT_STATUSES),
+        )
+        .first()
+    )
+    return missed is not None
 
 
 def _map_comm_status(status: str | None, *, bounce_hint: bool) -> str | None:

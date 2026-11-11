@@ -1531,6 +1531,10 @@ class PayflowWorkflowRunModel(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # Amount already recovered when the run started. Condition "Payment Status" counts only payments
+    # made since then: a part payment from before the workflow is not the customer acting on it.
+    # Null on runs from before this column (they count every part payment, as before).
+    recovered_at_start: Mapped[float | None] = mapped_column(Float, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

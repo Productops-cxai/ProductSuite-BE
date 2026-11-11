@@ -84,16 +84,21 @@ BAND_DEFINITIONS: dict[str, dict] = {
 MIN_STEPS = 3
 # Raised from 12, then 15: stopping when the customer pays adds a check before every follow-up and a 3-step stop
 # branch, so 5 messages need ~19 steps. With 15 the AI often failed Regenerate remarks such as "add an SMS route".
-MAX_STEPS = 18
+# Raised to 20 when the stop branch grew from 3 to 5 steps (paid in full / on a plan / part paid kept apart).
+MAX_STEPS = 20
 MAX_COMMUNICATIONS = 5
 
 # Stop when the customer acts: on the payment page they can pay in full, pay part or set up a plan.
-# Before every follow-up message, PAID_OR_PLAN_CHECK — yes = they acted → FULL_OR_PLAN_CHECK:
-# yes → Outcome "Paid In Full", no (paid part only) → Human Review. Payment Plan customers are already on
-# a plan: for them both checks are always yes, so their workflows check MISSED_INSTALMENT_CHECK instead.
+# Before every follow-up message, PAID_OR_PLAN_CHECK — yes = they acted → the stop branch:
+# PAID_IN_FULL_CHECK yes → Outcome "Paid In Full"; no → ON_A_PLAN_CHECK yes → Outcome "Payment Plan Active";
+# no (paid part only) → Human Review. The worker's Outcome "Paid In Full" closes the case and sets the balance
+# to 0, so it must never be reached by a customer who is on a plan or paid only part.
+# Payment Plan customers are already on a plan: for them PAID_OR_PLAN_CHECK and ON_A_PLAN_CHECK are always
+# yes, so their workflows check MISSED_INSTALMENT_CHECK instead.
 # Stated in the prompt (prompt.py), checked by validator.py.
 PAID_OR_PLAN_CHECK = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Unpaid"}
-FULL_OR_PLAN_CHECK = {"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"}
+PAID_IN_FULL_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Paid In Full"}
+ON_A_PLAN_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Payment Plan Active"}
 MISSED_INSTALMENT_CHECK = {"attribute": "Payment Status", "operator": "Equals", "value": "Unpaid"}
 PAID_OUTCOME = "Paid In Full"
 ON_A_PLAN_OUTCOME = "Payment Plan Active"
@@ -107,6 +112,13 @@ CONTACT_CHANNEL = "Email + SMS"  # a channel-free step's messages: an email (sub
 CHANNEL_FIELDS = ("channel", "template_id")
 CONTACT_ATTRIBUTES = ("Email Delivery", "SMS Delivery", "Email Address", "Mobile Number")
 CHANNEL_EVENTS = ("Previous Email", "Previous SMS")  # timing after a contact step: "Previous Action"
+
+# The worker waits until reference date + amount. These dates are in the past for most accounts, so a wait
+# after the first message timed from them ends at once and the next message follows right away.
+FIXED_DATE_EVENTS = ("Case Received", "Due Date")
+# The worker counts PayFlow's own messages as contact, so Customer Response "Received" / "None" say nothing
+# about the customer: only this value can be checked.
+CUSTOMER_RESPONSE_VALUE = "Dispute Raised"
 
 # Why the AI chose a workflow — one short text per field, saved as ai_context lines.
 # changes_made is only filled on regenerate.

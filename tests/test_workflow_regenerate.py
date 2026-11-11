@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.core.exceptions import ForbiddenError, NotFoundError, ServiceUnavailableError, ValidationAppError
+from app.core.exceptions import ForbiddenError, NotFoundError, ServiceUnavailableError
 from app.core.security import hash_password
 from app.infrastructure.database.models import (
     OrganizationModel,

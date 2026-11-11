@@ -170,3 +170,14 @@ def test_run_on_inactive_workflow_is_replaced_by_active_one(db_session):
 
     runs = _open_runs(db_session, account)
     assert [r.strategy_id for r in runs] == [new.id]
+
+
+def test_enrollment_records_what_was_already_recovered(db_session):
+    """Condition "Payment Status" counts only payments made after this (workflow_condition_runtime)."""
+    client = _client(db_session)
+    account = _account(db_session, client)
+    account.recovered_balance = 120.0
+    strategy = _strategy(db_session, client, "enr-baseline")
+    WorkflowExecutionService(db_session).enroll_strategy(strategy.id)
+    [run] = _open_runs(db_session, account)
+    assert run.recovered_at_start == 120.0
