@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.exceptions import ForbiddenError
 from app.infrastructure.database.models import (
     PayflowClientModel,
+    PayflowHumanReviewModel,
     PayflowStrategyModel,
     PayflowStrategyVersionModel,
     UserModel,
@@ -131,11 +132,13 @@ def _is_ai_origin(origin: str | None) -> bool:
     return "ai" in key or "suggest" in key or "generated" in key
 
 
-def _status_bucket(status: str | None) -> str:
+def _status_bucket(status: str | None, note: str | None = None) -> str:
+    """`note`: the history row's note. Reject puts a workflow back to "AI Proposed" / "Draft", so
+    its status alone never says "rejected" - the note of that row does ("Rejected / ...")."""
     s = (status or "").strip().lower()
     if s in {"active", "approved"}:
         return "approved"
-    if "reject" in s:
+    if "reject" in s or (note or "").strip().lower().startswith("rejected"):
         return "rejected"
     if "modif" in s or s in {"under review", "ai proposed", "draft"}:
         return "in_review"
@@ -164,6 +167,23 @@ class AiEvalExportService:
             return [client_id]
         return allowed
 
+    def _review_stats(self, user: UserModel, client_id: int | None) -> dict[str, Any]:
+        """Case reviews in the same client scope as the report, and the AI's average confidence
+        on those that carry one (0-100; None when no review has a confidence)."""
+        scoped = self._scoped_client_ids(user, client_id)
+        if scoped is not None and len(scoped) == 0:
+            return {"human_reviews": 0, "reviews_with_confidence": 0, "avg_confidence": None}
+        q = self.db.query(PayflowHumanReviewModel.confidence)
+        if scoped is not None:
+            q = q.filter(PayflowHumanReviewModel.client_id.in_(scoped))
+        values = [row[0] for row in q.all()]
+        scored = [float(v) for v in values if v is not None]
+        return {
+            "human_reviews": len(values),
+            "reviews_with_confidence": len(scored),
+            "avg_confidence": round(sum(scored) / len(scored), 1) if scored else None,
+        }
+
     def _performance(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
         versions = [r for r in rows if r.get("row_type") == "workflow_version"]
         ai_versions = [r for r in versions if _is_ai_origin(str(r.get("origin") or ""))]
@@ -180,7 +200,7 @@ class AiEvalExportService:
         rejected = 0
         in_review = 0
         for r in latest_by_strategy.values():
-            bucket = _status_bucket(str(r.get("status") or ""))
+            bucket = _status_bucket(str(r.get("status") or ""), r.get("note"))
             if bucket == "approved":
                 approved += 1
             elif bucket == "rejected":
@@ -340,7 +360,7 @@ class AiEvalExportService:
         limit: int = 500,
     ) -> dict[str, Any]:
         rows, export_ref = self._rows(user, client_id=client_id, limit=limit)
-        performance = self._performance(rows)
+        performance = {**self._performance(rows), **self._review_stats(user, client_id)}
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "export_reference": export_ref,
@@ -348,7 +368,7 @@ class AiEvalExportService:
                 "row_count": len(rows),
                 "workflow_versions": performance["workflow_versions"],
                 "workflows": performance.get("workflows") or 0,
-                "human_reviews": 0,
+                "human_reviews": performance["human_reviews"],
             },
             "performance": performance,
             "rows": rows[:200],
@@ -379,7 +399,7 @@ class AiEvalExportService:
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "export_reference": export_ref,
-            "performance": self._performance(rows),
+            "performance": {**self._performance(rows), **self._review_stats(user, client_id)},
             "rows": rows,
         }
         filename = f"ai-eval-{export_ref}.json"

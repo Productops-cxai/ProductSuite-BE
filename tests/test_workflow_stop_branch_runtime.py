@@ -61,8 +61,9 @@ def test_stop_branch_with_the_workers_own_checks(db_session, example, customer):
     assert float(account.outstanding_balance) == balance_after
 
 
-def test_the_old_branch_cleared_a_plan_customers_balance(db_session):
-    """Shows the bug this fixes: old branch + the worker's Outcome = the plan customer's balance set to 0."""
+def test_the_old_branch_no_longer_clears_a_plan_customers_balance(db_session):
+    """The old branch still leads a plan customer to Outcome "Paid In Full" (workflows saved before the
+    fix, or built by hand), but the worker no longer closes the case or sets the balance to 0 for it."""
     old = copy.deepcopy(load_examples()[0])
     next(s for s in old["steps"] if s["id"] == "s10").update(
         config={"attribute": "Payment Status", "operator": "Not Equals", "value": "Partial Payment"},
@@ -73,8 +74,9 @@ def test_the_old_branch_cleared_a_plan_customers_balance(db_session):
 
     end = _run_checks(db_session, account, old, _first_payment_check(old))
     assert end["config"]["outcome"] == "Paid In Full"
-    apply_outcome_to_account(account, end["config"]["outcome"])
-    assert account.collection_status == "Resolved" and float(account.outstanding_balance) == 0.0
+    applied = apply_outcome_to_account(account, end["config"]["outcome"])
+    assert applied["applied"] is False and account.human_review is True  # a person looks at it
+    assert account.collection_status == "Payment Plan" and float(account.outstanding_balance) == 500.0
 
 
 # --------------------------------------------------------------------------- Payment Status since the start

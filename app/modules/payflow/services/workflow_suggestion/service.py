@@ -24,6 +24,7 @@ from app.modules.payflow.services.workflow_suggestion.context import (
     load_segment_languages,
     load_suggest_scope,
 )
+from app.modules.payflow.services.workflow_suggestion.gates import uncovered_accounts
 from app.modules.payflow.services.workflow_suggestion.languages import (
     extra_languages,
     language_name,
@@ -107,11 +108,21 @@ class WorkflowSuggestionService:
         }
 
     def suggest_workflows(
-        self, user: UserModel, client_id: int, portfolio_id: int | None
+        self,
+        user: UserModel,
+        client_id: int,
+        portfolio_id: int | None,
+        *,
+        only_uncovered: bool = False,
     ) -> dict[str, Any]:
+        """`only_uncovered`: design workflows only for the accounts that fit no existing workflow
+        (the automatic run on a scope that already has workflows) - never a second workflow for a
+        segment that has one."""
         self.strategies._assert_manage(user, client_id)
         client = load_client_context(self.db, client_id)
         scope, accounts = load_suggest_scope(self.db, client_id, portfolio_id)
+        if only_uncovered:
+            accounts = uncovered_accounts(self.db, client_id, portfolio_id, accounts)
         rules = load_rules(self.db, client_id)
         segments = build_segments(accounts)["segments"]
         if not segments:

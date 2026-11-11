@@ -162,11 +162,21 @@ def test_wait_weeks_and_reference_after_previous_email(db_session):
 
 
 def test_outcome_paid_in_full_updates_account(db_session):
-    _, account = _client_account(db_session, outstanding=120.0, original=120.0)
+    _, account = _client_account(db_session, outstanding=0.0, original=120.0, recovered=120.0)
     applied = apply_outcome_to_account(account, "Paid In Full")
     assert account.collection_status == PayflowCollectionStatus.RESOLVED.value
     assert float(account.outstanding_balance) == 0.0
-    assert applied["outcome"] == "Paid In Full"
+    assert applied["outcome"] == "Paid In Full" and applied["applied"] is True
+
+
+def test_outcome_paid_in_full_is_not_applied_while_money_is_owed(db_session):
+    """The worker never clears a balance itself: only a recorded payment does."""
+    _, account = _client_account(db_session, outstanding=120.0, original=120.0)
+    applied = apply_outcome_to_account(account, "Paid In Full")
+    assert applied["applied"] is False
+    assert account.collection_status == "Active"
+    assert float(account.outstanding_balance) == 120.0 and float(account.recovered_balance) == 0.0
+    assert account.human_review is True
 
 
 def test_path_ending_without_outcome_completes_run(db_session):

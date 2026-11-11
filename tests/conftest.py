@@ -41,9 +41,14 @@ def message_ai_off():
     (as before). Tests of the writer patch message_writer.call_llm with their own fake.
     """
     from app.core.exceptions import ServiceUnavailableError
+    from app.modules.payflow.services import case_reassessment_service
     from app.modules.payflow.services.workflow_suggestion import message_writer
 
-    with patch.object(message_writer, "call_llm", side_effect=ServiceUnavailableError("AI is off in tests")):
+    off = ServiceUnavailableError("AI is off in tests")
+    # Case reassessment asks the AI too; off, it uses its fixed rules (tests patch it to try the AI).
+    with patch.object(message_writer, "call_llm", side_effect=off), patch.object(
+        case_reassessment_service, "call_llm", side_effect=off
+    ):
         yield
 
 
