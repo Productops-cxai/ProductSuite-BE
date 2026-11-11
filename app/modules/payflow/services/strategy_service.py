@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ValidationAppError
@@ -881,7 +882,10 @@ class PayflowStrategyService:
             ),
         )
 
-    def _serialize(self, row: PayflowStrategyModel) -> dict[str, Any]:
+    def _serialize(
+        self, row: PayflowStrategyModel, *, replaced_by: dict[int, int] | None = None
+    ) -> dict[str, Any]:
+        """`replaced_by`: {id: replaced_by_id} already loaded for a list (else one query for this row)."""
         steps = list(row.steps or [])
         # Ensure timing labels present for older rows
         for step in steps:
@@ -915,6 +919,10 @@ class PayflowStrategyService:
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
             "revision_of_id": row.revision_of_id,
+            # The newest version regenerated from this one (it is then Rejected).
+            "replaced_by_id": (
+                replaced_by.get(row.id) if replaced_by is not None else self._replaced_by_map([row.id]).get(row.id)
+            ),
             "versions": self._list_versions(row),
             "approved_by": row.approved_by,
             "approval_date": row.approval_date,
@@ -964,8 +972,9 @@ class PayflowStrategyService:
             return sum(1 for r in rows if r.status == status_value)
 
         awaiting = sum(1 for r in rows if _awaiting_review(r.status))
+        replaced_by = self._replaced_by_map([r.id for r in rows])
         return {
-            "strategies": [self._serialize(r) for r in rows],
+            "strategies": [self._serialize(r, replaced_by=replaced_by) for r in rows],
             "summary": {
                 "total": len(rows),
                 "ai_proposed": count(PayflowStrategyStatus.AI_PROPOSED.value),
@@ -974,6 +983,7 @@ class PayflowStrategyService:
                 "approved": count(PayflowStrategyStatus.APPROVED.value),
                 "active": count(PayflowStrategyStatus.ACTIVE.value),
                 "inactive": count(PayflowStrategyStatus.INACTIVE.value),
+                "rejected": count(PayflowStrategyStatus.REJECTED.value),
                 "awaiting_review": awaiting,
             },
             "statuses": [s.value for s in PayflowStrategyStatus],
@@ -989,14 +999,21 @@ class PayflowStrategyService:
         return self._serialize(row)
 
     def create_strategy(
-        self, user: UserModel, payload: dict[str, Any], *, commit: bool = True, version: int = 1
+        self,
+        user: UserModel,
+        payload: dict[str, Any],
+        *,
+        commit: bool = True,
+        version: int = 1,
+        history_note: str | None = None,
     ) -> dict[str, Any]:
         """commit=False only flushes and skips the notification: the caller saves several
         workflows together, commits once, then calls notify_awaiting for each.
 
         `version`: the starting version number — 1, except for AI Regenerate, whose new workflow
         continues the number of the one it replaces (v2 → v3). A keyword, not a payload field,
-        so the create API cannot set it."""
+        so the create API cannot set it.
+        `history_note`: the first history entry's note instead of the default (Regenerate: where it came from)."""
         name = (payload.get("name") or "").strip()
         if not name:
             raise ValidationAppError("Strategy name is required")
@@ -1107,11 +1124,8 @@ class PayflowStrategyService:
             row,
             self._version_entry(
                 version=version,
-                note=(
-                    "Proposed by PayFlow AI"
-                    if ai_generated
-                    else f"Created by {user.full_name}"
-                ),
+                note=history_note
+                or ("Proposed by PayFlow AI" if ai_generated else f"Created by {user.full_name}"),
                 steps=steps,
                 segment=segment,
                 status=status,
@@ -1136,6 +1150,7 @@ class PayflowStrategyService:
     def begin_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.AI_PROPOSED.value:
             raise ValidationAppError("Only AI Proposed workflows can begin review this way")
         row.status = PayflowStrategyStatus.UNDER_REVIEW.value
@@ -1159,6 +1174,7 @@ class PayflowStrategyService:
     ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
 
         before_steps = copy.deepcopy(list(row.steps or []))
         was_ai_proposed = row.status == PayflowStrategyStatus.AI_PROPOSED.value
@@ -1283,6 +1299,7 @@ class PayflowStrategyService:
         """
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         before = {step.get("id"): step for step in row.steps or []}
         written = [
             step.get("title") or step.get("id")
@@ -1319,6 +1336,7 @@ class PayflowStrategyService:
     def save_draft(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
 
         if row.status in {
             PayflowStrategyStatus.APPROVED.value,
@@ -1368,6 +1386,7 @@ class PayflowStrategyService:
     def submit_review(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.DRAFT.value:
             raise ValidationAppError("Only Draft workflows can be submitted for review")
         if not row.steps:
@@ -1393,6 +1412,7 @@ class PayflowStrategyService:
     def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         # Reviewer can approve from AI Proposed or Under Review; Active still requires a separate activate.
         if row.status not in {
             PayflowStrategyStatus.AI_PROPOSED.value,
@@ -1436,6 +1456,9 @@ class PayflowStrategyService:
         self._assert_manage(user, row.client_id)
         # Lovable: Reject / Request Regeneration is available for AI workflows in any
         # reviewable state including Active (returns to AI Proposed for regeneration).
+        if row.status == PayflowStrategyStatus.REJECTED.value:
+            # Already rejected (Regenerate did it): nothing to change - the frontend rejects right after it.
+            return self._serialize(row)
         if row.status not in {
             PayflowStrategyStatus.DRAFT.value,
             PayflowStrategyStatus.UNDER_REVIEW.value,
@@ -1499,6 +1522,7 @@ class PayflowStrategyService:
     ) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status in {
             PayflowStrategyStatus.AI_PROPOSED.value,
             PayflowStrategyStatus.DRAFT.value,
@@ -1549,6 +1573,7 @@ class PayflowStrategyService:
     def deactivate(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
+        self._assert_open(row)
         if row.status != PayflowStrategyStatus.ACTIVE.value:
             raise ValidationAppError("Only Active workflows can be deactivated")
         row.status = PayflowStrategyStatus.INACTIVE.value
@@ -1644,6 +1669,26 @@ class PayflowStrategyService:
         except Exception:
             pass
 
+    def _replaced_by_map(self, strategy_ids: list[int]) -> dict[int, int]:
+        """{id: newest workflow regenerated from it} for the given workflows (one query)."""
+        if not strategy_ids:
+            return {}
+        rows = (
+            self.db.query(PayflowStrategyModel.revision_of_id, func.max(PayflowStrategyModel.id))
+            .filter(PayflowStrategyModel.revision_of_id.in_(strategy_ids))
+            .group_by(PayflowStrategyModel.revision_of_id)
+            .all()
+        )
+        return {original_id: newest_id for original_id, newest_id in rows}
+
+    def _assert_open(self, row: PayflowStrategyModel) -> None:
+        """A Rejected workflow is closed: it was replaced by a regenerated version."""
+        if row.status != PayflowStrategyStatus.REJECTED.value:
+            return
+        replaced_by = self._replaced_by_map([row.id]).get(row.id)
+        where = f" by #{replaced_by}" if replaced_by else ""
+        raise ValidationAppError(f"This workflow was rejected and replaced{where} - use the new version")
+
     def _get_row(self, strategy_id: int) -> PayflowStrategyModel:
         row = (
             self.db.query(PayflowStrategyModel)
@@ -1677,6 +1722,7 @@ class PayflowStrategyService:
                 "approved": 0,
                 "active": 0,
                 "inactive": 0,
+                "rejected": 0,
                 "awaiting_review": 0,
             },
             "statuses": [s.value for s in PayflowStrategyStatus],

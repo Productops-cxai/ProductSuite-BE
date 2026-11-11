@@ -77,12 +77,13 @@ def test_regenerate_saves_a_new_linked_version(db_session, admin, ai_workflow):
     assert REMARKS in prompt and ai_workflow["name"] in prompt and "Revise the current workflow" in prompt
 
 
-def test_original_is_not_changed(db_session, admin, ai_workflow):
+def test_original_keeps_its_content_and_becomes_rejected(db_session, admin, ai_workflow):
     before = copy.deepcopy(PayflowStrategyService(db_session).get_strategy(admin, ai_workflow["id"]))
-    regenerate(db_session, admin, ai_workflow["id"])
+    new, _ = regenerate(db_session, admin, ai_workflow["id"])
     after = PayflowStrategyService(db_session).get_strategy(admin, ai_workflow["id"])
-    for key in ("status", "version", "steps", "ai_context", "segment"):
+    for key in ("version", "steps", "ai_context", "segment"):
         assert after[key] == before[key], key
+    assert after["status"] == "Rejected" and after["replaced_by_id"] == new["id"]
 
 
 def versions_of(db_session, admin, workflow_id):
@@ -121,13 +122,13 @@ def test_the_rejected_history_row_is_kept_out_of_ai_learning(db_session, admin, 
 
 
 def test_ui_flow_reject_then_regenerate(db_session, admin, ai_workflow):
-    """The frontend calls reject, then regenerate: both history rows are kept; reject sets the status."""
+    """Active / Inactive workflows: the frontend rejects, then regenerates. Both history rows are kept."""
     strategies = PayflowStrategyService(db_session)
     strategies.reject(admin, ai_workflow["id"], note=REMARKS)
     new, calls = regenerate(db_session, admin, ai_workflow["id"])
 
     original = strategies.get_strategy(admin, ai_workflow["id"])
-    assert original["status"] == "AI Proposed"
+    assert original["status"] == "Rejected"
     regenerated, rejected = original["versions"][:2]
     assert regenerated["status"] == "Rejected" and f"#{new['id']}" in regenerated["note"]
     assert rejected["reviewer_note"] == REMARKS
@@ -164,7 +165,9 @@ def test_regenerate_continues_the_version_number(db_session, admin, ai_workflow)
     assert ai_workflow["version"] == 1  # Suggest still starts at v1
     second, _ = regenerate(db_session, admin, ai_workflow["id"])
     assert second["version"] == 2
-    assert second["versions"][0]["version"] == 2 and second["versions"][0]["note"] == "Proposed by PayFlow AI"
+    assert second["versions"][0]["version"] == 2 and second["versions"][0]["note"].startswith(
+        f"Proposed by PayFlow AI as the next version of #{ai_workflow['id']} {ai_workflow['name']} (v1), rejected by"
+    )
 
     third, _ = regenerate(db_session, admin, second["id"])  # a chain keeps counting
     assert third["version"] == 3
@@ -345,10 +348,11 @@ def test_human_created_workflow_can_be_regenerated(db_session, admin, portfolio)
     assert new["status"] == "AI Proposed" and new["source"] == "AI Generated"
     assert new["version"] == human["version"] + 1
     assert context(new)["Revision of"].startswith(f"#{human['id']} ")
-    # The hand-made original is kept as it was, with the rejection on its history.
+    # The hand-made original keeps its content and source; like every regenerated original it is now
+    # Rejected (replaced by the new version), with the rejection on its history.
     original = PayflowStrategyService(db_session).get_strategy(admin, human["id"])
-    assert original["status"] == "Draft" and original["source"] == "Human Created"
-    assert original["versions"][0]["status"] == "Rejected"
+    assert original["status"] == "Rejected" and original["source"] == "Human Created"
+    assert original["versions"][0]["status"] == "Rejected" and original["replaced_by_id"] == new["id"]
 
 
 def test_unknown_workflow(db_session, admin):

@@ -65,9 +65,9 @@ REGENERATE_STATUSES = {
     PayflowStrategyStatus.UNDER_REVIEW.value,
     PayflowStrategyStatus.APPROVED.value,
 }
-# Status of the history row Regenerate writes on the original (the workflow's own status is set by reject).
-# Workflows only run from "Active" / "Approved" history rows, so this row never changes what runs.
-REJECTED_HISTORY_STATUS = "Rejected"
+# Regenerate sets the original to this status and writes a history row with it. A Rejected workflow is
+# closed and never runs (only Active workflows run; versions pin to "Active" / "Approved" history rows).
+REJECTED_HISTORY_STATUS = PayflowStrategyStatus.REJECTED.value
 # Message text is written before approval only — approved text must not change without a review.
 WRITE_MESSAGES_STATUSES = {
     PayflowStrategyStatus.DRAFT.value,
@@ -195,13 +195,14 @@ class WorkflowSuggestionService:
     def regenerate_workflow(self, user: UserModel, strategy_id: int, remarks: str) -> dict[str, Any]:
         """New "AI Proposed" version of a workflow, guided by reviewer remarks.
 
-        Works for AI Generated and Human Created sources. The original workflow is
-        not replaced; the new one records revision_of_id (plus a "Revision of #id"
-        line for reviewers) and continues its version number (v2 → v3). The original
-        only gets a "Rejected" history row (who, when, remarks, new version), saved in
-        the same commit as the new workflow.
+        Works for AI Generated and Human Created sources. The new one records revision_of_id
+        (plus a "Revision of #id" line for reviewers), continues the version number (v2 → v3)
+        and its first history row says which workflow it was made from. The original becomes
+        Rejected (closed; replaced_by_id points to the new one) with a "Rejected" history row
+        (who, when, remarks, new version) - all saved together with the new workflow.
         """
         original = self.strategies.get_strategy(user, strategy_id)
+        _assert_not_rejected(original, "regenerate the new version")
         if original["source"] not in {
             PayflowStrategySource.AI_GENERATED.value,
             PayflowStrategySource.HUMAN_CREATED.value,
@@ -281,7 +282,9 @@ class WorkflowSuggestionService:
         ai_context += messages_note
         if carried:
             ai_context.append({"label": "Reviewer text kept", "value": ", ".join(carried.values())})
-        # The new workflow and the original's "Rejected" history row are saved together: both or nothing.
+        rejected_by = user.full_name or user.email
+        rejected_at = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+        # The new workflow and the original's rejection are saved together: both or nothing.
         try:
             new = self._save(
                 user,
@@ -294,30 +297,39 @@ class WorkflowSuggestionService:
                 revision_of_id=original["id"],
                 commit=False,
                 version=int(original["version"] or 1) + 1,  # continues the number: v2 → v3
+                history_note=(
+                    f"Proposed by PayFlow AI as the next version of #{original['id']} {original['name']} "
+                    f"(v{original['version']}), rejected by {rejected_by} on {rejected_at}. Remarks: {remarks}"
+                ),
             )
-            self._record_rejection(user, original["id"], new, remarks)
+            self._record_rejection(original["id"], new, remarks, rejected_by=rejected_by, rejected_at=rejected_at)
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
-        # Notifications commit on their own, so they are sent only after the save.
+        # Notifications commit on their own, so they are sent / cleared only after the save.
         self.strategies.notify_awaiting(user, new["id"])
+        self.strategies._mark_notifications_read(self.db.get(PayflowStrategyModel, original["id"]))
         return self.strategies.get_strategy(user, new["id"])
 
-    def _record_rejection(self, user: UserModel, original_id: int, new: dict[str, Any], remarks: str) -> None:
-        """History row on the original: who rejected it, when (date and time), why, and its new version.
+    def _record_rejection(
+        self, original_id: int, new: dict[str, Any], remarks: str, *, rejected_by: str, rejected_at: str
+    ) -> None:
+        """The original becomes Rejected (closed: replaced by `new`), with a history row saying who rejected
+        it, when (date and time), why, and its new version.
 
         Kept out of AI learning on purpose (no reviewer_note, no changes): the remarks already reach
         the AI through the reject note and the new workflow's "Reviewer remarks" line.
         """
         row = self.db.get(PayflowStrategyModel, original_id)
+        row.status = REJECTED_HISTORY_STATUS
         self.strategies._prepend_version(
             row,
             {
                 "version": int(row.version or 1),
-                "date": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+                "date": rejected_at,
                 "note": (
-                    f"Rejected / regeneration requested by {user.full_name or user.email}. "
+                    f"Rejected / regeneration requested by {rejected_by}. "
                     f"New version: #{new['id']} (v{new['version']}). Remarks: {remarks}"
                 ),
                 "status": REJECTED_HISTORY_STATUS,
@@ -330,6 +342,7 @@ class WorkflowSuggestionService:
     ) -> dict[str, Any]:
         """AI writes the email / SMS text of a workflow — every message, or only `step_id`."""
         workflow = self.strategies.get_strategy(user, strategy_id)
+        _assert_not_rejected(workflow, "write the messages of the new version")
         if workflow["status"] not in WRITE_MESSAGES_STATUSES:
             raise ValidationAppError(
                 "Message text can only be written for Draft, AI Proposed or Under Review workflows"
@@ -477,10 +490,11 @@ class WorkflowSuggestionService:
         commit: bool = True,
         revision_of_id: int | None = None,
         version: int = 1,
+        history_note: str | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
-        # version: 1 on Suggest; Regenerate continues the original's number.
+        # version: 1 on Suggest; Regenerate continues the original's number (history_note: made from what).
         return self.strategies.create_strategy(
             user,
             {
@@ -498,6 +512,7 @@ class WorkflowSuggestionService:
             },
             commit=commit,
             version=version,
+            history_note=history_note,
         )
 
 
@@ -668,6 +683,14 @@ def _refreshed_context(
 
 def _names(codes: list[str]) -> str:
     return ", ".join(language_name(code) for code in codes)
+
+
+def _assert_not_rejected(workflow: dict[str, Any], instead: str) -> None:
+    """A Rejected workflow was replaced by a regenerated version: point to that version instead."""
+    if workflow.get("status") != REJECTED_HISTORY_STATUS:
+        return
+    replaced_by = f" by #{workflow['replaced_by_id']}" if workflow.get("replaced_by_id") else ""
+    raise ValidationAppError(f"This workflow was rejected and replaced{replaced_by} - {instead}")
 
 
 def _stored_segment(workflow: dict[str, Any]) -> dict[str, Any]:
