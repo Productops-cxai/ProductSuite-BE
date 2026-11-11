@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.exceptions import AppError
+from app.core.exceptions import AppError, NotFoundError, ValidationAppError
 from app.infrastructure.database.models import (
     PayflowAiSuggestJobModel,
     PayflowClientModel,
@@ -21,8 +21,10 @@ from app.infrastructure.database.models import (
 from app.infrastructure.database.session import SessionLocal
 from app.modules.payflow.services.workflow_suggestion.context import load_suggest_scope
 from app.modules.payflow.services.workflow_suggestion.gates import (
+    ALL_COVERED_REASON,
     evaluate_suggest_gates,
     portfolio_has_ai_workflows,
+    uncovered_accounts,
 )
 from app.modules.payflow.services.workflow_suggestion.segmenter import build_segments
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService, _batches
@@ -38,6 +40,9 @@ STATUS_FAILED = "failed"
 
 # Do not enqueue another job while one is waiting or in flight.
 _BLOCKING_STATUSES = {STATUS_PENDING, STATUS_RUNNING}
+# "Suggest with AI" pressed by a person: designs a workflow for every segment, as the button
+# always did. Every other trigger is automatic and only fills what has no workflow yet.
+TRIGGER_MANUAL = "manual_suggest"
 
 
 def _utcnow() -> datetime:
@@ -61,8 +66,9 @@ class AiSuggestJobService:
 
         ``portfolio_id=None`` = client-level job for parent accounts (no sub-client).
 
-        A prior ``done`` job only blocks when the scope still has AI-generated
-        strategies. After strategies are wiped, a new job can be enqueued again.
+        A scope that already has AI-generated workflows gets a new job only when some of
+        its eligible accounts fit no existing workflow (they moved into, or arrived in, a
+        segment without one). The job then designs workflows for those accounts only.
         """
         q = self.db.query(PayflowAiSuggestJobModel).filter(
             PayflowAiSuggestJobModel.client_id == client_id,
@@ -83,14 +89,21 @@ class AiSuggestJobService:
             )
             return None
 
-        if portfolio_has_ai_workflows(self.db, client_id, portfolio_id):
-            logger.info(
-                "AI suggest skip enqueue client=%s portfolio=%s already has AI workflows trigger=%s",
-                client_id,
-                portfolio_id,
-                trigger,
-            )
-            return None
+        if trigger != TRIGGER_MANUAL and portfolio_has_ai_workflows(
+            self.db, client_id, portfolio_id
+        ):
+            try:
+                _, accounts = load_suggest_scope(self.db, client_id, portfolio_id)
+            except NotFoundError:
+                return None
+            if not uncovered_accounts(self.db, client_id, portfolio_id, accounts):
+                logger.info(
+                    "AI suggest skip enqueue client=%s portfolio=%s every account is covered trigger=%s",
+                    client_id,
+                    portfolio_id,
+                    trigger,
+                )
+                return None
 
         job = PayflowAiSuggestJobModel(
             client_id=client_id,
@@ -110,6 +123,46 @@ class AiSuggestJobService:
             trigger,
         )
         return job
+
+    def start_manual(
+        self, user: UserModel, client_id: int, portfolio_id: int | None
+    ) -> tuple[PayflowAiSuggestJobModel, bool]:
+        """ "Suggest with AI" as a background job: (job, started).
+
+        Checked here so the person gets the reason at once instead of a failed job. While a
+        job for the scope is already waiting or running that job is returned (started=False):
+        a second run would only produce the same workflows twice.
+        """
+        gates = evaluate_suggest_gates(self.db, client_id, portfolio_id)
+        if not gates.ok:
+            raise ValidationAppError(gates.reason or "AI suggestion is not available for this scope")
+        job = self.enqueue(
+            client_id, portfolio_id, trigger=TRIGGER_MANUAL, requested_by_user_id=user.id
+        )
+        if job is not None:
+            self.db.commit()
+            return job, True
+        q = self.db.query(PayflowAiSuggestJobModel).filter(
+            PayflowAiSuggestJobModel.client_id == client_id,
+            PayflowAiSuggestJobModel.status.in_(list(_BLOCKING_STATUSES)),
+        )
+        if portfolio_id is None:
+            q = q.filter(PayflowAiSuggestJobModel.portfolio_id.is_(None))
+        else:
+            q = q.filter(PayflowAiSuggestJobModel.portfolio_id == portfolio_id)
+        return q.order_by(PayflowAiSuggestJobModel.id.desc()).first(), False
+
+    def get_job(self, job_id: int) -> dict[str, Any] | None:
+        job = (
+            self.db.query(PayflowAiSuggestJobModel)
+            .options(
+                joinedload(PayflowAiSuggestJobModel.client),
+                joinedload(PayflowAiSuggestJobModel.portfolio),
+            )
+            .filter(PayflowAiSuggestJobModel.id == job_id)
+            .first()
+        )
+        return self._serialize(job) if job else None
 
     def enqueue_many(
         self,
@@ -255,19 +308,23 @@ class AiSuggestJobService:
                 )
                 return
 
-            if portfolio_has_ai_workflows(self.db, job.client_id, job.portfolio_id):
-                self._finish(
-                    job,
-                    STATUS_SKIPPED,
-                    skip_reason=(
-                        "Client already has AI-generated parent workflows"
-                        if job.portfolio_id is None
-                        else "Portfolio already has AI-generated workflows"
-                    ),
-                    duration_ms=int((time.perf_counter() - t0) * 1000),
-                )
-                logger.info("AI suggest job=%s skipped: already has AI workflows", job.id)
-                return
+            # An automatic run on a scope that already has AI workflows only designs workflows
+            # for the accounts that fit none of them. A person's Suggest designs all of them.
+            only_uncovered = job.trigger != TRIGGER_MANUAL and portfolio_has_ai_workflows(
+                self.db, job.client_id, job.portfolio_id
+            )
+            _, accounts = load_suggest_scope(self.db, job.client_id, job.portfolio_id)
+            if only_uncovered:
+                accounts = uncovered_accounts(self.db, job.client_id, job.portfolio_id, accounts)
+                if not accounts:
+                    self._finish(
+                        job,
+                        STATUS_SKIPPED,
+                        skip_reason=ALL_COVERED_REASON,
+                        duration_ms=int((time.perf_counter() - t0) * 1000),
+                    )
+                    logger.info("AI suggest job=%s skipped: every account is covered", job.id)
+                    return
 
             user = self._resolve_user(job)
             if not user:
@@ -279,7 +336,6 @@ class AiSuggestJobService:
                 )
                 return
 
-            _, accounts = load_suggest_scope(self.db, job.client_id, job.portfolio_id)
             segments = build_segments(accounts)["segments"]
             batches = _batches(segments)
             job.segments_count = len(segments)
@@ -287,7 +343,7 @@ class AiSuggestJobService:
             self.db.commit()
 
             result = WorkflowSuggestionService(self.db).suggest_workflows(
-                user, job.client_id, job.portfolio_id
+                user, job.client_id, job.portfolio_id, only_uncovered=only_uncovered
             )
             workflows = result.get("workflows") or []
             ids = [w.get("id") for w in workflows if isinstance(w, dict) and w.get("id") is not None]

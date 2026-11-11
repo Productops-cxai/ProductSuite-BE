@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     SMTP_USE_TLS: bool = True
 
     # AI workflow suggestion — an OpenAI-compatible chat API, chosen by LLM_PROVIDER.
-    LLM_PROVIDER: str = "groq"  # groq | together
+    LLM_PROVIDER: str = "together"  # together | groq
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     TOGETHER_API_KEY: str = ""

@@ -44,6 +44,11 @@ _MISSED_INSTALMENT_STATUSES = (
     PayflowPaymentInstallmentStatus.FAILED.value,
 )
 _EPSILON = 0.0001
+# Outcome "Paid In Full" reached while money is still owed (see apply_outcome_to_account).
+PAID_IN_FULL_NOT_PAID = "Outcome 'Paid In Full' reached but a balance is still owed - needs review"
+# Reference events that are a date on the account, often long before the workflow started
+# (same list as workflow_suggestion.config.FIXED_DATE_EVENTS, which cannot be imported here).
+FIXED_DATE_REFERENCE_EVENTS = frozenset({"case received", "due date"})
 _BOUNCE_HINTS = ("bounce", "bounced", "dropped", "invalid", "blocked", "undeliverable")
 
 # Catalog operators (and aliases) → comparable form with spaces.
@@ -324,8 +329,8 @@ def customer_response(
         if "dispute" in reason:
             return "Dispute Raised"
 
-    if account.last_contact_date:
-        return "Received"
+    # account.last_contact_date is not used here: every message PayFlow sends sets it, so it says
+    # that the customer was contacted, not that the customer answered.
     return "None"
 
 
@@ -438,14 +443,22 @@ def apply_outcome_to_account(account: PayflowAccountModel, outcome: str | None) 
     label = (outcome or "").strip()
     before = account.collection_status
     lowered = label.lower()
+    if lowered == "paid in full" and float(account.outstanding_balance or 0) > _EPSILON:
+        # Money is still owed: the workflow reached this Outcome by mistake (a customer on a plan,
+        # a part payment, a missing check). Never close the case or clear the balance for it -
+        # only a recorded payment may do that. A person looks at the case instead.
+        account.human_review = True
+        account.next_action = PAID_IN_FULL_NOT_PAID
+        account.last_action = f"Outcome: {label} not applied"
+        return {
+            "outcome": label,
+            "applied": False,
+            "reason": PAID_IN_FULL_NOT_PAID,
+            "collection_status_before": before,
+            "collection_status": account.collection_status,
+        }
     if lowered in {"paid in full", "case closed"}:
         account.collection_status = PayflowCollectionStatus.RESOLVED.value
-        if lowered == "paid in full" and float(account.outstanding_balance or 0) > 0:
-            # Record closure without inventing a payment txn — balance already trusted upstream.
-            account.recovered_balance = float(account.recovered_balance or 0) + float(
-                account.outstanding_balance or 0
-            )
-            account.outstanding_balance = 0.0
     elif lowered == "payment plan active":
         account.collection_status = PayflowCollectionStatus.PAYMENT_PLAN.value
     elif lowered in {"promise to pay recorded", "promise-to-pay recorded"}:
@@ -456,6 +469,7 @@ def apply_outcome_to_account(account: PayflowAccountModel, outcome: str | None) 
     account.last_action = f"Outcome: {label or 'done'}"
     return {
         "outcome": label or None,
+        "applied": True,
         "collection_status_before": before,
         "collection_status": account.collection_status,
     }
@@ -480,8 +494,13 @@ def resolve_reference_anchor(
     reference_event: str | None,
     *,
     run_started_at: datetime | None = None,
+    previous_action_at: datetime | None = None,
 ) -> datetime | None:
-    """Best-effort timestamp for Wait/Communication reference_event."""
+    """Best-effort timestamp for Wait/Communication reference_event.
+
+    `previous_action_at`: when the run's previous step finished ("Previous Action"). Without it the
+    account's contact dates are used, which are whole days (a 2-day wait could end hours early).
+    """
     ref = (reference_event or "").strip().lower()
     if not ref:
         return None
@@ -506,7 +525,9 @@ def resolve_reference_anchor(
     if ref == "broken promise-to-pay":
         return _as_dt(account.ptp_due_date)
     if ref == "last customer response":
-        return _as_dt(account.last_contact_date)
+        # Not account.last_contact_date: PayFlow's own messages set it. Without a recorded reply
+        # there is no such moment, and the caller then waits its full amount from now.
+        return last_customer_response_at(account)
     if ref == "previous email":
         return _latest_comm_at(db, account.id, "Email") or _as_dt(
             account.last_email_sent_date
@@ -518,12 +539,43 @@ def resolve_reference_anchor(
         return at or _latest_comm_at(db, account.id, None, payment_link_only=True)
     if ref == "previous action":
         return (
-            _as_dt(account.last_contact_date)
+            _as_dt(previous_action_at)
+            or _as_dt(account.last_contact_date)
             or _as_dt(account.last_email_sent_date)
             or _as_dt(account.last_sms_sent_date)
             or _as_dt(run_started_at)
         )
     return None
+
+
+_CUSTOMER_REPLY_WORDS = ("customer reply", "customer response", "inbound")
+
+
+def last_customer_response_at(account: PayflowAccountModel) -> datetime | None:
+    """When the customer last answered: the newest reply recorded on the case timeline
+    (the same entries customer_response reads), or None when there is none."""
+    for item in reversed(list(account.timeline or [])):
+        if not isinstance(item, dict):
+            continue
+        blob = f"{item.get('label') or ''} {item.get('detail') or ''}".lower()
+        if not any(word in blob for word in _CUSTOMER_REPLY_WORDS):
+            continue
+        at = _parse_timeline_at(item.get("at"))
+        if at is not None:
+            return at
+    return None
+
+
+def _parse_timeline_at(value: Any) -> datetime | None:
+    """Timeline stamps are ISO ("2026-11-12T09:30:00+00:00") or "2026-11-12 09:30" (UTC)."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
 def _latest_comm_at(

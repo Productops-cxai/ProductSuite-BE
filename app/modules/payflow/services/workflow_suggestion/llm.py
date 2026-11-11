@@ -122,7 +122,9 @@ def build_message_schema(step_ids: list[str]) -> dict[str, Any]:
     return _object({"messages": {"type": "array", "items": message}}, required=["messages"])
 
 
-def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
+def call_llm(messages: list[dict[str, str]], schema: dict[str, Any], *, quick: bool = False) -> dict[str, Any]:
+    """`quick`: for a call made while a workflow step or a page is waiting (one case, a short
+    answer): no waiting out a rate limit and one retry only - the caller has a fallback."""
     provider = _provider()
     api_key = getattr(settings, provider["key"])
     if not api_key:
@@ -139,7 +141,13 @@ def call_llm(messages: list[dict[str, str]], schema: dict[str, Any]) -> dict[str
     }
     if provider["max_tokens"]:
         payload["max_tokens"] = getattr(settings, provider["max_tokens"])
-    response = _post_with_retries(provider["url"], api_key, payload)
+    response = _post_with_retries(
+        provider["url"],
+        api_key,
+        payload,
+        rate_limit_retries=0 if quick else RATE_LIMIT_RETRIES,
+        server_error_waits=SERVER_ERROR_WAITS_SECONDS[:1] if quick else SERVER_ERROR_WAITS_SECONDS,
+    )
     if response.status_code != 200:
         raise ServiceUnavailableError(f"AI service error ({response.status_code}): {_error_message(response)}")
     choice = response.json()["choices"][0]
@@ -158,11 +166,18 @@ def _provider() -> dict[str, str | None]:
     return PROVIDERS[name]
 
 
-def _post_with_retries(url: str, api_key: str, payload: dict[str, Any]) -> httpx.Response:
+def _post_with_retries(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    rate_limit_retries: int = RATE_LIMIT_RETRIES,
+    server_error_waits: tuple[int, ...] = SERVER_ERROR_WAITS_SECONDS,
+) -> httpx.Response:
     """POST to the AI service and retry what is temporary.
 
-    429 (rate limit): wait as told by `retry-after`, up to RATE_LIMIT_RETRIES times.
-    Timeout, connection error or 5xx: wait SERVER_ERROR_WAITS_SECONDS, one wait per retry.
+    429 (rate limit): wait as told by `retry-after`, up to `rate_limit_retries` times.
+    Timeout, connection error or 5xx: wait `server_error_waits`, one wait per retry.
     """
     rate_limited = server_errors = 0
     while True:
@@ -174,16 +189,16 @@ def _post_with_retries(url: str, api_key: str, payload: dict[str, Any]) -> httpx
                 timeout=settings.GROQ_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:  # timeouts and connection errors
-            if server_errors == len(SERVER_ERROR_WAITS_SECONDS):
+            if server_errors == len(server_error_waits):
                 raise ServiceUnavailableError("AI service could not be reached") from exc
-            time.sleep(SERVER_ERROR_WAITS_SECONDS[server_errors])
+            time.sleep(server_error_waits[server_errors])
             server_errors += 1
             continue
-        if response.status_code == 429 and rate_limited < RATE_LIMIT_RETRIES:
+        if response.status_code == 429 and rate_limited < rate_limit_retries:
             time.sleep(_retry_after_seconds(response))
             rate_limited += 1
-        elif response.status_code >= 500 and server_errors < len(SERVER_ERROR_WAITS_SECONDS):
-            time.sleep(SERVER_ERROR_WAITS_SECONDS[server_errors])
+        elif response.status_code >= 500 and server_errors < len(server_error_waits):
+            time.sleep(server_error_waits[server_errors])
             server_errors += 1
         else:
             return response
