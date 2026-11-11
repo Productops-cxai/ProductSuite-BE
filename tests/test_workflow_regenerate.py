@@ -326,8 +326,8 @@ def test_approved_can_be_regenerated(db_session, admin, ai_workflow):
     assert new["id"] != ai_workflow["id"]
 
 
-def test_human_workflow_can_be_regenerated(db_session, admin, portfolio):  # noqa: F811
-    """Human Created workflows regenerate too (a rejected one is back in Draft): the new one is an AI proposal."""
+def test_human_created_workflow_can_be_regenerated(db_session, admin, portfolio):  # noqa: F811
+    """A hand-made Draft can be handed to the AI: the result is a new, linked AI proposal."""
     human = PayflowStrategyService(db_session).create_strategy(
         admin,
         {
@@ -337,10 +337,18 @@ def test_human_workflow_can_be_regenerated(db_session, admin, portfolio):  # noq
             "steps": load_examples()[0]["steps"],
         },
     )
-    assert human["status"] == "Draft" and human["source"] == "Human Created"
-    new, calls = regenerate(db_session, admin, human["id"])
-    assert new["source"] == "AI Generated" and new["status"] == "AI Proposed"
-    assert new["revision_of_id"] == human["id"] and len(calls) == 1
+    assert human["source"] == "Human Created" and human["status"] == "Draft"
+
+    new, _ = regenerate(db_session, admin, human["id"])
+
+    assert new["id"] != human["id"]
+    assert new["status"] == "AI Proposed" and new["source"] == "AI Generated"
+    assert new["version"] == human["version"] + 1
+    assert context(new)["Revision of"].startswith(f"#{human['id']} ")
+    # The hand-made original is kept as it was, with the rejection on its history.
+    original = PayflowStrategyService(db_session).get_strategy(admin, human["id"])
+    assert original["status"] == "Draft" and original["source"] == "Human Created"
+    assert original["versions"][0]["status"] == "Rejected"
 
 
 def test_unknown_workflow(db_session, admin):
@@ -417,11 +425,12 @@ def test_api_approved_workflow_can_be_regenerated(client, admin_token, admin, db
     assert body["id"] != ai_workflow["id"]
 
 
-def test_api_client_level_workflow_can_be_regenerated(client, admin_token, db_session, portfolio):  # noqa: F811
-    """No portfolio = a client-level workflow (parent accounts): it regenerates as one."""
-    old = PayflowStrategyModel(
-        code="old-ai-workflow",
-        name="Old AI workflow",
+def test_api_parent_level_workflow_is_regenerated(client, admin_token, db_session, portfolio):  # noqa: F811
+    """A workflow without a portfolio is a client-level one (parent accounts): it regenerates
+    like any other, and the new version stays at client level."""
+    parent = PayflowStrategyModel(
+        code="parent-ai-workflow",
+        name="Parent AI workflow",
         client_id=portfolio["client_id"],
         portfolio_id=None,
         status="AI Proposed",
@@ -430,15 +439,18 @@ def test_api_client_level_workflow_can_be_regenerated(client, admin_token, db_se
         steps=load_examples()[0]["steps"],
         entry_node_id="s1",
     )
-    db_session.add(old)
+    db_session.add(parent)
     db_session.commit()
     call, calls = fake_llm()
     with patch.object(suggestion_service, "call_llm", side_effect=call):
-        response = _post(client, admin_token, old.id)
-    assert response.status_code == 200, response.json()
+        response = _post(client, admin_token, parent.id)
+
+    assert response.status_code == 200, response.text
     body = response.json()
-    assert body["portfolio_id"] is None and body["revision_of_id"] == old.id
-    assert body["status"] == "AI Proposed" and len(calls) == 1
+    assert body["id"] != parent.id
+    assert body["portfolio_id"] is None
+    assert body["client_id"] == portfolio["client_id"]
+    assert len(calls) == 1
 
 
 def test_api_needs_workflow_permission(client, supervisor_token, ai_workflow):  # noqa: F811
