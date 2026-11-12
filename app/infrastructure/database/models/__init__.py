@@ -531,6 +531,8 @@ class PayflowEmailUnsubscribeEventModel(Base):
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     # preference_page | one_click | staff
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="preference_page")
+    # Set when customer picks a high-risk reason; does not delay unsubscribe itself.
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     account_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     email_masked: Mapped[str | None] = mapped_column(String(255), nullable=True)

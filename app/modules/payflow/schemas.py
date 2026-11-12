@@ -1243,6 +1243,7 @@ class PayflowEmailUnsubscribePublicEvent(BaseModel):
     reason_labels: List[str] = []
     comment: Optional[str] = None
     source: str
+    review_required: bool = False
     unsubscribed_at: Optional[str] = None
 
 
@@ -1271,6 +1272,7 @@ class PayflowEmailUnsubscribeListItem(BaseModel):
     reason_labels: List[str] = []
     comment: Optional[str] = None
     source: str
+    review_required: bool = False
     unsubscribed_at: Optional[str] = None
 
 
@@ -1280,6 +1282,7 @@ class PayflowEmailUnsubscribeListResponse(BaseModel):
     limit: int
     offset: int
     reason_options: List[PayflowEmailUnsubscribeReasonOption] = []
+    review_reason_codes: List[str] = []
 
 
 class PayflowPaymentLinkEventItem(BaseModel):

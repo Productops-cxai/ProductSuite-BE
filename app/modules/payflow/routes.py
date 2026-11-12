@@ -822,6 +822,7 @@ def list_email_unsubscribes(
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    review_required: Optional[bool] = None,
     limit: int = 50,
     offset: int = 0,
 ):
@@ -845,6 +846,7 @@ def list_email_unsubscribes(
             search=search,
             date_from=_parse(date_from),
             date_to=_parse(date_to),
+            review_required=review_required,
             limit=limit,
             offset=offset,
         )
