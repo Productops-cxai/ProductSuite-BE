@@ -1506,6 +1506,8 @@ class DashboardFunnelBreakdown(BaseModel):
     placement_available: bool = False
     placement: List[DashboardFunnelPlacementItem] = Field(default_factory=list)
     opens_available: bool = True
+    # SendGrid (and similar ESPs) do not report Gmail Promotions / tab placement.
+    promotions_available: bool = False
     placement_note: Optional[str] = None
 
 

@@ -380,8 +380,11 @@ def _actual(
         "Unsubscribe Instructions": _yes(data.unsubscribe_instructions),
         "Template Approved": _yes(data.template_approved),
         "Reply Handling Enabled": _yes(data.reply_enabled),
-        "Channel Permitted": "Yes",
-        "Collector Licensed": "Yes",
+        # Unknown when not supplied in extra — do not invent a green light for JUR-07 / JUR-21.
+        "Channel Permitted": "Yes"
+        if (data.channel or "").strip().lower() in {"email", "sms", "whatsapp"}
+        else "No",
+        "Collector Licensed": "Unknown",
         "Language": data.language,
         "Communication Type": data.activity,
         "Outstanding Balance": data.balance,

@@ -232,7 +232,7 @@ _PAYFLOW_NAV: list[
         [
             (
                 "rules",
-                "Rules",
+                "Rules (System+Client)",
                 "/payflow/rules",
                 "billing",
                 1,

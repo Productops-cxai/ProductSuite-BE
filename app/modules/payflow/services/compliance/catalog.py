@@ -45,7 +45,7 @@ ENFORCEMENT_ADVISORY = "Advisory"
 ENFORCEMENTS = [ENFORCEMENT_MANDATORY, ENFORCEMENT_CONFIGURABLE, ENFORCEMENT_ADVISORY]
 
 ACTIONS = ["Allow", "Block", "Reschedule", "Suppress", "Require Approval", "Flag for Review"]
-CHANNELS = ["All Channels", "Email", "SMS", "Voice", "WhatsApp"]
+CHANNELS = ["All Channels", "Email", "SMS", "Voice", "WhatsApp", "Letter"]
 LOGICS = ["AND", "OR"]
 OPERATORS = ["Equals", "Greater Than", "Less Than", "Between", "Includes", "Excludes"]
 JURISDICTION_TYPES = ["Federal", "State / Province", "Regional", "Municipal", "Postal"]
@@ -205,6 +205,16 @@ _REGIONS: dict[tuple[str, str], list[dict[str, Any]]] = {
             "cities": ["Mississauga", "Brampton", "Caledon"],
             "postal_prefixes": ["L4", "L5", "L6", "L7"],
         },
+        {
+            "name": "Hamilton / Niagara",
+            "cities": ["Hamilton", "St. Catharines", "Niagara Falls", "Burlington"],
+            "postal_prefixes": ["L0", "L2", "L8", "L9"],
+        },
+        {
+            "name": "Kitchener / Waterloo",
+            "cities": ["Kitchener", "Waterloo", "Cambridge"],
+            "postal_prefixes": ["N2"],
+        },
     ],
     ("CA", "QC"): [
         {
@@ -351,6 +361,72 @@ _REGIONS: dict[tuple[str, str], list[dict[str, Any]]] = {
             "cities": ["Atlanta", "Sandy Springs", "Roswell"],
             "postal_prefixes": ["303", "311"],
         }
+    ],
+    ("US", "AZ"): [
+        {
+            "name": "Phoenix / Maricopa",
+            "cities": ["Phoenix", "Scottsdale", "Mesa", "Tempe", "Glendale"],
+            "postal_prefixes": ["850", "851", "852", "853"],
+        }
+    ],
+    ("US", "CO"): [
+        {
+            "name": "Denver / Front Range",
+            "cities": ["Denver", "Aurora", "Lakewood", "Boulder"],
+            "postal_prefixes": ["800", "801", "802", "803"],
+        }
+    ],
+    ("US", "NV"): [
+        {
+            "name": "Las Vegas / Clark",
+            "cities": ["Las Vegas", "Henderson", "North Las Vegas"],
+            "postal_prefixes": ["890", "891"],
+        }
+    ],
+    ("US", "OH"): [
+        {
+            "name": "Columbus / Franklin",
+            "cities": ["Columbus", "Dublin", "Westerville"],
+            "postal_prefixes": ["430", "431", "432"],
+        },
+        {
+            "name": "Cleveland / Cuyahoga",
+            "cities": ["Cleveland", "Parma", "Lakewood"],
+            "postal_prefixes": ["441"],
+        },
+    ],
+    ("US", "MI"): [
+        {
+            "name": "Detroit / Wayne",
+            "cities": ["Detroit", "Dearborn", "Livonia"],
+            "postal_prefixes": ["481", "482"],
+        }
+    ],
+    ("US", "NJ"): [
+        {
+            "name": "Newark / Essex",
+            "cities": ["Newark", "Jersey City", "Elizabeth"],
+            "postal_prefixes": ["070", "071", "072", "073"],
+        }
+    ],
+    ("US", "OR"): [
+        {
+            "name": "Portland / Multnomah",
+            "cities": ["Portland", "Gresham", "Beaverton"],
+            "postal_prefixes": ["970", "971", "972"],
+        }
+    ],
+    ("CA", "NB"): [
+        {
+            "name": "Moncton",
+            "cities": ["Moncton", "Dieppe", "Riverview"],
+            "postal_prefixes": ["E1"],
+        },
+        {
+            "name": "Saint John",
+            "cities": ["Saint John"],
+            "postal_prefixes": ["E2"],
+        },
     ],
 }
 

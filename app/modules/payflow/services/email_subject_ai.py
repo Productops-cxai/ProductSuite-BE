@@ -40,6 +40,7 @@ from app.core.exceptions import (
 )
 from app.infrastructure.database.models import (
     PayflowClientModel,
+    PayflowEmailSubjectInsightModel,
     PayflowMessageProposalModel,
     PayflowMessageVersionModel,
     PayflowStrategyModel,
@@ -88,7 +89,8 @@ REPEAT_AFTER_DAYS = 30
 VIEW_WORKFLOWS = "view_workflows"
 MANAGE_WORKFLOWS = "create_edit_workflows"
 
-# AI explanations already given, keyed by the exact numbers they explain: {key: (time, reply)}.
+# Process-local L1 for AI explanations already given this worker: {facts_hash: (monotonic, reply)}.
+# Durable store is ``PayflowEmailSubjectInsightModel`` (survives restart / multi-worker).
 _INSIGHT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _INSIGHT_CACHE_MAX = 500
 
@@ -327,7 +329,16 @@ class PayflowEmailSubjectAiService:
             ][:8],
             "question": f"Why is this the top subject for {metric}?" if scope == "kpi" else "How is this subject doing?",
         }
-        reply = self._ask(facts) if use_ai else None
+        reply = (
+            self._ask(
+                facts,
+                scope=scope,
+                subject_key=row.get("subject_key"),
+                client_id=owners[0] if owners else None,
+            )
+            if use_ai
+            else None
+        )
         if reply:
             return self._result(
                 row, reply["insight"], evidence=evidence, observations=reply.get("observations"), ai=True,
@@ -360,7 +371,8 @@ class PayflowEmailSubjectAiService:
                 "typical_subject": evidence["typical_subject"],
                 "subjects_without_enough_volume": len(rows) - len(qualifying),
                 "question": "Summarise what is working and what is not across these subjects.",
-            }
+            },
+            scope="section",
         ) if use_ai else None
         if reply:
             return self._result(
@@ -374,16 +386,47 @@ class PayflowEmailSubjectAiService:
             text += f" {SEVERAL_CLIENTS_NOTE}"
         return self._result(None, text, evidence=evidence)
 
-    def _ask(self, facts: dict[str, Any]) -> dict[str, Any] | None:
+    def _ask(
+        self,
+        facts: dict[str, Any],
+        *,
+        scope: str | None = None,
+        subject_key: str | None = None,
+        client_id: int | None = None,
+    ) -> dict[str, Any] | None:
         """The AI's explanation of `facts`, or None when it is unavailable (the caller has fixed wording).
 
-        The same numbers asked again within EMAIL_INSIGHT_CACHE_MINUTES get the stored answer: any
-        change in the data changes `facts`, so a stored answer is never about old numbers."""
-        ttl = max(0, int(settings.EMAIL_INSIGHT_CACHE_MINUTES or 0)) * 60
+        The same numbers asked again within EMAIL_INSIGHT_CACHE_MINUTES get the stored answer
+        (process L1, then durable DB). Any change in the data changes `facts`, so a stored
+        answer is never about old numbers.
+        """
+        ttl_minutes = max(0, int(settings.EMAIL_INSIGHT_CACHE_MINUTES or 0))
+        ttl = ttl_minutes * 60
         key = hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-        stored = _INSIGHT_CACHE.get(key)
-        if ttl and stored and time.monotonic() - stored[0] < ttl:
-            return {**stored[1], "cached": True}
+        if ttl:
+            stored = _INSIGHT_CACHE.get(key)
+            if stored and time.monotonic() - stored[0] < ttl:
+                return {**stored[1], "cached": True}
+            row = (
+                self.db.query(PayflowEmailSubjectInsightModel)
+                .filter(PayflowEmailSubjectInsightModel.facts_hash == key)
+                .first()
+            )
+            if row is not None:
+                created = row.created_at
+                if created is not None and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_ok = created is not None and (
+                    datetime.now(timezone.utc) - created
+                ) <= timedelta(minutes=ttl_minutes)
+                if age_ok:
+                    answer = {
+                        "insight": row.insight,
+                        "observations": list(row.observations or [])[:3],
+                    }
+                    self._remember_insight(key, answer)
+                    return {**answer, "cached": True}
+
         try:
             reply = message_writer.call_llm(
                 [
@@ -402,10 +445,54 @@ class PayflowEmailSubjectAiService:
         observations = [str(item).strip() for item in (reply.get("observations") or []) if str(item).strip()]
         answer = {"insight": text, "observations": observations[:3]}
         if ttl:
-            if len(_INSIGHT_CACHE) >= _INSIGHT_CACHE_MAX:
-                _INSIGHT_CACHE.clear()
-            _INSIGHT_CACHE[key] = (time.monotonic(), answer)
+            self._remember_insight(key, answer)
+            self._persist_insight(
+                key,
+                answer,
+                scope=scope,
+                subject_key=subject_key,
+                client_id=client_id,
+            )
         return {**answer, "cached": False}
+
+    def _remember_insight(self, key: str, answer: dict[str, Any]) -> None:
+        if len(_INSIGHT_CACHE) >= _INSIGHT_CACHE_MAX:
+            _INSIGHT_CACHE.clear()
+        _INSIGHT_CACHE[key] = (time.monotonic(), answer)
+
+    def _persist_insight(
+        self,
+        key: str,
+        answer: dict[str, Any],
+        *,
+        scope: str | None = None,
+        subject_key: str | None = None,
+        client_id: int | None = None,
+    ) -> None:
+        """Upsert durable insight row. Failures are logged; the in-memory answer still returns."""
+        try:
+            row = (
+                self.db.query(PayflowEmailSubjectInsightModel)
+                .filter(PayflowEmailSubjectInsightModel.facts_hash == key)
+                .first()
+            )
+            if row is None:
+                row = PayflowEmailSubjectInsightModel(facts_hash=key)
+                self.db.add(row)
+            row.insight = answer["insight"]
+            row.observations = list(answer.get("observations") or [])[:3]
+            row.generated_by = "ai"
+            row.subject_key = str(subject_key)[:512] if subject_key else None
+            row.scope = str(scope)[:32] if scope else None
+            try:
+                row.client_id = int(client_id) if client_id is not None else None
+            except (TypeError, ValueError):
+                row.client_id = None
+            row.created_at = datetime.now(timezone.utc)
+            self.db.commit()
+        except Exception:
+            logger.exception("email subject insight: durable store failed")
+            self.db.rollback()
 
     @staticmethod
     def _result(

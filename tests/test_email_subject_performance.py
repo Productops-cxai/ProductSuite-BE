@@ -65,10 +65,14 @@ def admin(db_session):
 
 
 @pytest.fixture(autouse=True)
-def small_minimum(monkeypatch):
+def small_minimum(monkeypatch, db_session):
     """Three delivered emails are enough to rank in these tests (100 in production)."""
     monkeypatch.setattr(settings, "EMAIL_SUBJECT_MIN_DELIVERIES", 3)
     email_subject_ai._INSIGHT_CACHE.clear()  # no AI answer carried over from another test
+    from app.infrastructure.database.models import PayflowEmailSubjectInsightModel
+
+    db_session.query(PayflowEmailSubjectInsightModel).delete()
+    db_session.commit()
 
 
 def make_client(db, name=None):

@@ -520,7 +520,36 @@ class PayflowCommunicationService:
             "can_view_rule": can_view_rule,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
+            **self._unsubscribe_preview_fields(row, account),
         }
+
+    def _unsubscribe_preview_fields(
+        self, row: PayflowCommunicationModel, account: Any
+    ) -> dict[str, Any]:
+        """Staff Message Preview: same unsubscribe link the customer email carries."""
+        if (row.channel or "") != "Email" or account is None:
+            return {
+                "include_email_unsubscribe": False,
+                "email_unsubscribe_url": None,
+            }
+        try:
+            from app.modules.payflow.services.email_preference_service import (
+                PayflowEmailPreferenceService,
+                email_preference_page_url,
+            )
+
+            include = PayflowEmailPreferenceService(self.db).should_include_email_unsubscribe(
+                account
+            )
+            return {
+                "include_email_unsubscribe": include,
+                "email_unsubscribe_url": email_preference_page_url(account.id) if include else None,
+            }
+        except Exception:
+            return {
+                "include_email_unsubscribe": False,
+                "email_unsubscribe_url": None,
+            }
 
     def list_communications(
         self,
