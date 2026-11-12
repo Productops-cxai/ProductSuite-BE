@@ -1940,6 +1940,7 @@ class PayflowComplianceEventModel(Base):
         UniqueConstraint("event_key", name="uq_payflow_compliance_event_key"),
         Index("ix_payflow_compliance_events_account", "account_id", "occurred_at"),
         Index("ix_payflow_compliance_events_debtor", "client_id", "debtor_ref", "occurred_at"),
+        Index("ix_payflow_compliance_events_portfolio", "client_id", "portfolio_id", "occurred_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -1947,12 +1948,62 @@ class PayflowComplianceEventModel(Base):
     client_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     debtor_ref: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Portfolio ≈ creditor book within a client (FR-08 creditor scope).
+    portfolio_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     channel: Mapped[str] = mapped_column(String(32), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="attempted")
     source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PayflowComplianceOverrideModel(Base):
+    """A time-bounded, authorized exception to one compliance rule for one account (FR-13).
+
+    Mandatory rules with ``override_policy = Not Permitted`` cannot be overridden.
+    Only an Approved override inside its validity window may clear a restriction;
+    the evaluation engine itself is unchanged — overrides are applied after it runs.
+    """
+
+    __tablename__ = "payflow_compliance_overrides"
+    __table_args__ = (
+        Index("ix_payflow_compliance_overrides_account", "account_id", "status", "valid_until"),
+        Index("ix_payflow_compliance_overrides_rule", "rule_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    rule_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("payflow_compliance_rules.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, default="All Channels")
+    # Pending | Approved | Rejected | Expired | Used
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Pending", index=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    communication_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
 

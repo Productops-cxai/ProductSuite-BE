@@ -37,6 +37,10 @@ General points:
 | 23 | `POST /clients/{id}/compliance-rules/sync` | Re-link the client to the rules of its jurisdiction |
 | 24 | `GET /accounts/{id}/compliance-profile` | An account's compliance facts (consent, flags, ...) |
 | 25 | `POST /accounts/{id}/compliance-profile/update` | Edit those facts |
+| 26 | `GET /accounts/{id}/compliance-overrides` | Overrides requested for this account |
+| 27 | `POST /compliance/overrides` | Request an authorized override (reason + evidence) |
+| 28 | `POST /compliance/overrides/{id}/approve` | Approve a Pending override |
+| 29 | `POST /compliance/overrides/{id}/reject` | Reject a Pending override |
 
 ---
 
@@ -254,6 +258,21 @@ The `flags` keys are the catalog's `account_flags`.
 ## 25. `POST /accounts/{id}/compliance-profile/update`
 
 Body: any of `timezone`, `flags` (`{"Disputed Debt": true}`), `sms_consent`, `consent_source`, `consent_evidence`, `consent_recorded_at`, `written_notice_sent_at`, `last_conversation_at`, `attorney_contact`, `inconvenient_times`, `notes`, plus `reason`. Returns the profile (endpoint 24 shape). The change is written to the audit log.
+
+---
+
+## 26–29. Compliance overrides (FR-13)
+
+Authorized, time-bounded exceptions for one Active rule on one account. The evaluation engine still runs first; an **Approved** override may clear a matched restriction only when the rule’s `override_policy` permits it. `Not Permitted` can never be overridden. Default validity after approval: 24 hours (max 7 days).
+
+| # | Endpoint | What it is for |
+|---|---|---|
+| 26 | `GET /accounts/{id}/compliance-overrides` | List overrides for an account (`status` optional) |
+| 27 | `POST /compliance/overrides` | Request: `{account_id, rule_id, reason, evidence, channel?, valid_until?}` |
+| 28 | `POST /compliance/overrides/{id}/approve` | Approve Pending (`review_note?`, `valid_until?`). Ops Admin for `Operations Admin With Reason`; Ops Admin or `modify_governance` for `Client Configurable` |
+| 29 | `POST /compliance/overrides/{id}/reject` | Reject Pending (`review_note` required) |
+
+`POST /compliance/evaluate` may also return `overrides_applied` and each match may include `override_policy` / `overrideable`.
 
 ---
 

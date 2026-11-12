@@ -1368,7 +1368,8 @@ class PayflowCommunicationService:
             row.last_opened_at = when
             self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"click", "clicked"}:
-            # Stripe/provider pay-link open — timeline only; clicks_count is PayFlow app.
+            # Unique subject analytics use last_clicked_url / payment-link status / clicks_count.
+            # Portal visits still own incremental clicks_count; ESP clicks must not double-count it.
             if url:
                 row.last_clicked_url = url[:1024]
             if is_payment_click or row.payment_link:
@@ -1382,7 +1383,7 @@ class PayflowCommunicationService:
                 except Exception:  # noqa: BLE001
                     logger.exception("payment link click record failed")
             else:
-                # Non-pay URL click in email — still engagement, not our app Click counter.
+                # Non-pay URL click in email — engagement via last_clicked_url for unique clicks.
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"canceled", "cancelled"}:
             self._advance_status(row, PayflowCommStatus.CANCELLED.value)

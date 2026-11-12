@@ -56,6 +56,8 @@ class ContactEvent:
     channel: str
     kind: str = "attempted"  # attempted | completed | conversation
     account_id: int | None = None
+    debtor_ref: str | None = None
+    portfolio_id: int | None = None
 
 
 @dataclass
@@ -65,6 +67,8 @@ class EvaluationInput:
     channel: str
     at: datetime
     account_id: int | None = None
+    debtor_ref: str | None = None
+    portfolio_id: int | None = None
     activity: str = "Collection"
     consent: bool | None = None
     opted_out: bool = False
@@ -98,6 +102,8 @@ class EvaluationResult:
     next_permitted_at: datetime | None = None
     requires_review: bool = False
     explanation: str = ""
+    # Filled by ComplianceOverrideService after evaluate(); never set by the pure engine.
+    overrides_applied: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +118,7 @@ class EvaluationResult:
             "explanation": self.explanation,
             "rule_ids": [m["rule_id"] for m in self.matches],
             "reason_codes": [m["reason_code"] for m in self.matches],
+            "overrides_applied": self.overrides_applied,
         }
 
 
@@ -282,6 +289,27 @@ def _inconvenient(windows: list[dict[str, Any]], local: datetime) -> bool:
     return False
 
 
+def _in_scope(event: ContactEvent, data: EvaluationInput, scope: str) -> bool:
+    """FR-08: account / customer / creditor (portfolio) rolling counters."""
+    scope = (scope or "account").lower()
+    if scope == "creditor":
+        if data.portfolio_id is not None:
+            return event.portfolio_id == data.portfolio_id
+        # Unknown portfolio: fall back to customer so we never ignore same-person contacts.
+        scope = "customer"
+    if scope == "customer":
+        if data.debtor_ref:
+            if event.debtor_ref and event.debtor_ref == data.debtor_ref:
+                return True
+            # Events without debtor_ref still count when they are this account.
+            return event.account_id is not None and event.account_id == data.account_id
+        return event.account_id is None or event.account_id == data.account_id
+    # account (default)
+    if event.account_id is not None and data.account_id is not None:
+        return event.account_id == data.account_id
+    return True
+
+
 def _count(
     data: EvaluationInput,
     settings: dict[str, Any],
@@ -302,12 +330,7 @@ def _count(
             continue
         if not combined and event.channel.lower() != (data.channel or "").lower():
             continue
-        if (
-            scope == "account"
-            and event.account_id is not None
-            and data.account_id is not None
-            and event.account_id != data.account_id
-        ):
+        if not _in_scope(event, data, scope):
             continue
         total += 1
     return total
@@ -451,6 +474,7 @@ def _is_time_based(rule: dict[str, Any]) -> bool:
 
 
 def _match(rule: dict[str, Any], code: str, explanation: str) -> dict[str, Any]:
+    policy = rule.get("override_policy") or "Not Permitted"
     return {
         "rule_id": rule.get("id"),
         "rule_code": rule.get("code"),
@@ -458,6 +482,8 @@ def _match(rule: dict[str, Any], code: str, explanation: str) -> dict[str, Any]:
         "name": rule.get("name"),
         "action": rule.get("action"),
         "enforcement": rule.get("enforcement"),
+        "override_policy": policy,
+        "overrideable": policy != "Not Permitted",
         "reason_code": code,
         "explanation": explanation,
         "layer": "Client Compliance" if rule.get("client_id") else "Compliance",
@@ -472,6 +498,8 @@ def _context_match(code: str, name: str, explanation: str) -> dict[str, Any]:
         "name": name,
         "action": "Require Approval",
         "enforcement": MANDATORY,
+        "override_policy": "Not Permitted",
+        "overrideable": False,
         "reason_code": code,
         "explanation": explanation,
         "layer": "Compliance",
