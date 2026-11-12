@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 CATEGORIES = [
-    "Consent & Opt-Out",
+    "Unsubscribe Option",
     "Reply Handling",
     "Frequency",
     "Permitted Hours",
@@ -24,6 +24,13 @@ CATEGORIES = [
     "Notice & Waiting Periods",
     "Additional Controls",
 ]
+
+# Legacy label kept for rows created before the product rename.
+CATEGORY_UNSUBSCRIBE_OPTION = "Unsubscribe Option"
+CATEGORY_UNSUBSCRIBE_OPTION_LEGACY = "Consent & Opt-Out"
+UNSUBSCRIBE_OPTION_CATEGORIES = frozenset(
+    {CATEGORY_UNSUBSCRIBE_OPTION, CATEGORY_UNSUBSCRIBE_OPTION_LEGACY}
+)
 
 STATUS_DRAFT = "Draft"
 STATUS_PENDING = "Pending Approval"
@@ -110,8 +117,8 @@ RULE_TYPES: list[dict[str, Any]] = [
     {"code": "JUR-05", "name": "Communication Frequency", "category": "Frequency", "action": "Reschedule", "field": "Days Since Last Contact", "value": "1", "operator": "Less Than", "needs": ["limit"]},
     {"code": "JUR-06", "name": "Post-Conversation Cooling Period", "category": "Frequency", "action": "Block", "field": "Days Since Conversation", "value": "7", "operator": "Less Than", "needs": ["period"]},
     {"code": "JUR-07", "name": "Communication Channel Restrictions", "category": "Contact Restrictions", "action": "Block", "field": "Channel Permitted", "value": "No"},
-    {"code": "JUR-08", "name": "Consent Requirements", "category": "Consent & Opt-Out", "action": "Block", "field": "Consent", "value": "No"},
-    {"code": "JUR-09", "name": "Unsubscribe / Opt-Out", "category": "Consent & Opt-Out", "action": "Suppress", "field": "Opt-Out", "value": "Yes"},
+    {"code": "JUR-08", "name": "Consent Requirements", "category": "Unsubscribe Option", "action": "Block", "field": "Consent", "value": "No"},
+    {"code": "JUR-09", "name": "Unsubscribe / Opt-Out", "category": "Unsubscribe Option", "action": "Suppress", "field": "Opt-Out", "value": "Yes"},
     {"code": "JUR-10", "name": "Cease Communication", "category": "Contact Restrictions", "action": "Suppress", "field": "Cease Communication", "value": "Yes"},
     {"code": "JUR-11", "name": "Attorney Representation", "category": "Contact Restrictions", "action": "Require Approval", "field": "Legal Representation", "value": "Yes"},
     {"code": "JUR-12", "name": "Workplace Communication", "category": "Contact Restrictions", "action": "Block", "field": "Workplace Contact", "value": "Yes"},
@@ -502,8 +509,8 @@ _SAMPLE_SETTINGS = {"weekend_start": "10:00", "weekend_end": "16:00"}
 # code, rule type, name, category, country, state, channel, condition (field, operator, value),
 # action, enforcement, status
 SAMPLE_RULES: list[dict[str, Any]] = [
-    {"code": "CMP-001", "type": "JUR-09", "name": "Canada · channel opt-out suppression", "category": "Consent & Opt-Out", "country": _CA, "condition": ("Opt-Out", "Equals", "Yes"), "action": "Suppress"},
-    {"code": "CMP-002", "type": "JUR-08", "name": "Canada · explicit consent", "category": "Consent & Opt-Out", "country": _CA, "channel": "SMS", "condition": ("Consent", "Equals", "No"), "action": "Block"},
+    {"code": "CMP-001", "type": "JUR-09", "name": "Canada · channel opt-out suppression", "category": "Unsubscribe Option", "country": _CA, "condition": ("Opt-Out", "Equals", "Yes"), "action": "Suppress"},
+    {"code": "CMP-002", "type": "JUR-08", "name": "Canada · explicit consent", "category": "Unsubscribe Option", "country": _CA, "channel": "SMS", "condition": ("Consent", "Equals", "No"), "action": "Block"},
     {"code": "CMP-003", "type": "JUR-01", "name": "Ontario · recipient-local contact window", "category": "Permitted Hours", "country": _CA, "state": "Ontario", "condition": ("Outside Permitted Hours", "Equals", "Yes"), "action": "Reschedule"},
     {"code": "CMP-004", "type": "JUR-04", "name": "United States · rolling voice attempts", "category": "Frequency", "country": _US, "channel": "Voice", "condition": ("Contact Attempts", "Greater Than", "6"), "action": "Block"},
     {"code": "CMP-005", "type": "JUR-10", "name": "United States · cease communication", "category": "Contact Restrictions", "country": _US, "condition": ("Cease Communication", "Equals", "Yes"), "action": "Suppress"},

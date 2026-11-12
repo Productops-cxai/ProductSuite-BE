@@ -1080,12 +1080,17 @@ class PayflowCommunicationService:
                 # Already rendered templates may include brand; leave body as-is.
                 pass
             from app.modules.payflow.services.email_preference_service import (
+                PayflowEmailPreferenceService,
                 email_preference_page_url,
                 email_unsubscribe_one_click_url,
             )
 
-            unsub_page = email_preference_page_url(account.id)
-            unsub_one_click = email_unsubscribe_one_click_url(account.id)
+            pref = PayflowEmailPreferenceService(self.db)
+            include_unsub = pref.should_include_email_unsubscribe(account)
+            unsub_page = email_preference_page_url(account.id) if include_unsub else None
+            unsub_one_click = (
+                email_unsubscribe_one_click_url(account.id) if include_unsub else None
+            )
             log = send_collection_email(
                 self.db,
                 to_email=email,

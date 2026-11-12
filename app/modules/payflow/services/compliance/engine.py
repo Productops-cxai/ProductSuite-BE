@@ -20,6 +20,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.modules.payflow.services.compliance import catalog
+
 ALL_CHANNELS = "All Channels"
 MANDATORY = "Mandatory"
 ADVISORY = "Advisory"
@@ -456,7 +458,7 @@ def _triggered(
         if interval > 0 and since is not None and since * 24 < interval:
             return True, "MINIMUM_INTERVAL", f"Less than {interval:g} hours since the last contact"
     expiry = int(settings.get("consent_expiry_days") or 0)
-    if category == "Consent & Opt-Out" and expiry > 0:
+    if category in catalog.UNSUBSCRIBE_OPTION_CATEGORIES and expiry > 0:
         age = _days_since(data.consent_date, at)
         if age is None or age >= expiry:
             return True, "CONSENT_EXPIRED", f"Consent older than {expiry} days or not recorded"
