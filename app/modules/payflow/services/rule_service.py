@@ -16,16 +16,24 @@ from app.infrastructure.database.models import (
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
 from app.shared.deletion import record_deletion, snapshot_model
+from app.modules.payflow.services.rule_runtime_service import unenforced_parts
 from app.shared.enums import PayflowRuleLogic, PayflowRuleStatus, PayflowRuleType
 
 RULE_CATEGORIES = [
     "Amount",
     "Collection Attempts",
+    "Payment Status",
     "Payment Activity",
+    "Promise-to-Pay",
     "Payment Plan",
+    "Workflow",
     "Communication",
+    "Customer Risk",
+    "AI Confidence",
 ]
 
+# The first six are carried out by the runtime; the others describe a proposal for a person and
+# can be saved as Draft only (see unenforced_parts) until PayFlow carries them out.
 RULE_ACTIONS = [
     "Require Human Review",
     "Hold Action",
@@ -33,6 +41,11 @@ RULE_ACTIONS = [
     "Request Reassessment",
     "Escalate Case",
     "Apply / Change Workflow",
+    "Include Unsubscribe Option",
+    "Offer Alternate Payment Method",
+    "Send via Alternate Channel",
+    "Send Payment Reminder",
+    "Send Payment Confirmation",
 ]
 
 RULE_FIELDS = [
@@ -40,7 +53,23 @@ RULE_FIELDS = [
     {"label": "Original Balance", "category": "Amount", "type": "currency"},
     {"label": "Recovered Amount", "category": "Amount", "type": "currency"},
     {"label": "Unsuccessful Attempts", "category": "Collection Attempts", "type": "number"},
+    {"label": "Total Contact Attempts", "category": "Collection Attempts", "type": "number"},
+    {"label": "Days Since Last Contact", "category": "Collection Attempts", "type": "number"},
+    {
+        "label": "Payment Status",
+        "category": "Payment Status",
+        "type": "enum",
+        "options": ["Unpaid", "Partially Paid", "Paid", "Failed"],
+    },
+    {"label": "Days Past Due", "category": "Payment Status", "type": "number"},
     {"label": "Failed Payment Attempts", "category": "Payment Activity", "type": "number"},
+    {"label": "Last Payment Amount", "category": "Payment Activity", "type": "currency"},
+    {
+        "label": "Payment Processing Status",
+        "category": "Payment Activity",
+        "type": "enum",
+        "options": ["None", "Pending", "Succeeded", "Failed"],
+    },
     {
         "label": "Payment Plan Status",
         "category": "Payment Plan",
@@ -54,7 +83,20 @@ RULE_FIELDS = [
         "type": "enum",
         "options": ["Email", "SMS", "WhatsApp"],
     },
+    {"label": "Messages Sent (7 days)", "category": "Communication", "type": "number"},
+    {"label": "Customer Opted Out", "category": "Communication", "type": "enum", "options": ["Yes", "No"]},
 ]
+
+
+def _assert_enforceable(conditions: list[dict] | None, action: str | None) -> None:
+    """An Active rule must be one PayFlow can check and carry out - never one that silently does nothing."""
+    problems = unenforced_parts(conditions, action)
+    if problems:
+        raise ValidationAppError(
+            "This rule can be saved as a Draft but not activated: PayFlow cannot check or carry out "
+            + ", ".join(problems)
+            + " yet."
+        )
 
 
 def _slugify(name: str) -> str:
@@ -187,6 +229,8 @@ class PayflowRuleService:
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "last_updated_label": row.updated_at.strftime("%d %b %Y") if row.updated_at else None,
+            # What PayFlow cannot check or carry out yet: such a rule stays a Draft.
+            "unenforced": unenforced_parts(conditions, row.action),
         }
         if user is not None:
             data["can_edit"] = self.can_edit_rule(user, row)
@@ -342,6 +386,8 @@ class PayflowRuleService:
         status = payload.get("status") or PayflowRuleStatus.DRAFT.value
         if status not in {s.value for s in PayflowRuleStatus}:
             raise ValidationAppError("Invalid status")
+        if status == PayflowRuleStatus.ACTIVE.value:
+            _assert_enforceable(conditions, action)
         return {
             "name": name,
             "description": (payload.get("description") or "").strip() or None,
@@ -476,6 +522,7 @@ class PayflowRuleService:
         row = self._get_row(rule_id)
         if not self.can_edit_rule(user, row):
             raise ForbiddenError("Create / Edit Client Rules permission required")
+        _assert_enforceable(row.conditions, row.action)
         if row.status == PayflowRuleStatus.ACTIVE.value:
             # Idempotent re-scan: recovers accounts that should already have been queued.
             self._enqueue_retroactive_human_reviews(row, actor_name=user.full_name)

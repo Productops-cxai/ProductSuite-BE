@@ -127,9 +127,27 @@ class PayflowPaymentPortalService:
 
     @classmethod
     def _strip_preview_token(cls, token: str) -> tuple[str, bool]:
+        """(the link's own token, is preview). A message's URL may also carry a reference to its
+        communication after the token ("<token>.<ref>", see tracked_token): dropped here."""
+        from app.modules.payflow.services.payment_link_service import split_tracked_token
+
         if token.startswith(cls._PREVIEW_TOKEN_PREFIX):
-            return token[len(cls._PREVIEW_TOKEN_PREFIX) :], True
-        return token, False
+            return split_tracked_token(token[len(cls._PREVIEW_TOKEN_PREFIX) :])[0], True
+        return split_tracked_token(token)[0], False
+
+    def _source_communication_id(self, token: str, link: PayflowPaymentLinkModel) -> int | None:
+        """The email / SMS the customer came in through: the one named in the URL when it is a
+        message of this account, else the one the link was first created for."""
+        from app.infrastructure.database.models import PayflowCommunicationModel
+        from app.modules.payflow.services.payment_link_service import split_tracked_token
+
+        if not token.startswith(self._PREVIEW_TOKEN_PREFIX):
+            communication_id = split_tracked_token(token)[1]
+            if communication_id:
+                comm = self.db.get(PayflowCommunicationModel, communication_id)
+                if comm is not None and comm.account_id == link.account_id:
+                    return comm.id
+        return link.communication_id
 
     def _is_third_party(self, client: PayflowClientModel | None) -> bool:
         if not client or not client.client_type:
@@ -420,14 +438,15 @@ class PayflowPaymentPortalService:
                 row, "Accessed", "usable" if usable else (block_reason or "blocked")
             )
             # Distinct portal visit on originating communication (vs email link click).
-            if row.communication_id:
+            visit_communication_id = self._source_communication_id(token, row)
+            if visit_communication_id:
                 try:
                     from app.modules.payflow.services.communication_service import (
                         PayflowCommunicationService,
                     )
 
                     PayflowCommunicationService(self.db).record_portal_visit(
-                        row.communication_id,
+                        visit_communication_id,
                         detail="Customer opened payment portal",
                     )
                 except Exception:  # noqa: BLE001
@@ -486,9 +505,9 @@ class PayflowPaymentPortalService:
         except Exception:  # noqa: BLE001
             logger.exception("failed to load payment plans for portal")
 
-        response_token = (
-            f"{self._PREVIEW_TOKEN_PREFIX}{real_token}" if preview_mode else real_token
-        )
+        # The customer's token goes back as it came (with its communication reference), so the
+        # checkout they start from this page is credited to the message they opened.
+        response_token = f"{self._PREVIEW_TOKEN_PREFIX}{real_token}" if preview_mode else token
         # A link that expired or was revoked no longer identifies the customer:
         # say why it cannot be used, and nothing about who or how much.
         withdrawn = row.status in {
@@ -801,7 +820,7 @@ class PayflowPaymentPortalService:
                 PayflowCommunicationService(self.db).mark_payment_event(
                     account.id,
                     event="initiated",
-                    communication_id=row.communication_id,
+                    communication_id=self._source_communication_id(token, row),
                     detail=f"Stripe Checkout · {recent.stripe_session_id or recent.public_id[:12]}",
                     commit=True,
                 )
@@ -834,6 +853,7 @@ class PayflowPaymentPortalService:
             provider="stripe" if use_stripe else "mock",
             idempotency_key=idempotency_key,
             balance_at_initiation=balance,
+            communication_id=self._source_communication_id(token, row),
             events=[],
             provider_payload={
                 "plan_quote": plan_quote,
@@ -971,7 +991,7 @@ class PayflowPaymentPortalService:
             PayflowCommunicationService(self.db).mark_payment_event(
                 account.id,
                 event="initiated",
-                communication_id=row.communication_id,
+                communication_id=self._source_communication_id(token, row),
                 detail=(
                     f"Stripe Checkout · {attempt.stripe_session_id or attempt.public_id[:12]}"
                     if use_stripe
@@ -1311,7 +1331,7 @@ class PayflowPaymentPortalService:
             PayflowCommunicationService(self.db).mark_payment_event(
                 attempt.account_id,
                 event=event,
-                communication_id=link.communication_id if link else None,
+                communication_id=attempt.communication_id or (link.communication_id if link else None),
                 detail=detail,
                 commit=commit,
             )
@@ -1375,7 +1395,7 @@ class PayflowPaymentPortalService:
 
         link = (
             self.db.query(PayflowPaymentLinkModel)
-            .filter(PayflowPaymentLinkModel.token == token)
+            .filter(PayflowPaymentLinkModel.token == self._strip_preview_token(token)[0])
             .first()
         )
         if not link:
@@ -1768,6 +1788,7 @@ class PayflowPaymentPortalService:
                     "source": "stripe" if attempt.provider == "stripe" else "mock",
                     "attempt_id": attempt.public_id,
                     "transaction_id": txn.public_id if txn else None,
+                    "communication_id": txn.attributed_communication_id if txn else None,
                     "payment_date": _utcnow().date().isoformat(),
                 },
                 commit=False,

@@ -150,6 +150,15 @@ class PayflowPaymentOutcomeService:
         )
         self.db.add(txn)
         self.db.flush()
+        try:
+            from app.modules.payflow.services.payment_attribution import attribute_payment
+
+            # Savepoint: a failure here must not undo the ledger row.
+            with self.db.begin_nested():
+                attribute_payment(self.db, txn, attempt)
+                self.db.flush()
+        except Exception:  # noqa: BLE001 - the payment is recorded either way
+            logger.exception("failed to attribute payment txn=%s", txn.public_id)
         return txn
 
     def _plan_quote_from_attempt(self, attempt: PayflowPaymentAttemptModel) -> dict[str, Any]:

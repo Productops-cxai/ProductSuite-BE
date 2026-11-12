@@ -286,6 +286,8 @@ class PayflowNotificationType(str, Enum):
     # Customer payment portal / Stripe (or mock) outcomes
     PAYMENT_RECEIVED = "payment_received"
     PAYMENT_FAILED = "payment_failed"
+    # The automatic email-performance check stored AI proposals for a workflow
+    EMAIL_PROPOSALS_READY = "email_proposals_ready"
 
 
 class PayflowWorkflowRunStatus(str, Enum):

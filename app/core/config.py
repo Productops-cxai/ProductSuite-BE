@@ -125,6 +125,15 @@ class Settings(BaseSettings):
     WORKFLOW_PAYMENT_LINK_BASE: str = ""
     # Opaque payment-link token TTL (hours). Default 14 days.
     PAYMENT_LINK_TTL_HOURS: int = 336
+    # Email subject performance: a payment is credited to the last payment-link click within
+    # this many days; a subject needs this many delivered emails to rank for Best Conversion.
+    PAYMENT_ATTRIBUTION_WINDOW_DAYS: int = 7
+    EMAIL_SUBJECT_MIN_DELIVERIES: int = 100
+    # The worker checks Active workflows for under-performing emails this often and stores AI
+    # proposals for review (0 = never on its own; the check can still be run by hand).
+    EMAIL_OPTIMIZATION_SCAN_HOURS: int = 24
+    # An AI insight is reused for this long while its numbers have not changed (0 = always ask).
+    EMAIL_INSIGHT_CACHE_MINUTES: int = 15
 
     # Stripe Checkout (empty secret → local mock checkout for development).
     STRIPE_SECRET_KEY: str = ""

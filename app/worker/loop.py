@@ -88,6 +88,22 @@ def _drain_due(
         fut.add_done_callback(in_flight.discard)
 
 
+def _scan_email_performance() -> None:
+    """One pass of the automatic email-performance check (its own thread and database session)."""
+    try:
+        from app.modules.payflow.services.email_subject_ai import PayflowEmailSubjectAiService
+
+        db = SessionLocal()
+        try:
+            result = PayflowEmailSubjectAiService(db).scan_low_performers()
+            if result.get("proposals"):
+                logger.info("email performance check %s", result)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("email performance check failed")
+
+
 def run_maintenance(state: dict) -> None:
     """Periodic housekeeping that no event triggers. Each part fails on its own."""
     # Payment plans: mark overdue instalments, auto-charge the ones that are due.
@@ -172,6 +188,20 @@ def run_maintenance(state: dict) -> None:
             runner.start()
     except Exception:  # noqa: BLE001
         logger.exception("background job recovery sweep failed")
+
+    # Email performance: under-performing emails of Active workflows get AI proposals for review.
+    scan_seconds = int(settings.EMAIL_OPTIMIZATION_SCAN_HOURS or 0) * 3600
+    scanner = state.get("email_scan_runner")
+    if (
+        scan_seconds > 0
+        and time.monotonic() - state.get("last_email_scan", 0.0) >= scan_seconds
+        and not (scanner is not None and scanner.is_alive())
+    ):
+        state["last_email_scan"] = time.monotonic()
+        # AI calls can take minutes: never on the loop that schedules customer messages.
+        scanner = threading.Thread(target=_scan_email_performance, name="email-performance-scan", daemon=True)
+        state["email_scan_runner"] = scanner
+        scanner.start()
 
     # Gap fill: accounts that fit an Active workflow but were never enrolled
     # (enroll job lost, account aged into the segment, activate hiccup).

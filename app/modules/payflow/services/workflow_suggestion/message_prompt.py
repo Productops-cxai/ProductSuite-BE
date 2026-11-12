@@ -49,6 +49,8 @@ def build_message_prompt(
     `remarks` (on a rewrite): what the reviewer asked for."""
     parts = [_client_lines(client), _segment_lines(segment), _workflow_lines(workflow)]
     parts.append("Messages to write (one per step_id):\n" + "\n".join(_brief_line(b) for b in briefs))
+    if client.get("email_performance"):
+        parts.append(_performance_lines(client["email_performance"]))
     if others:
         parts.append(
             "Other messages in this workflow (already written - do not repeat their wording):\n"
@@ -167,6 +169,26 @@ def _workflow_lines(workflow: dict[str, Any]) -> str:
 def _brief_line(brief: dict[str, Any]) -> str:
     keys = ("step_id", "title", "channel", "purpose", "timing", "path_so_far", "tone", "why_this_tone", "current_text")
     return json.dumps({key: brief[key] for key in keys if brief.get(key)}, ensure_ascii=False)
+
+
+def _performance_lines(performance: dict[str, Any]) -> str:
+    """This client's own measured email subjects (email_subject_ai.performance_context): numbers and
+    subject text only, no customer data."""
+    parts = [
+        "Measured results of this client's past emails (their own history; open rates are estimates; "
+        "conversion = completed payments / delivered emails). Use them for the emails you write:\n"
+        "- For an email with the same purpose or reminder stage, build on what the best subjects do "
+        "(their angle and wording style) - do not copy one word for word.\n"
+        "- Avoid the angle and wording of the weak subjects.\n"
+        "- Judge by conversion together with delivered volume, never by raw counts.\n"
+        "The tone decided for each message and every writing rule still apply.",
+        "Best subjects:\n" + "\n".join(json.dumps(item, ensure_ascii=False) for item in performance.get("best") or []),
+    ]
+    if performance.get("weak"):
+        parts.append(
+            "Weak subjects:\n" + "\n".join(json.dumps(item, ensure_ascii=False) for item in performance["weak"])
+        )
+    return "\n".join(parts)
 
 
 def _feedback_lines(feedback: list[dict[str, Any]]) -> str:

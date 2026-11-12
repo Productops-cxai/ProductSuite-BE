@@ -1218,6 +1218,13 @@ class PayflowStrategyService:
             new_steps = _carry_translations(
                 before_steps, _normalize_steps(payload["steps"], default_origin=default_origin)
             )
+            from app.modules.payflow.services.email_tracking import stamp_content_origin
+
+            # Who wrote each message's text. "_ai_step_ids" (internal, not from the API): steps
+            # whose new text is an AI proposal the user accepted as written.
+            new_steps = stamp_content_origin(
+                before_steps, new_steps, ai_step_ids=set(payload.get("_ai_step_ids") or [])
+            )
             steps_changed = _steps_changed(before_steps, new_steps)
             # Same steps sent back: keep the stored ones, so step origins are not re-stamped.
             if steps_changed:
