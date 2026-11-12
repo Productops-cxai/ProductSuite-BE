@@ -166,13 +166,27 @@ class ComplianceEvaluationService:
                 (PayflowComplianceEventModel.client_id == account.client_id)
                 & (PayflowComplianceEventModel.debtor_ref == account.debtor_id),
             )
+        if account.portfolio_id is not None:
+            # Creditor-scope counters need peer accounts on the same portfolio.
+            same = or_(
+                same,
+                (PayflowComplianceEventModel.client_id == account.client_id)
+                & (PayflowComplianceEventModel.portfolio_id == account.portfolio_id),
+            )
         rows = (
             self.db.query(PayflowComplianceEventModel)
             .filter(same, PayflowComplianceEventModel.occurred_at >= since)
             .all()
         )
         return [
-            ContactEvent(at=_aware(r.occurred_at), channel=r.channel, kind=r.kind, account_id=r.account_id)
+            ContactEvent(
+                at=_aware(r.occurred_at),
+                channel=r.channel,
+                kind=r.kind,
+                account_id=r.account_id,
+                debtor_ref=r.debtor_ref,
+                portfolio_id=r.portfolio_id,
+            )
             for r in rows
         ]
 
@@ -207,6 +221,8 @@ class ComplianceEvaluationService:
         return EvaluationInput(
             client_id=account.client_id,
             account_id=account.id,
+            debtor_ref=(account.debtor_id or None),
+            portfolio_id=account.portfolio_id,
             jurisdiction=self.jurisdiction_for(account),
             channel=channel.strip() or "Email",
             at=when,
@@ -253,7 +269,13 @@ class ComplianceEvaluationService:
             data,
             disabled_rule_ids=self.disabled_rule_ids(account.client_id),
         )
-        if record and (result.decision != "ALLOW" or result.warnings):
+        # Authorized overrides clear matched restrictions after the engine runs (FR-13).
+        from app.modules.payflow.services.compliance.override_service import (
+            ComplianceOverrideService,
+        )
+
+        result = ComplianceOverrideService(self.db).apply_to_result(result, data)
+        if record and (result.decision != "ALLOW" or result.warnings or result.overrides_applied):
             self._record(result, data, actor_name=actor_name)
         return result
 
@@ -380,6 +402,11 @@ class ComplianceEvaluationService:
             data,
             disabled_rule_ids=self.disabled_rule_ids(data.client_id),
         )
+        from app.modules.payflow.services.compliance.override_service import (
+            ComplianceOverrideService,
+        )
+
+        result = ComplianceOverrideService(self.db).apply_to_result(result, data)
         if record:
             self._record(result, data, actor=user)
             self.db.commit()
@@ -411,6 +438,7 @@ class ComplianceEvaluationService:
             client_id=account.client_id,
             account_id=account.id,
             debtor_ref=account.debtor_id,
+            portfolio_id=account.portfolio_id,
             channel=channel.strip() or "Email",
             kind=kind,
             source=source,

@@ -12,6 +12,8 @@ from app.infrastructure.database.models import TokenDenylistModel, UserModel, Us
 from app.infrastructure.database.session import get_db
 from app.modules.identity.session_messages import (
     SESSION_ENDED_MESSAGE,
+    SESSION_LOGGED_OUT_CODE,
+    SESSION_LOGGED_OUT_MESSAGE,
     SESSION_REPLACED_MESSAGE,
 )
 from app.modules.platform.services.entitlement_service import has_product_access, load_user
@@ -92,6 +94,11 @@ def get_current_user(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=_auth_detail(SESSION_REPLACED_MESSAGE, "session_replaced"),
+            )
+        if session.revoke_reason == "logout":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=_auth_detail(SESSION_LOGGED_OUT_MESSAGE, SESSION_LOGGED_OUT_CODE),
             )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

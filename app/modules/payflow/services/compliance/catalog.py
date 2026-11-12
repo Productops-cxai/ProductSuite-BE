@@ -171,10 +171,180 @@ _CA_PROVINCES = [
     ("SK", "Saskatchewan", "America/Regina"), ("YT", "Yukon", "America/Whitehorse"),
 ]
 
-# Regions / cities that carry their own rules today. More are added as rules need them.
+# Regions / cities / postal prefixes used by municipal and metro-level rules.
+# Shape: (country_code, state_code) → [{name, cities, postal_prefixes}].
+# Country-level entries use state_code "". Validated identifiers — not free text.
 _REGIONS: dict[tuple[str, str], list[dict[str, Any]]] = {
-    ("US", "NY"): [{"name": "New York City", "cities": ["New York"], "postal_prefixes": ["100", "101", "102", "103", "104", "111", "112", "113", "114", "116"]}],
-    ("CA", ""): [{"name": "Federally regulated financial institutions", "cities": [], "postal_prefixes": []}],
+    ("CA", ""): [
+        {
+            "name": "Federally regulated financial institutions",
+            "cities": [],
+            "postal_prefixes": [],
+        }
+    ],
+    ("CA", "ON"): [
+        {
+            "name": "Toronto",
+            "cities": ["Toronto", "North York", "Scarborough", "Etobicoke", "York"],
+            "postal_prefixes": ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"],
+        },
+        {
+            "name": "Ottawa",
+            "cities": ["Ottawa", "Nepean", "Kanata", "Orleans"],
+            "postal_prefixes": ["K1", "K2", "K4"],
+        },
+        {
+            "name": "Mississauga / Peel",
+            "cities": ["Mississauga", "Brampton", "Caledon"],
+            "postal_prefixes": ["L4", "L5", "L6", "L7"],
+        },
+    ],
+    ("CA", "QC"): [
+        {
+            "name": "Montréal",
+            "cities": ["Montreal", "Montréal", "Laval", "Longueuil"],
+            "postal_prefixes": ["H1", "H2", "H3", "H4", "H5", "H7", "H8", "H9", "J4"],
+        },
+        {
+            "name": "Québec City",
+            "cities": ["Quebec", "Québec", "Lévis"],
+            "postal_prefixes": ["G1", "G2", "G3"],
+        },
+    ],
+    ("CA", "BC"): [
+        {
+            "name": "Metro Vancouver",
+            "cities": ["Vancouver", "Burnaby", "Surrey", "Richmond", "Coquitlam"],
+            "postal_prefixes": ["V5", "V6", "V7", "V3", "V4"],
+        },
+        {
+            "name": "Victoria / Capital",
+            "cities": ["Victoria", "Saanich", "Esquimalt"],
+            "postal_prefixes": ["V8", "V9"],
+        },
+    ],
+    ("CA", "AB"): [
+        {
+            "name": "Calgary",
+            "cities": ["Calgary"],
+            "postal_prefixes": ["T1", "T2", "T3"],
+        },
+        {
+            "name": "Edmonton",
+            "cities": ["Edmonton", "St. Albert", "Sherwood Park"],
+            "postal_prefixes": ["T5", "T6"],
+        },
+    ],
+    ("CA", "MB"): [
+        {"name": "Winnipeg", "cities": ["Winnipeg"], "postal_prefixes": ["R2", "R3"]},
+    ],
+    ("CA", "SK"): [
+        {"name": "Saskatoon", "cities": ["Saskatoon"], "postal_prefixes": ["S7"]},
+        {"name": "Regina", "cities": ["Regina"], "postal_prefixes": ["S4"]},
+    ],
+    ("CA", "NS"): [
+        {"name": "Halifax", "cities": ["Halifax", "Dartmouth"], "postal_prefixes": ["B3"]},
+    ],
+    ("US", "NY"): [
+        {
+            "name": "New York City",
+            "cities": ["New York", "Brooklyn", "Queens", "Bronx", "Staten Island"],
+            "postal_prefixes": ["100", "101", "102", "103", "104", "111", "112", "113", "114", "116"],
+        },
+        {
+            "name": "Buffalo / Erie",
+            "cities": ["Buffalo", "Cheektowaga", "Tonawanda"],
+            "postal_prefixes": ["142"],
+        },
+    ],
+    ("US", "CA"): [
+        {
+            "name": "Los Angeles County",
+            "cities": ["Los Angeles", "Long Beach", "Glendale", "Pasadena", "Santa Monica"],
+            "postal_prefixes": ["900", "901", "902", "903", "904", "905", "906", "907", "908", "910", "911", "912", "913", "914", "915", "916", "917", "918"],
+        },
+        {
+            "name": "San Francisco Bay Area",
+            "cities": ["San Francisco", "Oakland", "San Jose", "Berkeley", "Fremont"],
+            "postal_prefixes": ["940", "941", "943", "944", "945", "946", "947", "948", "949", "950", "951"],
+        },
+        {
+            "name": "San Diego County",
+            "cities": ["San Diego", "Chula Vista", "Oceanside"],
+            "postal_prefixes": ["919", "920", "921"],
+        },
+    ],
+    ("US", "IL"): [
+        {
+            "name": "Chicago / Cook County",
+            "cities": ["Chicago", "Evanston", "Oak Park", "Cicero"],
+            "postal_prefixes": ["606", "607", "608"],
+        }
+    ],
+    ("US", "TX"): [
+        {
+            "name": "Houston / Harris County",
+            "cities": ["Houston", "Pasadena", "Baytown"],
+            "postal_prefixes": ["770", "772", "773", "774", "775"],
+        },
+        {
+            "name": "Dallas / Collin / Tarrant",
+            "cities": ["Dallas", "Fort Worth", "Arlington", "Plano"],
+            "postal_prefixes": ["750", "751", "752", "753", "760", "761", "762"],
+        },
+        {
+            "name": "Austin / Travis",
+            "cities": ["Austin", "Round Rock"],
+            "postal_prefixes": ["786", "787"],
+        },
+    ],
+    ("US", "FL"): [
+        {
+            "name": "Miami-Dade",
+            "cities": ["Miami", "Miami Beach", "Hialeah", "Coral Gables"],
+            "postal_prefixes": ["330", "331", "332"],
+        },
+        {
+            "name": "Orlando / Orange",
+            "cities": ["Orlando", "Winter Park"],
+            "postal_prefixes": ["327", "328"],
+        },
+    ],
+    ("US", "MA"): [
+        {
+            "name": "Boston / Suffolk",
+            "cities": ["Boston", "Cambridge", "Somerville", "Brookline"],
+            "postal_prefixes": ["021", "022", "024"],
+        }
+    ],
+    ("US", "WA"): [
+        {
+            "name": "Seattle / King County",
+            "cities": ["Seattle", "Bellevue", "Renton", "Kent"],
+            "postal_prefixes": ["980", "981"],
+        }
+    ],
+    ("US", "DC"): [
+        {
+            "name": "District of Columbia",
+            "cities": ["Washington"],
+            "postal_prefixes": ["200", "202", "203", "204", "205"],
+        }
+    ],
+    ("US", "PA"): [
+        {
+            "name": "Philadelphia",
+            "cities": ["Philadelphia"],
+            "postal_prefixes": ["190", "191"],
+        }
+    ],
+    ("US", "GA"): [
+        {
+            "name": "Atlanta / Fulton",
+            "cities": ["Atlanta", "Sandy Springs", "Roswell"],
+            "postal_prefixes": ["303", "311"],
+        }
+    ],
 }
 
 COUNTRIES: list[dict[str, Any]] = [

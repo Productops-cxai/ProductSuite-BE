@@ -303,6 +303,13 @@ def test_jurisdiction_api_returns_the_states_of_a_country(client, admin_token):
         f"{BASE}/jurisdictions?country=US&state=NY", headers=_auth(admin_token)
     ).json()
     assert ny["regions"][0]["name"] == "New York City"
+    assert "100" in ny["regions"][0]["postal_prefixes"]
+
+    ontario = client.get(
+        f"{BASE}/jurisdictions?country=Canada&state=ON", headers=_auth(admin_token)
+    ).json()
+    names = [r["name"] for r in ontario["regions"]]
+    assert "Toronto" in names and "Ottawa" in names
 
 
 def test_unknown_country_is_not_found(client, admin_token):

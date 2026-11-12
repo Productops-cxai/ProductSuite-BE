@@ -7,6 +7,7 @@ General points:
 - **Rates are fractions**: `0.425` means 42.5%. All rates use Delivered as the denominator.
 - **A subject** is the subject as written on the workflow step (`{{placeholders}}` kept, extra spaces removed). `subject_key` identifies it; send it back as it is.
 - **Opens are estimates.** Automatic opens by mail apps are left out.
+- **Unique clicks** count an email once when it has a portal/`clicks_count` visit, a `last_clicked_url` from a SendGrid click, or payment-link-clicked status. SendGrid click events update engagement/`last_clicked_url`; the PayFlow app portal visit still owns incremental `clicks_count`.
 - **Completed** = number of successful payment transactions credited to the emails (not an amount). Refunded payments are not counted.
 - Only clients the user is allowed to see are returned. `403` = no access, `400` = bad input, `404` = not found, `502` = the AI is not available.
 - Tracking starts from the day this is deployed: older emails are not included.
