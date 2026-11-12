@@ -2074,7 +2074,7 @@ def resolve_public_payment_link(
 def quote_public_payment_plan(
     token: str, payload: PayflowPaymentPlanQuoteRequest, db: DbSession
 ):
-    """Preview Daily/Weekly/Monthly instalment schedule (amount-first)."""
+    """Preview Weekly / Bi-Weekly / Monthly instalment schedule (amount-first)."""
     try:
         return PayflowPaymentPortalService(db).quote_plan(
             token,
@@ -2103,6 +2103,7 @@ def initiate_public_payment(
             frequency=payload.frequency,
             installment_amount=payload.installment_amount,
             start_date=payload.start_date,
+            authorize_recurring=bool(payload.authorize_recurring),
         )
     except AppError as exc:
         raise _map_error(exc) from exc

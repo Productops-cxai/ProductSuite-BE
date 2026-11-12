@@ -1350,6 +1350,8 @@ class PayflowPaymentInitiateRequest(BaseModel):
     frequency: Optional[str] = Field(default=None, max_length=16)
     installment_amount: Optional[float] = Field(default=None, gt=0)
     start_date: Optional[str] = Field(default=None, max_length=32)
+    # Explicit customer consent to auto-charge future plan instalments (optional).
+    authorize_recurring: Optional[bool] = False
 
 
 class PayflowPaymentAttemptItem(BaseModel):
@@ -1498,8 +1500,10 @@ class DashboardFunnelBreakdown(BaseModel):
     invalid_addresses: int = 0
     sent: int = 0
     delivered: int = 0
-    placement_available: bool = True
+    placement_available: bool = False
     placement: List[DashboardFunnelPlacementItem] = Field(default_factory=list)
+    opens_available: bool = True
+    placement_note: Optional[str] = None
 
 
 class DashboardOutcomeItem(BaseModel):

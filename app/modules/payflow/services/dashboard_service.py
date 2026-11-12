@@ -551,8 +551,21 @@ class PayflowDashboardService:
         valid = max(sent, sum(1 for c in comms if not _is_invalid_address_comm(c)))
 
         channel_norm = (channel or "").strip().lower()
-        placement_available = channel_norm != "sms"
-        placement = _placement_split(comms, delivered) if placement_available else []
+        opens_available = channel_norm != "sms"
+        # Inbox/Spam/Promotions only when Email (or All with email rows) and we have
+        # real placement/engagement signals — never invent Inbox = delivered.
+        placement: list[dict[str, Any]] = []
+        placement_available = False
+        placement_note: str | None = None
+        if channel_norm == "sms":
+            placement_note = "Inbox placement is not available for SMS."
+        else:
+            placement, placement_available = _placement_split(comms, delivered)
+            if not placement_available:
+                placement_note = (
+                    "Inbox / Spam / Promotions unavailable — no placement or "
+                    "engagement signals for delivered messages in this filter."
+                )
 
         return {
             "valid_addresses": int(valid),
@@ -561,6 +574,8 @@ class PayflowDashboardService:
             "delivered": int(delivered),
             "placement_available": placement_available,
             "placement": placement,
+            "opens_available": opens_available,
+            "placement_note": placement_note,
         }
 
     def _build_funnel(
@@ -755,8 +770,10 @@ class PayflowDashboardService:
                 "invalid_addresses": 0,
                 "sent": 0,
                 "delivered": 0,
-                "placement_available": True,
+                "placement_available": False,
                 "placement": [],
+                "opens_available": True,
+                "placement_note": None,
             },
             "outcomes": [],
             "clients_attention": [],
@@ -780,38 +797,60 @@ def _is_invalid_address_comm(row: PayflowCommunicationModel) -> bool:
 
 def _placement_split(
     comms: list[PayflowCommunicationModel], delivered: int
-) -> list[dict[str, Any]]:
-    """Best-effort Inbox / Spam / Promotions from engagement + spam signals."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Inbox / Spam / Promotions from real signals only.
+
+    Returns (placement rows, available). Never invents Inbox = all delivered.
+    Promotions stays 0 unless a provider signal exists (none today).
+    """
+    empty = [
+        {"label": "Inbox", "volume": 0},
+        {"label": "Spam", "volume": 0},
+        {"label": "Promotions", "volume": 0},
+    ]
     if delivered <= 0:
-        return [
-            {"label": "Inbox", "volume": 0},
-            {"label": "Spam", "volume": 0},
-            {"label": "Promotions", "volume": 0},
-        ]
+        return empty, False
+
+    email_comms = [
+        c
+        for c in comms
+        if str(getattr(c, "channel", "") or "").strip().lower() == "email"
+    ]
+    if not email_comms:
+        # Channel filter "all" with only SMS — no email placement.
+        return empty, False
 
     inbox = sum(
         1
-        for c in comms
+        for c in email_comms
         if int(getattr(c, "opens_count", 0) or 0) > 0
         or int(getattr(c, "clicks_count", 0) or 0) > 0
     )
     spam = 0
-    for c in comms:
+    for c in email_comms:
         reason = (getattr(c, "restriction_reason", None) or "").lower()
-        if "spam" in reason or "spamreport" in reason:
+        events = getattr(c, "events", None) or []
+        event_blob = " ".join(
+            str(ev.get("label") or ev.get("type") or ev.get("event_type") or "")
+            for ev in events
+            if isinstance(ev, dict)
+        ).lower()
+        if "spam" in reason or "spamreport" in reason or "spam" in event_blob:
             spam += 1
     inbox = min(delivered, max(0, inbox))
     spam = min(max(0, delivered - inbox), max(0, spam))
-    promotions = max(0, delivered - inbox - spam)
-    # No placement signals yet — attribute all delivered to Inbox (unknown folder).
-    if inbox + spam + promotions == 0:
-        inbox = delivered
-        promotions = 0
-    return [
-        {"label": "Inbox", "volume": int(inbox)},
-        {"label": "Spam", "volume": int(spam)},
-        {"label": "Promotions", "volume": int(promotions)},
-    ]
+    # No folder provider for Promotions yet — keep 0 rather than assuming.
+    promotions = 0
+    if inbox == 0 and spam == 0:
+        return empty, False
+    return (
+        [
+            {"label": "Inbox", "volume": int(inbox)},
+            {"label": "Spam", "volume": int(spam)},
+            {"label": "Promotions", "volume": int(promotions)},
+        ],
+        True,
+    )
 
 
 def _money(value: float) -> str:
