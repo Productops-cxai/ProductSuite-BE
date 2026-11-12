@@ -8,6 +8,7 @@ accounts it cannot reach ("No contactable channel").
 from __future__ import annotations
 
 import json
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,10 @@ from sqlalchemy.orm import Session
 from app.infrastructure.database.models import PayflowAccountModel
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
 from app.modules.payflow.services.workflow_condition_runtime import apply_outcome_to_account
+from app.modules.payflow.services.workflow_suggestion.audiences import audience_of
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
+
+MAIN_TEXT = "main"  # the step's own text (not an audience version) - see audience_message_config
 
 # The message templates in other languages: {"FR": {template_id: {"subject", "body"}}}. Written by
 # workflow_suggestion/template_translations.py (AI-translated and checked); read once per process.
@@ -100,6 +104,30 @@ def localized_template(template: dict[str, Any] | None, language: str | None) ->
     if not isinstance(version, dict):
         return template
     return {**template, **{key: version[key] for key in ("subject", "body") if version.get(key)}}
+
+
+def audience_message_config(
+    cfg: dict[str, Any], account: Any, today: date | None = None
+) -> tuple[dict[str, Any], str | None]:
+    """The step's config with the text this customer gets, and which text it is.
+
+    A step written per audience holds `cfg["versions"]` ({"age_65_plus": {"subject", "body", "sms_body",
+    "translations"}, ...}, workflow_suggestion/audiences.py). The customer's audience comes from their date of
+    birth; their language comes first: when only the main text is in their language, they get the main text.
+    Returns (config, "age_65_plus" / "main" / None) - None when the step has no text of its own (a template).
+    """
+    versions = cfg.get("versions")
+    key = audience_of(account, today) if isinstance(versions, dict) and versions else None
+    version = versions.get(key) if key else None
+    if isinstance(version, dict) and (version.get("body") or version.get("sms_body")):
+        language = str(getattr(account, "language", None) or "").strip().upper()
+        own = version.get("translations") if isinstance(version.get("translations"), dict) else {}
+        main_languages = cfg.get("translations") if isinstance(cfg.get("translations"), dict) else {}
+        if language in own or language not in main_languages:
+            text = {part: version[part] for part in ("subject", "body", "sms_body") if version.get(part)}
+            return {**cfg, **text, "translations": own}, key
+    has_text = any(cfg.get(part) for part in ("subject", "body", "sms_body"))
+    return cfg, (MAIN_TEXT if has_text else None)
 
 
 def localized_message_config(cfg: dict[str, Any], language: str | None) -> dict[str, Any]:

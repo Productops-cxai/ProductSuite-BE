@@ -734,6 +734,11 @@ class PayflowCommunicationModel(Base):
     strategy_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("payflow_strategies.id"), nullable=True, index=True
     )
+    # Which workflow step sent it, and which of the step's texts: "main", or an audience version written
+    # for the customer's group (e.g. "age_65_plus"); None when the step had no text and a template was
+    # sent. Lets results be compared per message and per version.
+    step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message_audience: Mapped[str | None] = mapped_column(String(64), nullable=True)
     engagement: Mapped[str | None] = mapped_column(String(128), nullable=True)
     date_bucket: Mapped[str | None] = mapped_column(String(32), nullable=True)
     date_label: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -898,7 +898,11 @@ class PayflowCommunicationService:
         run_id: int | None = None,
         client_id: int | None = None,
         compliance_review_approved: bool = False,
+        step_id: str | None = None,
+        message_audience: str | None = None,
     ) -> dict[str, Any]:
+        """`step_id` / `message_audience`: the workflow step and which of its texts is sent ("main" or an
+        audience version such as "age_65_plus") - stored on the communication."""
         channel_norm = (channel or "Email").strip()
         purpose_norm = purpose or "Payment Reminder"
 
@@ -960,6 +964,8 @@ class PayflowCommunicationService:
             status=PayflowCommStatus.PREPARED.value,
             workflow_name=strategy.name,
             strategy_id=getattr(strategy, "id", None),
+            step_id=step_id,
+            message_audience=message_audience,
             engagement=None,
             engagement_tracking=tracking,
             date_bucket=date_bucket,

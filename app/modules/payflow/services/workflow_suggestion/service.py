@@ -16,16 +16,18 @@ from app.modules.payflow.services.strategy_service import (
     _message_text,
     read_strategy_versions,
 )
+from app.modules.payflow.services.workflow_suggestion.audiences import find_audiences, members_by_segment
 from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
     load_payment_options,
     load_rules,
-    load_segment_languages,
+    load_segment_members,
     load_suggest_scope,
 )
 from app.modules.payflow.services.workflow_suggestion.gates import uncovered_accounts
 from app.modules.payflow.services.workflow_suggestion.languages import (
+    accounts_languages,
     extra_languages,
     language_name,
     languages_line,
@@ -39,6 +41,7 @@ from app.modules.payflow.services.workflow_suggestion.learning import (
     pick_lessons,
 )
 from app.modules.payflow.services.workflow_suggestion.llm import build_output_schema, call_llm
+from app.modules.payflow.services.workflow_suggestion.message_brief import MAIN, plan_messages
 from app.modules.payflow.services.workflow_suggestion.message_writer import (
     apply_messages,
     translate_messages,
@@ -86,6 +89,7 @@ _REWRITTEN_CONTEXT = {
     "Messages",  # set only when the message text could not be written
     "Languages",  # the languages the messages were written in
     "Reviewer text kept",  # Regenerate: messages whose reviewer-written text was improved, not replaced
+    "Audiences",  # who the messages were written for (main text and audience versions)
 }
 
 
@@ -158,6 +162,7 @@ class WorkflowSuggestionService:
         # Email / SMS text for every workflow (one AI call each, plus one per other language of its
         # segment's accounts), written before saving.
         writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
+        members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
             segment_id = segment["segment_id"]
@@ -166,6 +171,7 @@ class WorkflowSuggestionService:
                 workflows[segment_id],
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
+                found=find_audiences(members[segment_id]),
             )
 
         governed_by = governing_rules(client, rules)
@@ -266,13 +272,15 @@ class WorkflowSuggestionService:
         # Messages a reviewer wrote or edited on the original keep that text as written (and are translated);
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
+        members = load_segment_members(self.db, original)
         workflow, messages_note = _with_messages(
             {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
             workflow,
             _stored_segment(original),
             remarks=remarks,
-            languages=extra_languages(client.get("language"), load_segment_languages(self.db, original)),
+            languages=_other_languages(client, members),
             keep=list(carried),
+            found=find_audiences(members),
         )
 
         ai_context = kept + _reasoning_context(workflow) + [
@@ -363,30 +371,31 @@ class WorkflowSuggestionService:
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
         }
-        written = write_messages(
+        members = load_segment_members(self.db, workflow)
+        written, audiences_note = _write_for_audiences(
             client,
             workflow,
             _stored_segment(workflow),
+            find_audiences(members),
             step_ids=[step_id] if step_id else None,
             remarks=remarks,
         )
-        languages = extra_languages(client.get("language"), load_segment_languages(self.db, workflow))
+        languages = _other_languages(client, members)
         written, _ = _with_translations(client, workflow, written, languages)
         steps = apply_messages(workflow["steps"], written)
-        return self.strategies.save_ai_messages(
-            user,
-            strategy_id,
-            steps,
-            remarks=remarks,
-            ai_context=_refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps),
-        )
+        ai_context = _refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps)
+        if not step_id:  # every message rewritten: who they are written for is new too
+            ai_context = [item for item in ai_context if item.get("label") != "Audiences"] + audiences_note
+        return self.strategies.save_ai_messages(user, strategy_id, steps, remarks=remarks, ai_context=ai_context)
 
     def update_workflow(self, user: UserModel, strategy_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         """The existing workflow update, then every message whose main text it changed is translated again into
-        the other languages of the workflow's segment (one AI call per language).
+        the other languages of the workflow's segment (one AI call per language) - and so is every audience
+        version whose own text it changed.
 
-        update_strategy drops an edited message's outdated versions. A translation that fails never undoes
-        the edit: those customers get the edited main text, and the workflow's history says so.
+        update_strategy drops an edited message's outdated versions (and, for an edited main text, its audience
+        versions: the reviewer's text goes to everyone). A translation that fails never undoes the edit: those
+        customers get the edited main text, and the workflow's history says so.
         """
         row = self.db.get(PayflowStrategyModel, strategy_id)
         before = {step.get("id"): step for step in copy.deepcopy((row.steps if row else None) or [])}
@@ -400,10 +409,11 @@ class WorkflowSuggestionService:
             and _message_text(step) != _message_text(before.get(step["id"]) or {})
             and not (step.get("config") or {}).get("translations")  # versions sent with the edit are kept
         }
-        if not edited:
+        edited_versions = _edited_versions(before, updated["steps"])
+        if not edited and not edited_versions:
             return updated
         client = load_client_context(self.db, updated["client_id"])
-        languages = extra_languages(client.get("language"), load_segment_languages(self.db, updated))
+        languages = _other_languages(client, load_segment_members(self.db, updated))
         if not languages:
             return updated
 
@@ -413,18 +423,26 @@ class WorkflowSuggestionService:
             for step_id, step in edited.items()
         }
         written, _ = _with_translations(client, updated, written, languages)
-        steps = [
-            {**step, "config": {**(step.get("config") or {}), "translations": written[step["id"]]["translations"]}}
-            if (written.get(step.get("id")) or {}).get("translations")
-            else step
-            for step in updated["steps"]
-        ]
+        versions, failed_versions = _translate_versions(client, updated, edited_versions, languages)
+        steps = []
+        for step in updated["steps"]:
+            config = dict(step.get("config") or {})
+            if (written.get(step.get("id")) or {}).get("translations"):
+                config["translations"] = written[step["id"]]["translations"]
+            for (step_id, key), version in versions.items():
+                if step_id == step.get("id"):
+                    config["versions"] = {**(config.get("versions") or {}), key: version}
+            steps.append({**step, "config": config})
         done = [code for code in languages if all(code in (m.get("translations") or {}) for m in written.values())]
         failed = [code for code in languages if code not in done]
-        titles = ", ".join(step.get("title") or step_id for step_id, step in edited.items())
-        note = f"Edited messages ({titles}) translated by AI into: {_names(done) or 'none'}"
+        titles = [step.get("title") or step_id for step_id, step in edited.items()]
+        titles += [f"{version.get('label') or key} version of {step_id}"
+                   for (step_id, key), version in edited_versions.items()]
+        note = f"Edited messages ({', '.join(titles)}) translated by AI into: {_names(done) or 'none'}"
         if failed:
             note += f"; not translated into {_names(failed)} - these customers get the edited text"
+        if failed_versions:
+            note += f"; not translated: {', '.join(failed_versions)} - those customers get the main text"
         return self.strategies.save_ai_messages(
             user,
             strategy_id,
@@ -586,12 +604,14 @@ def _with_messages(
     remarks: str | None = None,
     languages: list[str] | None = None,
     keep: list[str] | None = None,
+    found: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """The workflow with its email / SMS text written in (`remarks`: the reviewer's, on Regenerate),
+    """The workflow with its email / SMS text written in (`remarks`: the reviewer's, on Regenerate) - the main
+    text and a version for each audience in `found` (audiences.find_audiences; None: one text for everyone) -
     plus a version in each of `languages` (the other languages of its segment's accounts).
 
     `keep`: message steps whose text (already on the step: a reviewer's) is kept as written - only
-    translated; the AI sees it as the workflow's other messages.
+    translated, and sent to everyone (no audience versions); the AI sees it as the workflow's other messages.
     Writing never blocks a save: if it fails, the workflow is kept as it is (its templates
     are sent) and a "Messages" ai_context line tells reviewers to write them later.
     """
@@ -600,9 +620,14 @@ def _with_messages(
         return workflow, []
     keep = [step_id for step_id in keep or [] if any(step.get("id") == step_id for step in messages)]
     to_write = [step["id"] for step in messages if step["id"] not in keep]
+    written: dict[str, dict[str, Any]] = {}
+    audiences_note: list[dict[str, str]] = []
     try:
         step_ids = to_write if keep else None  # nothing kept: write every message, as before
-        written = write_messages(client, workflow, segment, step_ids=step_ids, remarks=remarks) if to_write else {}
+        if to_write:
+            written, audiences_note = _write_for_audiences(
+                client, workflow, segment, found or {}, step_ids=step_ids, remarks=remarks
+            )
     except AppError as exc:
         note = f"Not written, so the templates will be sent. Use Write messages to try again. ({exc.message})"
         return workflow, [{"label": "Messages", "value": note}]
@@ -611,7 +636,87 @@ def _with_messages(
             written[step["id"]] = {key: value for key, value in (step.get("config") or {}).items()
                                    if key in ("subject", "body", "sms_body", "tone") and value}
     written, languages_note = _with_translations(client, workflow, written, languages or [])
-    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, languages_note
+    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, languages_note + audiences_note
+
+
+def _write_for_audiences(
+    client: dict[str, Any],
+    workflow: dict[str, Any],
+    segment: dict[str, Any],
+    found: dict[str, Any],
+    *,
+    step_ids: list[str] | None = None,
+    remarks: str | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
+    """{step_id: main text + its "brief" + its audience "versions"}, and the "Audiences" ai_context line.
+
+    AI call 1 (plan_messages) plans every message for the main text and for each audience in `found`; call 2
+    (write_messages) writes the main text, then each audience's version, from those plans. Raises AppError when
+    the main text cannot be written. An audience version that fails is left out - those customers get the main
+    text. Without plans (the AI could not plan) the main text is written as before, with no versions.
+    """
+    plans = plan_messages(client, workflow, segment, found, step_ids=step_ids)
+    main_plans = _plans_for(plans, MAIN)
+    main = {"key": MAIN, "label": "Main text", **(found.get("main") or {})}
+    written = write_messages(
+        client, workflow, segment, step_ids=step_ids, remarks=remarks, plans=main_plans,
+        audience=main if plans else None,
+    )
+    for step_id, brief in main_plans.items():
+        if step_id in written:
+            written[step_id] = {**written[step_id], "brief": brief}
+
+    done, failed = [], []
+    for audience in found.get("audiences") or []:
+        audience_plans = {step_id: brief for step_id, brief in _plans_for(plans, audience["key"]).items()
+                          if step_id in written}
+        if not audience_plans:
+            continue
+        try:
+            texts = write_messages(client, workflow, segment, step_ids=list(audience_plans), remarks=remarks,
+                                   plans=audience_plans, audience=audience)
+        except AppError:
+            failed.append(audience)
+            continue
+        for step_id, text in texts.items():
+            version = {"label": audience["label"], **text, "brief": audience_plans[step_id]}
+            written[step_id] = {**written[step_id],
+                                "versions": {**(written[step_id].get("versions") or {}), audience["key"]: version}}
+        done.append(audience)
+    return written, _audiences_line(found, done, failed, planned=bool(plans))
+
+
+def _plans_for(plans: dict[str, dict[str, dict[str, str]]], audience: str) -> dict[str, dict[str, str]]:
+    """{step_id: brief} of one audience, from plan_messages' {step_id: {audience: brief}}."""
+    return {step_id: by_audience[audience] for step_id, by_audience in plans.items() if audience in by_audience}
+
+
+def _audiences_line(
+    found: dict[str, Any], done: list[dict], failed: list[dict], *, planned: bool
+) -> list[dict[str, str]]:
+    """The "Audiences" ai_context line: who the messages were written for."""
+    main_accounts = (found.get("main") or {}).get("accounts", 0)
+    if not planned:
+        value = "One text for everyone - the AI could not plan the messages per audience (Write messages tries again)"
+    elif not found.get("audiences"):
+        value = f"One text for all {main_accounts} accounts - no age group is big enough for its own version"
+    else:
+        parts = [f"Own version for {', '.join(_who(audience) for audience in done)}"] if done else []
+        parts.append(f"main text for the other {main_accounts} accounts")
+        if failed:
+            labels = ", ".join(audience["label"] for audience in failed)
+            parts.append(f"not written for {labels} - they get the main text")
+        value = "; ".join(parts)
+    return [{"label": "Audiences", "value": value}]
+
+
+def _who(audience: dict[str, Any]) -> str:
+    return f"{audience['label']} ({audience['accounts']} accounts)"
+
+
+def _other_languages(client: dict[str, Any], members: list) -> list[str]:
+    """The languages of a workflow's accounts other than the client's own (whose text is the main text)."""
+    return extra_languages(client.get("language"), accounts_languages(members, lambda account: True))
 
 
 def _with_translations(
@@ -619,12 +724,12 @@ def _with_translations(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
     """`written` with a version in each of `languages` (account language codes), and the "Languages" line.
 
-    One AI call per language. A language that cannot be translated is left out - its customers get the
-    main text - and never blocks a save.
+    One AI call per language for the main text, and one per language for each audience's versions. A
+    language that cannot be translated is left out - its customers get the main text - and never blocks a save.
     """
     done: list[str] = []
     failed: list[str] = []
-    for code in languages:
+    for code in languages if written else []:
         try:
             versions = translate_messages(client, workflow, written, code)
         except AppError:
@@ -635,7 +740,60 @@ def _with_translations(
             for step_id, message in written.items()
         }
         done.append(code)
-    return written, languages_line(client.get("language"), done, failed)
+    note = languages_line(client.get("language"), done, failed)
+
+    audience_versions = {
+        (step_id, key): version
+        for step_id, message in written.items()
+        for key, version in (message.get("versions") or {}).items()
+    }
+    translated, failed_versions = _translate_versions(client, workflow, audience_versions, languages)
+    for (step_id, key), version in translated.items():
+        written[step_id] = {**written[step_id], "versions": {**written[step_id]["versions"], key: version}}
+    if failed_versions:
+        extra = f"not written: {', '.join(failed_versions)} - those customers get the main text in their language"
+        note = ([{**note[0], "value": f"{note[0]['value']}; {extra}"}] if note
+                else [{"label": "Languages", "value": extra[0].upper() + extra[1:]}])
+    return written, note
+
+
+def _translate_versions(
+    client: dict[str, Any], workflow: dict[str, Any], versions: dict[tuple[str, str], dict], languages: list[str]
+) -> tuple[dict[tuple[str, str], dict], list[str]]:
+    """{(step_id, audience): version with its other-language versions}, and what could not be translated
+    ("Age 65 and over in French"). One AI call per audience and language: a customer gets all of their
+    audience's messages in the same language, or the main text."""
+    result = {pair: dict(version) for pair, version in versions.items()}
+    failed: list[str] = []
+    for key in dict.fromkeys(audience for _, audience in versions):
+        texts = {step_id: version for (step_id, audience), version in result.items() if audience == key}
+        label = next(iter(texts.values())).get("label") or key
+        for code in languages:
+            try:
+                translated = translate_messages(client, workflow, texts, code)
+            except AppError:
+                failed.append(f"{label} in {language_name(code)}")
+                continue
+            for step_id in texts:
+                version = result[(step_id, key)]
+                version["translations"] = {**(version.get("translations") or {}), code: translated[step_id]}
+    return result, failed
+
+
+def _edited_versions(before: dict[str, dict], steps: list[dict]) -> dict[tuple[str, str], dict]:
+    """Audience versions whose own text a person edited - update_strategy dropped their other-language versions."""
+    edited = {}
+    for step in steps:
+        if step.get("kind") != "Communication":
+            continue
+        old = ((before.get(step.get("id")) or {}).get("config") or {}).get("versions") or {}
+        for key, version in ((step.get("config") or {}).get("versions") or {}).items():
+            was = old.get(key) or {}
+            if not version.get("translations") and any(
+                version.get(name) != was.get(name) for name in ("subject", "body", "sms_body")
+            ):
+                edited[(step["id"], key)] = version
+    return edited
 
 
 def _seed_reviewer_text(

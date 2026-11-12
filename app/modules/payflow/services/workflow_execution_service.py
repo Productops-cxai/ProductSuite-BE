@@ -38,6 +38,7 @@ from app.modules.payflow.services.workflow_condition_runtime import (
     timedelta_for_unit,
 )
 from app.modules.payflow.services.workflow_contact_runtime import (
+    audience_message_config,
     flag_unreachable,
     is_contact_step,
     localized_message_config,
@@ -2357,6 +2358,8 @@ class WorkflowExecutionService:
             return
 
         channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
+        # The text written for the customer's audience when the step has one (else its main text).
+        cfg, audience = audience_message_config(cfg, account)
         subject, body = self._render_channel_message(
             cfg, step, channel=channel, purpose=str(purpose), account=account, strategy=strategy
         )
@@ -2371,6 +2374,8 @@ class WorkflowExecutionService:
             run_id=run.id,
             client_id=run.client_id,
             compliance_review_approved=review_approved,
+            step_id=step.get("id"),
+            message_audience=audience,
         )
         self._record_send_result(run, account, strategy, step_run, channel=channel, result=result)
 
@@ -2386,7 +2391,8 @@ class WorkflowExecutionService:
         payment_link: str,
         review_approved: bool = False,
     ) -> None:
-        cfg = _cfg(step)
+        # The text written for the customer's audience when the step has one (else its main text).
+        cfg, audience = audience_message_config(_cfg(step), account)
         channels = preferred_contact_channels(self.db, account)
         attempts: list[dict[str, Any]] = []
         chosen: str | None = None
@@ -2412,6 +2418,8 @@ class WorkflowExecutionService:
                 run_id=run.id,
                 client_id=run.client_id,
                 compliance_review_approved=review_approved,
+                step_id=step.get("id"),
+                message_audience=audience,
             )
             attempt = {**result, "attempt_channel": channel}
             attempts.append(attempt)

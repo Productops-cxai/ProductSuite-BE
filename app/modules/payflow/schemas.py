@@ -845,6 +845,34 @@ class StrategyMessageText(BaseModel):
     sms_body: Optional[str] = Field(default=None, max_length=1000)
 
 
+class StrategyMessageBrief(BaseModel):
+    """How the AI planned a message for its audience, before writing it (message_brief.py)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    approach: Optional[str] = None
+    tone: Optional[str] = None
+    length: Optional[str] = None
+    subject_style: Optional[str] = None
+    lead_option: Optional[str] = None
+    call_to_action: Optional[str] = None
+    why: Optional[str] = None
+
+
+class StrategyMessageVersion(BaseModel):
+    """A message step's text for one audience, e.g. "age_65_plus" (StrategyNodeConfig.versions)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    label: Optional[str] = None
+    subject: Optional[str] = Field(default=None, max_length=255)
+    body: Optional[str] = Field(default=None, max_length=5000)
+    sms_body: Optional[str] = Field(default=None, max_length=1000)
+    tone: Optional[str] = Field(default=None, max_length=32)
+    brief: Optional[StrategyMessageBrief] = None
+    translations: Optional[dict[str, StrategyMessageText]] = None
+
+
 class StrategyNodeConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -873,6 +901,11 @@ class StrategyNodeConfig(BaseModel):
     # The same message in other languages, keyed by account language code: {"FR": {subject, body, sms_body}}.
     # The worker sends the customer's language when there is a version for it, else the text above.
     translations: Optional[dict[str, StrategyMessageText]] = None
+    # How the AI planned the text above (its audience: the accounts without a version of their own).
+    brief: Optional[StrategyMessageBrief] = None
+    # The same message written for an audience, keyed by audience (audiences.py), e.g. "age_65_plus".
+    # Each has its own text, brief and translations; customers outside every audience get the text above.
+    versions: Optional[dict[str, StrategyMessageVersion]] = None
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
