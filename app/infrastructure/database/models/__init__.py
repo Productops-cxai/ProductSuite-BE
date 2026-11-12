@@ -1194,6 +1194,33 @@ class PayflowMessageProposalModel(Base):
     )
 
 
+class PayflowEmailSubjectInsightModel(Base):
+    """Durable cache of AI explanations for email subject / KPI / section insights (BE-07).
+
+    Keyed by a hash of the exact numbers shown to the model so a stored answer is never about
+    stale metrics. TTL is enforced on read via ``EMAIL_INSIGHT_CACHE_MINUTES``.
+    """
+
+    __tablename__ = "payflow_email_subject_insights"
+    __table_args__ = (
+        UniqueConstraint("facts_hash", name="uq_payflow_email_subject_insight_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    facts_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    insight: Mapped[str] = mapped_column(Text, nullable=False)
+    observations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    generated_by: Mapped[str] = mapped_column(String(32), nullable=False, default="ai")
+    subject_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    scope: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
 class PayflowOperationalExceptionModel(Base):
     """Operational failure requiring attention (separate from Human Review governance)."""
 

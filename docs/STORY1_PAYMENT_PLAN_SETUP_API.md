@@ -102,4 +102,7 @@ After checkout, attempt/plan `auto_charge_enabled` follows `authorize_recurring`
 
 1. Frequencies: only `weekly` / `bi_weekly` / `monthly`.
 2. Quote API for live “Your Plan” summary; gate Continue on valid quote.
-3. Pass `authorize_recurring` from an explicit customer checkbox (optional consent).
+3. Optional `start_date` (ISO date, not before today) — future dates yield `setup_only: true`.
+4. Pass `authorize_recurring` from an explicit customer checkbox (optional consent).
+5. Review step restates plan summary + whether automatic charges were authorized.
+6. Plan *setup* stays one screen (freq + amount + Your Plan). Options → plan → review/checkout matches Lovable; do not collapse checkout into the setup screen.

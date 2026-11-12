@@ -640,7 +640,7 @@ class PayflowPaymentPortalService:
         installment_amount: float | None = None,
         start_date: str | None = None,
     ) -> dict[str, Any]:
-        """Preview Lovable-style Daily/Weekly/Monthly schedule (no Stripe call)."""
+        """Preview Weekly / Bi-Weekly / Monthly schedule (no Stripe call)."""
         real_token, _ = self._strip_preview_token(token)
         row = (
             self.db.query(PayflowPaymentLinkModel)

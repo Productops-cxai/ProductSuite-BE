@@ -810,6 +810,61 @@ class ComplianceRuleService:
             rule, catalog.STATUS_ACTIVE, actor=user, reason=reason, approval="Approved by Operations Admin"
         )
 
+    def schedule_activate(
+        self,
+        user: UserModel,
+        rule_id: int,
+        *,
+        effective_from: str | None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Approve (if needed) and activate with a future effective_from.
+
+        Status becomes Active; the engine ignores the rule until ``effective_from``.
+        """
+        self._assert_admin(user)
+        rule = self._get(rule_id)
+        start = _parse_date(effective_from, "Effective from")
+        if not start:
+            raise ValidationAppError("A future effective date is required to schedule activation")
+        if start <= date.today():
+            raise ValidationAppError(
+                "Schedule Activation needs a future date. Use Activate for today or earlier."
+            )
+
+        if rule.status == catalog.STATUS_PENDING:
+            self._assert_ready(rule)
+            rule.approved_by = user.full_name
+            rule.approved_at = _utcnow()
+        elif rule.status == catalog.STATUS_INACTIVE and rule.approved_at:
+            self._assert_ready(rule)
+        else:
+            raise ValidationAppError(
+                "Only Pending Approval or approved Inactive rules can be schedule-activated"
+            )
+
+        before = serialize_rule(rule)
+        rule.effective_from = start
+        self._assert_no_overlap(rule)
+        rule.status = catalog.STATUS_ACTIVE
+        rule.updated_by = user.full_name
+        self.db.flush()
+        event = f"Schedule activation · effective {start.isoformat()}"
+        self._snapshot(rule, event=event, by=user.full_name, reason=reason)
+        self.audit(
+            entity_type="rule",
+            event=event,
+            actor=user,
+            rule=rule,
+            reason=reason,
+            before=before,
+            after=serialize_rule(rule),
+            approval="Scheduled activation",
+        )
+        self.db.commit()
+        self.db.refresh(rule)
+        return serialize_rule(rule)
+
     def deactivate(self, user: UserModel, rule_id: int, *, reason: str | None) -> dict[str, Any]:
         self._assert_admin(user)
         if not _text(reason):

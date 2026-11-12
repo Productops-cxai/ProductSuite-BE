@@ -173,7 +173,10 @@ AI explanation from the tracked numbers. Body: the shared filters as JSON fields
 
 - `insufficient_data: true` = not enough delivered emails (or nothing in the selection); `insight` says so.
 - `generated_by`: `ai`, or `rules` (fixed wording, used when data is too thin or the AI is not available). Always `200`.
+- `cached: true` = answer reused from durable store (`payflow_email_subject_insights`) or process L1 within `EMAIL_INSIGHT_CACHE_MINUTES`. Same numbers → same hash; metric changes force a new LLM call.
 - For `section`, `subject` is `null` and `evidence` has `best` and `weakest`.
+
+Ops (optional): `scripts/backfill_email_subject_tracking.py` fills missing `subject_key` / attributes unpaid-attribution transactions. It does not invent historical ESP opens/clicks.
 
 ## 4. `GET /email-subjects/suggestions`
 

@@ -18,6 +18,7 @@ from app.modules.payflow.deps import RequirePayflowProduct
 from app.modules.payflow.services.compliance import catalog
 from app.modules.payflow.services.compliance.client_mapping import ClientComplianceService
 from app.modules.payflow.services.compliance.evaluation_service import ComplianceEvaluationService
+from app.modules.payflow.services.compliance.explain import explain_rule
 from app.modules.payflow.services.compliance.override_service import ComplianceOverrideService
 from app.modules.payflow.services.compliance.rule_service import ComplianceRuleService
 
@@ -29,6 +30,7 @@ _STATUS = {
     "not_found": status.HTTP_404_NOT_FOUND,
     "conflict": status.HTTP_409_CONFLICT,
     "validation_error": status.HTTP_400_BAD_REQUEST,
+    "service_unavailable": status.HTTP_502_BAD_GATEWAY,
 }
 
 
@@ -74,6 +76,13 @@ class ReasonBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=2000)
     # Approve only: False = approved but not yet in force (activate it later).
     activate: bool = True
+
+
+class ScheduleActivateBody(BaseModel):
+    """Schedule Activation: future ``effective_from``; status becomes Active."""
+
+    effective_from: str = Field(min_length=8, max_length=32)
+    reason: Optional[str] = Field(default=None, max_length=2000)
 
 
 class HolidayBody(BaseModel):
@@ -243,6 +252,16 @@ def get_compliance_rule(rule_id: int, user: RequirePayflowProduct, db: DbSession
         raise _http(exc) from exc
 
 
+@router.post("/compliance/rules/{rule_id}/explain")
+def explain_compliance_rule(rule_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Plain-language AI summary of the rule (What it is / When it applies / What happens)."""
+    try:
+        rule = ComplianceRuleService(db).get_rule(user, rule_id)
+        return explain_rule(rule)
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
 @router.post("/compliance/rules/{rule_id}/update")
 def update_compliance_rule(rule_id: int, body: RuleBody, user: RequirePayflowProduct, db: DbSession):
     """Change a rule. A reason is required; the previous version is kept."""
@@ -307,6 +326,19 @@ def activate_compliance_rule(
         raise _http(exc) from exc
 
 
+@router.post("/compliance/rules/{rule_id}/schedule-activate")
+def schedule_activate_compliance_rule(
+    rule_id: int, body: ScheduleActivateBody, user: RequirePayflowProduct, db: DbSession
+):
+    """Pending Approval / approved Inactive → Active with a future ``effective_from`` (FR-06)."""
+    try:
+        return ComplianceRuleService(db).schedule_activate(
+            user, rule_id, effective_from=body.effective_from, reason=body.reason
+        )
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
 @router.post("/compliance/rules/{rule_id}/deactivate")
 def deactivate_compliance_rule(rule_id: int, body: ReasonBody, user: RequirePayflowProduct, db: DbSession):
     try:
@@ -330,6 +362,15 @@ def compliance_rule_history(rule_id: int, user: RequirePayflowProduct, db: DbSes
     """Every version of the rule and its audit trail, newest first."""
     try:
         return ComplianceRuleService(db).history(user, rule_id)
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
+@router.get("/compliance/rules/{rule_id}/clients")
+def compliance_rule_clients(rule_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Clients associated with this rule (FR-05 Associated Clients)."""
+    try:
+        return ClientComplianceService(db).list_clients_for_rule(user, rule_id)
     except AppError as exc:
         raise _http(exc) from exc
 

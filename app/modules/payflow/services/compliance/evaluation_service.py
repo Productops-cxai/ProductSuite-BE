@@ -318,7 +318,9 @@ class ComplianceEvaluationService:
             raise ForbiddenError("Permission required: view_rules")
         channel = str(payload.get("channel") or "Email").strip()
         if channel not in catalog.CHANNELS or channel == "All Channels":
-            raise ValidationAppError("channel must be one of: Email, SMS, Voice, WhatsApp")
+            raise ValidationAppError(
+                "channel must be one of: Email, SMS, Voice, WhatsApp, Letter"
+            )
         at = _parse_dt(payload.get("at")) or _utcnow()
         record = bool(payload.get("record"))
 
