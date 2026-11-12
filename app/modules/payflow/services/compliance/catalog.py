@@ -322,6 +322,53 @@ HOLIDAY_SEED = [
 ]
 ILLUSTRATIVE_NOTE = "illustrative, legal validation required"
 
+# Sample rules shown on the Compliance screens (the prototype's CMP-001 ... CMP-010): one per
+# category and status, so the lists, filters, detail, history and audit pages have data.
+# Unlike the library they are not all Drafts: the Active ones are enforced like any Active rule.
+SAMPLE_REFERENCE = "Illustrative configuration — legal validation required"
+SAMPLE_ACTOR = "PayFlow sample catalogue"
+# The prototype's default settings for a new rule.
+_SAMPLE_SETTINGS = {"weekend_start": "10:00", "weekend_end": "16:00"}
+# code, rule type, name, category, country, state, channel, condition (field, operator, value),
+# action, enforcement, status
+SAMPLE_RULES: list[dict[str, Any]] = [
+    {"code": "CMP-001", "type": "JUR-09", "name": "Canada · channel opt-out suppression", "category": "Consent & Opt-Out", "country": _CA, "condition": ("Opt-Out", "Equals", "Yes"), "action": "Suppress"},
+    {"code": "CMP-002", "type": "JUR-08", "name": "Canada · explicit consent", "category": "Consent & Opt-Out", "country": _CA, "channel": "SMS", "condition": ("Consent", "Equals", "No"), "action": "Block"},
+    {"code": "CMP-003", "type": "JUR-01", "name": "Ontario · recipient-local contact window", "category": "Permitted Hours", "country": _CA, "state": "Ontario", "condition": ("Outside Permitted Hours", "Equals", "Yes"), "action": "Reschedule"},
+    {"code": "CMP-004", "type": "JUR-04", "name": "United States · rolling voice attempts", "category": "Frequency", "country": _US, "channel": "Voice", "condition": ("Contact Attempts", "Greater Than", "6"), "action": "Block"},
+    {"code": "CMP-005", "type": "JUR-10", "name": "United States · cease communication", "category": "Contact Restrictions", "country": _US, "condition": ("Cease Communication", "Equals", "Yes"), "action": "Suppress"},
+    {"code": "CMP-006", "type": "JUR-03", "name": "Canada · restricted calendar dates", "category": "Holidays & Restricted Dates", "country": _CA, "condition": ("Restricted Date", "Equals", "Yes"), "action": "Reschedule"},
+    {"code": "CMP-007", "type": "JUR-20", "name": "United States · sender identification", "category": "Content", "country": _US, "condition": ("Sender Identified", "Equals", "No"), "action": "Require Approval", "enforcement": ENFORCEMENT_CONFIGURABLE},
+    # No rule type of its own in the JUR list: the nearest one, with the prototype's category.
+    {"code": "CMP-008", "type": "JUR-07", "name": "Canada · two-way SMS replies", "category": "Reply Handling", "country": _CA, "channel": "SMS", "condition": ("Reply Handling Enabled", "Equals", "No"), "action": "Block"},
+    {"code": "CMP-009", "type": "JUR-23", "name": "Quebec · language review", "category": "Additional Controls", "country": _CA, "state": "Quebec", "condition": ("Language", "Equals", "French"), "action": "Flag for Review", "enforcement": ENFORCEMENT_ADVISORY, "status": STATUS_PENDING},
+    {"code": "CMP-010", "type": "JUR-23", "name": "California · approved content", "category": "Content", "country": _US, "state": "California", "condition": ("Template Approved", "Equals", "No"), "action": "Require Approval", "status": STATUS_DRAFT},
+]
+
+
+def sample_rule_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """A sample rule as a rule payload (same shape the create API takes)."""
+    field, operator, value = entry["condition"]
+    return {
+        "code": entry["code"],
+        "name": entry["name"],
+        "rule_type": entry["type"],
+        "category": entry["category"],
+        "description": "",
+        "legal_reference": SAMPLE_REFERENCE,
+        "source": "",
+        "country": entry["country"],
+        "state": entry.get("state", ""),
+        "channel": entry.get("channel", "All Channels"),
+        "enforcement": entry.get("enforcement", ENFORCEMENT_MANDATORY),
+        "action": entry["action"],
+        "logic": "AND",
+        "conditions": [{"field": field, "operator": operator, "value": value, "period": 7}],
+        "settings": {**DEFAULT_SETTINGS, **_SAMPLE_SETTINGS},
+        "priority": 100,
+        "effective_from": "2026-01-01",
+    }
+
 
 def library_rule_payload(entry: dict[str, Any]) -> dict[str, Any]:
     """A library entry as a Draft rule payload (same shape the create API takes)."""

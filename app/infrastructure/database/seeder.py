@@ -801,6 +801,24 @@ def _seed_compliance_library() -> None:
         db.close()
 
 
+def _seed_compliance_samples() -> None:
+    """Sample compliance rules (CMP-001 ... CMP-010) for the Compliance screens."""
+    import logging
+
+    from app.infrastructure.database.session import SessionLocal
+    from app.modules.payflow.services.compliance.rule_service import seed_compliance_samples
+
+    db = SessionLocal()
+    try:
+        seed_compliance_samples(db)
+    except Exception:  # noqa: BLE001 - sample data must not stop the API from starting
+        db.rollback()
+        logging.getLogger("uvicorn.error").exception("compliance sample seed failed")
+    finally:
+        db.close()
+
+
 def run_seeder() -> None:
     DatabaseSeeder().run()
     _seed_compliance_library()
+    _seed_compliance_samples()

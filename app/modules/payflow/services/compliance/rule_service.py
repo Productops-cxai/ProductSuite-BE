@@ -1038,3 +1038,54 @@ def seed_compliance_library(db: Session) -> dict[str, int]:
     if added or holidays:
         db.commit()
     return {"rules": added, "holidays": holidays}
+
+
+def seed_compliance_samples(db: Session) -> dict[str, int]:
+    """Add the sample rules (CMP-001 ... CMP-010) with their history and audit rows, once each.
+
+    The Compliance screens then have rules in every category and status. The Active ones are
+    enforced like any Active rule. A sample that already exists - edited, deactivated or
+    archived - is left as it is; one that is not ready to be in force is stored as a Draft.
+    """
+    service = ComplianceRuleService(db)
+    existing = {code for (code,) in db.query(PayflowComplianceRuleModel.code)}
+    added = 0
+    for entry in catalog.SAMPLE_RULES:
+        if entry["code"] in existing:
+            continue
+        data = service._normalized(catalog.sample_rule_payload(entry))  # noqa: SLF001 - the API's checks
+        status = entry.get("status", catalog.STATUS_ACTIVE)
+        if status != catalog.STATUS_DRAFT and activation_problems(data):
+            status = catalog.STATUS_DRAFT
+        rule = PayflowComplianceRuleModel(
+            code=entry["code"],
+            status=status,
+            version=1,
+            is_library=False,
+            created_by=catalog.SAMPLE_ACTOR,
+            updated_by=catalog.SAMPLE_ACTOR,
+        )
+        if status in (catalog.STATUS_PENDING, catalog.STATUS_ACTIVE):
+            rule.submitted_by = catalog.SAMPLE_ACTOR
+        if status == catalog.STATUS_ACTIVE:
+            rule.approved_by = catalog.SAMPLE_ACTOR
+            rule.approved_at = _utcnow()
+        service._apply(rule, data)  # noqa: SLF001
+        db.add(rule)
+        db.flush()
+        reason = "Illustrative configuration requiring legal validation"
+        service._snapshot(rule, event="Rule created", by=catalog.SAMPLE_ACTOR, reason=reason)  # noqa: SLF001
+        service.audit(
+            entity_type="rule",
+            event="Sample rule created",
+            actor_name=catalog.SAMPLE_ACTOR,
+            rule=rule,
+            reason=reason,
+            before=None,
+            after=serialize_rule(rule),
+            approval="Sample configuration",
+        )
+        added += 1
+    if added:
+        db.commit()
+    return {"rules": added}
