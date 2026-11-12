@@ -507,6 +507,39 @@ class PayflowAccountModel(Base):
         back_populates="account",
         cascade="all, delete-orphan",
     )
+    email_unsubscribe_events = relationship(
+        "PayflowEmailUnsubscribeEventModel",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowEmailUnsubscribeEventModel(Base):
+    """Customer email unsubscribe record (reasons + comment) for staff review."""
+
+    __tablename__ = "payflow_email_unsubscribe_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Preference codes from EMAIL_UNSUBSCRIBE_REASONS (JSON list of strings).
+    reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # preference_page | one_click | staff
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="preference_page")
+    account_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_masked: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    account = relationship("PayflowAccountModel", back_populates="email_unsubscribe_events")
+    client = relationship("PayflowClientModel")
 
 
 class PayflowImportRunModel(Base):

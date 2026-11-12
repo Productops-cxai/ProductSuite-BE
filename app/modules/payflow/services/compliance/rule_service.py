@@ -1048,6 +1048,18 @@ def seed_compliance_samples(db: Session) -> dict[str, int]:
     enforced like any Active rule. A sample that already exists - edited, deactivated or
     archived - is left as it is; one that is not ready to be in force is stored as a Draft.
     """
+    # Product rename: category "Consent & Opt-Out" → "Unsubscribe Option".
+    renamed = (
+        db.query(PayflowComplianceRuleModel)
+        .filter(PayflowComplianceRuleModel.category == catalog.CATEGORY_UNSUBSCRIBE_OPTION_LEGACY)
+        .update(
+            {PayflowComplianceRuleModel.category: catalog.CATEGORY_UNSUBSCRIBE_OPTION},
+            synchronize_session=False,
+        )
+    )
+    if renamed:
+        db.commit()
+
     service = ComplianceRuleService(db)
     existing = {code for (code,) in db.query(PayflowComplianceRuleModel.code)}
     added = 0

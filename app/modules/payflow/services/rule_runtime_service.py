@@ -239,6 +239,15 @@ RUNTIME_ACTIONS = (
     "Apply / Change Workflow",
 )
 
+# Matched at send time but never block a message (e.g. include unsubscribe footer).
+CAPABILITY_ACTIONS = frozenset(
+    {
+        "Include Unsubscribe Option",
+    }
+)
+
+ENFORCEABLE_ACTIONS = frozenset(RUNTIME_ACTIONS) | CAPABILITY_ACTIONS
+
 
 def unenforced_parts(conditions: list[dict] | None, action: str | None) -> list[str]:
     """The parts of a rule PayFlow cannot check or carry out yet ([] = the rule works as written)."""
@@ -249,7 +258,7 @@ def unenforced_parts(conditions: list[dict] | None, action: str | None) -> list[
         )
         if field not in FIELD_GETTERS
     ]
-    if action and action not in RUNTIME_ACTIONS:
+    if action and action not in ENFORCEABLE_ACTIONS:
         problems.append(f'action "{action}"')
     return problems
 

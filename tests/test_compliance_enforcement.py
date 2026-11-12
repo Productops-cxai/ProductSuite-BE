@@ -73,7 +73,7 @@ def setup(db, *, province="Ontario", country="CA"):
     return client, account, run
 
 
-def active_rule(db, *, rule_type="JUR-09", category="Consent & Opt-Out", action="Suppress",
+def active_rule(db, *, rule_type="JUR-09", category="Unsubscribe Option", action="Suppress",
                 field="Cease Communication", value="Yes", settings=None, state="", channel="All Channels"):
     global _SEQ
     _SEQ += 1
