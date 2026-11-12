@@ -11,8 +11,9 @@ This doc covers **backend only**. FE should implement the customer preference pa
 1. Governance rule **Allow Unsubscribe Option** (`code: allow-unsubscribe-option`, action `Include Unsubscribe Option`).
 2. While that system rule is **not Active**, collection emails keep the **legacy always-on** unsubscribe footer (unchanged).
 3. Once the rule is **Active**, only clients that **selected** it under governance get unsubscribe links on collection emails.
-4. When that rule applies to the account’s client, the public preference page should collect **reasons + optional comment** before unsubscribe.
-5. Unsubscribes are stored and listed for staff; `email_consent = false` still blocks further email (existing behaviour).
+4. When that rule applies to the account’s client, the public preference page **shows** reason options + optional comment. Reasons are **never required** — customer can confirm unsubscribe with zero reasons.
+5. Selecting any of `already_paid` | `wrong_person` | `dispute` | `attorney` sets `review_required: true` on the event for Ops visibility. Opt-out is **immediate** (no delay); Human Review queue is **not** used.
+6. Unsubscribes are stored and listed for staff; `email_consent = false` still blocks further email (existing behaviour).
 
 Compliance category rename (already on BE): **Consent & Opt-Out** → **Unsubscribe Option** (legacy DB rows are renamed on sample seed).
 
@@ -22,19 +23,19 @@ Compliance category rename (already on BE): **Consent & Opt-Out** → **Unsubscr
 
 Use these `code` values when posting reasons. Labels are also returned by the API as `reason_options`.
 
-| code | label |
-|------|--------|
-| `too_many` | Too many emails / contacting too often |
-| `prefer_other_channel` | Prefer a different channel (SMS, phone, or mail) |
-| `already_paid` | Already paid or arranged a payment plan |
-| `wrong_person` | Not the right person / wrong contact details |
-| `dispute` | Dispute this debt / do not believe I owe this |
-| `attorney` | Working with an attorney or another agency |
-| `not_helpful` | Emails are not helpful or not relevant |
-| `prefer_no_email` | Prefer not to receive collection emails |
-| `other` | Other |
+| code | label | Review Required? |
+|------|--------|------------------|
+| `too_many` | Too many emails / contacting too often | No |
+| `prefer_other_channel` | Prefer a different channel (SMS, phone, or mail) | No |
+| `already_paid` | Already paid or arranged a payment plan | **Yes** |
+| `wrong_person` | Not the right person / wrong contact details | **Yes** |
+| `dispute` | Dispute this debt / do not believe I owe this | **Yes** |
+| `attorney` | Working with an attorney or another agency | **Yes** |
+| `not_helpful` | Emails are not helpful or not relevant | No |
+| `prefer_no_email` | Prefer not to receive collection emails | No |
+| `other` | Other | No |
 
-If `other` is selected on the preference page (when `collect_reasons` is true), **comment is required**.
+Comment is always optional (including when `other` is selected).
 
 ---
 
@@ -65,7 +66,7 @@ Resolve the preference page.
 | Field | Meaning for FE |
 |-------|----------------|
 | `subscribed` | `true` if customer still receives collection email (`email_consent is not false`) |
-| `collect_reasons` | If `true`, show reason checklist + comment and require at least one reason before unsubscribe |
+| `collect_reasons` | If `true`, **show** reason checklist + optional comment (do **not** block unsubscribe if empty) |
 | `unsubscribe_option_enabled` | Same idea as rule applied for this account’s client |
 | `reason_options` | Checklist options when collecting reasons; empty array when not |
 | `last_unsubscribe` | Present when already unsubscribed and an event was recorded |
@@ -75,10 +76,11 @@ Resolve the preference page.
 ```json
 {
   "id": 12,
-  "reasons": ["too_many", "other"],
-  "reason_labels": ["Too many emails / contacting too often", "Other"],
+  "reasons": ["already_paid", "other"],
+  "reason_labels": ["Already paid or arranged a payment plan", "Other"],
   "comment": "Please only call me",
   "source": "preference_page",
+  "review_required": true,
   "unsubscribed_at": "2026-11-12T17:00:00+00:00"
 }
 ```
@@ -95,19 +97,19 @@ Unsubscribe. **Body is optional** so List-Unsubscribe one-click / legacy clients
 
 ```json
 {
-  "reasons": ["too_many", "other"],
-  "comment": "Optional unless Other is selected",
+  "reasons": ["already_paid"],
+  "comment": "Optional always",
   "source": "preference_page"
 }
 ```
 
 | When | Body | Validation |
 |------|------|------------|
-| Preference page + `collect_reasons` | JSON with `reasons` (+ comment if `other`) | At least one reason; comment required if `other` |
+| Preference page + `collect_reasons` | JSON with optional `reasons` / `comment` | Empty reasons OK; unknown codes rejected |
 | Preference page + no collect | JSON optional / empty reasons OK | Sets `email_consent = false`, still records an event |
 | One-click / form POST | No JSON (form body) | Treated as `source: one_click`; no reason required |
 
-**Response:** same shape as GET resolve (with `subscribed: false` and `last_unsubscribe` filled).
+**Response:** same shape as GET resolve (with `subscribed: false` and `last_unsubscribe` filled, including `review_required`).
 
 Suggested FE route: `/email-preferences/:token` (public, outside PayFlow shell).
 
@@ -135,6 +137,7 @@ Existing endpoint — **additive** optional fields. Still requires send-communic
 
 - `email_consent` (required bool) — unchanged
 - `reasons` / `comment` — optional; recorded only when flipping **to** unsubscribed
+- Staff-selected review reasons also set `review_required` on the event
 
 Returns the account object (existing shape).
 
@@ -151,10 +154,11 @@ Needs `view_communications` for that client (or ops admin).
   "account_id": 15,
   "last_unsubscribe": {
     "id": 12,
-    "reasons": ["too_many"],
-    "reason_labels": ["Too many emails / contacting too often"],
+    "reasons": ["dispute"],
+    "reason_labels": ["Dispute this debt / do not believe I owe this"],
     "comment": null,
     "source": "preference_page",
+    "review_required": true,
     "unsubscribed_at": "2026-11-12T17:00:00+00:00"
   }
 }
@@ -176,6 +180,7 @@ Query (all optional):
 | `search` | Name / account reference / email / client name |
 | `date_from` | ISO datetime |
 | `date_to` | ISO datetime |
+| `review_required` | `true` / `false` — filter Ops review flag |
 | `limit` | Default 50, max 200 |
 | `offset` | Default 0 |
 
@@ -193,17 +198,19 @@ Needs `view_communications` (scoped to visible clients).
       "customer_name": "Jane Doe",
       "email_masked": "j***e@example.com",
       "outstanding_balance": 450.0,
-      "reasons": ["too_many"],
-      "reason_labels": ["Too many emails / contacting too often"],
+      "reasons": ["dispute"],
+      "reason_labels": ["Dispute this debt / do not believe I owe this"],
       "comment": null,
       "source": "preference_page",
+      "review_required": true,
       "unsubscribed_at": "2026-11-12T17:00:00+00:00"
     }
   ],
   "total": 1,
   "limit": 50,
   "offset": 0,
-  "reason_options": [ { "code": "too_many", "label": "..." } ]
+  "reason_options": [ { "code": "too_many", "label": "..." } ],
+  "review_reason_codes": ["already_paid", "attorney", "dispute", "wrong_person"]
 }
 ```
 
@@ -215,9 +222,9 @@ Suggested FE route: `/payflow/email-unsubscribes` (permission: `view_communicati
 
 | Screen | Behaviour |
 |--------|-----------|
-| Public `/email-preferences/:token` | Resolve → if subscribed and `collect_reasons`, show checklist + comment → POST unsubscribe with `source: "preference_page"` → if unsubscribed, show resubscribe |
-| Staff list `/payflow/email-unsubscribes` | Table from `GET /email-unsubscribes` (client / search / date filters) → link to case |
-| Case detail | If `email_consent === false`, call `GET .../email-unsubscribe` and show reason labels + comment |
+| Public `/email-preferences/:token` | Resolve → if subscribed and `collect_reasons`, show optional checklist + comment → POST unsubscribe with `source: "preference_page"` (empty reasons OK) → if unsubscribed, show resubscribe |
+| Staff list `/payflow/email-unsubscribes` | Table from `GET /email-unsubscribes` (client / search / date / **review** filters) → show Review Required badge → link to case |
+| Case detail | If `email_consent === false`, call `GET .../email-unsubscribe` and show reason labels + comment + Review Required badge when flagged |
 | Ops “Mark unsubscribed” | Existing consent toggle; optionally pass `reasons` / `comment` |
 
 ---
@@ -226,7 +233,7 @@ Suggested FE route: `/payflow/email-unsubscribes` (permission: `view_communicati
 
 - Attaches / omits unsubscribe footer + List-Unsubscribe on **collection** send based on the rule (legacy always-on until rule is Active).
 - One-click List-Unsubscribe hits the same public unsubscribe URL (form POST).
-- Sets `account.email_consent = false` and records `payflow_email_unsubscribe_events`.
+- Sets `account.email_consent = false` and records `payflow_email_unsubscribe_events` (with `review_required` when applicable).
 - Compliance category label **Unsubscribe Option** (was Consent & Opt-Out).
 - Action `Include Unsubscribe Option` is activatable (capability — does not block sends).
 
@@ -243,6 +250,7 @@ Suggested FE route: `/payflow/email-unsubscribes` (permission: `view_communicati
 ## Backward compatibility
 
 - Old `POST .../unsubscribe` with **no JSON body** still works.
-- Old public response fields (`account_reference`, `brand_name`, `email_masked`, `subscribed`, `email_consent`) unchanged; new fields are additive.
+- Old public response fields (`account_reference`, `brand_name`, `email_masked`, `subscribed`, `email_consent`) unchanged; new fields are additive (`review_required`, `review_reason_codes`, list filter).
 - `POST .../email-consent/update` still accepts `{ "email_consent": true|false }` only.
 - SMS STOP / `sms_opt_out` unchanged.
+- Human Review / compliance pause flows are **not** touched by this flag.

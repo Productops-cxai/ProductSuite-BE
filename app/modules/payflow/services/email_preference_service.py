@@ -40,14 +40,24 @@ _TOKEN_PREFIX = "ep1"
 EMAIL_UNSUBSCRIBE_REASONS: list[dict[str, str]] = [
     {"code": "too_many", "label": "Too many emails / contacting too often"},
     {"code": "prefer_other_channel", "label": "Prefer a different channel (SMS, phone, or mail)"},
-    {"code": "already_paid", "label": "Already paid or arranged a payment plan"},
-    {"code": "wrong_person", "label": "Not the right person / wrong contact details"},
-    {"code": "dispute", "label": "Dispute this debt / do not believe I owe this"},
-    {"code": "attorney", "label": "Working with an attorney or another agency"},
-    {"code": "not_helpful", "label": "Emails are not helpful or not relevant"},
+    {"code": "already_paid", "label": "Already paid or arranged a plan"},
+    {"code": "wrong_person", "label": "Not the right person / wrong contact"},
+    {"code": "dispute", "label": "Dispute this debt / don't believe I owe this"},
+    {"code": "attorney", "label": "Working with an attorney or agency"},
+    {"code": "not_helpful", "label": "Content not helpful or relevant"},
     {"code": "prefer_no_email", "label": "Prefer not to receive collection emails"},
     {"code": "other", "label": "Other"},
 ]
+
+# Selecting any of these flags the unsubscribe for Operations review (does not delay opt-out).
+UNSUBSCRIBE_REVIEW_REASON_CODES = frozenset(
+    {
+        "already_paid",
+        "wrong_person",
+        "dispute",
+        "attorney",
+    }
+)
 
 _REASON_CODES = {r["code"] for r in EMAIL_UNSUBSCRIBE_REASONS}
 _REASON_LABELS = {r["code"]: r["label"] for r in EMAIL_UNSUBSCRIBE_REASONS}
@@ -205,8 +215,13 @@ class PayflowEmailPreferenceService:
             "reason_labels": reason_labels(codes),
             "comment": event.comment,
             "source": event.source,
+            "review_required": bool(getattr(event, "review_required", False)),
             "unsubscribed_at": event.created_at.isoformat() if event.created_at else None,
         }
+
+    @staticmethod
+    def _review_required_for(reasons: list[str] | None) -> bool:
+        return bool(UNSUBSCRIBE_REVIEW_REASON_CODES.intersection(reasons or []))
 
     def _serialize_public(self, account: PayflowAccountModel) -> dict[str, Any]:
         consented = account.email_consent is not False
@@ -256,12 +271,14 @@ class PayflowEmailPreferenceService:
         text = (comment or "").strip() or None
         if text and len(text) > 2000:
             raise ValidationAppError("Comment must be at most 2000 characters")
+        reason_list = list(reasons or [])
         event = PayflowEmailUnsubscribeEventModel(
             account_id=account.id,
             client_id=account.client_id,
-            reasons=list(reasons or []),
+            reasons=reason_list,
             comment=text,
             source=source,
+            review_required=self._review_required_for(reason_list),
             account_reference=account.account_reference or str(account.id),
             customer_name=(account.customer_name or "").strip() or None,
             email_masked=_mask_email(account.email),
@@ -285,15 +302,10 @@ class PayflowEmailPreferenceService:
         account = self._load_account(account_id)
         cleaned = self._normalize_reasons(reasons)
         text = (comment or "").strip() or None
-        collect = self.client_has_unsubscribe_option(account)
+        # Reasons + comment are always optional (journey: confirm unsubscribe without them).
         resolved_source = (source or "").strip() or (
             "one_click" if not cleaned and not text else "preference_page"
         )
-        if collect and resolved_source == "preference_page":
-            if not cleaned:
-                raise ValidationAppError("Select at least one reason to unsubscribe")
-            if "other" in cleaned and not text:
-                raise ValidationAppError("Please add a short comment when selecting Other")
 
         if account.email_consent is not False:
             account.email_consent = False
@@ -379,6 +391,7 @@ class PayflowEmailPreferenceService:
         search: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        review_required: bool | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -413,6 +426,10 @@ class PayflowEmailPreferenceService:
         )
         if client_id is not None:
             q = q.filter(PayflowAccountModel.client_id == int(client_id))
+        if review_required is True:
+            q = q.filter(PayflowEmailUnsubscribeEventModel.review_required.is_(True))
+        elif review_required is False:
+            q = q.filter(PayflowEmailUnsubscribeEventModel.review_required.is_(False))
         if date_from is not None:
             q = q.filter(PayflowEmailUnsubscribeEventModel.created_at >= date_from)
         if date_to is not None:
@@ -455,6 +472,7 @@ class PayflowEmailPreferenceService:
                     "reason_labels": reason_labels(codes),
                     "comment": event.comment,
                     "source": event.source,
+                    "review_required": bool(getattr(event, "review_required", False)),
                     "unsubscribed_at": event.created_at.isoformat() if event.created_at else None,
                 }
             )
@@ -464,4 +482,5 @@ class PayflowEmailPreferenceService:
             "limit": limit,
             "offset": offset,
             "reason_options": list(EMAIL_UNSUBSCRIBE_REASONS),
+            "review_reason_codes": sorted(UNSUBSCRIBE_REVIEW_REASON_CODES),
         }
