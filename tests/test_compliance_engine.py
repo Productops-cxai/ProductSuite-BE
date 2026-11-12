@@ -221,6 +221,132 @@ def test_per_channel_limit_does_not_count_other_channels():
     assert evaluate([limit], [], facts(channel="SMS", history=history)).decision == "ALLOW"
 
 
+def test_customer_scope_counts_same_debtor_across_accounts():
+    limit = rule(
+        category="Frequency",
+        rule_type="JUR-04",
+        action="Block",
+        conditions=[cond("Contact Attempts", "1", "Greater Than", period=7)],
+        settings={"combined": True, "scope": "customer"},
+    )
+    # Two prior contacts for the same debtor on different accounts → count 2 > 1.
+    history = [
+        ContactEvent(
+            MONDAY_MORNING - timedelta(days=1),
+            "Email",
+            "attempted",
+            account_id=99,
+            debtor_ref="D-1",
+            portfolio_id=1,
+        ),
+        ContactEvent(
+            MONDAY_MORNING - timedelta(days=2),
+            "Email",
+            "attempted",
+            account_id=10,
+            debtor_ref="D-1",
+            portfolio_id=1,
+        ),
+    ]
+    assert (
+        evaluate(
+            [limit],
+            [],
+            facts(account_id=10, debtor_ref="D-1", portfolio_id=1, history=history),
+        ).decision
+        == "BLOCK"
+    )
+    # Account scope would only see the one event on account 10 → still allowed at threshold 1.
+    account_limit = rule(
+        category="Frequency",
+        rule_type="JUR-04",
+        action="Block",
+        conditions=[cond("Contact Attempts", "1", "Greater Than", period=7)],
+        settings={"combined": True, "scope": "account"},
+    )
+    assert (
+        evaluate(
+            [account_limit],
+            [],
+            facts(account_id=10, debtor_ref="D-1", portfolio_id=1, history=history),
+        ).decision
+        == "ALLOW"
+    )
+
+
+def test_creditor_scope_counts_same_portfolio_not_other_books():
+    limit = rule(
+        category="Frequency",
+        rule_type="JUR-04",
+        action="Block",
+        conditions=[cond("Contact Attempts", "0", "Greater Than", period=7)],
+        settings={"combined": True, "scope": "creditor"},
+    )
+    history = [
+        ContactEvent(
+            MONDAY_MORNING - timedelta(days=1),
+            "Email",
+            "attempted",
+            account_id=50,
+            debtor_ref="OTHER",
+            portfolio_id=1,
+        ),
+        ContactEvent(
+            MONDAY_MORNING - timedelta(days=2),
+            "Email",
+            "attempted",
+            account_id=51,
+            debtor_ref="OTHER2",
+            portfolio_id=2,
+        ),
+    ]
+    # Same portfolio peer contact counts toward the creditor limit.
+    assert (
+        evaluate(
+            [limit],
+            [],
+            facts(account_id=10, debtor_ref="D-1", portfolio_id=1, history=history),
+        ).decision
+        == "BLOCK"
+    )
+    # A different portfolio does not.
+    assert (
+        evaluate(
+            [limit],
+            [],
+            facts(account_id=10, debtor_ref="D-1", portfolio_id=9, history=history),
+        ).decision
+        == "ALLOW"
+    )
+
+
+def test_account_scope_ignores_peer_accounts_of_same_debtor():
+    limit = rule(
+        category="Frequency",
+        rule_type="JUR-04",
+        action="Block",
+        conditions=[cond("Contact Attempts", "0", "Greater Than", period=7)],
+        settings={"combined": True, "scope": "account"},
+    )
+    history = [
+        ContactEvent(
+            MONDAY_MORNING - timedelta(days=1),
+            "Email",
+            "attempted",
+            account_id=99,
+            debtor_ref="D-1",
+        ),
+    ]
+    assert (
+        evaluate(
+            [limit],
+            [],
+            facts(account_id=10, debtor_ref="D-1", history=history),
+        ).decision
+        == "ALLOW"
+    )
+
+
 def test_cooling_period_after_a_conversation():
     cooling = rule(
         category="Frequency",

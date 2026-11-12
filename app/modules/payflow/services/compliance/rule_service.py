@@ -159,6 +159,7 @@ def engine_rule(rule: PayflowComplianceRuleModel) -> dict[str, Any]:
         "client_id": rule.client_id,
         "collector_type": rule.collector_type,
         "debt_type": rule.debt_type,
+        "override_policy": rule.override_policy or "Not Permitted",
         "effective_from": rule.effective_from,
         "effective_until": rule.effective_until,
         "conditions": list(rule.conditions or []),

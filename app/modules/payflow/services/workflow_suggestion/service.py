@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.exceptions import AppError, ServiceUnavailableError, ValidationAppError
 from app.infrastructure.database.models import PayflowStrategyModel, UserModel
+from app.modules.payflow.services.email_tracking import ORIGIN_HUMAN
 from app.modules.payflow.services.strategy_service import (
     PayflowStrategyService,
     _message_text,
@@ -161,7 +162,11 @@ class WorkflowSuggestionService:
 
         # Email / SMS text for every workflow (one AI call each, plus one per other language of its
         # segment's accounts), written before saving.
-        writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
+        writer_client = {
+            **client,
+            "payment_options": load_payment_options(self.db, client["id"]),
+            "email_performance": _email_performance(self.db, client["id"]),
+        }
         members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
@@ -274,7 +279,11 @@ class WorkflowSuggestionService:
         workflow, carried = _seed_reviewer_text(workflow, original)
         members = load_segment_members(self.db, original)
         workflow, messages_note = _with_messages(
-            {**client, "payment_options": load_payment_options(self.db, original["client_id"])},
+            {
+                **client,
+                "payment_options": load_payment_options(self.db, original["client_id"]),
+                "email_performance": _email_performance(self.db, original["client_id"]),
+            },
             workflow,
             _stored_segment(original),
             remarks=remarks,
@@ -370,6 +379,7 @@ class WorkflowSuggestionService:
         client = {
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
+            "email_performance": _email_performance(self.db, workflow["client_id"]),
         }
         members = load_segment_members(self.db, workflow)
         written, audiences_note = _write_for_audiences(
@@ -386,6 +396,7 @@ class WorkflowSuggestionService:
         ai_context = _refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps)
         if not step_id:  # every message rewritten: who they are written for is new too
             ai_context = [item for item in ai_context if item.get("label") != "Audiences"] + audiences_note
+        ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
         return self.strategies.save_ai_messages(user, strategy_id, steps, remarks=remarks, ai_context=ai_context)
 
     def update_workflow(self, user: UserModel, strategy_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -634,9 +645,10 @@ def _with_messages(
     for step in messages:
         if step["id"] in keep:
             written[step["id"]] = {key: value for key, value in (step.get("config") or {}).items()
-                                   if key in ("subject", "body", "sms_body", "tone") and value}
+                                   if key in ("subject", "body", "sms_body", "tone", "content_origin") and value}
     written, languages_note = _with_translations(client, workflow, written, languages or [])
-    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, languages_note + audiences_note
+    notes = languages_note + audiences_note + (_performance_note(client) if to_write else [])
+    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, notes
 
 
 def _write_for_audiences(
@@ -717,6 +729,38 @@ def _who(audience: dict[str, Any]) -> str:
 def _other_languages(client: dict[str, Any], members: list) -> list[str]:
     """The languages of a workflow's accounts other than the client's own (whose text is the main text)."""
     return extra_languages(client.get("language"), accounts_languages(members, lambda account: True))
+
+
+PERFORMANCE_LABEL = "Email performance"
+
+
+def _email_performance(db: Session, client_id: int) -> dict[str, Any] | None:
+    """This client's measured email subjects, for the message writer (see message_prompt).
+    None: no history yet - or it could not be read, which never blocks writing."""
+    try:
+        from app.modules.payflow.services.email_subject_ai import PayflowEmailSubjectAiService
+
+        return PayflowEmailSubjectAiService(db).performance_context(client_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _performance_note(client: dict[str, Any]) -> list[dict[str, str]]:
+    """The ai_context line that tells reviewers the emails were written with measured results."""
+    performance = client.get("email_performance")
+    if not performance or not performance.get("best"):
+        return []
+    best = performance["best"][0]
+    return [
+        {
+            "label": PERFORMANCE_LABEL,
+            "value": (
+                f"Emails written using this client's measured results ({len(performance['best'])} strong and "
+                f"{len(performance.get('weak') or [])} weak subjects). Best so far: \"{best['subject']}\" - "
+                f"{best['conversion']} conversion on {best['delivered']:,} delivered."
+            ),
+        }
+    ]
 
 
 def _with_translations(
@@ -808,6 +852,8 @@ def _seed_reviewer_text(
         if old is not None and step.get("kind") == "Communication" and _purpose(old) == _purpose(step):
             text = {key: value for key, value in (old.get("config") or {}).items()
                     if key in ("subject", "body", "sms_body", "tone") and value}
+            # Who wrote it (email_tracking): a person - the original's own mark when it has one.
+            text["content_origin"] = (old.get("config") or {}).get("content_origin") or ORIGIN_HUMAN
             step = {**step, "config": {**(step.get("config") or {}), **text}}
             carried[step["id"]] = step.get("title") or step["id"]
         steps.append(step)

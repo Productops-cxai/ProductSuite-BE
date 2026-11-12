@@ -2374,7 +2374,9 @@ class WorkflowExecutionService:
             run_id=run.id,
             client_id=run.client_id,
             compliance_review_approved=review_approved,
-            step_id=step.get("id"),
+            tracking=self._message_tracking(
+                run, account, strategy, step, channel=channel, purpose=str(purpose)
+            ),
             message_audience=audience,
         )
         self._record_send_result(run, account, strategy, step_run, channel=channel, result=result)
@@ -2418,7 +2420,9 @@ class WorkflowExecutionService:
                 run_id=run.id,
                 client_id=run.client_id,
                 compliance_review_approved=review_approved,
-                step_id=step.get("id"),
+                tracking=self._message_tracking(
+                    run, account, strategy, step, channel=channel, purpose=purpose
+                ),
                 message_audience=audience,
             )
             attempt = {**result, "attempt_channel": channel}
@@ -2515,6 +2519,24 @@ class WorkflowExecutionService:
         strategy: PayflowStrategyModel,
     ) -> tuple[str, str]:
         """Build rendered subject/body for a fixed channel or contact-step channel pick."""
+        subject, body = self._channel_message_source(
+            cfg, step, channel=channel, purpose=purpose, account=account
+        )
+        return (
+            self._render(subject, account, strategy),
+            self._render(body, account, strategy),
+        )
+
+    def _channel_message_source(
+        self,
+        cfg: dict[str, Any],
+        step: dict,
+        *,
+        channel: str,
+        purpose: str,
+        account: PayflowAccountModel,
+    ) -> tuple[str, str]:
+        """The subject/body to send, before the customer's values are filled in ({{...}} kept)."""
         # The step's text (or its template) in the customer's language when there is a version for it.
         language = getattr(account, "language", None)
         cfg = localized_message_config(cfg, language)
@@ -2536,10 +2558,44 @@ class WorkflowExecutionService:
             else:
                 subject = cfg.get("subject") or (template or {}).get("subject") or purpose
                 body = cfg.get("body") or (template or {}).get("body") or ""
-        return (
-            self._render(str(subject or ""), account, strategy),
-            self._render(str(body or ""), account, strategy),
-        )
+        return str(subject or ""), str(body or "")
+
+    def _message_tracking(
+        self,
+        run: PayflowWorkflowRunModel,
+        account: PayflowAccountModel,
+        strategy: PayflowStrategyModel,
+        step: dict,
+        *,
+        channel: str,
+        purpose: str,
+    ) -> dict[str, Any] | None:
+        """What is recorded on the communication for subject performance (see email_tracking)."""
+        try:
+            from app.modules.payflow.services.email_tracking import (
+                ORIGIN_TEMPLATE,
+                reminder_stage,
+            )
+
+            cfg = _cfg(step)
+            subject, body = self._channel_message_source(
+                cfg, step, channel=channel, purpose=purpose, account=account
+            )
+            own_text = bool(cfg.get("body") or cfg.get("sms_body") or cfg.get("subject"))
+            return {
+                "subject_template": subject,
+                "body_template": body,
+                "step_id": step.get("id"),
+                "strategy_version": int(getattr(strategy, "version", None) or 1),
+                "run_id": run.id,
+                "portfolio_id": run.portfolio_id or getattr(account, "portfolio_id", None),
+                "reminder_stage": reminder_stage(list(strategy.steps or []), step, purpose),
+                "template_id": None if own_text else (cfg.get("template_id") or step.get("template_id")),
+                "origin": (cfg.get("content_origin") or "Human Created") if own_text else ORIGIN_TEMPLATE,
+            }
+        except Exception:  # noqa: BLE001 - tracking never blocks a send
+            logger.exception("failed to build message tracking for run_id=%s", run.id)
+            return None
 
     def _record_send_result(
         self,
@@ -3461,6 +3517,8 @@ class WorkflowExecutionService:
             PayflowCommunicationService(self.db).mark_payment_event(
                 account_id,
                 event="completed" if payload.get("completed") else "initiated",
+                # The message the payment is credited to, when the caller knows it.
+                communication_id=payload.get("communication_id"),
                 commit=False,
             )
         except Exception:  # noqa: BLE001

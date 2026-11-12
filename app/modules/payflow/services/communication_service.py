@@ -283,7 +283,7 @@ class PayflowCommunicationService:
             link = PayflowPaymentLinkService(self.db).ensure_active_link(
                 account, communication_id=communication_id, commit=False
             )
-            return PayflowPaymentLinkService(self.db).public_url(link)
+            return PayflowPaymentLinkService(self.db).public_url(link, communication_id=communication_id)
         except Exception:  # noqa: BLE001
             logger.exception("failed to ensure payment link for account_id=%s", account.id)
             return None
@@ -898,11 +898,13 @@ class PayflowCommunicationService:
         run_id: int | None = None,
         client_id: int | None = None,
         compliance_review_approved: bool = False,
-        step_id: str | None = None,
+        tracking: dict[str, Any] | None = None,
         message_audience: str | None = None,
     ) -> dict[str, Any]:
-        """`step_id` / `message_audience`: the workflow step and which of its texts is sent ("main" or an
-        audience version such as "age_65_plus") - stored on the communication."""
+        """`tracking`: what email_tracking.apply_tracking records on the communication (the text
+        before customer values were filled in, its workflow step, reminder stage, ...).
+        `message_audience`: which of the step's texts is sent ("main" or an audience version such as
+        "age_65_plus") - stored on the communication."""
         channel_norm = (channel or "Email").strip()
         purpose_norm = purpose or "Payment Reminder"
 
@@ -946,7 +948,7 @@ class PayflowCommunicationService:
         date_bucket, date_label, time_label = _date_meta(now)
         code = f"COM-{uuid4().hex[:10].upper()}"
         email_provider = active_collection_provider()
-        tracking = (
+        engagement_tracking = (
             "not_available"
             if channel_norm == "SMS" or email_provider in {"smtp", "log"}
             else "available"
@@ -964,10 +966,9 @@ class PayflowCommunicationService:
             status=PayflowCommStatus.PREPARED.value,
             workflow_name=strategy.name,
             strategy_id=getattr(strategy, "id", None),
-            step_id=step_id,
-            message_audience=message_audience,
+            message_audience=message_audience,  # the workflow step itself: tracking (apply_tracking)
             engagement=None,
-            engagement_tracking=tracking,
+            engagement_tracking=engagement_tracking,
             date_bucket=date_bucket,
             date_label=date_label,
             time_label=time_label,
@@ -989,6 +990,20 @@ class PayflowCommunicationService:
         self.db.add(comm)
         self.db.flush()
         self._record_event_row(comm, event_type="prepared", label="Communication Prepared")
+        try:
+            from app.modules.payflow.services.email_tracking import apply_tracking
+
+            apply_tracking(
+                self.db,
+                comm,
+                {
+                    "portfolio_id": getattr(account, "portfolio_id", None),
+                    "language": (str(getattr(account, "language", None) or "").strip().upper() or None),
+                    **(tracking or {}),
+                },
+            )
+        except Exception:  # noqa: BLE001 - tracking never blocks a send
+            logger.exception("failed to record tracking for communication_id=%s", comm.id)
 
         # Opaque tokenized payment URL (reuse Active link; never account_reference).
         action_url: str | None = None
@@ -996,6 +1011,15 @@ class PayflowCommunicationService:
             action_url = self._ensure_payment_url(account, communication_id=comm.id)
             if action_url:
                 if channel_norm == "SMS":
+                    # The worker rendered the account's plain link: make it this message's own.
+                    from app.modules.payflow.services.payment_link_service import split_tracked_token
+
+                    plain_url = action_url.rsplit("/", 1)[0] + "/" + split_tracked_token(
+                        action_url.rsplit("/", 1)[-1]
+                    )[0]
+                    if action_url not in (body or "") and plain_url in (body or ""):
+                        body = body.replace(plain_url, action_url)
+                        comm.body_lines = body.splitlines()[:40]
                     # SMS has no button — keep the raw URL in the message body.
                     if action_url not in (body or ""):
                         body = f"{(body or '').rstrip()}\nPay: {action_url}"
@@ -1341,11 +1365,15 @@ class PayflowCommunicationService:
         elif et in {"open", "opened"}:
             # Email open (provider) only — never from pay-link click / portal.
             row.opens_count = int(row.opens_count or 0) + 1
+            if isinstance(payload, dict) and payload.get("sg_machine_open") in (True, "true", "True", 1):
+                # An automatic open (mail app pre-load): counted apart, see machine_opens_count.
+                row.machine_opens_count = int(row.machine_opens_count or 0) + 1
             row.first_opened_at = row.first_opened_at or when
             row.last_opened_at = when
             self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"click", "clicked"}:
-            # Stripe/provider pay-link open — timeline only; clicks_count is PayFlow app.
+            # Unique subject analytics use last_clicked_url / payment-link status / clicks_count.
+            # Portal visits still own incremental clicks_count; ESP clicks must not double-count it.
             if url:
                 row.last_clicked_url = url[:1024]
             if is_payment_click or row.payment_link:
@@ -1359,7 +1387,7 @@ class PayflowCommunicationService:
                 except Exception:  # noqa: BLE001
                     logger.exception("payment link click record failed")
             else:
-                # Non-pay URL click in email — still engagement, not our app Click counter.
+                # Non-pay URL click in email — engagement via last_clicked_url for unique clicks.
                 self._advance_status(row, PayflowCommStatus.OPENED_READ.value)
         elif et in {"canceled", "cancelled"}:
             self._advance_status(row, PayflowCommStatus.CANCELLED.value)
@@ -1763,6 +1791,7 @@ class PayflowCommunicationService:
             payment_link=payment_url,
             run_id=None,
             client_id=account.client_id,
+            tracking={"is_manual": True},
         )
         if result.get("communication_id"):
             row = self.db.get(PayflowCommunicationModel, result["communication_id"])

@@ -48,7 +48,7 @@ def test_a_customer_of_the_audience_gets_its_version(db_session):
     calls, _, _ = _send(db_session, step(), account=_account(date_of_birth=SENIOR_BORN))
     assert calls[0]["channel"] == "Email"
     assert calls[0]["subject"] == "Your account ACC-991" and calls[0]["body"].startswith("Dear Ali, $120.00 is open.")
-    assert (calls[0]["step_id"], calls[0]["message_audience"]) == ("s2", "age_65_plus")
+    assert calls[0]["message_audience"] == "age_65_plus"  # the step itself goes with the tracking (end-to-end test)
 
 
 def test_everyone_else_gets_the_main_text(db_session):

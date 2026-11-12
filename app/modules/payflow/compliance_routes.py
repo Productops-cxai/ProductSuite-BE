@@ -18,6 +18,7 @@ from app.modules.payflow.deps import RequirePayflowProduct
 from app.modules.payflow.services.compliance import catalog
 from app.modules.payflow.services.compliance.client_mapping import ClientComplianceService
 from app.modules.payflow.services.compliance.evaluation_service import ComplianceEvaluationService
+from app.modules.payflow.services.compliance.override_service import ComplianceOverrideService
 from app.modules.payflow.services.compliance.rule_service import ComplianceRuleService
 
 router = APIRouter(prefix="/payflow", tags=["PayFlow · Compliance"])
@@ -105,6 +106,25 @@ class ProfileBody(BaseModel):
     inconvenient_times: Optional[list[dict[str, Any]]] = None
     notes: Optional[str] = None
     reason: Optional[str] = Field(default=None, max_length=2000)
+
+
+class OverrideRequestBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    account_id: int
+    rule_id: int
+    reason: str = Field(max_length=4000)
+    evidence: str = Field(max_length=4000)
+    channel: Optional[str] = Field(default="All Channels", max_length=32)
+    valid_until: Optional[str] = None
+    communication_id: Optional[int] = None
+
+
+class OverrideDecisionBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    review_note: Optional[str] = Field(default=None, max_length=4000)
+    valid_until: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- reference data
@@ -400,6 +420,79 @@ def compliance_audit(
             account_id=account_id,
             limit=limit,
             offset=offset,
+        )
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
+# --------------------------------------------------------------------------- overrides (FR-13)
+
+
+@router.get("/accounts/{account_id}/compliance-overrides")
+def list_account_compliance_overrides(
+    account_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Authorized exceptions requested for this account."""
+    try:
+        return ComplianceOverrideService(db).list_for_account(
+            user, account_id, status=status_filter, limit=limit
+        )
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/compliance/overrides")
+def request_compliance_override(
+    body: OverrideRequestBody, user: RequirePayflowProduct, db: DbSession
+):
+    """Request a time-bounded override for one Active rule on one account.
+
+    Requires reason + evidence. Rules with override_policy ``Not Permitted`` are refused.
+    Does not change the decision until an authorized approver accepts it.
+    """
+    try:
+        return ComplianceOverrideService(db).request(
+            user,
+            account_id=body.account_id,
+            rule_id=body.rule_id,
+            reason=body.reason,
+            evidence=body.evidence,
+            channel=body.channel or "All Channels",
+            valid_until=body.valid_until,
+            communication_id=body.communication_id,
+        )
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/compliance/overrides/{override_id}/approve")
+def approve_compliance_override(
+    override_id: int, body: OverrideDecisionBody, user: RequirePayflowProduct, db: DbSession
+):
+    """Approve a Pending override. Authorization follows the rule's override_policy."""
+    try:
+        return ComplianceOverrideService(db).approve(
+            user,
+            override_id,
+            review_note=body.review_note,
+            valid_until=body.valid_until,
+        )
+    except AppError as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/compliance/overrides/{override_id}/reject")
+def reject_compliance_override(
+    override_id: int, body: OverrideDecisionBody, user: RequirePayflowProduct, db: DbSession
+):
+    """Reject a Pending override. ``review_note`` is required."""
+    try:
+        return ComplianceOverrideService(db).reject(
+            user, override_id, review_note=body.review_note or ""
         )
     except AppError as exc:
         raise _http(exc) from exc

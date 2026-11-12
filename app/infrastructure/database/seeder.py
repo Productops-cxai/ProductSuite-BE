@@ -818,7 +818,25 @@ def _seed_compliance_samples() -> None:
         db.close()
 
 
+def _seed_operational_rules() -> None:
+    """The prototype's operational (governance) rules, as System rules a client can select."""
+    import logging
+
+    from app.infrastructure.database.session import SessionLocal
+    from app.modules.payflow.services.operational_rule_seed import seed_operational_rules
+
+    db = SessionLocal()
+    try:
+        seed_operational_rules(db)
+    except Exception:  # noqa: BLE001 - sample data must not stop the API from starting
+        db.rollback()
+        logging.getLogger("uvicorn.error").exception("operational rule seed failed")
+    finally:
+        db.close()
+
+
 def run_seeder() -> None:
     DatabaseSeeder().run()
     _seed_compliance_library()
     _seed_compliance_samples()
+    _seed_operational_rules()

@@ -103,7 +103,10 @@ def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any
         message = written.get(step.get("id"))
         if message:
             text = {key: value for key, value in message.items() if value}
-            config = {**(step.get("config") or {}), **text}
+            # content_origin: who wrote the text (a later human edit changes it, see email_tracking) -
+            # the AI, unless the message says otherwise (a reviewer's text kept on Regenerate).
+            origin = message.get("content_origin") or "AI Generated"
+            config = {**(step.get("config") or {}), **text, "content_origin": origin}
             for key in ("translations", "versions", "brief"):
                 if not message.get(key):
                     config.pop(key, None)

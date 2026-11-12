@@ -35,6 +35,7 @@ def _map_error(exc: AppError):
         "unauthorized": status.HTTP_401_UNAUTHORIZED,
         "session_replaced": status.HTTP_401_UNAUTHORIZED,
         "session_ended": status.HTTP_401_UNAUTHORIZED,
+        "logged_out": status.HTTP_401_UNAUTHORIZED,
         "refresh_reused": status.HTTP_401_UNAUTHORIZED,
         "forbidden": status.HTTP_403_FORBIDDEN,
         "not_found": status.HTTP_404_NOT_FOUND,
@@ -42,7 +43,7 @@ def _map_error(exc: AppError):
         "validation_error": status.HTTP_400_BAD_REQUEST,
     }
     status_code = code_map.get(exc.code, 400)
-    if exc.code in {"session_replaced", "session_ended", "refresh_reused"}:
+    if exc.code in {"session_replaced", "session_ended", "logged_out", "refresh_reused"}:
         return HTTPException(
             status_code=status_code,
             detail={"code": exc.code, "message": exc.message},
