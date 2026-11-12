@@ -37,6 +37,33 @@ def public_url_for_token(token: str) -> str:
     return f"{base}/{token}"
 
 
+# One Active link per account is shared by every reminder, so each message's URL carries a short
+# reference to its own communication after the token: "<token>.<ref>". The portal reads it to know
+# which email / SMS the customer came in through (clicks, checkout and payment credit).
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def communication_ref(communication_id: int) -> str:
+    number, digits = int(communication_id), ""
+    while number:
+        number, rest = divmod(number, 36)
+        digits = _BASE36[rest] + digits
+    return digits or "0"
+
+
+def tracked_token(token: str, communication_id: int | None) -> str:
+    return f"{token}.{communication_ref(communication_id)}" if communication_id else token
+
+
+def split_tracked_token(token: str) -> tuple[str, int | None]:
+    """("<token>", communication id or None) from a token that may carry a communication ref."""
+    real, _, ref = (token or "").partition(".")
+    try:
+        return real, (int(ref, 36) if ref else None)
+    except ValueError:
+        return real, None
+
+
 class PayflowPaymentLinkService:
     def __init__(self, db: Session):
         self.db = db
@@ -76,8 +103,9 @@ class PayflowPaymentLinkService:
             return False, f"Case status '{account.collection_status}' prevents payment"
         return True, None
 
-    def public_url(self, row: PayflowPaymentLinkModel) -> str:
-        return public_url_for_token(row.token)
+    def public_url(self, row: PayflowPaymentLinkModel, *, communication_id: int | None = None) -> str:
+        """`communication_id`: the message this URL goes out in (see tracked_token)."""
+        return public_url_for_token(tracked_token(row.token, communication_id))
 
     def serialize(self, row: PayflowPaymentLinkModel) -> dict[str, Any]:
         self._refresh_expiry(row)
@@ -251,6 +279,7 @@ class PayflowPaymentLinkService:
             token = url[len(base) + 1 :].split("?", 1)[0].split("#", 1)[0]
         elif "/pay/" in url:
             token = url.rsplit("/pay/", 1)[-1].split("?", 1)[0].split("#", 1)[0]
+        token = split_tracked_token(token or "")[0]
         if not token or len(token) < 16:
             return
         row = (

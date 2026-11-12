@@ -139,7 +139,11 @@ async def sendgrid_event_webhook(
                 provider_message_id=str(provider_message_id) if provider_message_id else None,
                 provider_event_id=provider_event_id,
                 url=ev.get("url"),
-                payload={k: ev.get(k) for k in ("email", "reason", "status", "url", "useragent") if k in ev},
+                payload={
+                    k: ev.get(k)
+                    for k in ("email", "reason", "status", "url", "useragent", "sg_machine_open")
+                    if k in ev
+                },
                 commit=False,
             )
             if result.get("duplicate"):

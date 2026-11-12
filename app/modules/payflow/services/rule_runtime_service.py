@@ -142,6 +142,74 @@ def _payment_plan_status(account: PayflowAccountModel, ctx: dict | None) -> str:
     return "On Track"
 
 
+def _total_contact_attempts(account: PayflowAccountModel, ctx: dict | None) -> int:
+    """Messages that went out to the customer (any time, any channel), failed ones included."""
+    db = _db(ctx)
+    if db is None:
+        return 0
+    return (
+        db.query(PayflowCommunicationModel.id)
+        .filter(
+            PayflowCommunicationModel.account_id == account.id,
+            PayflowCommunicationModel.status.notin_(_NOT_SENT_STATUSES),
+        )
+        .count()
+    )
+
+
+def _days_since(day: date | None) -> int | None:
+    return (datetime.now(timezone.utc).date() - day).days if day else None
+
+
+def _customer_opted_out(account: PayflowAccountModel, ctx: dict | None) -> str:
+    """Yes when the customer opted out of the channel being used (either channel when none is given)."""
+    channel = str((ctx or {}).get("channel") or "").strip().lower()
+    email_out = account.email_consent is False
+    sms_out = bool(account.sms_opt_out)
+    if channel == "email":
+        return "Yes" if email_out else "No"
+    if channel == "sms":
+        return "Yes" if sms_out else "No"
+    return "Yes" if email_out or sms_out else "No"
+
+
+def _latest_attempt(account: PayflowAccountModel, ctx: dict | None) -> PayflowPaymentAttemptModel | None:
+    db = _db(ctx)
+    if db is None:
+        return None
+    return (
+        db.query(PayflowPaymentAttemptModel)
+        .filter(PayflowPaymentAttemptModel.account_id == account.id)
+        .order_by(PayflowPaymentAttemptModel.id.desc())
+        .first()
+    )
+
+
+def _payment_processing_status(account: PayflowAccountModel, ctx: dict | None) -> str:
+    """The customer's latest payment: Pending (started, no outcome yet), Succeeded, Failed or None."""
+    attempt = _latest_attempt(account, ctx)
+    if attempt is None:
+        return "None"
+    if attempt.status in (PayflowPaymentAttemptStatus.INITIATED.value, PayflowPaymentAttemptStatus.PROCESSING.value):
+        return "Pending"
+    if attempt.status == PayflowPaymentAttemptStatus.SUCCEEDED.value:
+        return "Succeeded"
+    if attempt.status == PayflowPaymentAttemptStatus.FAILED.value:
+        return "Failed"
+    return "None"  # cancelled / expired checkout: nothing in progress
+
+
+def _payment_status(account: PayflowAccountModel, ctx: dict | None) -> str:
+    """Paid (nothing left to pay), Failed (the latest payment failed), Partially Paid, or Unpaid."""
+    if float(account.outstanding_balance or 0) <= 0:
+        return "Paid"
+    if _payment_processing_status(account, ctx) == "Failed":
+        return "Failed"
+    if float(account.recovered_balance or 0) > 0:
+        return "Partially Paid"
+    return "Unpaid"
+
+
 FIELD_GETTERS: dict[str, Any] = {
     "Outstanding Balance": lambda a, _: float(a.outstanding_balance or 0),
     "Original Balance": lambda a, _: float(a.original_balance or 0),
@@ -152,7 +220,38 @@ FIELD_GETTERS: dict[str, Any] = {
     "Payment Plan Status": _payment_plan_status,
     "Missed Installments": _missed_installments,
     MESSAGES_SENT_7D_FIELD: _messages_sent_7d,
+    "Total Contact Attempts": _total_contact_attempts,
+    "Days Since Last Contact": lambda a, _: _days_since(a.last_contact_date),
+    "Days Past Due": lambda a, _: a.days_past_due,
+    "Last Payment Amount": lambda a, _: a.last_payment_amount,
+    "Customer Opted Out": _customer_opted_out,
+    "Payment Status": _payment_status,
+    "Payment Processing Status": _payment_processing_status,
 }
+
+# What the runtime does when a rule matches (in this order of precedence, see first_blocking_action).
+RUNTIME_ACTIONS = (
+    "Prevent Communication",
+    "Hold Action",
+    "Require Human Review",
+    "Escalate Case",
+    "Request Reassessment",
+    "Apply / Change Workflow",
+)
+
+
+def unenforced_parts(conditions: list[dict] | None, action: str | None) -> list[str]:
+    """The parts of a rule PayFlow cannot check or carry out yet ([] = the rule works as written)."""
+    problems = [
+        f'condition field "{field}"'
+        for field in dict.fromkeys(
+            str(c.get("field") or "") for c in conditions or [] if isinstance(c, dict)
+        )
+        if field not in FIELD_GETTERS
+    ]
+    if action and action not in RUNTIME_ACTIONS:
+        problems.append(f'action "{action}"')
+    return problems
 
 
 class RuleRuntimeService:
@@ -234,14 +333,7 @@ class RuleRuntimeService:
             matched = [m for m in matched if m.get("action") not in exclude_actions]
         if not matched:
             return None
-        priority = [
-            "Prevent Communication",
-            "Hold Action",
-            "Require Human Review",
-            "Escalate Case",
-            "Request Reassessment",
-            "Apply / Change Workflow",
-        ]
+        priority = list(RUNTIME_ACTIONS)
         # Only pause for review right before a message is sent — not on every workflow step.
         communication_only = frozenset(
             {"Prevent Communication", "Require Human Review", "Escalate Case"}

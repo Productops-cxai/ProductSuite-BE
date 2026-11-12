@@ -92,7 +92,8 @@ def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any
         message = written.get(step.get("id"))
         if message:
             text = {key: value for key, value in message.items() if value}
-            config = {**(step.get("config") or {}), **text}
+            # content_origin: who wrote the text (a later human edit changes it, see email_tracking).
+            config = {**(step.get("config") or {}), **text, "content_origin": "AI Generated"}
             if not message.get("translations"):
                 config.pop("translations", None)
             step = {**step, "config": config}

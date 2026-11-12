@@ -771,6 +771,22 @@ class PayflowCommunicationModel(Base):
     rule_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     rule_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Email subject performance tracking (all nullable: older rows have none of it).
+    # subject_template: the subject before customer values were filled in ({{...}} kept);
+    # subject_key: the same, whitespace-normalised - what subjects are grouped by.
+    subject_template: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    subject_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    message_version_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    portfolio_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    reminder_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_manual: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Opens the provider flagged as automatic (a mail app pre-loading the email, not a person).
+    # They stay in opens_count (existing behaviour); subject performance leaves them out.
+    machine_opens_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -896,6 +912,8 @@ class PayflowPaymentAttemptModel(Base):
     balance_at_initiation: Mapped[float | None] = mapped_column(Float, nullable=True)
     events: Mapped[list | None] = mapped_column(JSON, nullable=True)
     provider_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The email / SMS whose payment link the customer came in through (plain id, no foreign key).
+    communication_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -1041,6 +1059,12 @@ class PayflowPaymentTransactionModel(Base):
     related_transaction_public_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Which communication this payment is credited to (one per transaction, so never two subjects).
+    # attribution_method: "last_click" | "plan" (instalment of a plan that email started) |
+    # "none" (no qualifying payment-link click) | NULL (recorded before attribution existed).
+    attributed_communication_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    attribution_method: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    attributed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -1051,6 +1075,88 @@ class PayflowPaymentTransactionModel(Base):
 
     client = relationship("PayflowClientModel")
     account = relationship("PayflowAccountModel")
+
+
+class PayflowMessageVersionModel(Base):
+    """One distinct email / SMS text (subject + body, placeholders kept) that was actually sent.
+
+    The history of what was sent: rows are never changed or deleted, so an old version keeps its
+    results after a workflow's text is edited. Communications point here (message_version_id).
+    """
+
+    __tablename__ = "payflow_message_versions"
+    __table_args__ = (
+        UniqueConstraint("client_id", "content_hash", name="uq_payflow_message_version_content"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    # sha256 of channel + language + subject + body (whitespace-normalised).
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    language: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    subject_template: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    subject_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    body_template: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    purpose: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reminder_stage: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # "AI Generated" | "Human Created" | "AI Generated, Human Edited" | "System Template"
+    origin: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # Where it was first used (plain ids, no foreign keys: a deleted workflow keeps its history).
+    strategy_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    template_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PayflowMessageProposalModel(Base):
+    """An AI recommendation for one email step of a workflow, waiting for a human decision.
+
+    The AI never changes a workflow: a proposal only becomes workflow text when a user accepts
+    (or edits and accepts) it, through the normal workflow update / approval path.
+    """
+
+    __tablename__ = "payflow_message_proposals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    strategy_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    step_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    step_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # "Retain" | "Revise" | "Test alternative subjects" | "Replace" | "Insufficient data"
+    recommendation: Mapped[str] = mapped_column(String(48), nullable=False)
+    # "Pending" | "Accepted" | "Edited" | "Rejected"
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="Pending", index=True)
+    existing_subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    existing_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proposed_subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    proposed_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    alternative_subjects: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # {"step": metrics, "peers": metrics, "examples": [...], "scope": "..."} - numbers only.
+    evidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # What was put on the workflow when accepted (the proposal as written, or the user's edit).
+    final_subject: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    final_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class PayflowOperationalExceptionModel(Base):
