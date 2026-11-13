@@ -152,8 +152,12 @@ def validate_flowchart(workflow: dict[str, Any]) -> list[str]:
         unreachable = [step_id for step_id in steps if step_id not in reachable]
         if unreachable:
             errors.append(f"{_label(workflow)}: steps not reachable from the entry step: {', '.join(unreachable)}")
-        if _has_loop(steps, entry["id"]):
-            errors.append(f"{_label(workflow)}: the flowchart contains a loop")
+        loop = _loop(steps, entry["id"])
+        if loop:
+            errors.append(
+                f"{_label(workflow)}: the flowchart contains a loop - step {loop[0]} points back to step {loop[1]}; "
+                "every path must only move forward (to remind again, add a new step)"
+            )
     return errors
 
 
@@ -272,7 +276,10 @@ def validate_limits(workflow: dict[str, Any], limits: dict[str, Any], *, check_p
     name = _label(workflow)
     count = len(workflow["steps"])
     if not limits["min_steps"] <= count <= limits["max_steps"]:
-        errors.append(f"{name}: has {count} steps (allowed {limits['min_steps']}-{limits['max_steps']})")
+        error = f"{name}: has {count} steps (allowed {limits['min_steps']}-{limits['max_steps']})"
+        if count > limits["max_steps"]:
+            error += " - use fewer messages or branches; never point back to an earlier step to save steps"
+        errors.append(error)
     messages = [s for s in workflow["steps"] if s.get("kind") == "Communication"]
     if len(messages) > limits["max_communications"]:
         errors.append(
@@ -394,15 +401,25 @@ def _reachable(steps: dict[str, dict], entry_id: str) -> set[str]:
     return seen
 
 
-def _has_loop(steps: dict[str, dict], entry_id: str) -> bool:
-    def visit(step_id: str, path: set[str]) -> bool:
-        if step_id in path:
-            return True
-        if step_id not in steps:
-            return False
-        return any(visit(target, path | {step_id}) for target in _links(steps[step_id]))
+def _loop(steps: dict[str, dict], entry_id: str) -> tuple[str, str] | None:
+    """(step, earlier step it points back to) of the first loop found from the entry step, else None."""
+    on_path: set[str] = set()
+    done: set[str] = set()  # fully explored, no loop reachable from it
 
-    return visit(entry_id, set())
+    def visit(step_id: str) -> tuple[str, str] | None:
+        on_path.add(step_id)
+        for target in _links(steps[step_id]):
+            if target in on_path:
+                return step_id, target
+            if target in steps and target not in done:
+                found = visit(target)
+                if found:
+                    return found
+        on_path.discard(step_id)
+        done.add(step_id)
+        return None
+
+    return visit(entry_id) if entry_id in steps else None
 
 
 def _next_message_without_wait(steps: dict[str, dict], message: dict[str, Any]) -> str | None:
