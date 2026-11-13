@@ -444,7 +444,7 @@ Code constants:
 | Constant | Default | File |
 |---|---|---|
 | `MIN_SEGMENT_SIZE` / `MAX_SEGMENTS` | 20 / 8 | `workflow_suggestion/config.py` |
-| `MIN_STEPS` / `MAX_STEPS` / `MAX_COMMUNICATIONS` | 3 / 15 / 5 | `workflow_suggestion/config.py` |
+| `MIN_STEPS` / `MAX_STEPS` / `MAX_COMMUNICATIONS` | 3 / 24 / 5 | `workflow_suggestion/config.py` |
 | Band meanings (days late, balance, age, tenure, region, language) | catalog bands | `workflow_suggestion/config.py` |
 | `MAX_FIX_ATTEMPTS` | 2 | `workflow_suggestion/service.py` |
 | `MAX_CLIENT_EXAMPLES` / `MAX_LESSONS` / `MAX_CHANGES_PER_LESSON` | 2 / 15 / 3 | `workflow_suggestion/learning.py` |
