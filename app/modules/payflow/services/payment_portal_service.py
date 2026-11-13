@@ -284,26 +284,41 @@ class PayflowPaymentPortalService:
 
         min_plan = float(settings_map.get("min_plan_amount") or 0)
         if settings_map.get("allow_payment_plan", True) and balance > 0 and balance >= min_plan:
-            # Lovable amount-first: customer picks Daily/Weekly/Monthly + amount + start date.
+            # Lovable amount-first: Weekly / Bi-Weekly / Monthly + amount (+ optional recurring auth).
+            plan_min = 1.0
+            try:
+                from app.modules.payflow.services.plan_schedule import normalize_plan_limits
+
+                preview = build_plan_quote(
+                    balance=balance,
+                    frequency="monthly",
+                    installment_amount=None,
+                    start_date=_utcnow().date(),
+                    currency_code=currency,
+                    plan_limits=normalize_plan_limits(settings_map.get("plan_limits")),
+                )
+                plan_min = float(preview.get("min_installment") or plan_min)
+            except Exception:  # noqa: BLE001
+                plan_min = 1.0
             options.append(
                 {
                     "id": CUSTOM_PLAN_OPTION_ID,
                     "type": PayflowPaymentOptionType.PAYMENT_PLAN.value,
                     "label": "Set up a payment plan",
                     "description": (
-                        f"Choose daily, weekly, or monthly instalments for {balance:.2f} {currency}. "
-                        "Future instalments are auto-charged when a Card or Bank Account is saved."
+                        f"Choose weekly, bi-weekly, or monthly instalments for {balance:.2f} {currency}. "
+                        "Future instalments are only auto-charged if you authorize recurring payments."
                     ),
                     "amount": None,
                     "currency_code": currency,
                     "amount_editable": True,
-                    "min_amount": 1.0,
+                    "min_amount": plan_min,
                     "max_amount": balance,
                     "plan_id": CUSTOM_PLAN_OPTION_ID,
-                    "frequencies": ["daily", "weekly", "monthly"],
+                    "frequencies": ["weekly", "bi_weekly", "monthly"],
                     "custom_plan": True,
                     "total_payable": balance,
-                    "auto_charge_enabled": True,
+                    "auto_charge_enabled": False,
                 }
             )
 
@@ -625,7 +640,7 @@ class PayflowPaymentPortalService:
         installment_amount: float | None = None,
         start_date: str | None = None,
     ) -> dict[str, Any]:
-        """Preview Lovable-style Daily/Weekly/Monthly schedule (no Stripe call)."""
+        """Preview Weekly / Bi-Weekly / Monthly schedule (no Stripe call)."""
         real_token, _ = self._strip_preview_token(token)
         row = (
             self.db.query(PayflowPaymentLinkModel)
@@ -680,6 +695,7 @@ class PayflowPaymentPortalService:
         frequency: str | None = None,
         installment_amount: float | None = None,
         start_date: str | None = None,
+        authorize_recurring: bool = False,
     ) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
         if is_preview:
@@ -859,6 +875,7 @@ class PayflowPaymentPortalService:
                 "plan_quote": plan_quote,
                 "setup_only": setup_only,
                 "save_payment_method": save_pm,
+                "authorize_recurring": bool(authorize_recurring) if save_pm else False,
             }
             if plan_quote or save_pm
             else None,
@@ -1108,7 +1125,7 @@ class PayflowPaymentPortalService:
                             "start_date": quote.get("start_date"),
                             "next_due_date": quote.get("first_payment_date") or quote.get("start_date"),
                             "final_payment_date": quote.get("final_payment_date"),
-                            "auto_charge_enabled": True,
+                            "auto_charge_enabled": bool(payload.get("authorize_recurring")),
                             "setup_only": bool(payload.get("setup_only") or quote.get("setup_only")),
                             "installments": quote.get("schedule") or [],
                         }
@@ -1648,10 +1665,15 @@ class PayflowPaymentPortalService:
                     stripe_payment_method_id=pm_info.get("payment_method_id"),
                     payment_method_type=pm_info.get("payment_method_type"),
                 )
+                armed = bool(payload.get("authorize_recurring"))
                 outcome._append_account_timeline(
                     account,
                     "Payment Plan Confirmed",
-                    f"Auto-charge armed · start {(payload.get('plan_quote') or {}).get('start_date')}",
+                    (
+                        f"Auto-charge authorized · start {(payload.get('plan_quote') or {}).get('start_date')}"
+                        if armed
+                        else f"Plan confirmed (manual future payments) · start {(payload.get('plan_quote') or {}).get('start_date')}"
+                    ),
                 )
                 try:
                     from app.modules.payflow.services.workflow_execution_service import (

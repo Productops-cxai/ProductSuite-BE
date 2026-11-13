@@ -19,7 +19,7 @@ def rule(db, *, country="Canada", state="", enforcement="Mandatory", status="Act
     row = PayflowComplianceRuleModel(
         code=f"CMP-M{_SEQ:03d}",
         name=f"Mapping rule {_SEQ}",
-        category="Consent & Opt-Out",
+        category="Unsubscribe Option",
         rule_type="JUR-09",
         enforcement=enforcement,
         country=country,

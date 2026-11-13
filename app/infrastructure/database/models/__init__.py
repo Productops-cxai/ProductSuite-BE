@@ -507,6 +507,41 @@ class PayflowAccountModel(Base):
         back_populates="account",
         cascade="all, delete-orphan",
     )
+    email_unsubscribe_events = relationship(
+        "PayflowEmailUnsubscribeEventModel",
+        back_populates="account",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowEmailUnsubscribeEventModel(Base):
+    """Customer email unsubscribe record (reasons + comment) for staff review."""
+
+    __tablename__ = "payflow_email_unsubscribe_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Preference codes from EMAIL_UNSUBSCRIBE_REASONS (JSON list of strings).
+    reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # preference_page | one_click | staff
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="preference_page")
+    # Set when customer picks a high-risk reason; does not delay unsubscribe itself.
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    account_reference: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    email_masked: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    account = relationship("PayflowAccountModel", back_populates="email_unsubscribe_events")
+    client = relationship("PayflowClientModel")
 
 
 class PayflowImportRunModel(Base):
@@ -1163,6 +1198,33 @@ class PayflowMessageProposalModel(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PayflowEmailSubjectInsightModel(Base):
+    """Durable cache of AI explanations for email subject / KPI / section insights (BE-07).
+
+    Keyed by a hash of the exact numbers shown to the model so a stored answer is never about
+    stale metrics. TTL is enforced on read via ``EMAIL_INSIGHT_CACHE_MINUTES``.
+    """
+
+    __tablename__ = "payflow_email_subject_insights"
+    __table_args__ = (
+        UniqueConstraint("facts_hash", name="uq_payflow_email_subject_insight_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    facts_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    insight: Mapped[str] = mapped_column(Text, nullable=False)
+    observations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    generated_by: Mapped[str] = mapped_column(String(32), nullable=False, default="ai")
+    subject_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    scope: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    client_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
 
 

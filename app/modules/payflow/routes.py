@@ -1,7 +1,8 @@
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response
 
 from app.core.config import settings
@@ -50,6 +51,7 @@ from app.modules.payflow.schemas import (
     ManualSmsSendRequest,
     ManualSmsSendResponse,
     PayflowEmailPreferencePublic,
+    PayflowEmailUnsubscribeListResponse,
     ResendCommunicationRequest,
     UpdateEmailConsentRequest,
     PayflowCommunicationItem,
@@ -780,6 +782,73 @@ def update_account_email_consent(
             user,
             account_id,
             email_consent=payload.email_consent,
+            reasons=payload.reasons,
+            comment=payload.comment,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/accounts/{account_id}/email-unsubscribe")
+def get_account_email_unsubscribe(
+    account_id: int,
+    user: RequirePayflowProduct,
+    db: DbSession,
+):
+    """Latest email unsubscribe reasons for a case (if any)."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    try:
+        return {
+            "account_id": account_id,
+            "last_unsubscribe": PayflowEmailPreferenceService(db).latest_for_account(
+                user, account_id
+            ),
+        }
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get(
+    "/email-unsubscribes",
+    response_model=PayflowEmailUnsubscribeListResponse,
+)
+def list_email_unsubscribes(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: Optional[int] = None,
+    search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    review_required: Optional[bool] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Staff list of customers who unsubscribed from collection email."""
+    from app.modules.payflow.services.email_preference_service import (
+        PayflowEmailPreferenceService,
+    )
+
+    def _parse(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid date filter") from exc
+
+    try:
+        return PayflowEmailPreferenceService(db).list_unsubscribes(
+            user,
+            client_id=client_id,
+            search=search,
+            date_from=_parse(date_from),
+            date_to=_parse(date_to),
+            review_required=review_required,
+            limit=limit,
+            offset=offset,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -1921,14 +1990,47 @@ def resolve_public_email_preference(token: str, db: DbSession):
     "/public/email-preferences/{token}/unsubscribe",
     response_model=PayflowEmailPreferencePublic,
 )
-def public_email_unsubscribe(token: str, db: DbSession):
-    """Unsubscribe (footer confirm + List-Unsubscribe one-click). No JWT."""
+async def public_email_unsubscribe(token: str, request: Request, db: DbSession):
+    """Unsubscribe (footer confirm + List-Unsubscribe one-click). No JWT.
+
+    JSON body with reasons/comment is optional. RFC 8058 one-click posts a form
+    body — that path stays unchanged (no reasons required).
+    """
     from app.modules.payflow.services.email_preference_service import (
         PayflowEmailPreferenceService,
     )
 
+    reasons = None
+    comment = None
+    source = None
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            data = None
+        if isinstance(data, dict):
+            raw_reasons = data.get("reasons")
+            if isinstance(raw_reasons, list):
+                reasons = [str(x) for x in raw_reasons]
+            comment = data.get("comment")
+            source = data.get("source")
+            if isinstance(comment, str) is False and comment is not None:
+                comment = str(comment)
+            if isinstance(source, str) is False and source is not None:
+                source = str(source)
+    elif ctype.startswith("application/x-www-form-urlencoded") or ctype.startswith(
+        "multipart/form-data"
+    ):
+        source = "one_click"
+
     try:
-        return PayflowEmailPreferenceService(db).unsubscribe_public(token)
+        return PayflowEmailPreferenceService(db).unsubscribe_public(
+            token,
+            reasons=reasons,
+            comment=comment,
+            source=source,
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1974,7 +2076,7 @@ def resolve_public_payment_link(
 def quote_public_payment_plan(
     token: str, payload: PayflowPaymentPlanQuoteRequest, db: DbSession
 ):
-    """Preview Daily/Weekly/Monthly instalment schedule (amount-first)."""
+    """Preview Weekly / Bi-Weekly / Monthly instalment schedule (amount-first)."""
     try:
         return PayflowPaymentPortalService(db).quote_plan(
             token,
@@ -2003,6 +2105,7 @@ def initiate_public_payment(
             frequency=payload.frequency,
             installment_amount=payload.installment_amount,
             start_date=payload.start_date,
+            authorize_recurring=bool(payload.authorize_recurring),
         )
     except AppError as exc:
         raise _map_error(exc) from exc

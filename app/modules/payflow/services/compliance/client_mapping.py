@@ -207,3 +207,75 @@ class ClientComplianceService:
         client = self._client_for(user, client_id, permission="modify_governance")
         result = self.sync_client(client, actor=user, commit=True)
         return {**result, **self.list_for_client(user, client_id)}
+
+    def list_clients_for_rule(self, user: UserModel, rule_id: int) -> dict[str, Any]:
+        """Clients associated with (or in scope of) a compliance rule — FR-05 reverse view."""
+        ComplianceRuleService(self.db)._assert_view(user)
+        rule = self.db.get(PayflowComplianceRuleModel, rule_id)
+        if not rule or rule.status == catalog.STATUS_ARCHIVED:
+            raise NotFoundError("Compliance rule not found")
+
+        mappings = {
+            row.client_id: row
+            for row in self.db.query(PayflowClientComplianceRuleModel).filter(
+                PayflowClientComplianceRuleModel.rule_id == rule.id
+            )
+        }
+
+        if rule.client_id is not None:
+            client_ids = {rule.client_id} | set(mappings.keys())
+            clients = (
+                self.db.query(PayflowClientModel)
+                .filter(PayflowClientModel.id.in_(client_ids))
+                .order_by(PayflowClientModel.name.asc())
+                .all()
+                if client_ids
+                else []
+            )
+        else:
+            country = catalog.find_country(rule.country)
+            country_name = country["name"] if country else (rule.country or "")
+            query = self.db.query(PayflowClientModel)
+            if country_name:
+                names = {country_name}
+                if country:
+                    names.add(str(country.get("code") or ""))
+                    for alias in country.get("aliases") or []:
+                        names.add(str(alias))
+                names.discard("")
+                query = query.filter(PayflowClientModel.country.in_(sorted(names)))
+            clients = query.order_by(PayflowClientModel.name.asc()).all()
+
+        mandatory = rule.enforcement == catalog.ENFORCEMENT_MANDATORY
+        items: list[dict[str, Any]] = []
+        for client in clients:
+            if not self.access.can_see_client(user, client.id):
+                continue
+            row = mappings.get(client.id)
+            enabled = True if mandatory else (row.enabled if row else True)
+            items.append(
+                {
+                    "client_id": client.id,
+                    "code": client.code,
+                    "name": client.name,
+                    "country": client.country,
+                    "province_state": client.province_state,
+                    "city": client.city,
+                    "status": client.status,
+                    "associated": row is not None,
+                    "enabled": enabled,
+                    "locked": mandatory,
+                    "in_force": rule.status == catalog.STATUS_ACTIVE and enabled,
+                    "source": row.source if row else None,
+                }
+            )
+
+        return {
+            "rule_id": rule.id,
+            "rule_code": rule.code,
+            "rule_name": rule.name,
+            "client_scoped": rule.client_id is not None,
+            "total": len(items),
+            "associated_count": sum(1 for i in items if i["associated"]),
+            "clients": items,
+        }

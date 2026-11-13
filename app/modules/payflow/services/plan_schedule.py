@@ -87,6 +87,8 @@ def normalize_plan_limits(raw: Any) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             continue
         months = max(1, min(months, 36))
+        if max_b is not None and max_b < min_b:
+            continue
         out.append(
             {
                 "id": str(item.get("id") or f"pl-{i + 1}"),
@@ -95,7 +97,44 @@ def normalize_plan_limits(raw: Any) -> list[dict[str, Any]]:
                 "max_term_months": months,
             }
         )
+    out.sort(key=lambda row: float(row.get("min_balance") or 0))
     return out or [dict(row) for row in DEFAULT_PLAN_LIMITS]
+
+
+def validate_plan_limits_no_overlap(raw: Any) -> list[dict[str, Any]]:
+    """Normalize plan_limits and reject overlaps / gaps between balance tiers.
+
+    Contiguous tiers share an edge (prev.max_balance == next.min_balance) so
+    ``tier_for_balance`` (balance > min and <= max) has no hole and no overlap.
+    """
+    tiers = normalize_plan_limits(raw)
+    if len(tiers) < 2:
+        return tiers
+    for i in range(len(tiers) - 1):
+        cur = tiers[i]
+        nxt = tiers[i + 1]
+        cur_max = cur.get("max_balance")
+        nxt_min = float(nxt.get("min_balance") or 0)
+        if cur_max is None:
+            raise ValueError(
+                "Only the last payment-plan balance range may have no upper limit"
+            )
+        cur_max_f = float(cur_max)
+        if nxt_min < cur_max_f:
+            raise ValueError(
+                f"Payment-plan balance ranges overlap around "
+                f"${nxt_min:,.2f}–${cur_max_f:,.2f}"
+            )
+        if nxt_min > cur_max_f:
+            raise ValueError(
+                f"Payment-plan balance ranges have a gap between "
+                f"${cur_max_f:,.2f} and ${nxt_min:,.2f}"
+            )
+    if any(t.get("max_balance") is None for t in tiers[:-1]):
+        raise ValueError(
+            "Only the last payment-plan balance range may have no upper limit"
+        )
+    return tiers
 
 
 def tier_for_balance(balance: float, plan_limits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -217,7 +256,8 @@ def build_plan_quote(
         "charge_today": charge_today,
         "first_charge_amount": first_amount if charge_today else 0.0,
         "setup_only": not charge_today,
-        "auto_charge_enabled": True,
+        # Recurring charges require explicit customer authorization (authorize_recurring).
+        "auto_charge_enabled": False,
         "schedule": schedule,
         "option_id": CUSTOM_PLAN_OPTION_ID,
         "label": f"{n} {freq.replace('_', '-')} instalments",

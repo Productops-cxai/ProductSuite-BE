@@ -20,6 +20,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.modules.payflow.services.compliance import catalog
+
 ALL_CHANNELS = "All Channels"
 MANDATORY = "Mandatory"
 ADVISORY = "Advisory"
@@ -378,8 +380,11 @@ def _actual(
         "Unsubscribe Instructions": _yes(data.unsubscribe_instructions),
         "Template Approved": _yes(data.template_approved),
         "Reply Handling Enabled": _yes(data.reply_enabled),
-        "Channel Permitted": "Yes",
-        "Collector Licensed": "Yes",
+        # Unknown when not supplied in extra — do not invent a green light for JUR-07 / JUR-21.
+        "Channel Permitted": "Yes"
+        if (data.channel or "").strip().lower() in {"email", "sms", "whatsapp"}
+        else "No",
+        "Collector Licensed": "Unknown",
         "Language": data.language,
         "Communication Type": data.activity,
         "Outstanding Balance": data.balance,
@@ -456,7 +461,7 @@ def _triggered(
         if interval > 0 and since is not None and since * 24 < interval:
             return True, "MINIMUM_INTERVAL", f"Less than {interval:g} hours since the last contact"
     expiry = int(settings.get("consent_expiry_days") or 0)
-    if category == "Consent & Opt-Out" and expiry > 0:
+    if category in catalog.UNSUBSCRIBE_OPTION_CATEGORIES and expiry > 0:
         age = _days_since(data.consent_date, at)
         if age is None or age >= expiry:
             return True, "CONSENT_EXPIRED", f"Consent older than {expiry} days or not recorded"

@@ -745,7 +745,19 @@ class PayflowClientService:
                 raise ValidationAppError("payment_settings must be an object")
             # Merge: the form sends the options it knows; anything else stored here
             # (set by another screen or a later release) must survive the save.
-            client.payment_settings = {**(client.payment_settings or {}), **settings_payload}
+            merged = {**(client.payment_settings or {}), **settings_payload}
+            if "plan_limits" in settings_payload:
+                try:
+                    from app.modules.payflow.services.plan_schedule import (
+                        validate_plan_limits_no_overlap,
+                    )
+
+                    merged["plan_limits"] = validate_plan_limits_no_overlap(
+                        settings_payload.get("plan_limits")
+                    )
+                except ValueError as exc:
+                    raise ValidationAppError(str(exc)) from exc
+            client.payment_settings = merged
         if "communication_settings" in payload and payload["communication_settings"] is not None:
             comm_payload = payload["communication_settings"]
             if not isinstance(comm_payload, dict):

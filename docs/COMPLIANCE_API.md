@@ -17,15 +17,18 @@ General points:
 | 3 | `GET /compliance/rules` | Rules list with filters |
 | 4 | `POST /compliance/rules` | Create a rule (Draft) |
 | 5 | `GET /compliance/rules/{id}` | One rule |
+| 5b | `POST /compliance/rules/{id}/explain` | AI plain-language explanation (What it is / When it applies / What happens) |
 | 6 | `POST /compliance/rules/{id}/update` | Edit a rule |
 | 7 | `POST /compliance/rules/{id}/duplicate` | Copy a rule as a new Draft |
 | 8 | `POST /compliance/rules/{id}/submit` | Draft → Pending Approval |
 | 9 | `POST /compliance/rules/{id}/approve` | Pending Approval → Active (or approved, not yet active) |
 | 10 | `POST /compliance/rules/{id}/reject` | Pending Approval → Draft |
 | 11 | `POST /compliance/rules/{id}/activate` | Put an approved / inactive rule in force |
+| 11b | `POST /compliance/rules/{id}/schedule-activate` | FR-06: Active with a **future** `effective_from` (Pending Approval or approved Inactive) |
 | 12 | `POST /compliance/rules/{id}/deactivate` | Take a rule out of force |
 | 13 | `POST /compliance/rules/{id}/archive` | Archive a rule |
 | 14 | `GET /compliance/rules/{id}/history` | Version history of a rule |
+| 14b | `GET /compliance/rules/{id}/clients` | FR-05 Associated Clients (reverse mapping) |
 | 15 | `GET /compliance/holidays` | Holiday / restricted-date calendar |
 | 16 | `POST /compliance/holidays` | Add a holiday |
 | 17 | `POST /compliance/holidays/{id}/update` | Edit a holiday |
@@ -132,10 +135,13 @@ No body. Returns the copy (a new Draft).
 | `approve` | `{"reason": "optional", "activate": true}` | `activate: false` = approved but not in force yet |
 | `reject` | `{"reason": "required"}` | back to Draft, `rejection_reason` set |
 | `activate` | `{"reason": "optional"}` | `400` with the problems when the rule is not complete |
+| `schedule-activate` | `{"effective_from": "YYYY-MM-DD", "reason": "optional"}` | Future date required. Pending Approval or approved Inactive → **Active**; engine waits until `effective_from` |
 | `deactivate` | `{"reason": "required"}` | |
 | `archive` | `{"reason": "optional"}` | |
 
 All return the rule object.
+
+FE may **display** lifecycle aliases without changing API statuses: `Pending Approval` → Pending Review; `Active` + future `effective_from` → Scheduled; `Active` + past `effective_until` → Expired.
 
 ## 14. `GET /compliance/rules/{id}/history`
 
@@ -144,6 +150,37 @@ All return the rule object.
   "rule_id": 12, "code": "CMP-003", "current_version": 2,
   "versions": [
     {"id": 40, "version": 2, "status": "Active", "event": "Rule activated", "snapshot": {"...": "rule fields"}, "change_reason": "...", "changed_by": "...", "created_at": "..."}
+  ]
+}
+```
+
+## 14b. `GET /compliance/rules/{id}/clients`
+
+Associated Clients (FR-05). Returns clients in the rule’s jurisdiction (or the single client when the rule is client-scoped), with mapping flags.
+
+```json
+{
+  "rule_id": 12,
+  "rule_code": "CMP-003",
+  "rule_name": "Ontario · contact window",
+  "client_scoped": false,
+  "total": 3,
+  "associated_count": 2,
+  "clients": [
+    {
+      "client_id": 5,
+      "code": "ACME",
+      "name": "Acme Collections",
+      "country": "Canada",
+      "province_state": "Ontario",
+      "city": "Toronto",
+      "status": "active",
+      "associated": true,
+      "enabled": true,
+      "locked": true,
+      "in_force": true,
+      "source": "auto"
+    }
   ]
 }
 ```

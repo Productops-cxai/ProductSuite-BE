@@ -1253,6 +1253,31 @@ class ResendCommunicationRequest(BaseModel):
 
 class UpdateEmailConsentRequest(BaseModel):
     email_consent: bool
+    reasons: Optional[List[str]] = None
+    comment: Optional[str] = None
+
+
+class EmailUnsubscribeRequest(BaseModel):
+    """Optional body for preference-page unsubscribe (one-click sends no body)."""
+
+    reasons: Optional[List[str]] = None
+    comment: Optional[str] = None
+    source: Optional[str] = None
+
+
+class PayflowEmailUnsubscribeReasonOption(BaseModel):
+    code: str
+    label: str
+
+
+class PayflowEmailUnsubscribePublicEvent(BaseModel):
+    id: int
+    reasons: List[str] = []
+    reason_labels: List[str] = []
+    comment: Optional[str] = None
+    source: str
+    review_required: bool = False
+    unsubscribed_at: Optional[str] = None
 
 
 class PayflowEmailPreferencePublic(BaseModel):
@@ -1261,6 +1286,36 @@ class PayflowEmailPreferencePublic(BaseModel):
     email_masked: Optional[str] = None
     subscribed: bool
     email_consent: Optional[bool] = None
+    unsubscribe_option_enabled: bool = False
+    collect_reasons: bool = False
+    reason_options: List[PayflowEmailUnsubscribeReasonOption] = []
+    last_unsubscribe: Optional[PayflowEmailUnsubscribePublicEvent] = None
+
+
+class PayflowEmailUnsubscribeListItem(BaseModel):
+    event_id: int
+    account_id: int
+    client_id: int
+    client_name: str
+    account_reference: str
+    customer_name: Optional[str] = None
+    email_masked: Optional[str] = None
+    outstanding_balance: float = 0
+    reasons: List[str] = []
+    reason_labels: List[str] = []
+    comment: Optional[str] = None
+    source: str
+    review_required: bool = False
+    unsubscribed_at: Optional[str] = None
+
+
+class PayflowEmailUnsubscribeListResponse(BaseModel):
+    items: List[PayflowEmailUnsubscribeListItem]
+    total: int
+    limit: int
+    offset: int
+    reason_options: List[PayflowEmailUnsubscribeReasonOption] = []
+    review_reason_codes: List[str] = []
 
 
 class PayflowPaymentLinkEventItem(BaseModel):
@@ -1331,6 +1386,8 @@ class PayflowPaymentInitiateRequest(BaseModel):
     frequency: Optional[str] = Field(default=None, max_length=16)
     installment_amount: Optional[float] = Field(default=None, gt=0)
     start_date: Optional[str] = Field(default=None, max_length=32)
+    # Explicit customer consent to auto-charge future plan instalments (optional).
+    authorize_recurring: Optional[bool] = False
 
 
 class PayflowPaymentAttemptItem(BaseModel):
@@ -1479,8 +1536,12 @@ class DashboardFunnelBreakdown(BaseModel):
     invalid_addresses: int = 0
     sent: int = 0
     delivered: int = 0
-    placement_available: bool = True
+    placement_available: bool = False
     placement: List[DashboardFunnelPlacementItem] = Field(default_factory=list)
+    opens_available: bool = True
+    # SendGrid (and similar ESPs) do not report Gmail Promotions / tab placement.
+    promotions_available: bool = False
+    placement_note: Optional[str] = None
 
 
 class DashboardOutcomeItem(BaseModel):

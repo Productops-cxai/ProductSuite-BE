@@ -64,9 +64,13 @@ DATE_BUCKETS = {
 # Address / contact failures that never entered a successful send path.
 _INVALID_ADDRESS_RE = re.compile(
     r"invalid|not a valid|no valid email|no valid mobile|no valid phone|"
-    r"format is invalid|email address format|phone number is not",
+    r"format is invalid|email address format|phone number is not|"
+    r"\bbounce\b|\bbounced\b|\bdropped\b|undelivered|mailbox (?:not found|unavailable)|"
+    r"user unknown|recipient rejected|does not exist",
     re.IGNORECASE,
 )
+
+_SPAM_SIGNAL_RE = re.compile(r"spamreport|\bspam\b", re.IGNORECASE)
 
 # Statuses that have progressed at least to this funnel stage.
 # Opened = real open/read (or opens_count), not click-only.
@@ -546,13 +550,33 @@ class PayflowDashboardService:
         sent = by_label.get("Sent", 0)
         delivered = by_label.get("Delivered", 0)
 
+        # Total Records = Valid + Invalid (partition of scoped communications).
         invalid = sum(1 for c in comms if _is_invalid_address_comm(c))
-        # Valid = outbound rows that were not invalid-address failures (floored at Sent).
-        valid = max(sent, sum(1 for c in comms if not _is_invalid_address_comm(c)))
+        valid = max(0, len(comms) - invalid)
 
         channel_norm = (channel or "").strip().lower()
-        placement_available = channel_norm != "sms"
-        placement = _placement_split(comms, delivered) if placement_available else []
+        opens_available = channel_norm != "sms"
+        # Inbox/Spam only when Email (or All with email rows) and we have
+        # real placement/engagement signals — never invent Inbox = delivered.
+        # Promotions is not reported by SendGrid; FE shows it as unavailable.
+        placement: list[dict[str, Any]] = []
+        placement_available = False
+        promotions_available = False
+        placement_note: str | None = None
+        if channel_norm == "sms":
+            placement_note = "Inbox placement is not available for SMS."
+        else:
+            placement, placement_available = _placement_split(comms, delivered)
+            if placement_available:
+                placement_note = (
+                    "Inbox uses open/click signals; Spam uses provider spam-report events. "
+                    "Promotions is not reported by the email provider."
+                )
+            else:
+                placement_note = (
+                    "Inbox / Spam / Promotions unavailable — no placement or "
+                    "engagement signals for delivered messages in this filter."
+                )
 
         return {
             "valid_addresses": int(valid),
@@ -561,6 +585,9 @@ class PayflowDashboardService:
             "delivered": int(delivered),
             "placement_available": placement_available,
             "placement": placement,
+            "opens_available": opens_available,
+            "promotions_available": promotions_available,
+            "placement_note": placement_note,
         }
 
     def _build_funnel(
@@ -755,8 +782,11 @@ class PayflowDashboardService:
                 "invalid_addresses": 0,
                 "sent": 0,
                 "delivered": 0,
-                "placement_available": True,
+                "placement_available": False,
                 "placement": [],
+                "opens_available": True,
+                "promotions_available": False,
+                "placement_note": None,
             },
             "outcomes": [],
             "clients_attention": [],
@@ -765,6 +795,7 @@ class PayflowDashboardService:
 
 
 def _is_invalid_address_comm(row: PayflowCommunicationModel) -> bool:
+    """True when the attempt failed because the address/contact was bad or undeliverable."""
     if row.status != PayflowCommStatus.FAILED.value:
         return False
     blob = " ".join(
@@ -778,40 +809,82 @@ def _is_invalid_address_comm(row: PayflowCommunicationModel) -> bool:
     return bool(_INVALID_ADDRESS_RE.search(blob))
 
 
+def _has_spam_signal(row: PayflowCommunicationModel) -> bool:
+    reason = str(getattr(row, "restriction_reason", None) or "")
+    error = str(getattr(row, "provider_error", None) or "")
+    if _SPAM_SIGNAL_RE.search(reason) or _SPAM_SIGNAL_RE.search(error):
+        return True
+    events = getattr(row, "events", None) or []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        blob = " ".join(
+            str(ev.get(key) or "")
+            for key in ("label", "detail", "type", "event_type", "event")
+        )
+        if _SPAM_SIGNAL_RE.search(blob):
+            return True
+    return False
+
+
 def _placement_split(
     comms: list[PayflowCommunicationModel], delivered: int
-) -> list[dict[str, Any]]:
-    """Best-effort Inbox / Spam / Promotions from engagement + spam signals."""
-    if delivered <= 0:
-        return [
-            {"label": "Inbox", "volume": 0},
-            {"label": "Spam", "volume": 0},
-            {"label": "Promotions", "volume": 0},
-        ]
+) -> tuple[list[dict[str, Any]], bool]:
+    """Inbox / Spam / Promotions from real signals only.
 
-    inbox = sum(
-        1
-        for c in comms
-        if int(getattr(c, "opens_count", 0) or 0) > 0
-        or int(getattr(c, "clicks_count", 0) or 0) > 0
-    )
-    spam = 0
-    for c in comms:
-        reason = (getattr(c, "restriction_reason", None) or "").lower()
-        if "spam" in reason or "spamreport" in reason:
-            spam += 1
-    inbox = min(delivered, max(0, inbox))
-    spam = min(max(0, delivered - inbox), max(0, spam))
-    promotions = max(0, delivered - inbox - spam)
-    # No placement signals yet — attribute all delivered to Inbox (unknown folder).
-    if inbox + spam + promotions == 0:
-        inbox = delivered
-        promotions = 0
-    return [
-        {"label": "Inbox", "volume": int(inbox)},
-        {"label": "Spam", "volume": int(spam)},
-        {"label": "Promotions", "volume": int(promotions)},
+    Returns (placement rows, available). Never invents Inbox = all delivered.
+    Promotions volume stays 0 — provider does not report tab placement (FE shows N/A).
+    """
+    empty = [
+        {"label": "Inbox", "volume": 0},
+        {"label": "Spam", "volume": 0},
+        {"label": "Promotions", "volume": 0},
     ]
+    if delivered <= 0:
+        return empty, False
+
+    email_comms = [
+        c
+        for c in comms
+        if str(getattr(c, "channel", "") or "").strip().lower() == "email"
+    ]
+    if not email_comms:
+        # Channel filter "all" with only SMS — no email placement.
+        return empty, False
+
+    spam_ids: set[int] = set()
+    for c in email_comms:
+        if _has_spam_signal(c):
+            spam_ids.add(int(c.id))
+
+    inbox = 0
+    for c in email_comms:
+        if int(c.id) in spam_ids:
+            continue
+        opened = int(getattr(c, "opens_count", 0) or 0) > 0
+        clicked = int(getattr(c, "clicks_count", 0) or 0) > 0
+        engaged = opened or clicked or c.status in {
+            PayflowCommStatus.OPENED_READ.value,
+            PayflowCommStatus.PAYMENT_LINK_CLICKED.value,
+        }
+        if engaged:
+            inbox += 1
+
+    spam = len(spam_ids)
+    inbox = min(delivered, max(0, inbox))
+    # Spam reports can arrive after delivery; cap so Inbox + Spam never exceed Delivered.
+    spam = min(max(0, delivered - inbox), max(0, spam))
+    promotions = 0
+    if inbox == 0 and spam == 0:
+        return empty, False
+    return (
+        [
+            {"label": "Inbox", "volume": int(inbox)},
+            {"label": "Spam", "volume": int(spam)},
+            {"label": "Promotions", "volume": int(promotions)},
+        ],
+        True,
+    )
 
 
 def _money(value: float) -> str:

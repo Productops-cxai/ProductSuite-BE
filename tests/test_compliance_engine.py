@@ -26,7 +26,7 @@ def rule(**over):
         "code": f"CMP-T{_SEQ:03d}",
         "name": f"Rule {_SEQ}",
         "version": 1,
-        "category": "Consent & Opt-Out",
+        "category": "Unsubscribe Option",
         "rule_type": "JUR-09",
         "enforcement": "Mandatory",
         "status": "Active",
@@ -429,7 +429,7 @@ def test_missing_time_zone_is_review_required_for_time_based_rules():
 
 def test_consent_expires_after_the_configured_days():
     consent = rule(
-        category="Consent & Opt-Out",
+        category="Unsubscribe Option",
         rule_type="JUR-08",
         action="Block",
         conditions=[cond("Consent", "No")],

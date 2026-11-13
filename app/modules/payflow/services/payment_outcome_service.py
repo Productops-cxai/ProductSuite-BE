@@ -180,8 +180,8 @@ class PayflowPaymentOutcomeService:
             plan.stripe_payment_method_id = str(payment_method_id)[:255]
         if payment_method_type:
             plan.payment_method_type = str(payment_method_type)[:32]
-        if plan.stripe_customer_id and plan.stripe_payment_method_id:
-            plan.auto_charge_enabled = True
+        # Saving a payment method alone must not arm auto-charge — that needs
+        # explicit authorize_recurring (or staff toggling auto_charge later).
 
     def ensure_payment_plan_for_attempt(
         self,
@@ -194,6 +194,7 @@ class PayflowPaymentOutcomeService:
         stripe_customer_id: str | None = None,
         stripe_payment_method_id: str | None = None,
         payment_method_type: str | None = None,
+        authorize_recurring: bool | None = None,
     ) -> PayflowPaymentPlanModel | None:
         if attempt.option_type != PayflowPaymentOptionType.PAYMENT_PLAN.value:
             return None
@@ -275,6 +276,11 @@ class PayflowPaymentOutcomeService:
             elif not paid_first:
                 next_due = date.fromisoformat(str(schedule[0]["due_date"])[:10])
 
+        payload = attempt.provider_payload if isinstance(attempt.provider_payload, dict) else {}
+        if authorize_recurring is None:
+            authorize_recurring = bool(payload.get("authorize_recurring"))
+        auto_charge = bool(authorize_recurring)
+
         plan = PayflowPaymentPlanModel(
             public_id=f"plan_{uuid.uuid4().hex[:16]}",
             client_id=attempt.client_id,
@@ -291,16 +297,24 @@ class PayflowPaymentOutcomeService:
             amount_paid=amount_paid,
             start_date=start,
             next_due_date=next_due,
-            auto_charge_enabled=True,
+            auto_charge_enabled=auto_charge,
             consecutive_charge_failures=0,
             events=[
                 {
                     "at": _utcnow().isoformat(),
                     "label": "Created",
                     "detail": (
-                        "Payment method saved — first charge on start date"
+                        (
+                            "Payment method saved — auto-charge authorized for future due dates"
+                            if auto_charge
+                            else "Payment method saved — future instalments are not auto-charged"
+                        )
                         if setup_only
-                        else "First instalment paid"
+                        else (
+                            "First instalment paid — auto-charge authorized for remaining instalments"
+                            if auto_charge
+                            else "First instalment paid — remaining instalments are not auto-charged"
+                        )
                     ),
                 }
             ],
