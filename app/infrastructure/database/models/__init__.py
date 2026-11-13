@@ -769,6 +769,10 @@ class PayflowCommunicationModel(Base):
     strategy_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("payflow_strategies.id"), nullable=True, index=True
     )
+    # Which of the workflow step's texts was sent: "main", or an audience version written for the
+    # customer's group (e.g. "age_65_plus"); None when the step had no text and a template was sent.
+    # Lets results be compared per version (the step itself: step_id, with the tracking columns below).
+    message_audience: Mapped[str | None] = mapped_column(String(64), nullable=True)
     engagement: Mapped[str | None] = mapped_column(String(128), nullable=True)
     date_bucket: Mapped[str | None] = mapped_column(String(32), nullable=True)
     date_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -1144,6 +1148,9 @@ class PayflowMessageVersionModel(Base):
     step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     template_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which of the step's texts this is: "main", or an audience version written for one group of
+    # customers (e.g. "age_65_plus", workflow_suggestion/audiences.py); None for a template / older rows.
+    audience: Mapped[str | None] = mapped_column(String(64), nullable=True)
     first_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

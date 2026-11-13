@@ -19,8 +19,10 @@ from app.modules.payflow.services.workflow_suggestion.message_prompt import (
     build_message_prompt,
     build_translation_prompt,
 )
+from app.modules.payflow.services.workflow_suggestion.message_brief import LENGTHS, no_subject_style
 from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
+    EMAIL_WORDS,
     MAX_SUBJECT_CHARS,
     check_message,
     check_translation,
@@ -39,11 +41,16 @@ def write_messages(
     *,
     step_ids: list[str] | None = None,
     remarks: str | None = None,
+    plans: dict[str, dict[str, str]] | None = None,
+    audience: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """{step_id: {"subject", "body", "sms_body", "tone"}} for the workflow's Communication steps.
 
     `segment`: {"label", "segment" (fields), "stats"} — the segmenter's shape.
     `step_ids`: write only these messages (the others are context); default all.
+    `plans`: {step_id: brief} - the AI's plan per message for this audience (message_brief.py); a message
+    with a plan is written in the plan's tone (already checked: the code's tone or one step softer).
+    `audience`: who the texts are for ({"key", "label", "accounts", "profile"}, audiences.py).
     """
     steps = {step["id"]: step for step in workflow.get("steps") or [] if step.get("id")}
     stats = segment.get("stats") or {}
@@ -59,9 +66,12 @@ def write_messages(
     written: dict[str, dict[str, Any]] = {}
     feedback: list[dict[str, Any]] = []
     for _ in range(1 + MAX_FIX_ATTEMPTS):
-        briefs = [_brief(steps[step_id], tones[step_id], segment, english) for step_id in pending]
+        briefs = [
+            _brief(steps[step_id], tones[step_id], segment, english, (plans or {}).get(step_id))
+            for step_id in pending
+        ]
         others = _other_messages(steps, tones, written, skip=pending)
-        prompt = build_message_prompt(client, workflow, segment, briefs, others, feedback, remarks)
+        prompt = build_message_prompt(client, workflow, segment, briefs, others, feedback, remarks, audience)
         reply = _messages_by_step(call_llm(prompt, build_message_schema(pending)))
 
         feedback = []
@@ -85,17 +95,21 @@ def write_messages(
 def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Copy of the steps with the written text in their config (other steps unchanged).
 
-    A rewritten message keeps only the language versions written with it: older ones are outdated.
+    A rewritten message keeps only the language versions, audience versions and plan (brief) written with
+    it: older ones are outdated.
     """
     result = []
     for step in steps:
         message = written.get(step.get("id"))
         if message:
             text = {key: value for key, value in message.items() if value}
-            # content_origin: who wrote the text (a later human edit changes it, see email_tracking).
-            config = {**(step.get("config") or {}), **text, "content_origin": "AI Generated"}
-            if not message.get("translations"):
-                config.pop("translations", None)
+            # content_origin: who wrote the text (a later human edit changes it, see email_tracking) -
+            # the AI, unless the message says otherwise (a reviewer's text kept on Regenerate).
+            origin = message.get("content_origin") or "AI Generated"
+            config = {**(step.get("config") or {}), **text, "content_origin": origin}
+            for key in ("translations", "versions", "brief"):
+                if not message.get(key):
+                    config.pop(key, None)
             step = {**step, "config": config}
         result.append(step)
     return result
@@ -157,11 +171,17 @@ def _clean_version(message: Any) -> dict[str, str]:
     return version
 
 
-def _brief(step: dict[str, Any], tone: dict[str, str], segment: dict[str, Any], english: bool) -> dict[str, Any]:
+def _brief(
+    step: dict[str, Any],
+    tone: dict[str, str],
+    segment: dict[str, Any],
+    english: bool,
+    plan: dict[str, str] | None = None,
+) -> dict[str, Any]:
     cfg = step.get("config") or {}
     situation = (segment.get("segment") or {}).get("situation")
     current = {key: cfg[key] for key in ("subject", "body", "sms_body") if cfg.get(key)}
-    return {
+    brief = {
         "step_id": step["id"],
         "title": step.get("title"),
         "channel": cfg.get("channel") or step.get("channel") or CONTACT_CHANNEL,
@@ -176,6 +196,22 @@ def _brief(step: dict[str, Any], tone: dict[str, str], segment: dict[str, Any], 
         or situation == PayflowCollectionStatus.PROMISE_TO_PAY.value,
         "english": english,  # some checks look for English words
     }
+    if plan:
+        low, high = LENGTHS.get(plan.get("length"), EMAIL_WORDS)
+        brief.update(
+            tone=plan.get("tone") or tone["tone"],
+            approach=plan.get("approach"),
+            length_words=f"{low}-{high}",
+            # A message with an email always needs a subject, whatever the plan says ("none" is for SMS only).
+            subject_style=None if brief["channel"] != "SMS" and no_subject_style(plan.get("subject_style"))
+            else plan.get("subject_style"),
+            lead_option=plan.get("lead_option"),
+            call_to_action=plan.get("call_to_action"),
+            why=plan.get("why"),
+        )
+        if brief["tone"] != tone["tone"]:
+            brief.pop("why_this_tone")  # the rules' reason is for their tone; the plan chose one step softer
+    return brief
 
 
 def _other_messages(

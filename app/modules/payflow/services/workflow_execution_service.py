@@ -38,6 +38,7 @@ from app.modules.payflow.services.workflow_condition_runtime import (
     timedelta_for_unit,
 )
 from app.modules.payflow.services.workflow_contact_runtime import (
+    audience_message_config,
     flag_unreachable,
     is_contact_step,
     localized_message_config,
@@ -2357,6 +2358,8 @@ class WorkflowExecutionService:
             return
 
         channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
+        # The text written for the customer's audience when the step has one (else its main text).
+        cfg, audience = audience_message_config(cfg, account)
         subject, body = self._render_channel_message(
             cfg, step, channel=channel, purpose=str(purpose), account=account, strategy=strategy
         )
@@ -2372,7 +2375,7 @@ class WorkflowExecutionService:
             client_id=run.client_id,
             compliance_review_approved=review_approved,
             tracking=self._message_tracking(
-                run, account, strategy, step, channel=channel, purpose=str(purpose)
+                run, account, strategy, step, channel=channel, purpose=str(purpose), cfg=cfg, audience=audience
             ),
         )
         self._record_send_result(run, account, strategy, step_run, channel=channel, result=result)
@@ -2389,7 +2392,8 @@ class WorkflowExecutionService:
         payment_link: str,
         review_approved: bool = False,
     ) -> None:
-        cfg = _cfg(step)
+        # The text written for the customer's audience when the step has one (else its main text).
+        cfg, audience = audience_message_config(_cfg(step), account)
         channels = preferred_contact_channels(self.db, account)
         attempts: list[dict[str, Any]] = []
         chosen: str | None = None
@@ -2416,7 +2420,7 @@ class WorkflowExecutionService:
                 client_id=run.client_id,
                 compliance_review_approved=review_approved,
                 tracking=self._message_tracking(
-                    run, account, strategy, step, channel=channel, purpose=purpose
+                    run, account, strategy, step, channel=channel, purpose=purpose, cfg=cfg, audience=audience
                 ),
             )
             attempt = {**result, "attempt_channel": channel}
@@ -2563,15 +2567,21 @@ class WorkflowExecutionService:
         *,
         channel: str,
         purpose: str,
+        cfg: dict[str, Any] | None = None,
+        audience: str | None = None,
     ) -> dict[str, Any] | None:
-        """What is recorded on the communication for subject performance (see email_tracking)."""
+        """What is recorded on the communication for subject performance (see email_tracking).
+
+        `cfg`: the step config the message was sent from - with the customer's audience version in it
+        (audience_message_config), so the text recorded is the one that was sent; default the step's own.
+        `audience`: which of the step's texts that is ("main", "age_65_plus", ...; None: a template)."""
         try:
             from app.modules.payflow.services.email_tracking import (
                 ORIGIN_TEMPLATE,
                 reminder_stage,
             )
 
-            cfg = _cfg(step)
+            cfg = cfg if cfg is not None else _cfg(step)
             subject, body = self._channel_message_source(
                 cfg, step, channel=channel, purpose=purpose, account=account
             )
@@ -2582,10 +2592,11 @@ class WorkflowExecutionService:
                 "step_id": step.get("id"),
                 "strategy_version": int(getattr(strategy, "version", None) or 1),
                 "run_id": run.id,
-                "portfolio_id": run.portfolio_id or getattr(account, "portfolio_id", None),
-                "reminder_stage": reminder_stage(list(strategy.steps or []), step, purpose),
+                "portfolio_id": getattr(run, "portfolio_id", None) or getattr(account, "portfolio_id", None),
+                "reminder_stage": reminder_stage(list(getattr(strategy, "steps", None) or []), step, purpose),
                 "template_id": None if own_text else (cfg.get("template_id") or step.get("template_id")),
                 "origin": (cfg.get("content_origin") or "Human Created") if own_text else ORIGIN_TEMPLATE,
+                "message_audience": audience,
             }
         except Exception:  # noqa: BLE001 - tracking never blocks a send
             logger.exception("failed to build message tracking for run_id=%s", run.id)

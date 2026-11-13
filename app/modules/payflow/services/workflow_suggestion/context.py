@@ -158,13 +158,18 @@ def load_suggest_scope(
     return scope, accounts
 
 
-def load_segment_languages(db: Session, workflow: dict[str, Any]) -> list[str]:
-    """Language codes of the accounts a saved workflow is for: the eligible accounts of its scope (portfolio,
-    or the client's parent accounts) that fit its segment, most accounts first."""
+def load_segment_members(db: Session, workflow: dict[str, Any]) -> list[PayflowAccountModel]:
+    """The accounts a saved workflow is for: the eligible accounts of its scope (portfolio, or the
+    client's parent accounts) that fit its segment."""
     try:
         _, accounts = load_suggest_scope(db, workflow["client_id"], workflow.get("portfolio_id"))
     except NotFoundError:
         return []
     eligible, _ = filter_eligible(accounts)
     segment = workflow.get("segment") or {}
-    return accounts_languages(eligible, lambda account: account_fits_segment(account, segment))
+    return [account for account in eligible if account_fits_segment(account, segment)]
+
+
+def load_segment_languages(db: Session, workflow: dict[str, Any]) -> list[str]:
+    """Language codes of the accounts a saved workflow is for (load_segment_members), most accounts first."""
+    return accounts_languages(load_segment_members(db, workflow), lambda account: True)

@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.modules.payflow.services.workflow_suggestion.message_tone import FINAL_NOTICE, NEUTRAL
+from app.modules.payflow.services.workflow_suggestion.message_tone import FINAL_NOTICE, FIRM, NEUTRAL
 
 # The variables the worker fills per account (workflow_execution_service._render).
 VARIABLES = {
@@ -74,6 +74,23 @@ _TYPED_ADDRESS = re.compile(
 )
 _NUMBER_RUN = re.compile(r"\+?\(?\d[\d\s().-]{5,}\d")  # "1-800-555-0199", "(416) 555 0199"
 PHONE_DIGITS = 7
+# In an email the {{payment_link}} is cut out of the text and shown as a "Pay Now" button below it
+# (infrastructure/email/collection_provider.py): text around it on the same line would be left broken
+# ("You can pay securely at  in a minute.").
+_LINK_ALONE = re.compile(r"^\s*\{\{\s*payment_link\s*\}\}\s*$")
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️]")
+# In an email the customer sees a "Pay Now" button, not a link.
+_LINK_WORDS = re.compile(r"\b(?:the|this) (?:secure )?link\b", re.IGNORECASE)
+# A calm (Friendly, Clear, Supportive, Neutral) subject is a reminder, never a demand.
+_PRESSURE = re.compile(
+    r"\b(?:action (?:needed|required)|urgent\w*|important|immediate\w*|asap|act now)\b", re.IGNORECASE
+)
+# Customers are written FOR, never about: no word about their age or the group they are in (English text).
+_GROUP_WORDS = re.compile(
+    r"\b(?:seniors?|senior citizens?|elderly|older (?:people|adults|customers)|young (?:people|adults|customers)|"
+    r"millennials?|gen ?z|retirees?|pensioners?|at your age|your age)\b",
+    re.IGNORECASE,
+)
 
 
 def render_sample(text: str) -> str:
@@ -128,9 +145,21 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
     # The one consequence allowed — and it must be stated (checked for English text only).
     if brief["tone"] == FINAL_NOTICE and brief.get("english", True) and not _REVIEW_WORDS.search(text):
         errors.append(f"{where}: a Final notice must say the account will then be passed to our team for review")
+    if _EMOJI.search(text):
+        errors.append(f"{where}: has an emoji or a symbol - use words only")
+    group = brief.get("english", True) and _GROUP_WORDS.search(text)
+    if group:
+        errors.append(f"{where}: '{group.group(0)}' is about the customer's age or group - write for them, never "
+                      "about them")
+    pressure = brief["tone"] not in (FIRM, FINAL_NOTICE) and brief.get("english", True) and _PRESSURE.search(subject)
+    if pressure:
+        errors.append(f"{where}: '{pressure.group(0)}' in the subject sounds like pressure - a {brief['tone']} "
+                      "subject is a calm reminder")
 
     if brief["channel"] == "Email":
         errors += _check_email(where, subject, body)
+        if brief.get("english", True) and _LINK_WORDS.search(body):
+            errors.append(f"{where}: in an email the customer sees a Pay Now button - call it the button, not the link")
     else:
         errors += _check_sms(where, body)
     if body.strip() in {other.strip() for other in other_bodies}:
@@ -148,7 +177,17 @@ def _check_email(where: str, subject: str, body: str) -> list[str]:
     low, high = EMAIL_WORDS
     if not low <= words <= high:
         errors.append(f"{where}: email body has {words} words - write {low} to {high}")
+    if _link_inside_a_line(body):
+        errors.append(
+            f"{where}: put {{{{payment_link}}}} alone on its own line - in the email it becomes the Pay Now button, "
+            "so text on the same line would be left broken"
+        )
     return errors
+
+
+def _link_inside_a_line(text: str) -> bool:
+    """True when {{payment_link}} shares its line with other text."""
+    return any("payment_link" in line and not _LINK_ALONE.match(line) for line in text.splitlines())
 
 
 def _check_sms(where: str, body: str) -> list[str]:
@@ -191,7 +230,9 @@ def check_translation(
         if not text:
             errors.append(f"{part}: missing - translate it too")
             continue
-        errors += _check_translated_text(part, text, original, is_sms=key == SMS_KEY or channel == "SMS")
+        errors += _check_translated_text(
+            part, text, original, is_sms=key == SMS_KEY or channel == "SMS", may_leave_out=key == "subject"
+        )
         if key == "subject" and ("\n" in text or len(render_sample(text)) > MAX_SUBJECT_CHARS):
             errors.append(f"{part}: subject must be one line of at most {MAX_SUBJECT_CHARS} characters")
     return errors
@@ -201,10 +242,14 @@ def _variable_list(names: set[str]) -> str:
     return ", ".join(f"{{{{{name}}}}}" for name in sorted(names)) or "none"
 
 
-def _check_translated_text(where: str, text: str, original: str, *, is_sms: bool) -> list[str]:
+def _check_translated_text(
+    where: str, text: str, original: str, *, is_sms: bool, may_leave_out: bool = False
+) -> list[str]:
+    """`may_leave_out` (a subject): a variable of the original may be left out - a natural subject in another
+    language often has no room for e.g. {{brand_name}}, which the email shows anyway - but none may be added."""
     errors: list[str] = []
     used, wanted = set(_VARIABLE.findall(text)), set(_VARIABLE.findall(original))
-    if used != wanted:
+    if used != wanted and not (may_leave_out and used < wanted):
         errors.append(
             f"{where}: must use exactly the variables of the original ({_variable_list(wanted)}), written the "
             f"same way - it uses {_variable_list(used)}"
@@ -220,6 +265,10 @@ def _check_translated_text(where: str, text: str, original: str, *, is_sms: bool
         errors.append(f"{where}: types a web or email address - the only link allowed is {{{{payment_link}}}}")
     if text.strip() == original.strip():
         errors.append(f"{where}: is not translated")
+    if not is_sms and _link_inside_a_line(text) and not _link_inside_a_line(original):
+        errors.append(f"{where}: keep {{{{payment_link}}}} alone on its own line, as in the original")
+    if _EMOJI.search(text):
+        errors.append(f"{where}: has an emoji or a symbol - use words only")
     low, high = TRANSLATION_LENGTH_RATIO
     ratio = len(leftover.strip()) / max(len(_VARIABLE.sub("", original).strip()), 1)
     if not low <= ratio <= high:

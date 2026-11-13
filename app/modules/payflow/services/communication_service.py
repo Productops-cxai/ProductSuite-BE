@@ -930,7 +930,8 @@ class PayflowCommunicationService:
         tracking: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """`tracking`: what email_tracking.apply_tracking records on the communication (the text
-        before customer values were filled in, its workflow step, reminder stage, ...)."""
+        before customer values were filled in, its workflow step, reminder stage, which of the step's
+        texts was sent - "main" or an audience version such as "age_65_plus" - ...)."""
         channel_norm = (channel or "Email").strip()
         purpose_norm = purpose or "Payment Reminder"
 

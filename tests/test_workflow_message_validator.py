@@ -147,9 +147,9 @@ def test_final_notice_must_name_the_review_in_english_only():
 
 def test_email_needs_a_short_subject_and_a_real_body():
     assert check_message({**EMAIL, "subject": ""}, brief(), []) == ["s2: an email needs a subject"]
-    long_subject = check_message({**EMAIL, "subject": "Important information about your account " * 2}, brief(), [])
+    long_subject = check_message({**EMAIL, "subject": "A reminder with information about your account " * 2}, brief(), [])
     assert long_subject == ["s2: subject must be one line of at most 60 characters"]
-    short = check_message({**EMAIL, "body": "Hi {{first_name}}, pay: {{payment_link}} {{brand_name}}"}, brief(), [])
+    short = check_message({**EMAIL, "body": "Hi {{first_name}}, pay:\n{{payment_link}}\n{{brand_name}}"}, brief(), [])
     assert short == ["s2: email body has 7 words - write 30 to 200"]  # counted with sample values
 
 

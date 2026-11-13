@@ -16,6 +16,10 @@ from app.modules.payflow.services.workflow_suggestion.message_validator import (
     MAX_SUBJECT_CHARS,
 )
 from app.modules.payflow.services.workflow_suggestion.prompt import compact_step
+
+# The SMS length the writer aims for (the check allows MAX_SMS_CHARS): translations run ~15-25% longer and must
+# fit MAX_SMS_CHARS too.
+SMS_TARGET_CHARS = 260
 from app.shared.enums import PayflowCollectionStatus
 
 # Existing templates, shown as style examples: (template id, tone it is written in).
@@ -42,12 +46,18 @@ def build_message_prompt(
     others: list[dict[str, Any]],
     feedback: list[dict[str, Any]] | None = None,
     remarks: str | None = None,
+    audience: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    """`briefs`: the messages to write (step_id, title, channel, purpose, timing, tone, why, current text).
+    """`briefs`: the messages to write (step_id, title, channel, purpose, timing, tone, why, current text, and
+    the AI's plan when there is one: approach, length_words, subject_style, lead_option, call_to_action).
     `others`: the workflow's other messages, already written (context only).
     `feedback` (on a retry): [{"step_id", "message", "errors"}] from message_validator.
-    `remarks` (on a rewrite): what the reviewer asked for."""
-    parts = [_client_lines(client), _segment_lines(segment), _workflow_lines(workflow)]
+    `remarks` (on a rewrite): what the reviewer asked for.
+    `audience` ({"key", "label", "accounts", "profile"}): who these texts are for (audiences.py)."""
+    parts = [_client_lines(client), _segment_lines(segment)]
+    if audience:
+        parts.append(_audience_lines(audience))
+    parts.append(_workflow_lines(workflow))
     parts.append("Messages to write (one per step_id):\n" + "\n".join(_brief_line(b) for b in briefs))
     if client.get("email_performance"):
         parts.append(_performance_lines(client["email_performance"]))
@@ -107,6 +117,23 @@ Firm is never rude. Never threaten, shame or blame. Never mention courts, lawyer
 credit bureaus, fees or deadlines (no "within 48 hours"), and never guess at the customer's personal situation.
 Never hint at consequences either: no "to avoid further action", no service being cut or interrupted, no
 account being sent to a collection agency - only the Final notice line above.
+Write for the customer, never about them: no word about their age, where they live or a group they are in.
+No emojis, no jokes about money.
+
+## The plan for each message
+A message may come with a plan (approach, length_words, subject_style, lead_option, call_to_action, why) made for
+its audience. Follow it: write in that approach and tone, keep the email body within length_words, give the
+subject that style, put the lead_option first (other options may follow), and build the ask as call_to_action
+says. The approach shapes the whole text - greeting, wording, warmth, formality, sentence length - not only its
+first line. The audience totals are averages for many customers - never type them.
+
+## How customers see the message
+- Email: the text, then a box showing their balance, then a "Pay Now" button that opens their payment page.
+  {{{{payment_link}}}} becomes that button: put it alone on its own line after the ask and let the text lead to it
+  (e.g. "Use the Pay Now button below to pay securely."). Never put {{{{payment_link}}}} inside a sentence, and
+  in an email call it the button, not a link.
+- SMS: the link stays in the text.
+- The payment page is the only action: never ask them to reply, call or write.
 
 ## Writing rules
 - Plain words and short sentences (easy to read). Talk to the customer as "you".
@@ -120,10 +147,13 @@ account being sent to a collection agency - only the Final notice line above.
 - Offer only what the payment page really offers (listed with the client).
 - Email: a subject of at most {MAX_SUBJECT_CHARS} characters AFTER variables are filled
   ({{{{brand_name}}}} alone is ~24 characters — keep your own words short, ideally under 35 characters of
-  plain text). One line only. Body: {low}-{high} words, starts with "Hi {{{{first_name}}}}," and ends with
-  {{{{brand_name}}}}.
-- SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in. Start with "{{{{brand_name}}}}:"
-  and end with "Reply STOP to opt out."
+  plain text). One line only. Body: {low}-{high} words, starts with "Hi {{{{first_name}}}}," (or "Dear
+  {{{{first_name}}}}," when the plan's approach is formal) and ends with {{{{brand_name}}}}.
+- Subjects are in the message's tone: a Friendly, Clear, Supportive or Neutral subject is a calm reminder, never a
+  demand - no "action needed", "action required", "urgent", "important" or "immediately".
+- SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in - aim for {SMS_TARGET_CHARS} or fewer:
+  it is also translated, and other languages run longer. Start with "{{{{brand_name}}}}:" and end with
+  "Reply STOP to opt out."
 - Channel "{CONTACT_CHANNEL}": PayFlow sends each customer either the email or the SMS (whichever reaches them),
   so write both - the email in subject + body, and the same message as an SMS in sms_body (the SMS rules above).
   Never mention the other channel (no "we also sent you an email").
@@ -166,16 +196,32 @@ def _workflow_lines(workflow: dict[str, Any]) -> str:
     )
 
 
+def _audience_lines(audience: dict[str, Any]) -> str:
+    """Who these texts are for - totals only (audiences.find_audiences)."""
+    profile = {key: value for key, value in (audience.get("profile") or {}).items()
+               if key != "accounts" and value is not None}
+    if audience.get("key") == "main":
+        who = (f"the main text - {audience.get('accounts', 0)} accounts; it is also sent to anyone without a "
+               "version of their own")
+    else:
+        who = f"{audience.get('label')} - {audience.get('accounts', 0)} accounts (their own version)"
+    return (f"These texts are for: {who}. Totals (% of the accounts): {json.dumps(profile, ensure_ascii=False)}\n"
+            "Write for them - never about them: no word about their age, where they live or a group they are in.")
+
+
 def _brief_line(brief: dict[str, Any]) -> str:
-    keys = ("step_id", "title", "channel", "purpose", "timing", "path_so_far", "tone", "why_this_tone", "current_text")
+    keys = ("step_id", "title", "channel", "purpose", "timing", "path_so_far", "tone", "why_this_tone",
+            "approach", "length_words", "subject_style", "lead_option", "call_to_action", "why", "current_text")
     return json.dumps({key: brief[key] for key in keys if brief.get(key)}, ensure_ascii=False)
 
 
 def _performance_lines(performance: dict[str, Any]) -> str:
     """This client's own measured email subjects (email_subject_ai.performance_context): numbers and
     subject text only, no customer data."""
+    source = ", ".join(part for part in (performance.get("scope"), performance.get("period")) if part)
     parts = [
-        "Measured results of this client's past emails (their own history; open rates are estimates; "
+        f"Measured results of this client's past emails ({f'{source}; ' if source else ''}their own history; "
+        "open rates are estimates; "
         "conversion = completed payments / delivered emails). Use them for the emails you write:\n"
         "- For an email with the same purpose or reminder stage, build on what the best subjects do "
         "(their angle and wording style) - do not copy one word for word.\n"
@@ -187,6 +233,11 @@ def _performance_lines(performance: dict[str, Any]) -> str:
     if performance.get("weak"):
         parts.append(
             "Weak subjects:\n" + "\n".join(json.dumps(item, ensure_ascii=False) for item in performance["weak"])
+        )
+    if performance.get("decisions"):
+        parts.append(
+            "Reviewer decisions on earlier AI suggestions (newest first) - write like what they accepted or how "
+            "they edited, not like what they rejected:\n" + "\n".join(performance["decisions"])
         )
     return "\n".join(parts)
 
@@ -219,12 +270,14 @@ Reply with JSON only, matching the provided schema: one entry per step_id, with 
 
 ## Rules
 - Translate faithfully: the same meaning and the same tone (given per message). Add nothing, leave nothing out.
-- Keep every {{{{variable}}}} exactly as written - never translate, rename, add or remove one.
+- Keep every {{{{variable}}}} exactly as written - never translate, rename, add or remove one - in the subject too.
+- Keep the layout: the same lines and paragraphs. In an email, {{{{payment_link}}}} stays alone on its own line.
 - Do not add numbers, amounts, dates, deadlines, links, phone numbers or email addresses.
 - Write naturally for the customer, in the polite form of address (e.g. "vous" in French).
 - Email subject: one line, at most {MAX_SUBJECT_CHARS} characters with the values filled in.
-- SMS: at most {MAX_SMS_CHARS} characters with the values filled in. Translate the opt-out sentence too,
-  keeping the word STOP as it is (e.g. French: "Répondez STOP pour vous désabonner.")."""
+- SMS: at most {MAX_SMS_CHARS} characters with the values filled in - when the translation runs longer, say the
+  same thing in fewer words. Translate the opt-out sentence too, keeping the word STOP as it is (e.g. French:
+  "Répondez STOP pour vous désabonner.")."""
     parts = [
         f"Client: {client['name']}",
         "Messages to translate (one per step_id):\n"
