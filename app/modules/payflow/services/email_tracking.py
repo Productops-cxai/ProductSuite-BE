@@ -132,8 +132,10 @@ def record_message_version(
     step_id: str | None = None,
     strategy_version: int | None = None,
     template_id: str | None = None,
+    audience: str | None = None,
 ) -> PayflowMessageVersionModel:
-    """The stored row for this exact text (per client), created the first time it is sent."""
+    """The stored row for this exact text (per client), created the first time it is sent.
+    `audience`: which of the step's texts it is ("main", or an audience version such as "age_65_plus")."""
     digest = content_hash(channel, subject_template, body_template)
     now = datetime.now(timezone.utc)
 
@@ -164,6 +166,7 @@ def record_message_version(
             step_id=step_id,
             strategy_version=strategy_version,
             template_id=template_id,
+            audience=audience,
             first_used_at=now,
         )
         try:
@@ -182,7 +185,8 @@ def record_message_version(
 def apply_tracking(db: Session, comm: PayflowCommunicationModel, tracking: dict[str, Any] | None) -> None:
     """Fill the communication's tracking columns. `tracking` keys (all optional): subject_template,
     body_template, step_id, strategy_version, run_id, portfolio_id, reminder_stage, language,
-    template_id, origin, is_manual."""
+    template_id, origin, is_manual, message_audience (which of the step's texts: "main" or an audience
+    version such as "age_65_plus" - the subject / body templates are that text's)."""
     tracking = tracking or {}
     is_email = (comm.channel or "").strip().lower() != "sms"
     subject_template = tracking.get("subject_template") if is_email else None
@@ -197,6 +201,7 @@ def apply_tracking(db: Session, comm: PayflowCommunicationModel, tracking: dict[
     comm.reminder_stage = tracking.get("reminder_stage")
     comm.language = tracking.get("language")
     comm.is_manual = bool(tracking.get("is_manual"))
+    comm.message_audience = tracking.get("message_audience")
     body_template = tracking.get("body_template")
     if body_template is None:
         return  # text typed for one customer: nothing reusable to keep as a version
@@ -214,5 +219,6 @@ def apply_tracking(db: Session, comm: PayflowCommunicationModel, tracking: dict[
         step_id=comm.step_id,
         strategy_version=comm.strategy_version,
         template_id=tracking.get("template_id"),
+        audience=comm.message_audience,
     )
     comm.message_version_id = version.id

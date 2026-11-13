@@ -230,7 +230,9 @@ def check_translation(
         if not text:
             errors.append(f"{part}: missing - translate it too")
             continue
-        errors += _check_translated_text(part, text, original, is_sms=key == SMS_KEY or channel == "SMS")
+        errors += _check_translated_text(
+            part, text, original, is_sms=key == SMS_KEY or channel == "SMS", may_leave_out=key == "subject"
+        )
         if key == "subject" and ("\n" in text or len(render_sample(text)) > MAX_SUBJECT_CHARS):
             errors.append(f"{part}: subject must be one line of at most {MAX_SUBJECT_CHARS} characters")
     return errors
@@ -240,10 +242,14 @@ def _variable_list(names: set[str]) -> str:
     return ", ".join(f"{{{{{name}}}}}" for name in sorted(names)) or "none"
 
 
-def _check_translated_text(where: str, text: str, original: str, *, is_sms: bool) -> list[str]:
+def _check_translated_text(
+    where: str, text: str, original: str, *, is_sms: bool, may_leave_out: bool = False
+) -> list[str]:
+    """`may_leave_out` (a subject): a variable of the original may be left out - a natural subject in another
+    language often has no room for e.g. {{brand_name}}, which the email shows anyway - but none may be added."""
     errors: list[str] = []
     used, wanted = set(_VARIABLE.findall(text)), set(_VARIABLE.findall(original))
-    if used != wanted:
+    if used != wanted and not (may_leave_out and used < wanted):
         errors.append(
             f"{where}: must use exactly the variables of the original ({_variable_list(wanted)}), written the "
             f"same way - it uses {_variable_list(used)}"

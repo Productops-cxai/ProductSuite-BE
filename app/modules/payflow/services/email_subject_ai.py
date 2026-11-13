@@ -57,6 +57,7 @@ from app.modules.payflow.services.email_tracking import (
     ORIGIN_HUMAN,
     ORIGIN_TEMPLATE,
     REMINDER_STAGES,
+    content_hash,
     normalize_subject,
     reminder_stage,
     subject_key,
@@ -65,6 +66,7 @@ from app.modules.payflow.services.email_tracking import (
 # The AI is always reached through message_writer.call_llm (looked up at call time), so the
 # test suite's one switch that keeps tests away from the real AI covers this module too.
 from app.modules.payflow.services.workflow_suggestion import message_writer
+from app.modules.payflow.services.workflow_suggestion.audiences import audience_label
 
 logger = logging.getLogger("app.payflow.email_subject_ai")
 
@@ -85,6 +87,16 @@ WEAK_RECOMMENDATIONS = (RECOMMEND_REVISE, RECOMMEND_TEST, RECOMMEND_REPLACE)
 AUTOMATIC_AUTHOR = "PayFlow AI (automatic check)"
 # The automatic check does not raise the same finding for the same text again within this time.
 REPEAT_AFTER_DAYS = 30
+# A weak email must be weak in each period with enough of its emails: the last CONFIRM_DAYS days and before.
+CONFIRM_DAYS = 30
+# Reviewer decisions on earlier proposals given to the AI writers (newest first) - see decision_lessons.
+MAX_DECISION_LESSONS = 8
+# History for the AI that writes workflow emails (performance_context): the closest scope with at least this
+# many measured subjects, the recent months first; and at most this many subjects per audience.
+CONTEXT_ENOUGH_SUBJECTS = 3
+CONTEXT_RECENT_DAYS = 180
+CONTEXT_RECENT_LABEL = "last 6 months"
+CONTEXT_PER_AUDIENCE = 3
 VIEW_WORKFLOWS = "view_workflows"
 MANAGE_WORKFLOWS = "create_edit_workflows"
 
@@ -715,6 +727,7 @@ class PayflowEmailSubjectAiService:
             client = {
                 **load_client_context(self.db, client_id),
                 "payment_options": load_payment_options(self.db, client_id),
+                "email_performance": self.performance_context(client_id),  # incl. reviewer decisions
             }
             written = message_writer.write_messages(
                 client, workflow, {"segment": {}, "stats": {}}, step_ids=["draft"], remarks=request
@@ -755,14 +768,43 @@ class PayflowEmailSubjectAiService:
             ),
         }
 
-    def performance_context(self, client_id: int) -> dict[str, Any] | None:
-        """This client's measured subjects, for the AI that writes workflow emails (None = no history)."""
-        items = self.subjects.aggregate(
-            SubjectFilters(client_ids=[client_id]), [C.subject_key, C.reminder_stage, C.purpose]
-        )
-        measured = sorted((i for i in items if not i["low_sample"]), key=lambda i: -i["conversion"])
-        if not measured:
+    def performance_context(
+        self,
+        client_id: int,
+        *,
+        portfolio_id: int | None = None,
+        strategy_id: int | None = None,
+        audiences: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """This client's measured subjects, for the AI that writes workflow emails (None = no history).
+
+        The closest history that has enough measured subjects (CONTEXT_ENOUGH_SUBJECTS): this workflow
+        (`strategy_id`), then its portfolio, then the whole client - each for the recent months
+        (CONTEXT_RECENT_DAYS) first, then all time. When none has enough, the closest one with any.
+        `audiences`: audience keys ("age_65_plus", ...) - each one's own results in that same history (the
+        emails its own version went to), under "by_audience"."""
+        recent = datetime.now(timezone.utc) - timedelta(days=CONTEXT_RECENT_DAYS)
+        base = SubjectFilters(client_ids=[client_id])
+        scopes = []
+        if strategy_id is not None:
+            scopes.append(("this workflow", replace(base, strategy_id=strategy_id)))
+        if portfolio_id is not None:
+            scopes.append(("this portfolio", replace(base, portfolio_ids=(portfolio_id,))))
+        scopes.append(("this client", base))
+        chosen = fallback = None
+        for scope, filters in scopes:
+            for period, window in ((CONTEXT_RECENT_LABEL, replace(filters, start=recent)), ("all time", filters)):
+                found = self._measured(window)
+                if len(found) >= CONTEXT_ENOUGH_SUBJECTS:
+                    chosen = (scope, period, window, found)
+                    break
+                if found and fallback is None:
+                    fallback = (scope, period, window, found)
+            if chosen:
+                break
+        if not (chosen or fallback):
             return None
+        scope, period, window, measured = chosen or fallback
 
         def entry(item: dict[str, Any]) -> dict[str, Any]:
             subject, stage, purpose = item["group"]
@@ -780,11 +822,56 @@ class PayflowEmailSubjectAiService:
         middle = median(i["conversion"] for i in measured)
         best = measured[:5]
         weak = [i for i in reversed(measured) if i not in best and i["conversion"] < middle][:3]
+        by_audience = {}
+        for key in audiences or []:
+            own = self._measured(window, extra=[C.message_audience == key])
+            if own:
+                by_audience[key] = [entry(i) for i in own[:CONTEXT_PER_AUDIENCE]]
         return {
             "best": [entry(i) for i in best],
             "weak": [entry(i) for i in weak],
             "min_deliveries": min_deliveries(),
+            "scope": scope,
+            "period": period,
+            "by_audience": by_audience,
+            "decisions": self.decision_lessons(client_id),
         }
+
+    def decision_lessons(self, client_id: int) -> list[str]:
+        """This client's reviewer decisions on earlier AI proposals, newest first (at most MAX_DECISION_LESSONS):
+        what was accepted, how a proposal was edited, what was rejected - with the reviewer's note. Text as
+        written on workflows ({{placeholders}} kept) and the reviewer's own words: no customer data."""
+        rows = (
+            self.db.query(PayflowMessageProposalModel)
+            .filter(
+                PayflowMessageProposalModel.client_id == client_id,
+                PayflowMessageProposalModel.status.in_([STATUS_ACCEPTED, STATUS_EDITED, STATUS_REJECTED]),
+                PayflowMessageProposalModel.proposed_subject.isnot(None),
+            )
+            .order_by(PayflowMessageProposalModel.decided_at.desc(), PayflowMessageProposalModel.id.desc())
+            .limit(MAX_DECISION_LESSONS)
+            .all()
+        )
+        lessons = []
+        for row in rows:
+            evidence = row.evidence or {}
+            where = " · ".join(part for part in (evidence.get("reminder_stage"), evidence.get("purpose")) if part)
+            if row.status == STATUS_ACCEPTED:
+                what = f'ACCEPTED: "{row.proposed_subject}" instead of "{row.existing_subject}"'
+            elif row.status == STATUS_REJECTED:
+                what = f'REJECTED: "{row.proposed_subject}" (the reviewer kept "{row.existing_subject}")'
+            elif row.final_subject == row.proposed_subject:
+                what = f'EDITED: the reviewer kept the subject "{row.proposed_subject}" and rewrote the body'
+            else:
+                what = f'EDITED: the AI proposed "{row.proposed_subject}"; the reviewer used "{row.final_subject}"'
+            note = f" - reviewer's note: {row.decision_note[:300]}" if row.decision_note else ""
+            lessons.append(f"- {f'[{where}] ' if where else ''}{what}{note}")
+        return lessons
+
+    def _measured(self, filters: SubjectFilters, *, extra: list[Any] | None = None) -> list[dict[str, Any]]:
+        """Subjects (per reminder stage and purpose) with enough delivered emails, best conversion first."""
+        items = self.subjects.aggregate(filters, [C.subject_key, C.reminder_stage, C.purpose], extra=extra)
+        return sorted((i for i in items if not i["low_sample"]), key=lambda i: -i["conversion"])
 
     # ------------------------------------------------------------------ low performers (proposals)
 
@@ -894,6 +981,10 @@ class PayflowEmailSubjectAiService:
         ]
         peers = _peer_medians(peer_rows)
         recommendation, reason = self._classify(row, peers)
+        if recommendation in WEAK_RECOMMENDATIONS:
+            recommendation, reason = self._confirm_across_periods(
+                client_filters, strategy, step, key, stage, purpose, recommendation, reason
+            )
         return {
             "subject": subject,
             "body": body,
@@ -906,6 +997,54 @@ class PayflowEmailSubjectAiService:
             "reason": reason,
             "examples": sorted((r for r in peer_rows if not r["low_sample"]), key=lambda r: -r["conversion"])[:3],
         }
+
+    def _confirm_across_periods(
+        self,
+        client_filters: SubjectFilters,
+        strategy: PayflowStrategyModel,
+        step: dict[str, Any],
+        key: str | None,
+        stage: str,
+        purpose: str,
+        recommendation: str,
+        reason: str,
+    ) -> tuple[str, str]:
+        """A weak finding holds only when the email is weak in every period that has enough of its emails:
+        the last CONFIRM_DAYS days and the time before. With only one such period the finding stands as it is
+        (min_deliveries already keeps single low-volume results out). Weak in one period but in line in the
+        other → Retain: one bad stretch is not enough to replace a template."""
+        split = datetime.now(timezone.utc) - timedelta(days=CONFIRM_DAYS)
+        verdicts = []
+        for label, window in ((f"in the last {CONFIRM_DAYS} days", {"start": split}), ("before that", {"end": split})):
+            own = self.subjects.aggregate(
+                replace(client_filters, strategy_id=strategy.id, **window),
+                [C.subject_key],
+                extra=[C.step_id == step.get("id"), C.subject_key == key],
+            )
+            row = own[0] if own else None
+            if row is None or row["low_sample"]:
+                continue
+            peers = _peer_medians(
+                [
+                    r
+                    for r in self.subjects.subject_rows(
+                        replace(client_filters, reminder_stage=stage, purpose=purpose, **window)
+                    )
+                    if r["subject_key"] != key
+                ]
+            )
+            if peers is not None:
+                verdicts.append((label, self._classify(row, peers)[0]))
+        if len(verdicts) < 2:
+            return recommendation, reason
+        fine = [label for label, verdict in verdicts if verdict not in WEAK_RECOMMENDATIONS]
+        if fine:
+            return (
+                RECOMMEND_RETAIN,
+                f"{reason} But it is not weak in every period: it was in line with comparable templates "
+                f"{' and '.join(fine)}. It is kept, and checked again as new results come in.",
+            )
+        return recommendation, f"{reason} It was weak both in the last {CONFIRM_DAYS} days and before that."
 
     def analyze_workflow(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
         """Compare each email step of a workflow with the client's comparable templates and store a
@@ -1140,6 +1279,10 @@ class PayflowEmailSubjectAiService:
             client = {
                 **load_client_context(self.db, strategy.client_id),
                 "payment_options": load_payment_options(self.db, strategy.client_id),
+                # Its measured results and the reviewers' decisions on earlier proposals (feedback).
+                "email_performance": self.performance_context(
+                    strategy.client_id, portfolio_id=strategy.portfolio_id, strategy_id=strategy.id
+                ),
             }
             written = message_writer.write_messages(
                 client, workflow, _stored_segment(workflow), step_ids=[step["id"]], remarks=remarks
@@ -1186,6 +1329,36 @@ class PayflowEmailSubjectAiService:
             "created_at": row.created_at,
             "decided_by": row.decided_by,
             "decided_at": row.decided_at,
+            "result": self._since_decision(row),
+        }
+
+    def _since_decision(self, row: PayflowMessageProposalModel) -> dict[str, Any] | None:
+        """For an accepted / edited proposal: how the text it put on the workflow has done since - its own
+        message version, found by the same text fingerprint every sent email is recorded with. None before a
+        decision. "Not sent yet" → "Measuring" (fewer than min_deliveries delivered) → "Measured"."""
+        if row.status not in {STATUS_ACCEPTED, STATUS_EDITED} or not (row.final_subject or row.final_body):
+            return None
+        version = (
+            self.db.query(PayflowMessageVersionModel)
+            .filter(
+                PayflowMessageVersionModel.client_id == row.client_id,
+                PayflowMessageVersionModel.content_hash == content_hash("Email", row.final_subject, row.final_body),
+            )
+            .first()
+        )
+        if version is None:
+            return {"status": "Not sent yet", "message_version_id": None, "metrics": None}
+        items = self.subjects.aggregate(
+            SubjectFilters(client_ids=[row.client_id]),
+            [C.message_version_id],
+            extra=[C.message_version_id == version.id],
+        )
+        if not items:
+            return {"status": "Not sent yet", "message_version_id": version.id, "metrics": None}
+        return {
+            "status": "Measuring" if items[0]["low_sample"] else "Measured",
+            "message_version_id": version.id,
+            "metrics": _numbers(items[0]),
         }
 
     def list_proposals(
@@ -1379,6 +1552,8 @@ class PayflowEmailSubjectAiService:
                     "purpose": version.purpose,
                     "language": version.language,
                     "origin": version.origin,
+                    "audience": version.audience,
+                    "audience_label": audience_label(version.audience),
                     "subject": version.subject_template,
                     "body": version.body_template,
                     "first_used_at": version.first_used_at,

@@ -405,11 +405,12 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     # The AI's plan for the text, and the same message written for each audience (see _clean_versions).
     raw_brief, raw_versions = cfg.pop("brief", None), cfg.pop("versions", None)
     if kind == "Communication":
-        brief, versions = _clean_brief(raw_brief), _clean_versions(raw_versions)
+        brief = _clean_brief(raw_brief)
         if brief:
             cfg["brief"] = brief
-        if versions:
-            cfg["versions"] = versions
+        if isinstance(raw_versions, dict):
+            # Sent: these are the step's versions ({} = every version removed on purpose) - see _carry_versions.
+            cfg["versions"] = _clean_versions(raw_versions)
 
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
@@ -489,36 +490,44 @@ def _clean_versions(raw: Any) -> dict[str, dict[str, Any]]:
 
 
 def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
-    """A step's audience versions and the AI's plan (brief) follow its main text.
+    """A step's audience versions and the AI's plan (brief) when a person saves the steps. Every text - the main
+    one and each version - is edited on its own; nothing is removed automatically.
 
-    - Main text edited or cleared by a person → the step's versions and brief are dropped: the reviewer's text
-      goes to everyone (unless new versions are sent with the edit).
-    - Main text unchanged and no versions sent (a client that does not know about them) → the stored ones stay.
-    - A version's own text edited → its other-language versions are outdated and dropped.
+    - `versions` not sent (a client that does not know about them) → the stored ones stay.
+    - `versions` sent → they are the step's versions: a version left out was removed on purpose ({} = all of them).
+      A version whose own text was edited loses its outdated other-language versions (the update route writes them
+      again); an unchanged one keeps its stored ones - and its label and brief - when they were not sent back.
+    - The main text's brief stays unless a new one is sent.
     """
     stored = {step.get("id"): step for step in before}
     result = []
     for step in after:
-        old = stored.get(step.get("id"))
+        if step.get("kind") != "Communication":
+            result.append(step)
+            continue
+        cfg, old = _cfg(step), stored.get(step.get("id"))
         if old is not None:
-            cfg, old_cfg = _cfg(step), _cfg(old)
-            old_versions, new_versions = old_cfg.get("versions") or {}, cfg.get("versions") or {}
-            if _message_text(old) != _message_text(step):
-                if not new_versions or new_versions == old_versions:
-                    cfg.pop("versions", None)
-                    cfg.pop("brief", None)
-            elif not new_versions:
-                for key in ("versions", "brief"):
-                    if old_cfg.get(key) and not cfg.get(key):
-                        cfg[key] = copy.deepcopy(old_cfg[key])
+            old_cfg = _cfg(old)
+            old_versions = old_cfg.get("versions") or {}
+            if "versions" not in cfg:
+                if old_versions:
+                    cfg["versions"] = copy.deepcopy(old_versions)
             else:
-                for key, version in new_versions.items():
+                for key, version in (cfg.get("versions") or {}).items():
                     was = old_versions.get(key) or {}
                     edited = any((version.get(k) or "") != (was.get(k) or "") for k in MESSAGE_TEXT_KEYS)
                     if edited and version.get("translations") == was.get("translations"):
                         version.pop("translations", None)
-            step = {**step, "config": cfg}
-        result.append(step)
+                    elif not edited and was.get("translations") and not version.get("translations"):
+                        version["translations"] = copy.deepcopy(was["translations"])
+                    for name in ("label", "brief"):
+                        if was.get(name) and not version.get(name):
+                            version[name] = copy.deepcopy(was[name])
+            if old_cfg.get("brief") and not cfg.get("brief"):
+                cfg["brief"] = copy.deepcopy(old_cfg["brief"])
+        if "versions" in cfg and not cfg["versions"]:
+            cfg.pop("versions")  # sent empty: every version removed
+        result.append({**step, "config": cfg})
     return result
 
 

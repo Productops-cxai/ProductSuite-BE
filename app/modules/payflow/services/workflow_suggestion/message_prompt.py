@@ -16,6 +16,10 @@ from app.modules.payflow.services.workflow_suggestion.message_validator import (
     MAX_SUBJECT_CHARS,
 )
 from app.modules.payflow.services.workflow_suggestion.prompt import compact_step
+
+# The SMS length the writer aims for (the check allows MAX_SMS_CHARS): translations run ~15-25% longer and must
+# fit MAX_SMS_CHARS too.
+SMS_TARGET_CHARS = 260
 from app.shared.enums import PayflowCollectionStatus
 
 # Existing templates, shown as style examples: (template id, tone it is written in).
@@ -147,8 +151,9 @@ first line. The audience totals are averages for many customers - never type the
   {{{{first_name}}}}," when the plan's approach is formal) and ends with {{{{brand_name}}}}.
 - Subjects are in the message's tone: a Friendly, Clear, Supportive or Neutral subject is a calm reminder, never a
   demand - no "action needed", "action required", "urgent", "important" or "immediately".
-- SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in. Start with "{{{{brand_name}}}}:"
-  and end with "Reply STOP to opt out."
+- SMS: no subject. At most {MAX_SMS_CHARS} characters with the values filled in - aim for {SMS_TARGET_CHARS} or fewer:
+  it is also translated, and other languages run longer. Start with "{{{{brand_name}}}}:" and end with
+  "Reply STOP to opt out."
 - Channel "{CONTACT_CHANNEL}": PayFlow sends each customer either the email or the SMS (whichever reaches them),
   so write both - the email in subject + body, and the same message as an SMS in sms_body (the SMS rules above).
   Never mention the other channel (no "we also sent you an email").
@@ -213,8 +218,10 @@ def _brief_line(brief: dict[str, Any]) -> str:
 def _performance_lines(performance: dict[str, Any]) -> str:
     """This client's own measured email subjects (email_subject_ai.performance_context): numbers and
     subject text only, no customer data."""
+    source = ", ".join(part for part in (performance.get("scope"), performance.get("period")) if part)
     parts = [
-        "Measured results of this client's past emails (their own history; open rates are estimates; "
+        f"Measured results of this client's past emails ({f'{source}; ' if source else ''}their own history; "
+        "open rates are estimates; "
         "conversion = completed payments / delivered emails). Use them for the emails you write:\n"
         "- For an email with the same purpose or reminder stage, build on what the best subjects do "
         "(their angle and wording style) - do not copy one word for word.\n"
@@ -226,6 +233,11 @@ def _performance_lines(performance: dict[str, Any]) -> str:
     if performance.get("weak"):
         parts.append(
             "Weak subjects:\n" + "\n".join(json.dumps(item, ensure_ascii=False) for item in performance["weak"])
+        )
+    if performance.get("decisions"):
+        parts.append(
+            "Reviewer decisions on earlier AI suggestions (newest first) - write like what they accepted or how "
+            "they edited, not like what they rejected:\n" + "\n".join(performance["decisions"])
         )
     return "\n".join(parts)
 
@@ -258,13 +270,14 @@ Reply with JSON only, matching the provided schema: one entry per step_id, with 
 
 ## Rules
 - Translate faithfully: the same meaning and the same tone (given per message). Add nothing, leave nothing out.
-- Keep every {{{{variable}}}} exactly as written - never translate, rename, add or remove one.
+- Keep every {{{{variable}}}} exactly as written - never translate, rename, add or remove one - in the subject too.
 - Keep the layout: the same lines and paragraphs. In an email, {{{{payment_link}}}} stays alone on its own line.
 - Do not add numbers, amounts, dates, deadlines, links, phone numbers or email addresses.
 - Write naturally for the customer, in the polite form of address (e.g. "vous" in French).
 - Email subject: one line, at most {MAX_SUBJECT_CHARS} characters with the values filled in.
-- SMS: at most {MAX_SMS_CHARS} characters with the values filled in. Translate the opt-out sentence too,
-  keeping the word STOP as it is (e.g. French: "Répondez STOP pour vous désabonner.")."""
+- SMS: at most {MAX_SMS_CHARS} characters with the values filled in - when the translation runs longer, say the
+  same thing in fewer words. Translate the opt-out sentence too, keeping the word STOP as it is (e.g. French:
+  "Répondez STOP pour vous désabonner.")."""
     parts = [
         f"Client: {client['name']}",
         "Messages to translate (one per step_id):\n"

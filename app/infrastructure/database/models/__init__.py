@@ -1113,6 +1113,9 @@ class PayflowMessageVersionModel(Base):
     step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     strategy_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     template_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which of the step's texts this is: "main", or an audience version written for one group of
+    # customers (e.g. "age_65_plus", workflow_suggestion/audiences.py); None for a template / older rows.
+    audience: Mapped[str | None] = mapped_column(String(64), nullable=True)
     first_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

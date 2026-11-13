@@ -17,7 +17,11 @@ from app.modules.payflow.services.strategy_service import (
     _message_text,
     read_strategy_versions,
 )
-from app.modules.payflow.services.workflow_suggestion.audiences import find_audiences, members_by_segment
+from app.modules.payflow.services.workflow_suggestion.audiences import (
+    audience_label,
+    find_audiences,
+    members_by_segment,
+)
 from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
@@ -162,21 +166,19 @@ class WorkflowSuggestionService:
 
         # Email / SMS text for every workflow (one AI call each, plus one per other language of its
         # segment's accounts), written before saving.
-        writer_client = {
-            **client,
-            "payment_options": load_payment_options(self.db, client["id"]),
-            "email_performance": _email_performance(self.db, client["id"]),
-        }
+        writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
         members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
             segment_id = segment["segment_id"]
+            found = find_audiences(members[segment_id])
+            performance = _email_performance(self.db, client["id"], portfolio_id=scope.id, found=found)
             workflows[segment_id], messages_note[segment_id] = _with_messages(
-                writer_client,
+                {**writer_client, "email_performance": performance},
                 workflows[segment_id],
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
-                found=find_audiences(members[segment_id]),
+                found=found,
             )
 
         governed_by = governing_rules(client, rules)
@@ -278,18 +280,23 @@ class WorkflowSuggestionService:
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
         members = load_segment_members(self.db, original)
+        found = find_audiences(members)
         workflow, messages_note = _with_messages(
             {
                 **client,
                 "payment_options": load_payment_options(self.db, original["client_id"]),
-                "email_performance": _email_performance(self.db, original["client_id"]),
+                # The original's own results first: the new version replaces it.
+                "email_performance": _email_performance(
+                    self.db, original["client_id"], portfolio_id=original.get("portfolio_id"),
+                    strategy_id=original["id"], found=found,
+                ),
             },
             workflow,
             _stored_segment(original),
             remarks=remarks,
             languages=_other_languages(client, members),
             keep=list(carried),
-            found=find_audiences(members),
+            found=found,
         )
 
         ai_context = kept + _reasoning_context(workflow) + [
@@ -376,17 +383,21 @@ class WorkflowSuggestionService:
                 "Message text can only be written for Draft, AI Proposed or Under Review workflows"
             )
         self.strategies._assert_manage(user, workflow["client_id"])
+        members = load_segment_members(self.db, workflow)
+        found = find_audiences(members)
         client = {
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
-            "email_performance": _email_performance(self.db, workflow["client_id"]),
+            "email_performance": _email_performance(
+                self.db, workflow["client_id"], portfolio_id=workflow.get("portfolio_id"),
+                strategy_id=workflow["id"], found=found,
+            ),
         }
-        members = load_segment_members(self.db, workflow)
         written, audiences_note = _write_for_audiences(
             client,
             workflow,
             _stored_segment(workflow),
-            find_audiences(members),
+            found,
             step_ids=[step_id] if step_id else None,
             remarks=remarks,
         )
@@ -404,9 +415,9 @@ class WorkflowSuggestionService:
         the other languages of the workflow's segment (one AI call per language) - and so is every audience
         version whose own text it changed.
 
-        update_strategy drops an edited message's outdated versions (and, for an edited main text, its audience
-        versions: the reviewer's text goes to everyone). A translation that fails never undoes the edit: those
-        customers get the edited main text, and the workflow's history says so.
+        update_strategy drops an edited text's outdated other-language versions; the main text and each audience
+        version are edited on their own, and nothing else is removed. A translation that fails never undoes the
+        edit: those customers get the edited text in the main language, and the workflow's history says so.
         """
         row = self.db.get(PayflowStrategyModel, strategy_id)
         before = {step.get("id"): step for step in copy.deepcopy((row.steps if row else None) or [])}
@@ -734,13 +745,27 @@ def _other_languages(client: dict[str, Any], members: list) -> list[str]:
 PERFORMANCE_LABEL = "Email performance"
 
 
-def _email_performance(db: Session, client_id: int) -> dict[str, Any] | None:
-    """This client's measured email subjects, for the message writer (see message_prompt).
+def _email_performance(
+    db: Session,
+    client_id: int,
+    *,
+    portfolio_id: int | None = None,
+    strategy_id: int | None = None,
+    found: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """This client's measured email subjects, for the planner and the writer (message_brief, message_prompt):
+    the closest history with enough results - the workflow's own (`strategy_id`), its portfolio's, the client's -
+    plus each audience's own results (`found`: audiences.find_audiences).
     None: no history yet - or it could not be read, which never blocks writing."""
     try:
         from app.modules.payflow.services.email_subject_ai import PayflowEmailSubjectAiService
 
-        return PayflowEmailSubjectAiService(db).performance_context(client_id)
+        return PayflowEmailSubjectAiService(db).performance_context(
+            client_id,
+            portfolio_id=portfolio_id,
+            strategy_id=strategy_id,
+            audiences=[audience["key"] for audience in (found or {}).get("audiences") or []],
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -751,12 +776,15 @@ def _performance_note(client: dict[str, Any]) -> list[dict[str, str]]:
     if not performance or not performance.get("best"):
         return []
     best = performance["best"][0]
+    source = ", ".join(part for part in (performance.get("scope"), performance.get("period")) if part)
+    audiences = ", ".join(audience_label(key) for key in performance.get("by_audience") or {})
     return [
         {
             "label": PERFORMANCE_LABEL,
             "value": (
-                f"Emails written using this client's measured results ({len(performance['best'])} strong and "
-                f"{len(performance.get('weak') or [])} weak subjects). Best so far: \"{best['subject']}\" - "
+                f"Emails written using this client's measured results{f' ({source})' if source else ''}: "
+                f"{len(performance['best'])} strong and {len(performance.get('weak') or [])} weak subjects"
+                f"{f'; own results for {audiences}' if audiences else ''}. Best so far: \"{best['subject']}\" - "
                 f"{best['conversion']} conversion on {best['delivered']:,} delivered."
             ),
         }

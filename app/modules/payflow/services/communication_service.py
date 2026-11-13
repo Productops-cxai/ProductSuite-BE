@@ -899,12 +899,10 @@ class PayflowCommunicationService:
         client_id: int | None = None,
         compliance_review_approved: bool = False,
         tracking: dict[str, Any] | None = None,
-        message_audience: str | None = None,
     ) -> dict[str, Any]:
         """`tracking`: what email_tracking.apply_tracking records on the communication (the text
-        before customer values were filled in, its workflow step, reminder stage, ...).
-        `message_audience`: which of the step's texts is sent ("main" or an audience version such as
-        "age_65_plus") - stored on the communication."""
+        before customer values were filled in, its workflow step, reminder stage, which of the step's
+        texts was sent - "main" or an audience version such as "age_65_plus" - ...)."""
         channel_norm = (channel or "Email").strip()
         purpose_norm = purpose or "Payment Reminder"
 
@@ -966,7 +964,6 @@ class PayflowCommunicationService:
             status=PayflowCommStatus.PREPARED.value,
             workflow_name=strategy.name,
             strategy_id=getattr(strategy, "id", None),
-            message_audience=message_audience,  # the workflow step itself: tracking (apply_tracking)
             engagement=None,
             engagement_tracking=engagement_tracking,
             date_bucket=date_bucket,

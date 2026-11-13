@@ -46,12 +46,12 @@ def fake_planner():
     return call, calls
 
 
-def add_seniors(db_session, portfolio, count=25, **values):  # noqa: F811
-    """`count` more accounts in the portfolio, like the fixture's, aged 70."""
+def add_seniors(db_session, portfolio, count=25, *, start=500, born=date(1956, 1, 1), **values):  # noqa: F811
+    """`count` more accounts in the portfolio, like the fixture's, born `born` (default: aged 70)."""
     for i in range(count):
-        db_session.add(_account(portfolio["client_id"], portfolio["portfolio_id"], 500 + i,
+        db_session.add(_account(portfolio["client_id"], portfolio["portfolio_id"], start + i,
                                 outstanding_balance=300.0, days_past_due=10, collection_status="Active",
-                                date_of_birth=date(1956, 1, 1), **values))
+                                date_of_birth=born, **values))
     db_session.commit()
 
 
@@ -106,6 +106,18 @@ def test_a_translation_keeps_the_link_alone_when_the_original_does():
     )
     alone = {"subject": "Votre solde", "body": "Bonjour {{first_name}},\nPayez avec le bouton ci-dessous.\n{{payment_link}}"}
     assert check_translation("s2", alone, source, "Email") == []
+
+
+def test_a_translated_subject_may_leave_out_a_variable_but_never_add_one():
+    source = {"subject": "A reminder from {{brand_name}}", "body": "Hi {{first_name}},\nPay below.\n{{payment_link}}"}
+    body = "Bonjour {{first_name}},\nPayez ci-dessous.\n{{payment_link}}"
+    assert check_translation("s2", {"subject": "Petit rappel", "body": body}, source, "Email") == []
+    added = check_translation("s2", {"subject": "Rappel de {{brand_name}} pour {{first_name}}", "body": body},
+                              source, "Email")
+    assert added and "s2 (subject): must use exactly the variables of the original" in added[0]
+    no_name = check_translation("s2", {"subject": "Petit rappel", "body": "Bonjour,\nPayez ci-dessous.\n{{payment_link}}"},
+                                source, "Email")
+    assert no_name and "s2 (body): must use exactly the variables of the original" in no_name[0]  # bodies keep all
 
 
 def test_the_writer_follows_the_plan_and_knows_its_audience():
@@ -232,18 +244,67 @@ def test_a_client_that_does_not_send_versions_keeps_them(client, admin_token, db
     assert all(texts["versions"]["age_65_plus"]["body"] for texts in _texts(response.json()).values())
 
 
-def test_a_reviewer_editing_the_main_text_sends_their_text_to_everyone(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
+def test_a_reviewer_editing_the_main_text_keeps_the_versions(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
     add_seniors(db_session, portfolio)
     saved = write_with(db_session, admin, ai_workflow["id"])
+    before = _texts(saved)
     steps = json.loads(json.dumps(saved["steps"]))
     edited = next(step for step in steps if step["kind"] == "Communication")
     edited["config"]["body"] = edited["config"]["body"] + "\nThank you."
     response = _post_update(client, admin_token, saved["id"], steps)
     assert response.status_code == 200, response.json()
     after = _texts(response.json())
-    assert after[edited["id"]] == {"body": edited["config"]["body"]}  # no versions, no brief: one text
-    others = [step_id for step_id in after if step_id != edited["id"]]
-    assert others and all("age_65_plus" in after[step_id]["versions"] for step_id in others)
+    assert after[edited["id"]]["body"].endswith("\nThank you.")
+    # Each text is edited on its own: the versions and the AI's plan stay as they were.
+    assert after[edited["id"]]["versions"] == before[edited["id"]]["versions"]
+    assert after[edited["id"]]["brief"] == before[edited["id"]]["brief"]
+
+
+def test_one_version_is_edited_on_its_own(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
+    add_seniors(db_session, portfolio)
+    saved = write_with(db_session, admin, ai_workflow["id"])
+    before = _texts(saved)
+    steps = json.loads(json.dumps(saved["steps"]))
+    step = next(step for step in steps if step["kind"] == "Communication")
+    step["config"]["versions"]["age_65_plus"]["body"] += "\nWe are here to help."
+    response = _post_update(client, admin_token, saved["id"], steps)
+    assert response.status_code == 200, response.json()
+    after = _texts(response.json())
+    assert after[step["id"]]["versions"]["age_65_plus"]["body"].endswith("\nWe are here to help.")
+    assert after[step["id"]]["body"] == before[step["id"]]["body"]  # the main text is untouched
+    assert all(after[s]["versions"] == before[s]["versions"] for s in after if s != step["id"])
+
+
+def test_versions_sent_back_without_translations_keep_them(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
+    add_seniors(db_session, portfolio, language="FR")
+    writer, _ = fake_writer()
+    saved = write_with(db_session, admin, ai_workflow["id"], writer)
+    steps = json.loads(json.dumps(saved["steps"]))
+    for step in steps:
+        for version in ((step.get("config") or {}).get("versions") or {}).values():
+            version.pop("translations", None)  # a screen that only shows the texts
+            version.pop("brief", None)
+    response = _post_update(client, admin_token, saved["id"], steps)
+    assert response.status_code == 200, response.json()
+    for config in messages(response.json()).values():
+        version = config["versions"]["age_65_plus"]
+        assert version["translations"]["FR"]["body"].startswith("FR - ") and version["brief"]["approach"]
+
+
+def test_a_reviewer_can_remove_one_version_or_all_of_them(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
+    add_seniors(db_session, portfolio)
+    add_seniors(db_session, portfolio, count=25, start=600, born=date(2000, 1, 1))  # 18 - 34 too
+    saved = write_with(db_session, admin, ai_workflow["id"])
+    first, second = [step for step in json.loads(json.dumps(saved["steps"])) if step["kind"] == "Communication"][:2]
+    assert set(first["config"]["versions"]) == {"age_65_plus", "age_18_34"}
+    first["config"]["versions"].pop("age_18_34")  # left out: removed on purpose
+    second["config"]["versions"] = {}  # every version removed
+    steps = [first if s["id"] == first["id"] else second if s["id"] == second["id"] else s for s in saved["steps"]]
+    response = _post_update(client, admin_token, saved["id"], steps)
+    assert response.status_code == 200, response.json()
+    after = _texts(response.json())
+    assert set(after[first["id"]]["versions"]) == {"age_65_plus"}
+    assert "versions" not in after[second["id"]]
 
 
 def test_a_reviewer_editing_a_version_gets_it_translated_again(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501

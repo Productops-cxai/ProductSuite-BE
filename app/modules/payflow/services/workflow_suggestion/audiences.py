@@ -31,6 +31,7 @@ AUDIENCES: dict[str, tuple[str, tuple[int, int | None]]] = {
     "age_35_64": ("35 – 64", (35, 65)),
     "age_65_plus": ("65 and over", (65, None)),
 }
+MAIN_KEY = "main"  # the step's own text, for everyone without a version of their own
 MIN_AUDIENCE_SIZE = 20  # fewer accounts → no own version (they get the main text)
 MAX_VERSIONS = 3  # per message, besides the main text
 UNKNOWN = "Unknown"
@@ -41,6 +42,16 @@ PROVINCES = {
     "ON": "Ontario", "PE": "Prince Edward Island", "QC": "Quebec", "SK": "Saskatchewan", "YT": "Yukon",
 }
 COUNTRIES = {"CA": "Canada"}  # any other code is shown as the code itself
+
+
+def audience_label(key: str | None) -> str | None:
+    """"age_65_plus" → "Age 65 and over", "main" → "Main text" (the step's own text), None → None."""
+    if not key:
+        return None
+    if key == MAIN_KEY:
+        return "Main text"
+    band = AUDIENCES.get(key)
+    return f"Age {band[0]}" if band else key
 
 
 def audience_of(account, today: date | None = None) -> str | None:
@@ -81,7 +92,7 @@ def find_audiences(members: list, today: date | None = None) -> dict[str, Any]:
         "audiences": [
             {
                 "key": key,
-                "label": f"Age {AUDIENCES[key][0]}",
+                "label": audience_label(key),
                 "accounts": len(accounts),
                 "profile": audience_profile(accounts, today),
             }
