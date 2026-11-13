@@ -33,6 +33,8 @@ from app.modules.payflow.services.workflow_suggestion.config import (
     PAID_IN_FULL_CHECK,
     PAID_OR_PLAN_CHECK,
     PAID_OUTCOME,
+    STEPS_PER_FOLLOW_UP,
+    STOP_BRANCH_STEPS,
     STOP_WHEN_PAID_SITUATIONS,
 )
 
@@ -305,7 +307,10 @@ Case actions: {", ".join(CASE_ACTIONS)}
 Outcomes: {", ".join(OUTCOMES)}
 
 ## Limits
-- Between {limits["min_steps"]} and {limits["max_steps"]} steps per workflow.
+- Between {limits["min_steps"]} and {limits["max_steps"]} steps per workflow. Count them before you answer: in
+  {" and ".join(STOP_WHEN_PAID_SITUATIONS)} workflows each follow-up message takes {STEPS_PER_FOLLOW_UP} steps (Wait, check, message)
+  and the stop branch {STOP_BRANCH_STEPS}. If a workflow would have more, use fewer messages or branches - never point back
+  to an earlier step.
 - At most {limits["max_communications"]} Communication steps per workflow.{weekly_line}
 - Put a Wait between two Communication steps.
 

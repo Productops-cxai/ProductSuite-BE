@@ -85,7 +85,13 @@ MIN_STEPS = 3
 # Raised from 12, then 15: stopping when the customer pays adds a check before every follow-up and a 3-step stop
 # branch, so 5 messages need ~19 steps. With 15 the AI often failed Regenerate remarks such as "add an SMS route".
 # Raised to 20 when the stop branch grew from 3 to 5 steps (paid in full / on a plan / part paid kept apart).
-MAX_STEPS = 20
+# Raised to 24: the workflow the prompt asks for at MAX_COMMUNICATIONS needs 22 steps - Trigger + message,
+# 4 x (Wait, check, message), Wait + check + Human Review at the end, the 5-step stop branch. With 20 the AI failed
+# exactly that workflow and then "saved" steps by pointing back to an earlier step (a loop).
+MAX_STEPS = 24
+# Step cost the prompt states, so the AI can count before it answers (Active / Promise to Pay workflows).
+STEPS_PER_FOLLOW_UP = 3  # Wait, PAID_OR_PLAN_CHECK, the message
+STOP_BRANCH_STEPS = 5  # PAID_IN_FULL_CHECK, its Outcome, ON_A_PLAN_CHECK, its Outcome, Human Review
 MAX_COMMUNICATIONS = 5
 
 # Stop when the customer acts: on the payment page they can pay in full, pay part or set up a plan.
