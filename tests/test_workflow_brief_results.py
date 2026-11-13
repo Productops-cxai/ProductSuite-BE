@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 from app.modules.payflow.services.workflow_suggestion import message_brief, message_writer
 from app.modules.payflow.services.workflow_suggestion import service as suggestion_service
-from app.modules.payflow.services.workflow_suggestion.message_brief import MAIN, check_brief, large_balance_share
+from app.modules.payflow.services.workflow_suggestion.message_brief import (
+    MAIN,
+    check_brief,
+    large_balance_share,
+    no_subject_style,
+)
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
 from tests.test_workflow_audience_messages import add_seniors, fake_planner
 from tests.test_workflow_message_api import fake_message_ai
@@ -81,6 +86,25 @@ def test_why_never_claims_a_preference_a_cause_or_a_promise():
         assert len(errors) == 1 and "a preference, a cause or a promise the numbers do not show" in errors[0], claim
     honest = 'The calm first-reminder subject did better (4.1% conversion on 820 delivered); short, per the guidance.'
     assert check_brief("x", good("s2", MAIN, "Clear", why=honest), ["Clear"], options, "Active") == []
+
+
+def test_a_message_with_an_email_always_gets_a_subject_style():
+    """Seen live: a contact step titled "SMS payment link" was planned with subject_style "none", the writer left
+    the email's subject out, and the whole workflow's messages failed."""
+    options = ["pay in full", "pay part now", "set up a payment plan"]
+    none = good("s5", MAIN, "Clear", subject_style="none", lead_option="pay part now")
+    for channel in ("Email + SMS", "Email"):
+        assert check_brief("s5 (main)", none, ["Clear"], options, "Active", channel=channel) == [
+            f's5 (main): this message has an email (channel "{channel}") - give subject_style for its subject; '
+            'only an "SMS" message has none'
+        ]
+    assert check_brief("s5 (main)", none, ["Clear"], options, "Active", channel="SMS") == []
+    assert no_subject_style("N/A for SMS") and no_subject_style("Not applicable") and not no_subject_style("Calm")
+
+    # Safety net: the writer is never told "none" for an email.
+    line = message_writer._brief({"id": "s5", "config": {"purpose": "Payment Link"}},
+                                 {"tone": "Clear", "why": "", "path": ""}, SEGMENT, True, none)
+    assert line["channel"] == "Email + SMS" and line["subject_style"] is None
 
 
 def test_the_planner_sends_back_paying_in_full_for_large_balances():

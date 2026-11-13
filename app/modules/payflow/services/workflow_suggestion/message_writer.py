@@ -19,7 +19,7 @@ from app.modules.payflow.services.workflow_suggestion.message_prompt import (
     build_message_prompt,
     build_translation_prompt,
 )
-from app.modules.payflow.services.workflow_suggestion.message_brief import LENGTHS
+from app.modules.payflow.services.workflow_suggestion.message_brief import LENGTHS, no_subject_style
 from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
     EMAIL_WORDS,
@@ -202,7 +202,9 @@ def _brief(
             tone=plan.get("tone") or tone["tone"],
             approach=plan.get("approach"),
             length_words=f"{low}-{high}",
-            subject_style=plan.get("subject_style"),
+            # A message with an email always needs a subject, whatever the plan says ("none" is for SMS only).
+            subject_style=None if brief["channel"] != "SMS" and no_subject_style(plan.get("subject_style"))
+            else plan.get("subject_style"),
             lead_option=plan.get("lead_option"),
             call_to_action=plan.get("call_to_action"),
             why=plan.get("why"),

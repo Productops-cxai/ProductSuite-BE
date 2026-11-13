@@ -152,7 +152,7 @@ def plan_messages(
             brief = _clean(reply.get((step_id, audience)))
             label = f"{step_id} ({audience})"
             errors = check_brief(label, brief, allowed_tones(tones[step_id]["tone"]), options, situation,
-                                 large.get(audience))
+                                 large.get(audience), channel=_channel(steps[step_id]))
             if errors:
                 feedback.append({"step_id": step_id, "audience": audience, "brief": brief, "errors": errors})
             else:
@@ -170,6 +170,8 @@ def check_brief(
     options: list[str],
     situation: str | None,
     large_balances: int | None = None,
+    *,
+    channel: str | None = None,
 ) -> list[str]:
     """Problems with one brief - [] when it can be used. `allowed`: allowed_tones(code tone).
     `large_balances`: % of the audience owing LARGE_BALANCE_FROM or more (large_balance_share)."""
@@ -200,6 +202,11 @@ def check_brief(
                 f"{' or '.join(smaller)}, not paying in full (it can still be mentioned)"
             )
     errors += [f"{label}: {field} is empty" for field in TEXT_FIELDS if not brief.get(field)]
+    if channel and channel != "SMS" and brief.get("subject_style") and no_subject_style(brief["subject_style"]):
+        errors.append(
+            f'{label}: this message has an email (channel "{channel}") - give subject_style for its subject; '
+            'only an "SMS" message has none'
+        )
     errors += [
         f'{label}: {field} types an amount - the numbers are averages, not one customer\'s: say "their balance"'
         for field in WRITER_FIELDS
@@ -310,7 +317,8 @@ gets the same text, filled with their own details. Reply with JSON only, matchin
 - SMS: the payment link is in the text itself.
 - The payment page is the only action: never ask them to reply, call or write.
 - channel tells what each message is: "Email", "SMS", or "{CONTACT_CHANNEL}" (an email and an SMS version - PayFlow
-  sends whichever reaches the customer). An SMS has no subject: its subject_style is "none".
+  sends whichever reaches the customer). Only an "SMS" message has no subject (its subject_style is "none"); an
+  "Email" or "{CONTACT_CHANNEL}" message always needs a subject_style for its email, whatever its title says.
 
 ## What gets customers to pay
 - One clear ask that is easy to act on.
@@ -392,6 +400,17 @@ def _country_lines(found: dict[str, Any]) -> str:
     return "Country notes:\n" + "\n".join(
         f"- {name}: {COUNTRY_NOTES.get(name, UNKNOWN_COUNTRY_NOTE)}" for name in countries
     )
+
+
+def no_subject_style(subject_style: str | None) -> bool:
+    """True for a subject_style that means "no subject" ("none", "N/A", "Not applicable for SMS", ...)."""
+    text = (subject_style or "").strip().lower()
+    return not text or text.startswith(("none", "n/a", "not applicable", "no subject"))
+
+
+def _channel(step: dict[str, Any]) -> str:
+    cfg = step.get("config") or {}
+    return cfg.get("channel") or step.get("channel") or CONTACT_CHANNEL
 
 
 def large_balance_share(profile: dict[str, Any] | None) -> int | None:
