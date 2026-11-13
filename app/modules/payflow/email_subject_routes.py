@@ -237,6 +237,9 @@ class ProposalItem(BaseModel):
     created_at: Optional[datetime] = None
     decided_by: Optional[str] = None
     decided_at: Optional[datetime] = None
+    # Accepted / edited: how the text it put on the workflow has done since -
+    # {"status": "Not sent yet" | "Measuring" | "Measured", "message_version_id", "metrics"}.
+    result: Optional[dict] = None
 
 
 class WorkflowOptimizationResponse(BaseModel):
@@ -351,6 +354,9 @@ class MessageHistoryItem(SubjectMetrics):
     purpose: Optional[str] = None
     language: Optional[str] = None
     origin: Optional[str] = None
+    # Which of the step's texts: "main", or an audience version (e.g. "age_65_plus" - "Age 65 and over").
+    audience: Optional[str] = None
+    audience_label: Optional[str] = None
     subject: Optional[str] = None
     body: Optional[str] = None
     first_used_at: Optional[datetime] = None

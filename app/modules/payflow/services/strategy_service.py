@@ -402,6 +402,15 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     translations = _clean_translations(raw_translations) if kind == "Communication" else {}
     if translations:
         cfg["translations"] = translations
+    # The AI's plan for the text, and the same message written for each audience (see _clean_versions).
+    raw_brief, raw_versions = cfg.pop("brief", None), cfg.pop("versions", None)
+    if kind == "Communication":
+        brief = _clean_brief(raw_brief)
+        if brief:
+            cfg["brief"] = brief
+        if isinstance(raw_versions, dict):
+            # Sent: these are the step's versions ({} = every version removed on purpose) - see _carry_versions.
+            cfg["versions"] = _clean_versions(raw_versions)
 
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
@@ -449,6 +458,77 @@ def _clean_translations(raw: Any) -> dict[str, dict[str, str]]:
         if version.get("body") or version.get("sms_body"):
             cleaned[str(code).strip().upper()] = version
     return cleaned
+
+
+BRIEF_KEYS = ("approach", "tone", "length", "subject_style", "lead_option", "call_to_action", "why")
+
+
+def _clean_brief(raw: Any) -> dict[str, str]:
+    """How the AI planned a message (message_brief.py): text fields only, empty ones dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    return {key: str(raw[key]).strip() for key in BRIEF_KEYS if str(raw.get(key) or "").strip()}
+
+
+def _clean_versions(raw: Any) -> dict[str, dict[str, Any]]:
+    """{"age_65_plus": {"label", "subject", "body", "sms_body", "tone", "brief", "translations"}, ...}: the step's
+    message written for each audience (workflow_suggestion/audiences.py). Versions without text are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, dict[str, Any]] = {}
+    for key, version in raw.items():
+        if not isinstance(version, dict) or not str(key or "").strip():
+            continue
+        text = {name: str(version[name]).strip() for name in (*MESSAGE_TEXT_KEYS, "tone", "label")
+                if str(version.get(name) or "").strip()}
+        if not (text.get("body") or text.get("sms_body")):
+            continue
+        brief, translations = _clean_brief(version.get("brief")), _clean_translations(version.get("translations"))
+        cleaned[str(key).strip()] = {**text, **({"brief": brief} if brief else {}),
+                                     **({"translations": translations} if translations else {})}
+    return cleaned
+
+
+def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
+    """A step's audience versions and the AI's plan (brief) when a person saves the steps. Every text - the main
+    one and each version - is edited on its own; nothing is removed automatically.
+
+    - `versions` not sent (a client that does not know about them) → the stored ones stay.
+    - `versions` sent → they are the step's versions: a version left out was removed on purpose ({} = all of them).
+      A version whose own text was edited loses its outdated other-language versions (the update route writes them
+      again); an unchanged one keeps its stored ones - and its label and brief - when they were not sent back.
+    - The main text's brief stays unless a new one is sent.
+    """
+    stored = {step.get("id"): step for step in before}
+    result = []
+    for step in after:
+        if step.get("kind") != "Communication":
+            result.append(step)
+            continue
+        cfg, old = _cfg(step), stored.get(step.get("id"))
+        if old is not None:
+            old_cfg = _cfg(old)
+            old_versions = old_cfg.get("versions") or {}
+            if "versions" not in cfg:
+                if old_versions:
+                    cfg["versions"] = copy.deepcopy(old_versions)
+            else:
+                for key, version in (cfg.get("versions") or {}).items():
+                    was = old_versions.get(key) or {}
+                    edited = any((version.get(k) or "") != (was.get(k) or "") for k in MESSAGE_TEXT_KEYS)
+                    if edited and version.get("translations") == was.get("translations"):
+                        version.pop("translations", None)
+                    elif not edited and was.get("translations") and not version.get("translations"):
+                        version["translations"] = copy.deepcopy(was["translations"])
+                    for name in ("label", "brief"):
+                        if was.get(name) and not version.get(name):
+                            version[name] = copy.deepcopy(was[name])
+            if old_cfg.get("brief") and not cfg.get("brief"):
+                cfg["brief"] = copy.deepcopy(old_cfg["brief"])
+        if "versions" in cfg and not cfg["versions"]:
+            cfg.pop("versions")  # sent empty: every version removed
+        result.append({**step, "config": cfg})
+    return result
 
 
 def _carry_translations(before: list[dict], after: list[dict]) -> list[dict]:
@@ -1215,9 +1295,8 @@ class PayflowStrategyService:
                 if source == PayflowStrategySource.AI_GENERATED.value
                 else PayflowStrategyOrigin.HUMAN_CREATED.value
             )
-            new_steps = _carry_translations(
-                before_steps, _normalize_steps(payload["steps"], default_origin=default_origin)
-            )
+            normalized = _normalize_steps(payload["steps"], default_origin=default_origin)
+            new_steps = _carry_versions(before_steps, _carry_translations(before_steps, normalized))
             from app.modules.payflow.services.email_tracking import stamp_content_origin
 
             # Who wrote each message's text. "_ai_step_ids" (internal, not from the API): steps
