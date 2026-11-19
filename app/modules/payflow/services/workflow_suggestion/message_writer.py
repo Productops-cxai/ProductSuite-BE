@@ -20,7 +20,7 @@ from app.modules.payflow.services.workflow_suggestion.message_prompt import (
     build_translation_prompt,
 )
 from app.modules.payflow.services.workflow_suggestion.message_brief import LENGTHS, no_subject_style
-from app.modules.payflow.services.workflow_suggestion.message_tone import message_tones
+from app.modules.payflow.services.workflow_suggestion.message_tone import CLEAR, message_tones
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
     EMAIL_WORDS,
     MAX_SUBJECT_CHARS,
@@ -240,6 +240,53 @@ def _check(message: dict[str, Any], brief: dict[str, Any], bodies: list[str]) ->
     sms = {"body": message.get("sms_body")}
     sms_brief = {**brief, "channel": "SMS", "step_id": f"{brief['step_id']} (SMS version, sms_body)"}
     return check_message(email, {**brief, "channel": "Email"}, bodies) + check_message(sms, sms_brief, bodies)
+
+
+_EDITED = "text"  # where a person's text is named in check_message's problems ("text: ..."), cut off after
+
+
+def check_texts(
+    workflow: dict[str, Any],
+    segment: dict[str, Any],
+    texts: list[tuple[dict[str, Any], str, dict[str, Any]]],
+    *,
+    english: bool = True,
+) -> list[dict[str, str]]:
+    """Problems with message texts a person wrote - the same checks the AI's own text passes (message_validator).
+
+    `texts`: [(step, "main" or an audience key, {"subject", "body", "sms_body", "tone"})]. Each part is checked by
+    its channel's rules: a step without a fixed channel has an email (subject + body) and an SMS (sms_body); a part
+    without text is skipped (its template is sent). The text's own tone is used, else the code's tone for the step.
+    Returns [{"step_id", "text", "channel", "problem"}] - [] when every text is fine.
+    """
+    stats = segment.get("stats") or {}
+    tones = message_tones(workflow, segment.get("segment") or {}, stats.get("avg_days_past_due"))
+    warnings: list[dict[str, str]] = []
+    for step, key, text in texts:
+        code = tones.get(step["id"]) or {"tone": CLEAR, "path": None, "why": None}
+        brief = {**_brief(step, {**code, "tone": text.get("tone") or code["tone"]}, segment, english),
+                 "step_id": _EDITED}
+        bodies = [
+            body
+            for other in workflow.get("steps") or []
+            if other.get("kind") == "Communication" and other.get("id") != step["id"]
+            for body in ((other.get("config") or {}).get("body"), (other.get("config") or {}).get("sms_body"))
+            if body
+        ]
+        email = {"subject": text.get("subject"), "body": text.get("body")}
+        if brief["channel"] == CONTACT_CHANNEL:
+            parts = [("Email", email), ("SMS", {"body": text.get("sms_body")})]
+        elif brief["channel"] == "SMS":
+            parts = [("SMS", {"body": text.get("body")})]  # an SMS has no subject
+        else:
+            parts = [(brief["channel"], email)]
+        for channel, part in parts:
+            if not str(part.get("body") or "").strip():
+                continue
+            for problem in check_message(part, {**brief, "channel": channel}, bodies):
+                warnings.append({"step_id": step["id"], "text": key, "channel": channel,
+                                 "problem": problem.removeprefix(f"{_EDITED}: ")})
+    return warnings
 
 
 def _clean(message: Any, channel: str) -> dict[str, Any] | None:

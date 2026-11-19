@@ -489,6 +489,16 @@ def _clean_versions(raw: Any) -> dict[str, dict[str, Any]]:
     return cleaned
 
 
+def _sends_as(step: dict) -> tuple[str, str]:
+    """(channel, purpose) a message step is sent with - channel "" when the worker picks it ("Email + SMS").
+    The channel is read the way the worker reads it (workflow_contact_runtime.is_contact_step)."""
+    cfg = _cfg(step)
+    raw = cfg.get("channel") if cfg.get("channel") is not None else step.get("channel")
+    channel = str(raw or "").strip()
+    purpose = str(cfg.get("purpose") or step.get("purpose") or "").strip()
+    return ("" if channel == CONTACT_CHANNEL else channel), purpose
+
+
 def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
     """A step's audience versions and the AI's plan (brief) when a person saves the steps. Every text - the main
     one and each version - is edited on its own; nothing is removed automatically.
@@ -498,6 +508,8 @@ def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
       A version whose own text was edited loses its outdated other-language versions (the update route writes them
       again); an unchanged one keeps its stored ones - and its label and brief - when they were not sent back.
     - The main text's brief stays unless a new one is sent.
+    - The step's channel or purpose changed → its texts were written for the old one (an SMS-only step would send
+      a version's email body): every version not sent with new text is removed, and so is the main text's brief.
     """
     stored = {step.get("id"): step for step in before}
     result = []
@@ -509,13 +521,17 @@ def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
         if old is not None:
             old_cfg = _cfg(old)
             old_versions = old_cfg.get("versions") or {}
+            outdated = _sends_as(step) != _sends_as(old)
             if "versions" not in cfg:
-                if old_versions:
+                if old_versions and not outdated:
                     cfg["versions"] = copy.deepcopy(old_versions)
             else:
-                for key, version in (cfg.get("versions") or {}).items():
+                for key, version in list((cfg.get("versions") or {}).items()):
                     was = old_versions.get(key) or {}
                     edited = any((version.get(k) or "") != (was.get(k) or "") for k in MESSAGE_TEXT_KEYS)
+                    if outdated and not edited:
+                        cfg["versions"].pop(key)
+                        continue
                     if edited and version.get("translations") == was.get("translations"):
                         version.pop("translations", None)
                     elif not edited and was.get("translations") and not version.get("translations"):
@@ -523,7 +539,10 @@ def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
                     for name in ("label", "brief"):
                         if was.get(name) and not version.get(name):
                             version[name] = copy.deepcopy(was[name])
-            if old_cfg.get("brief") and not cfg.get("brief"):
+            if outdated:
+                if cfg.get("brief") == old_cfg.get("brief"):
+                    cfg.pop("brief", None)  # sent back as it was: the plan of the old message
+            elif old_cfg.get("brief") and not cfg.get("brief"):
                 cfg["brief"] = copy.deepcopy(old_cfg["brief"])
         if "versions" in cfg and not cfg["versions"]:
             cfg.pop("versions")  # sent empty: every version removed

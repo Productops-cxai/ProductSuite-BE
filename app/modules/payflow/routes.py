@@ -81,6 +81,8 @@ from app.modules.payflow.schemas import (
     PayflowRulesListResponse,
     PayflowStrategiesListResponse,
     PayflowStrategyItem,
+    PayflowStrategyUpdateItem,
+    WorkflowAudiencesResponse,
     PayflowUserDetailResponse,
     PayflowUsersListResponse,
     RejectReviewRequest,
@@ -1381,7 +1383,16 @@ def get_workflow(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
         raise _map_error(exc) from exc
 
 
-@router.post("/workflows/{strategy_id}/update", response_model=PayflowStrategyItem)
+@router.get("/workflows/{strategy_id}/audiences", response_model=WorkflowAudiencesResponse)
+def get_workflow_audiences(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Who gets the main text and each audience version, from today's accounts (no AI call, nothing saved)."""
+    try:
+        return WorkflowSuggestionService(db).workflow_audiences(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/update", response_model=PayflowStrategyUpdateItem)
 def update_workflow(
     strategy_id: int,
     payload: UpdatePayflowStrategyRequest,
@@ -1604,7 +1615,7 @@ def write_workflow_messages(
     try:
         payload = payload or WriteWorkflowMessagesRequest()
         return WorkflowSuggestionService(db).write_workflow_messages(
-            user, strategy_id, payload.step_id, payload.remarks
+            user, strategy_id, payload.step_id, payload.remarks, audience=payload.audience
         )
     except AppError as exc:
         raise _map_error(exc) from exc
