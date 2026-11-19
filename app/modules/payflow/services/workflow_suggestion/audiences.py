@@ -408,8 +408,9 @@ def text_audiences(
         if step.get("kind") == "Communication"
         for key in ((step.get("config") or {}).get("versions") or {})
     }
-    known = set(AUDIENCES) | set(OLDER_AUDIENCES) | keys
-    groups: dict[str, list] = {MAIN_KEY: [], **{key: [] for key in known if key in keys}}
+    # A fixed order (a set's order changes between runs): the age groups, the older wider ones, then any other key.
+    order = [*AUDIENCES, *OLDER_AUDIENCES, *sorted(keys - set(AUDIENCES) - set(OLDER_AUDIENCES))]
+    groups: dict[str, list] = {MAIN_KEY: [], **{key: [] for key in order if key in keys}}
     for account in members:
         matched = next(
             (key for key in audience_keys(account, today, segmentation=segmentation) if key in groups),

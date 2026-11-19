@@ -93,6 +93,13 @@ _GROUP_WORDS = re.compile(
 )
 
 
+def _without(text: str, wording: list[str]) -> str:
+    """`text` without the required wording (each occurrence, any case)."""
+    for required in wording:
+        text = re.sub(re.escape(required), " ", text, flags=re.IGNORECASE)
+    return text
+
+
 def render_sample(text: str) -> str:
     """The text as a customer would see it, with sample values for the variables."""
     return _VARIABLE.sub(lambda match: SAMPLE_VALUES.get(match.group(1), match.group(0)), text or "")
@@ -101,7 +108,8 @@ def render_sample(text: str) -> str:
 def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: list[str]) -> list[str]:
     """Problems with one written message — [] when it can be saved.
 
-    `brief`: step_id, channel, tone, promise_ok (promise variables allowed), english (text is English).
+    `brief`: step_id, channel, tone, promise_ok (promise variables allowed), english (text is English), and
+    required_wording ({"Email": [...], "SMS": [...]}: what the client's compliance rules require, word for word).
     `other_bodies`: the workflow's other message bodies (no copy-paste between messages).
     """
     where = brief["step_id"]
@@ -109,9 +117,17 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
     if not body.strip():
         return [f"{where}: the message has no text"]
     errors: list[str] = []
-    text = f"{subject}\n{body}"
+    # The send check looks for each required text in the message, ignoring case (compliance/engine.py).
+    wording = list((brief.get("required_wording") or {}).get(brief["channel"]) or [])
+    full = f"{subject}\n{body}"
+    for required in wording:
+        if required.lower() not in full.lower():
+            errors.append(f'{where}: must include the required wording, word for word: "{required}"')
+    # The required wording is the client's own legal text: the checks below are for the rest of the message.
+    subject_free, body_free = _without(subject, wording), _without(body, wording)
+    text = f"{subject_free}\n{body_free}"
 
-    used = set(_VARIABLE.findall(text))
+    used = set(_VARIABLE.findall(full))
     for name in sorted(used - VARIABLES):
         errors.append(f"{where}: {{{{{name}}}}} is not an allowed variable")
     if not brief.get("promise_ok"):
@@ -151,14 +167,15 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
     if group:
         errors.append(f"{where}: '{group.group(0)}' is about the customer's age or group - write for them, never "
                       "about them")
-    pressure = brief["tone"] not in (FIRM, FINAL_NOTICE) and brief.get("english", True) and _PRESSURE.search(subject)
+    pressure = (brief["tone"] not in (FIRM, FINAL_NOTICE) and brief.get("english", True)
+                and _PRESSURE.search(subject_free))
     if pressure:
         errors.append(f"{where}: '{pressure.group(0)}' in the subject sounds like pressure - a {brief['tone']} "
                       "subject is a calm reminder")
 
     if brief["channel"] == "Email":
         errors += _check_email(where, subject, body)
-        if brief.get("english", True) and _LINK_WORDS.search(body):
+        if brief.get("english", True) and _LINK_WORDS.search(body_free):
             errors.append(f"{where}: in an email the customer sees a Pay Now button - call it the button, not the link")
     else:
         errors += _check_sms(where, body)
@@ -213,12 +230,18 @@ SMS_KEY = "sms_body"
 
 
 def check_translation(
-    where: str, version: dict[str, Any], source: dict[str, Any], channel: str
+    where: str,
+    version: dict[str, Any],
+    source: dict[str, Any],
+    channel: str,
+    wording: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Problems with one message's other-language version — [] when it can be saved.
 
     `source`: the message's main text ({"subject", "body", "sms_body"}, already checked).
     `channel`: "Email", "SMS" (text in "body") or a contact step (email in subject + body, SMS in sms_body).
+    `wording`: the required wording ({"Email": [...], "SMS": [...]}) - the send check looks for it exactly as
+    written, so what the original has stays untranslated in the version.
     """
     errors: list[str] = []
     for key in ("subject", "body", SMS_KEY):
@@ -230,9 +253,13 @@ def check_translation(
         if not text:
             errors.append(f"{part}: missing - translate it too")
             continue
-        errors += _check_translated_text(
-            part, text, original, is_sms=key == SMS_KEY or channel == "SMS", may_leave_out=key == "subject"
-        )
+        is_sms = key == SMS_KEY or channel == "SMS"
+        errors += _check_translated_text(part, text, original, is_sms=is_sms, may_leave_out=key == "subject")
+        for required in (wording or {}).get("SMS" if is_sms else "Email") or []:
+            if required.lower() in original.lower() and required.lower() not in text.lower():
+                errors.append(
+                    f'{part}: keep the required wording "{required}" exactly as written - do not translate it'
+                )
         if key == "subject" and ("\n" in text or len(render_sample(text)) > MAX_SUBJECT_CHARS):
             errors.append(f"{part}: subject must be one line of at most {MAX_SUBJECT_CHARS} characters")
     return errors

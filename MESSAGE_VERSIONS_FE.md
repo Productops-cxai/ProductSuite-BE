@@ -30,7 +30,7 @@ Everything is inside the step's `config`, in the workflow you already load:
 | Main text's AI explanation | `brief` (the reason is in `brief.why`) |
 | Main text in other languages | `translations` → `{"FR": {subject, body, sms_body}}` |
 | The versions | `versions` → `{"age_65_plus": {...}, "age_18_34": {...}}` |
-| One version | `label`, `subject`, `body`, `sms_body`, `brief`, `translations`: the same fields as the main text |
+| One version | `label`, `subject`, `body`, `sms_body`, `brief`, `translations`: the same fields as the main text. Newer versions also have `segment` with the group's ages, e.g. `{"dimension": "age", "criteria": {"min_age": 65, "max_age": null}}` |
 
 **The "Selected version" dropdown:** "Main / Default", then one entry per key in `versions`, shown with its `label` (for example "Age 65 and over").
 - Only list the versions the step actually has.
@@ -84,6 +84,16 @@ Examples of problems: "must include {{payment_link}}", "'legal action' sounds li
 
 **Suggested UI:** after Save, show each warning under the text box it belongs to, in amber, with a note that the text was saved.
 
+## Required compliance wording
+
+A client's compliance rules can require some text in every message, for example *"This is a communication from a debt collector."* When a message is sent, the compliance check **blocks it, or holds it for review, if that text is missing**.
+
+- **The AI always includes it**, word for word, in every email and SMS it writes, and in their translations (the wording stays exactly as the rule has it).
+- **The workflow shows it** in its AI context, as a line labelled **"Required wording"**: *The client's compliance rules require, word for word: "This is a communication from a debt collector." (emails and SMS)*. If you already show the AI context lines, it appears with no extra work.
+- **If a person's edit leaves it out**, the save still goes through, and `text_warnings` has a warning for that text and channel: *must include the required wording, word for word: "This is a communication from a debt collector."*
+
+Nothing new to call: show the "Required wording" line (the "Compliance execution preview" area of the design is a good place), and show the warning like any other.
+
 ## Personalization Context (real data, not simulated)
 
 `GET /payflow/workflows/{id}/audiences` returns one entry per text: the main text plus each version. Match an entry to the dropdown by its `key`. It is read-only and cheap: no AI and nothing saved.
@@ -119,22 +129,11 @@ Every text can have versions in other languages (`translations`, keyed by langua
 
 ## Approval
 
-Each text can carry `review_status`: `Pending Review` | `Reviewed` | `Modified`.
-
-- Mark one text reviewed: `POST /payflow/workflows/{id}/versions/review` with `{step_id, audience, review_status}` (`audience`: `"main"` or a versions key).
-- Approving the workflow is blocked while any stamped text is still Pending or Modified.
-- Editing or regenerating a stamped text resets it to `Modified` / `Pending Review`.
-- Legacy workflows with no `review_status` still approve as before.
+There is no approval per version. Approving the workflow approves all of its texts together, as the Version Summary in the design says. Text warnings never block approval.
 
 Versions can't be switched off: a version is either there or removed. **Main / Default cannot be removed.**
 
-## Segmentation config
-
-- `GET /payflow/clients/{client_id}/segmentation-config`
-- `POST /payflow/clients/{client_id}/segmentation-config/update` with `{config, note}`
-- `GET /payflow/clients/{client_id}/segmentation-config/history`
-
-Defaults: age on (six groups), country/region off. Config changes do **not** rewrite approved workflows — each workflow stores `segmentation_snapshot`.
+There are no segment settings per client either. The age groups above are fixed, and there are no country or region versions.
 
 ## Checklist for the frontend
 
@@ -147,3 +146,4 @@ Defaults: age on (six groups), country/region off. Config changes do **not** rew
 7. AI Explanation: `brief.why` first. Remove "simulated".
 8. Language switch to view translations.
 9. Warn before a channel or purpose change.
+10. Show the "Required wording" line from the AI context, and its warning when an edit leaves it out.

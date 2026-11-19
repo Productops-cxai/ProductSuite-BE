@@ -88,13 +88,11 @@ from app.modules.payflow.schemas import (
     RejectReviewRequest,
     RejectStrategyRequest,
     ReleaseReviewRequest,
-    ReviewVariantRequest,
     UpdatePayflowClientRequest,
     UpdatePayflowRoleRequest,
     UpdatePayflowStrategyRequest,
     UpdatePayflowUserRequest,
     UpdatePortfolioRequest,
-    UpdateSegmentationConfigRequest,
     PayflowDashboardResponse,
     PayflowImportJobItem,
     PayflowImportListResponse,
@@ -137,7 +135,6 @@ from app.modules.payflow.services.ai_eval_export_service import AiEvalExportServ
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
-from app.modules.payflow.services.segmentation_config_service import SegmentationConfigService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
 from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
@@ -652,45 +649,6 @@ def delete_client(
     _assert_client_permission(db, admin, client_id, "delete_client")
     try:
         return PayflowClientService(db).delete_client(client_id, actor=admin, source=source)
-    except AppError as exc:
-        raise _map_error(exc) from exc
-
-
-@router.get("/clients/{client_id}/segmentation-config")
-def get_segmentation_config(client_id: int, user: RequirePayflowProduct, db: DbSession):
-    """Demographic segmentation rules for communication variants (defaults when none saved)."""
-    try:
-        return SegmentationConfigService(db).get_config(user, client_id)
-    except AppError as exc:
-        raise _map_error(exc) from exc
-
-
-@router.post("/clients/{client_id}/segmentation-config/update")
-def update_segmentation_config(
-    client_id: int,
-    payload: UpdateSegmentationConfigRequest,
-    user: PayflowManageWorkflows,
-    db: DbSession,
-):
-    """Save client segmentation config. Does not rewrite approved workflows (AC17)."""
-    try:
-        if payload.config is None:
-            raise HTTPException(status_code=400, detail="config is required")
-        return SegmentationConfigService(db).update_config(
-            user,
-            client_id,
-            payload.config.model_dump(),
-            note=payload.note,
-        )
-    except AppError as exc:
-        raise _map_error(exc) from exc
-
-
-@router.get("/clients/{client_id}/segmentation-config/history")
-def get_segmentation_config_history(client_id: int, user: RequirePayflowProduct, db: DbSession):
-    """Immutable history of segmentation config changes (FR-10)."""
-    try:
-        return SegmentationConfigService(db).history(user, client_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1488,27 +1446,6 @@ def approve_workflow(
     try:
         note = payload.note if payload else None
         return PayflowStrategyService(db).approve(user, strategy_id, note=note)
-    except AppError as exc:
-        raise _map_error(exc) from exc
-
-
-@router.post("/workflows/{strategy_id}/versions/review", response_model=PayflowStrategyItem)
-def review_workflow_variant(
-    strategy_id: int,
-    payload: ReviewVariantRequest,
-    user: PayflowManageWorkflows,
-    db: DbSession,
-):
-    """Mark one communication variant (or Main / Default) as Reviewed independently (FR-06)."""
-    try:
-        return PayflowStrategyService(db).review_variant(
-            user,
-            strategy_id,
-            step_id=payload.step_id,
-            audience=payload.audience,
-            review_status=payload.review_status,
-            note=payload.note,
-        )
     except AppError as exc:
         raise _map_error(exc) from exc
 

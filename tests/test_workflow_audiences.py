@@ -4,7 +4,7 @@ totals that describe them - code only, no AI."""
 from datetime import date
 
 from app.infrastructure.database.models import PayflowAccountModel
-from app.modules.payflow.services.workflow_suggestion import audiences
+from app.modules.payflow.services.segmentation_config_service import default_segmentation_config
 from app.modules.payflow.services.workflow_suggestion.audiences import (
     audience_keys,
     audience_label,
@@ -98,13 +98,12 @@ def test_too_few_left_the_biggest_audience_is_served_by_the_main_text():
     assert found["main"]["accounts"] == 170 and found["main"]["profile"]["age"] == {"65 and over": 100}
 
 
-def test_biggest_audiences_first_and_at_most_max_versions(monkeypatch):
+def test_biggest_audiences_first_and_at_most_max_versions():
     members = people(25, 25) + people(40, 70) + people(30, 50) + people(20, None)
     assert [a["key"] for a in find_audiences(members, TODAY)["audiences"]] == [
         "age_65_plus", "age_45_54", "age_25_34",
     ]
-    monkeypatch.setattr(audiences, "MAX_VERSIONS", 2)
-    found = find_audiences(members, TODAY)
+    found = find_audiences(members, TODAY, segmentation={**default_segmentation_config(), "max_versions": 2})
     assert [a["key"] for a in found["audiences"]] == ["age_65_plus", "age_45_54"]
     assert found["main"]["accounts"] == 45  # 25 – 34 joins the main text
 
@@ -127,7 +126,8 @@ def test_small_groups_get_only_the_main_text():
     found = find_audiences(people(15, 70) + people(4, 25), TODAY)
     assert found["audiences"] == [] and found["main"]["accounts"] == 19
     assert find_audiences([], TODAY) == {"group": {"accounts": 0}, "audiences": [],
-                                         "main": {"accounts": 0, "profile": {"accounts": 0}}}
+                                         "main": {"accounts": 0, "profile": {"accounts": 0}},
+                                         "segmentation": default_segmentation_config()}
 
 
 def test_the_profile_describes_the_accounts_by_totals_only():

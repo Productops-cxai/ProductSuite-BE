@@ -63,11 +63,13 @@ def write_messages(
         raise ValidationAppError("This workflow has no email or SMS steps")
 
     english = (client.get("language") or "English").strip().lower().startswith("english")
+    wording = client.get("required_wording") or {}  # the compliance rules' wording - checked in every message
     written: dict[str, dict[str, Any]] = {}
     feedback: list[dict[str, Any]] = []
     for _ in range(1 + MAX_FIX_ATTEMPTS):
         briefs = [
-            _brief(steps[step_id], tones[step_id], segment, english, (plans or {}).get(step_id))
+            {**_brief(steps[step_id], tones[step_id], segment, english, (plans or {}).get(step_id)),
+             "required_wording": wording}
             for step_id in pending
         ]
         others = _other_messages(steps, tones, written, skip=pending)
@@ -148,7 +150,8 @@ def translate_messages(
         feedback = []
         for step_id in pending:
             version = _clean_version(reply.get(step_id))
-            errors = check_translation(step_id, version, sources[step_id], channels.get(step_id) or CONTACT_CHANNEL)
+            errors = check_translation(step_id, version, sources[step_id], channels.get(step_id) or CONTACT_CHANNEL,
+                                       client.get("required_wording"))
             if errors:
                 feedback.append({"step_id": step_id, "message": version, "errors": errors})
             else:
@@ -251,12 +254,14 @@ def check_texts(
     texts: list[tuple[dict[str, Any], str, dict[str, Any]]],
     *,
     english: bool = True,
+    wording: dict[str, list[str]] | None = None,
 ) -> list[dict[str, str]]:
     """Problems with message texts a person wrote - the same checks the AI's own text passes (message_validator).
 
     `texts`: [(step, "main" or an audience key, {"subject", "body", "sms_body", "tone"})]. Each part is checked by
     its channel's rules: a step without a fixed channel has an email (subject + body) and an SMS (sms_body); a part
     without text is skipped (its template is sent). The text's own tone is used, else the code's tone for the step.
+    `wording`: what the client's compliance rules require in each email / SMS (required_wording.py).
     Returns [{"step_id", "text", "channel", "problem"}] - [] when every text is fine.
     """
     stats = segment.get("stats") or {}
@@ -265,7 +270,7 @@ def check_texts(
     for step, key, text in texts:
         code = tones.get(step["id"]) or {"tone": CLEAR, "path": None, "why": None}
         brief = {**_brief(step, {**code, "tone": text.get("tone") or code["tone"]}, segment, english),
-                 "step_id": _EDITED}
+                 "step_id": _EDITED, "required_wording": wording or {}}
         bodies = [
             body
             for other in workflow.get("steps") or []
