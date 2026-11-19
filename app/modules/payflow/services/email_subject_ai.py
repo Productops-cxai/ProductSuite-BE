@@ -1601,23 +1601,39 @@ class PayflowEmailSubjectAiService:
 
     # ------------------------------------------------------------------ text history of a workflow
 
-    def message_history(self, user: UserModel, strategy_id: int, step_id: str | None = None) -> dict[str, Any]:
+    def message_history(
+        self,
+        user: UserModel,
+        strategy_id: int,
+        step_id: str | None = None,
+        *,
+        audience: str | None = None,
+    ) -> dict[str, Any]:
         """Every distinct text this workflow has sent, newest first, each with its own results:
         an old version keeps its history after the workflow's text is changed."""
         strategy = self._strategy(user, strategy_id)
-        filters = SubjectFilters(client_ids=[strategy.client_id], strategy_id=strategy.id)
+        filters = SubjectFilters(
+            client_ids=[strategy.client_id],
+            strategy_id=strategy.id,
+            audience=(audience or "").strip() or None,
+        )
         extra = [C.step_id == step_id] if step_id else []
         metrics = {
             item["group"][0]: item
             for item in self.subjects.aggregate(filters, [C.message_version_id], extra=extra)
             if item["group"][0] is not None
         }
+        version_q = self.db.query(PayflowMessageVersionModel).filter(
+            PayflowMessageVersionModel.id.in_(set(metrics))
+        ) if metrics else None
+        if version_q is not None and filters.audience:
+            version_q = version_q.filter(PayflowMessageVersionModel.audience == filters.audience)
         versions = (
-            self.db.query(PayflowMessageVersionModel)
-            .filter(PayflowMessageVersionModel.id.in_(set(metrics)))
-            .order_by(PayflowMessageVersionModel.first_used_at.desc(), PayflowMessageVersionModel.id.desc())
-            .all()
-            if metrics
+            version_q.order_by(
+                PayflowMessageVersionModel.first_used_at.desc(),
+                PayflowMessageVersionModel.id.desc(),
+            ).all()
+            if version_q is not None
             else []
         )
         current = {

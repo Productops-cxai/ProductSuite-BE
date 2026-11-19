@@ -764,6 +764,25 @@ class PayflowClientService:
                 raise ValidationAppError("communication_settings must be an object")
             client.communication_settings = dict(comm_payload)
 
+        if "communication_retention_days" in payload and payload["communication_retention_days"] is not None:
+            from app.modules.payflow.services.communication_export_service import (
+                normalize_retention_days,
+                retention_days_of,
+            )
+
+            new_days = normalize_retention_days(payload["communication_retention_days"])
+            old_days = retention_days_of(client)
+            if new_days < old_days and not payload.get("confirm_retention_shorten"):
+                raise ValidationAppError(
+                    f"Shortening retention from {old_days} to {new_days} days will hide older "
+                    "communications from search and export. Pass confirm_retention_shorten=true to continue."
+                )
+            client.communication_retention_days = new_days
+            # Keep a mirror in communication_settings for older readers.
+            settings = dict(client.communication_settings or {})
+            settings["retention_days"] = new_days
+            client.communication_settings = settings
+
         if "mappings" in payload and payload["mappings"] is not None:
             self._replace_mappings(client, payload["mappings"])
 
@@ -3658,6 +3677,11 @@ class PayflowClientService:
             "governance_rules": list(client.governance_rules or []),
             "payment_settings": dict(client.payment_settings or {}),
             "communication_settings": dict(client.communication_settings or {}),
+            "communication_retention_days": (
+                int(client.communication_retention_days)
+                if client.communication_retention_days is not None
+                else 30
+            ),
             "mappings": [
                 {
                     "id": m.id,

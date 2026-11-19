@@ -70,6 +70,8 @@ class SubjectFilters:
     strategy_id: int | None = None
     reminder_stage: str | None = None
     purpose: str | None = None
+    # Communication variant key: "main", "age_65_plus", "country_ca", ... (FR-09)
+    audience: str | None = None
     start: datetime | None = None  # inclusive
     end: datetime | None = None  # exclusive
     search: str | None = None
@@ -126,6 +128,7 @@ class PayflowEmailSubjectService:
         strategy_id: int | None = None,
         reminder_stage: str | None = None,
         purpose: str | None = None,
+        audience: str | None = None,
         search: str | None = None,
     ) -> SubjectFilters:
         """The user's selection, limited to the clients they are allowed to see."""
@@ -160,6 +163,7 @@ class PayflowEmailSubjectService:
             strategy_id=strategy_id,
             reminder_stage=stage,
             purpose=(purpose or "").strip() or None,
+            audience=(audience or "").strip() or None,
             start=datetime(first.year, first.month, first.day, tzinfo=timezone.utc),
             end=datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(days=1),
             search=normalize_subject(search) or None,
@@ -177,6 +181,8 @@ class PayflowEmailSubjectService:
             conditions.append(C.reminder_stage == filters.reminder_stage)
         if filters.purpose:
             conditions.append(C.purpose == filters.purpose)
+        if filters.audience:
+            conditions.append(C.message_audience == filters.audience)
         if filters.start is not None:
             conditions.append(C.sent_at >= filters.start)
         if filters.end is not None:

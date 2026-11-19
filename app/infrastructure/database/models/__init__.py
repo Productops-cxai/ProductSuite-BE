@@ -315,6 +315,9 @@ class PayflowClientModel(Base):
     payment_settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Send windows / quiet hours (timezone, start/end hour). Additive JSON.
     communication_settings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # How long sent communications remain visible in operational search/export (FR-04).
+    # Default 30. Records stay in DB after expiry; they are only hidden from FE/search.
+    communication_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, default=30)
     # How the client was first created: add_client | file_upload
     added_through: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -691,6 +694,9 @@ class PayflowStrategyModel(Base):
     entry_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ai_context: Mapped[list | None] = mapped_column(JSON, nullable=True)
     ai_proposal_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Segmentation rules used when this workflow's variants were generated (FR-10 / AC17).
+    # Later client config edits must not silently change matching for this workflow.
+    segmentation_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Regenerate: id of the workflow this one was regenerated from. Plain id (no foreign key),
     # so deleting the parent never blocks or breaks — following the chain just stops there.
     revision_of_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -2077,6 +2083,56 @@ class PayflowComplianceOverrideModel(Base):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PAYFLOW — DEMOGRAPHIC SEGMENTATION CONFIG
+# ---------------------------------------------------------------------------
+
+
+class PayflowSegmentationConfigModel(Base):
+    """Per-client demographic segmentation rules for communication variants."""
+
+    __tablename__ = "payflow_segmentation_configs"
+    __table_args__ = (UniqueConstraint("client_id", name="uq_payflow_segmentation_config_client"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PayflowSegmentationConfigVersionModel(Base):
+    """Immutable history of segmentation config changes (FR-10)."""
+
+    __tablename__ = "payflow_segmentation_config_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    config_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("payflow_segmentation_configs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
 # Backward-compatible aliases
 # ---------------------------------------------------------------------------
 

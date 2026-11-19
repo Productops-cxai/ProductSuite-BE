@@ -211,6 +211,10 @@ class UpdatePayflowClientRequest(BaseModel):
     # Portal options: allow_pay_in_full, allow_partial, allow_payment_plan, min amounts, plans.
     payment_settings: Optional[dict] = None
     communication_settings: Optional[dict] = None
+    # FR-04 — days of communication history kept visible in search/export (default 30).
+    communication_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    # Required when shortening retention so existing rows become newly expired (FR-05).
+    confirm_retention_shorten: Optional[bool] = False
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
@@ -871,6 +875,11 @@ class StrategyMessageVersion(BaseModel):
     tone: Optional[str] = Field(default=None, max_length=32)
     brief: Optional[StrategyMessageBrief] = None
     translations: Optional[dict[str, StrategyMessageText]] = None
+    # Pending Review | Reviewed | Modified — independent per variant (FR-06).
+    review_status: Optional[str] = Field(default=None, max_length=64)
+    # {"dimension": "age"|"country"|"region", "criteria": {...}}
+    segment: Optional[dict] = None
+    content_origin: Optional[str] = Field(default=None, max_length=64)
 
 
 class StrategyNodeConfig(BaseModel):
@@ -906,6 +915,8 @@ class StrategyNodeConfig(BaseModel):
     # The same message written for an audience, keyed by audience (audiences.py), e.g. "age_65_plus".
     # Each has its own text, brief and translations; customers outside every audience get the text above.
     versions: Optional[dict[str, StrategyMessageVersion]] = None
+    # Review status of the Main / Default text (same values as StrategyMessageVersion.review_status).
+    review_status: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
@@ -1027,6 +1038,9 @@ class PayflowStrategyItem(BaseModel):
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
     ai_proposal_snapshot: Optional[dict] = None
+    # Segmentation rules snapshotted when variants were generated (FR-10 / AC17).
+    segmentation_snapshot: Optional[dict] = None
+    variant_reviews: Optional[dict] = None
     revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
     replaced_by_id: Optional[int] = None  # Regenerate: the newest version made from this one (it is then Rejected)
     versions: List[StrategyVersionItem] = Field(default_factory=list)
@@ -1075,6 +1089,56 @@ class WorkflowAudiencesResponse(BaseModel):
     accounts: int  # the workflow's eligible accounts today
     situation: Optional[str] = None  # the segment's situation (e.g. "Payment Plan"); None for an ordinary segment
     texts: List[WorkflowTextAudience] = Field(default_factory=list)
+    variant_reviews: Optional[dict] = None
+
+
+class SegmentationAgeGroup(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    key: str = Field(min_length=2, max_length=64)
+    label: str = Field(min_length=1, max_length=64)
+    min_age: int = Field(ge=18, le=120)
+    max_age: Optional[int] = Field(default=None, ge=18, le=120)
+
+
+class SegmentationDimensionAge(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    groups: List[SegmentationAgeGroup] = Field(default_factory=list)
+
+
+class SegmentationDimensionValues(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    # Empty = auto from portfolio data when enabled; otherwise only these labels/codes.
+    values: List[str] = Field(default_factory=list)
+
+
+class SegmentationConfigBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    min_audience_size: int = Field(default=12, ge=1, le=1000)
+    max_versions: int = Field(default=6, ge=1, le=20)
+    priority: List[str] = Field(default_factory=lambda: ["region", "country", "age"])
+    dimensions: dict = Field(default_factory=dict)
+
+
+class UpdateSegmentationConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    config: Optional[SegmentationConfigBody] = None
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ReviewVariantRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    step_id: str = Field(min_length=1, max_length=64)
+    audience: str = Field(default="main", max_length=64, description='"main" or a versions key')
+    review_status: str = Field(default="Reviewed", max_length=64)
+    note: Optional[str] = Field(default=None, max_length=2000)
 
 
 class StrategiesSummary(BaseModel):
@@ -1153,6 +1217,8 @@ class PayflowCommunicationItem(BaseModel):
     client_id: int
     client_code: Optional[str] = None
     client_name: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
     account_id: int
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None

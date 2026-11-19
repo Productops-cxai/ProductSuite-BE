@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.infrastructure.database.models import PayflowAccountModel
 from app.modules.payflow.services.strategy_service import MESSAGE_TEMPLATES
 from app.modules.payflow.services.workflow_condition_runtime import apply_outcome_to_account
-from app.modules.payflow.services.workflow_suggestion.audiences import audience_keys
+from app.modules.payflow.services.workflow_suggestion.audiences import match_keys_for_account
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 
 MAIN_TEXT = "main"  # the step's own text (not an audience version) - see audience_message_config
@@ -107,21 +107,35 @@ def localized_template(template: dict[str, Any] | None, language: str | None) ->
 
 
 def audience_message_config(
-    cfg: dict[str, Any], account: Any, today: date | None = None
+    cfg: dict[str, Any],
+    account: Any,
+    today: date | None = None,
+    *,
+    segmentation: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """The step's config with the text this customer gets, and which text it is.
 
     A step written per audience holds `cfg["versions"]` ({"age_65_plus": {"subject", "body", "sms_body",
-    "translations"}, ...}, workflow_suggestion/audiences.py). The customer's audience comes from their date of
-    birth; their language comes first: when only the main text is in their language, they get the main text.
-    A workflow saved before the six age groups has versions for wider groups ("age_18_34"): its customers still
-    get them (audiences.audience_keys - their own group's version first).
+    "translations"}, ...}, workflow_suggestion/audiences.py). Matching uses the workflow's
+    `segmentation_snapshot` priority (region → country → age by default). Language comes first:
+    when only the main text is in their language, they get the main text.
     Returns (config, "age_65_plus" / "main" / None) - None when the step has no text of its own (a template).
     """
     versions = cfg.get("versions")
-    keys = audience_keys(account, today) if isinstance(versions, dict) and versions else []
-    key = next((key for key in keys if isinstance(versions.get(key), dict)
-                and (versions[key].get("body") or versions[key].get("sms_body"))), None)
+    keys = (
+        match_keys_for_account(account, today, segmentation=segmentation)
+        if isinstance(versions, dict) and versions
+        else []
+    )
+    key = next(
+        (
+            candidate
+            for candidate in keys
+            if isinstance(versions.get(candidate), dict)
+            and (versions[candidate].get("body") or versions[candidate].get("sms_body"))
+        ),
+        None,
+    )
     version = versions.get(key) if key else None
     if isinstance(version, dict) and (version.get("body") or version.get("sms_body")):
         language = str(getattr(account, "language", None) or "").strip().upper()

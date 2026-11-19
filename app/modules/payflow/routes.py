@@ -88,11 +88,13 @@ from app.modules.payflow.schemas import (
     RejectReviewRequest,
     RejectStrategyRequest,
     ReleaseReviewRequest,
+    ReviewVariantRequest,
     UpdatePayflowClientRequest,
     UpdatePayflowRoleRequest,
     UpdatePayflowStrategyRequest,
     UpdatePayflowUserRequest,
     UpdatePortfolioRequest,
+    UpdateSegmentationConfigRequest,
     PayflowDashboardResponse,
     PayflowImportJobItem,
     PayflowImportListResponse,
@@ -135,6 +137,7 @@ from app.modules.payflow.services.ai_eval_export_service import AiEvalExportServ
 from app.modules.payflow.services.review_service import PayflowReviewService
 from app.modules.payflow.services.rule_service import PayflowRuleService
 from app.modules.payflow.services.geo_service import PayflowGeoService
+from app.modules.payflow.services.segmentation_config_service import SegmentationConfigService
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
 from app.modules.payflow.services.ai_suggest_job_service import schedule_ai_suggest_jobs
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
@@ -649,6 +652,45 @@ def delete_client(
     _assert_client_permission(db, admin, client_id, "delete_client")
     try:
         return PayflowClientService(db).delete_client(client_id, actor=admin, source=source)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/clients/{client_id}/segmentation-config")
+def get_segmentation_config(client_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Demographic segmentation rules for communication variants (defaults when none saved)."""
+    try:
+        return SegmentationConfigService(db).get_config(user, client_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/clients/{client_id}/segmentation-config/update")
+def update_segmentation_config(
+    client_id: int,
+    payload: UpdateSegmentationConfigRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    """Save client segmentation config. Does not rewrite approved workflows (AC17)."""
+    try:
+        if payload.config is None:
+            raise HTTPException(status_code=400, detail="config is required")
+        return SegmentationConfigService(db).update_config(
+            user,
+            client_id,
+            payload.config.model_dump(),
+            note=payload.note,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/clients/{client_id}/segmentation-config/history")
+def get_segmentation_config_history(client_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Immutable history of segmentation config changes (FR-10)."""
+    try:
+        return SegmentationConfigService(db).history(user, client_id)
     except AppError as exc:
         raise _map_error(exc) from exc
 
@@ -1450,6 +1492,27 @@ def approve_workflow(
         raise _map_error(exc) from exc
 
 
+@router.post("/workflows/{strategy_id}/versions/review", response_model=PayflowStrategyItem)
+def review_workflow_variant(
+    strategy_id: int,
+    payload: ReviewVariantRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    """Mark one communication variant (or Main / Default) as Reviewed independently (FR-06)."""
+    try:
+        return PayflowStrategyService(db).review_variant(
+            user,
+            strategy_id,
+            step_id=payload.step_id,
+            audience=payload.audience,
+            review_status=payload.review_status,
+            note=payload.note,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
 @router.post("/workflows/{strategy_id}/reject", response_model=PayflowStrategyItem)
 def reject_workflow(
     strategy_id: int,
@@ -1631,12 +1694,14 @@ def list_comms(
     user: RequirePayflowProduct,
     db: DbSession,
     client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
     account_id: int | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     channel: str | None = Query(default=None),
     purpose: str | None = Query(default=None),
     workflow: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    recipient_email: str | None = Query(default=None),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1646,17 +1711,72 @@ def list_comms(
         return PayflowCommunicationService(db).list_communications(
             user,
             client_id=client_id,
+            portfolio_id=portfolio_id,
             account_id=account_id,
             status=status_filter,
             channel=channel,
             purpose=purpose,
             workflow=workflow,
             search=search,
+            recipient_email=recipient_email,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             offset=offset,
         )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/comms/export")
+def export_comms(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    channel: str | None = Query(default=None),
+    purpose: str | None = Query(default=None),
+    workflow: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    recipient_email: str | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    format: str = Query(default="json", description="json | html"),
+    limit: int = Query(default=5000, ge=1, le=10000),
+):
+    """Generate Email Communication History for the current filters (preview JSON or printable HTML)."""
+    try:
+        from app.modules.payflow.services.communication_export_service import (
+            CommunicationExportService,
+        )
+
+        filters = {
+            "client_id": client_id,
+            "portfolio_id": portfolio_id,
+            "account_id": account_id,
+            "status": status_filter,
+            "channel": channel,
+            "purpose": purpose,
+            "workflow": workflow,
+            "search": search,
+            "recipient_email": recipient_email,
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": limit,
+        }
+        report = CommunicationExportService(db).build_report(user, filters=filters)
+        if (format or "json").strip().lower() == "html":
+            html = CommunicationExportService(db).render_html(report)
+            return Response(
+                content=html,
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": 'attachment; filename="email-communication-history.html"'
+                },
+            )
+        return report
     except AppError as exc:
         raise _map_error(exc) from exc
 

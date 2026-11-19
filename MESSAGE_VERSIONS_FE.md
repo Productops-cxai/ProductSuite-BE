@@ -119,7 +119,22 @@ Every text can have versions in other languages (`translations`, keyed by langua
 
 ## Approval
 
-There is no approval per version. Approving the workflow approves all of its texts together, as the Version Summary in the design says. Versions can't be switched off: a version is either there or removed.
+Each text can carry `review_status`: `Pending Review` | `Reviewed` | `Modified`.
+
+- Mark one text reviewed: `POST /payflow/workflows/{id}/versions/review` with `{step_id, audience, review_status}` (`audience`: `"main"` or a versions key).
+- Approving the workflow is blocked while any stamped text is still Pending or Modified.
+- Editing or regenerating a stamped text resets it to `Modified` / `Pending Review`.
+- Legacy workflows with no `review_status` still approve as before.
+
+Versions can't be switched off: a version is either there or removed. **Main / Default cannot be removed.**
+
+## Segmentation config
+
+- `GET /payflow/clients/{client_id}/segmentation-config`
+- `POST /payflow/clients/{client_id}/segmentation-config/update` with `{config, note}`
+- `GET /payflow/clients/{client_id}/segmentation-config/history`
+
+Defaults: age on (six groups), country/region off. Config changes do **not** rewrite approved workflows — each workflow stores `segmentation_snapshot`.
 
 ## Checklist for the frontend
 

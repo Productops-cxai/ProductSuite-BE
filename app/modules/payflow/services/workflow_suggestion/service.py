@@ -17,6 +17,8 @@ from app.modules.payflow.services.strategy_service import (
     _message_text,
     read_strategy_versions,
 )
+from app.modules.payflow.services.message_variant_review import stamp_pending
+from app.modules.payflow.services.segmentation_config_service import get_client_segmentation
 from app.modules.payflow.services.workflow_suggestion.audiences import (
     audience_keys,
     audience_label,
@@ -172,10 +174,11 @@ class WorkflowSuggestionService:
         # segment's accounts), written before saving.
         writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
         members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
+        segmentation = get_client_segmentation(self.db, client["id"])
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
             segment_id = segment["segment_id"]
-            found = find_audiences(members[segment_id])
+            found = find_audiences(members[segment_id], segmentation=segmentation)
             performance = _email_performance(self.db, client["id"], portfolio_id=scope.id, found=found)
             workflows[segment_id], messages_note[segment_id] = _with_messages(
                 {**writer_client, "email_performance": performance},
@@ -204,6 +207,7 @@ class WorkflowSuggestionService:
                         + learned[segment_id]
                         + messages_note[segment_id],
                         commit=False,
+                        segmentation_snapshot=segmentation,
                     )
                 )
             self.db.commit()
@@ -284,7 +288,8 @@ class WorkflowSuggestionService:
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
         members = load_segment_members(self.db, original)
-        found = find_audiences(members)
+        segmentation = get_client_segmentation(self.db, original["client_id"])
+        found = find_audiences(members, segmentation=segmentation)
         workflow, messages_note = _with_messages(
             {
                 **client,
@@ -340,6 +345,7 @@ class WorkflowSuggestionService:
                     f"Proposed by PayFlow AI as the next version of #{original['id']} {original['name']} "
                     f"(v{original['version']}), rejected by {rejected_by} on {rejected_at}. Remarks: {remarks}"
                 ),
+                segmentation_snapshot=segmentation,
             )
             self._record_rejection(original["id"], new, remarks, rejected_by=rejected_by, rejected_at=rejected_at)
             self.db.commit()
@@ -399,7 +405,11 @@ class WorkflowSuggestionService:
         self.strategies._assert_manage(user, workflow["client_id"])
         one_text_step = _one_text_step(workflow, step_id, audience) if audience else None
         members = load_segment_members(self.db, workflow)
-        found = find_audiences(members)
+        segmentation = (
+            workflow.get("segmentation_snapshot")
+            or get_client_segmentation(self.db, workflow["client_id"])
+        )
+        found = find_audiences(members, segmentation=segmentation)
         client = {
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
@@ -467,11 +477,18 @@ class WorkflowSuggestionService:
         the context the AI writes them for (audiences.text_audiences). No AI call; nothing is saved."""
         workflow = self.strategies.get_strategy(user, strategy_id)
         members = load_segment_members(self.db, workflow)
+        segmentation = (
+            workflow.get("segmentation_snapshot")
+            or get_client_segmentation(self.db, workflow["client_id"])
+        )
         return {
             "workflow_id": workflow["id"],
             "accounts": len(members),
             "situation": (workflow.get("segment") or {}).get("situation"),
-            "texts": text_audiences(members, workflow.get("steps") or []),
+            "texts": text_audiences(
+                members, workflow.get("steps") or [], segmentation=segmentation
+            ),
+            "variant_reviews": self.strategies.variant_review_summary(workflow.get("steps") or []),
         }
 
     def update_workflow(self, user: UserModel, strategy_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -626,6 +643,7 @@ class WorkflowSuggestionService:
         revision_of_id: int | None = None,
         version: int = 1,
         history_note: str | None = None,
+        segmentation_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
@@ -644,6 +662,7 @@ class WorkflowSuggestionService:
                 "source": PayflowStrategySource.AI_GENERATED.value,
                 "ai_context": ai_context,
                 "revision_of_id": revision_of_id,
+                "segmentation_snapshot": segmentation_snapshot,
             },
             commit=commit,
             version=version,
@@ -771,7 +790,10 @@ def _write_for_audiences(
     )
     for step_id, brief in main_plans.items():
         if step_id in written:
-            written[step_id] = {**written[step_id], "brief": brief}
+            written[step_id] = stamp_pending({**written[step_id], "brief": brief})
+    for step_id, text in list(written.items()):
+        if "review_status" not in text:
+            written[step_id] = stamp_pending(text)
 
     done, failed = [], []
     for audience in found.get("audiences") or []:
@@ -786,7 +808,15 @@ def _write_for_audiences(
             failed.append(audience)
             continue
         for step_id, text in texts.items():
-            version = {"label": audience["label"], **text, "brief": audience_plans[step_id]}
+            version = stamp_pending({
+                "label": audience["label"],
+                **text,
+                "brief": audience_plans[step_id],
+                "segment": {
+                    "dimension": audience.get("dimension") or "age",
+                    "criteria": audience.get("criteria") or {},
+                },
+            })
             written[step_id] = {**written[step_id],
                                 "versions": {**(written[step_id].get("versions") or {}), audience["key"]: version}}
         done.append(audience)
@@ -841,8 +871,18 @@ def _write_one(
                              audience=audience if plans else None)
     text = {name: value for name, value in written[step_id].items() if value}
     if key == MAIN:
-        return {**text, **({"brief": plans[step_id]} if plans else {})}
-    return {"label": audience["label"], **text, "brief": plans[step_id]}
+        return stamp_pending({**text, **({"brief": plans[step_id]} if plans else {})})
+    return stamp_pending({
+        "label": audience["label"],
+        **text,
+        "brief": plans[step_id],
+        "segment": {
+            "dimension": audience.get("dimension") or (
+                "country" if key.startswith("country_") else "region" if key.startswith("region_") else "age"
+            ),
+            "criteria": audience.get("criteria") or {},
+        },
+    })
 
 
 def _audience_for(found: dict[str, Any], members: list, key: str, label: str | None = None) -> dict[str, Any]:

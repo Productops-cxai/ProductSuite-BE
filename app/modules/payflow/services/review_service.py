@@ -537,27 +537,37 @@ class PayflowReviewService:
         return actions
 
     def _load_communications(self, account_id: int, limit: int = 8) -> list[dict[str, Any]]:
+        from app.modules.payflow.services.communication_export_service import within_retention
+
+        # Oversample then drop expired rows so retention-hidden subjects never appear.
         rows = (
             self.db.query(PayflowCommunicationModel)
+            .options(joinedload(PayflowCommunicationModel.client))
             .filter(PayflowCommunicationModel.account_id == account_id)
             .order_by(PayflowCommunicationModel.created_at.desc())
-            .limit(limit)
+            .limit(max(limit * 4, 32))
             .all()
         )
-        return [
-            {
-                "id": c.id,
-                "code": c.code,
-                "channel": c.channel,
-                "purpose": c.purpose,
-                "status": c.status,
-                "engagement": c.engagement,
-                "date_label": c.date_label,
-                "time_label": c.time_label,
-                "subject": c.subject,
-            }
-            for c in rows
-        ]
+        out: list[dict[str, Any]] = []
+        for c in rows:
+            if not within_retention(c):
+                continue
+            out.append(
+                {
+                    "id": c.id,
+                    "code": c.code,
+                    "channel": c.channel,
+                    "purpose": c.purpose,
+                    "status": c.status,
+                    "engagement": c.engagement,
+                    "date_label": c.date_label,
+                    "time_label": c.time_label,
+                    "subject": c.subject,
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
 
     def _payment_context(self, account: PayflowAccountModel | None) -> dict[str, Any] | None:
         if not account:
