@@ -385,6 +385,10 @@ def _filters(
     strategy_id: Optional[int] = Query(default=None),
     reminder_stage: Optional[str] = Query(default=None),
     purpose: Optional[str] = Query(default=None, description="email purpose, e.g. Payment Reminder"),
+    audience: Optional[str] = Query(
+        default=None,
+        description='communication variant: "main", "age_65_plus", "country_ca", ...',
+    ),
     search: Optional[str] = Query(default=None),
 ) -> SubjectFilters:
     try:
@@ -398,6 +402,7 @@ def _filters(
             strategy_id=strategy_id,
             reminder_stage=reminder_stage,
             purpose=purpose,
+            audience=audience,
             search=search,
         )
     except AppError as exc:
@@ -507,10 +512,16 @@ def get_workflow_message_history(
     user: RequirePayflowProduct,
     db: DbSession,
     step_id: Optional[str] = Query(default=None),
+    audience: Optional[str] = Query(
+        default=None,
+        description='filter by communication variant: "main", "age_65_plus", ...',
+    ),
 ):
     """Every distinct email text the workflow has sent (old versions keep their results)."""
     try:
-        return PayflowEmailSubjectAiService(db).message_history(user, strategy_id, step_id)
+        return PayflowEmailSubjectAiService(db).message_history(
+            user, strategy_id, step_id, audience=audience
+        )
     except AppError as exc:
         raise _http(exc) from exc
 

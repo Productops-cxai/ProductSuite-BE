@@ -211,6 +211,10 @@ class UpdatePayflowClientRequest(BaseModel):
     # Portal options: allow_pay_in_full, allow_partial, allow_payment_plan, min amounts, plans.
     payment_settings: Optional[dict] = None
     communication_settings: Optional[dict] = None
+    # FR-04 — days of communication history kept visible in search/export (default 30).
+    communication_retention_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    # Required when shortening retention so existing rows become newly expired (FR-05).
+    confirm_retention_shorten: Optional[bool] = False
     mappings: Optional[List[MappingUpdateItem]] = None
     supervisor_user_ids: Optional[List[UUID]] = None
 
@@ -871,6 +875,11 @@ class StrategyMessageVersion(BaseModel):
     tone: Optional[str] = Field(default=None, max_length=32)
     brief: Optional[StrategyMessageBrief] = None
     translations: Optional[dict[str, StrategyMessageText]] = None
+    # Pending Review | Reviewed | Modified — independent per variant (FR-06).
+    review_status: Optional[str] = Field(default=None, max_length=64)
+    # {"dimension": "age"|"country"|"region", "criteria": {...}}
+    segment: Optional[dict] = None
+    content_origin: Optional[str] = Field(default=None, max_length=64)
 
 
 class StrategyNodeConfig(BaseModel):
@@ -906,6 +915,8 @@ class StrategyNodeConfig(BaseModel):
     # The same message written for an audience, keyed by audience (audiences.py), e.g. "age_65_plus".
     # Each has its own text, brief and translations; customers outside every audience get the text above.
     versions: Optional[dict[str, StrategyMessageVersion]] = None
+    # Review status of the Main / Default text (same values as StrategyMessageVersion.review_status).
+    review_status: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
@@ -1027,6 +1038,8 @@ class PayflowStrategyItem(BaseModel):
     stats: StrategyStats = Field(default_factory=StrategyStats)
     ai_context: List[StrategyContextItem] = Field(default_factory=list)
     ai_proposal_snapshot: Optional[dict] = None
+    # Segmentation rules snapshotted when variants were generated (FR-10 / AC17).
+    segmentation_snapshot: Optional[dict] = None
     revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
     replaced_by_id: Optional[int] = None  # Regenerate: the newest version made from this one (it is then Rejected)
     versions: List[StrategyVersionItem] = Field(default_factory=list)
@@ -1039,6 +1052,42 @@ class PayflowStrategyItem(BaseModel):
     last_updated_label: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class PayflowTextWarning(BaseModel):
+    """A problem with a message text a person wrote - the checks the AI's own text passes. Never blocks the save."""
+
+    step_id: str
+    text: str  # which of the step's texts: "main" or an audience version, e.g. "age_65_plus"
+    channel: str  # the part with the problem: "Email" or "SMS"
+    problem: str
+
+
+class PayflowStrategyUpdateItem(PayflowStrategyItem):
+    """POST /workflows/{id}/update: the saved workflow, and problems with the texts this save changed."""
+
+    text_warnings: List[PayflowTextWarning] = Field(default_factory=list)
+
+
+class WorkflowTextAudience(BaseModel):
+    """Who gets one of a workflow's texts, from today's accounts - totals only, never one person."""
+
+    key: str  # "main" or an audience version, e.g. "age_65_plus"
+    label: str  # "Main text", "Age 65 and over"
+    accounts: int
+    # Shares in % of the accounts and averages: age, regions, countries, languages, avg_balance, balance_bands,
+    # partly_paid_pct, avg_days_past_due, with_email_pct, with_mobile_pct, contact_history
+    # (workflow_suggestion/audiences.py: audience_profile + reach_profile)
+    profile: dict = Field(default_factory=dict)
+
+
+class WorkflowAudiencesResponse(BaseModel):
+    """GET /workflows/{id}/audiences: the context of the main text and of each audience version."""
+
+    workflow_id: int
+    accounts: int  # the workflow's eligible accounts today
+    situation: Optional[str] = None  # the segment's situation (e.g. "Payment Plan"); None for an ordinary segment
+    texts: List[WorkflowTextAudience] = Field(default_factory=list)
 
 
 class StrategiesSummary(BaseModel):
@@ -1117,6 +1166,8 @@ class PayflowCommunicationItem(BaseModel):
     client_id: int
     client_code: Optional[str] = None
     client_name: Optional[str] = None
+    portfolio_id: Optional[int] = None
+    portfolio_name: Optional[str] = None
     account_id: int
     customer_name: Optional[str] = None
     account_reference: Optional[str] = None
@@ -1732,8 +1783,14 @@ class SuggestWorkflowsResponse(BaseModel):
 class WriteWorkflowMessagesRequest(BaseModel):
     step_id: Optional[str] = Field(default=None, max_length=64, description="Rewrite only this message step")
     remarks: Optional[str] = Field(default=None, max_length=2000, description="What the reviewer wants changed")
+    audience: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description='With step_id: rewrite only this text of the message - "main" (its main text) or one of its '
+        'audience versions (e.g. "age_65_plus"); its other texts stay as they are',
+    )
 
-    @field_validator("step_id", "remarks")
+    @field_validator("step_id", "remarks", "audience")
     @classmethod
     def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
         cleaned = (value or "").strip()

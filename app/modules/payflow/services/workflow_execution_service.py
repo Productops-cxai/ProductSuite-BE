@@ -2359,7 +2359,9 @@ class WorkflowExecutionService:
 
         channel = (cfg.get("channel") or step.get("channel") or "Email").strip()
         # The text written for the customer's audience when the step has one (else its main text).
-        cfg, audience = audience_message_config(cfg, account)
+        cfg, audience = audience_message_config(
+            cfg, account, segmentation=getattr(strategy, "segmentation_snapshot", None)
+        )
         subject, body = self._render_channel_message(
             cfg, step, channel=channel, purpose=str(purpose), account=account, strategy=strategy
         )
@@ -2393,7 +2395,9 @@ class WorkflowExecutionService:
         review_approved: bool = False,
     ) -> None:
         # The text written for the customer's audience when the step has one (else its main text).
-        cfg, audience = audience_message_config(_cfg(step), account)
+        cfg, audience = audience_message_config(
+            _cfg(step), account, segmentation=getattr(strategy, "segmentation_snapshot", None)
+        )
         channels = preferred_contact_channels(self.db, account)
         attempts: list[dict[str, Any]] = []
         chosen: str | None = None

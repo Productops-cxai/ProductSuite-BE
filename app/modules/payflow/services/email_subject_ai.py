@@ -1359,6 +1359,7 @@ class PayflowEmailSubjectAiService:
             load_client_context,
             load_payment_options,
         )
+        from app.modules.payflow.services.workflow_suggestion.required_wording import workflow_wording
         from app.modules.payflow.services.workflow_suggestion.service import _stored_segment
 
         try:
@@ -1370,6 +1371,8 @@ class PayflowEmailSubjectAiService:
                 "email_performance": self.performance_context(
                     strategy.client_id, portfolio_id=strategy.portfolio_id, strategy_id=strategy.id
                 ),
+                # The wording the client's compliance rules require (the send check blocks emails without it).
+                "required_wording": workflow_wording(self.db, workflow),
             }
             written = message_writer.write_messages(
                 client, workflow, _stored_segment(workflow), step_ids=[step["id"]], remarks=remarks
@@ -1567,6 +1570,7 @@ class PayflowEmailSubjectAiService:
         from app.modules.payflow.services.strategy_service import PayflowStrategyService
         from app.modules.payflow.services.workflow_suggestion.context import load_client_context
         from app.modules.payflow.services.workflow_suggestion.message_validator import check_message
+        from app.modules.payflow.services.workflow_suggestion.required_wording import workflow_wording
         from app.modules.payflow.services.workflow_suggestion.service import _stored_segment
 
         try:
@@ -1583,6 +1587,7 @@ class PayflowEmailSubjectAiService:
                 **message_writer._brief(step, tone, segment, language.strip().lower().startswith("english")),
                 "channel": "Email",
                 "step_id": step.get("title") or step.get("id"),
+                "required_wording": workflow_wording(self.db, workflow),  # the client's compliance rules
             }
             return check_message({"subject": subject or "", "body": body or ""}, brief, [])
         except Exception:  # noqa: BLE001
@@ -1601,23 +1606,39 @@ class PayflowEmailSubjectAiService:
 
     # ------------------------------------------------------------------ text history of a workflow
 
-    def message_history(self, user: UserModel, strategy_id: int, step_id: str | None = None) -> dict[str, Any]:
+    def message_history(
+        self,
+        user: UserModel,
+        strategy_id: int,
+        step_id: str | None = None,
+        *,
+        audience: str | None = None,
+    ) -> dict[str, Any]:
         """Every distinct text this workflow has sent, newest first, each with its own results:
         an old version keeps its history after the workflow's text is changed."""
         strategy = self._strategy(user, strategy_id)
-        filters = SubjectFilters(client_ids=[strategy.client_id], strategy_id=strategy.id)
+        filters = SubjectFilters(
+            client_ids=[strategy.client_id],
+            strategy_id=strategy.id,
+            audience=(audience or "").strip() or None,
+        )
         extra = [C.step_id == step_id] if step_id else []
         metrics = {
             item["group"][0]: item
             for item in self.subjects.aggregate(filters, [C.message_version_id], extra=extra)
             if item["group"][0] is not None
         }
+        version_q = self.db.query(PayflowMessageVersionModel).filter(
+            PayflowMessageVersionModel.id.in_(set(metrics))
+        ) if metrics else None
+        if version_q is not None and filters.audience:
+            version_q = version_q.filter(PayflowMessageVersionModel.audience == filters.audience)
         versions = (
-            self.db.query(PayflowMessageVersionModel)
-            .filter(PayflowMessageVersionModel.id.in_(set(metrics)))
-            .order_by(PayflowMessageVersionModel.first_used_at.desc(), PayflowMessageVersionModel.id.desc())
-            .all()
-            if metrics
+            version_q.order_by(
+                PayflowMessageVersionModel.first_used_at.desc(),
+                PayflowMessageVersionModel.id.desc(),
+            ).all()
+            if version_q is not None
             else []
         )
         current = {

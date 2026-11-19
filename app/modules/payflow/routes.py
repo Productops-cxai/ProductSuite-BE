@@ -81,6 +81,8 @@ from app.modules.payflow.schemas import (
     PayflowRulesListResponse,
     PayflowStrategiesListResponse,
     PayflowStrategyItem,
+    PayflowStrategyUpdateItem,
+    WorkflowAudiencesResponse,
     PayflowUserDetailResponse,
     PayflowUsersListResponse,
     RejectReviewRequest,
@@ -1381,7 +1383,16 @@ def get_workflow(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
         raise _map_error(exc) from exc
 
 
-@router.post("/workflows/{strategy_id}/update", response_model=PayflowStrategyItem)
+@router.get("/workflows/{strategy_id}/audiences", response_model=WorkflowAudiencesResponse)
+def get_workflow_audiences(strategy_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Who gets the main text and each audience version, from today's accounts (no AI call, nothing saved)."""
+    try:
+        return WorkflowSuggestionService(db).workflow_audiences(user, strategy_id)
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/workflows/{strategy_id}/update", response_model=PayflowStrategyUpdateItem)
 def update_workflow(
     strategy_id: int,
     payload: UpdatePayflowStrategyRequest,
@@ -1604,7 +1615,7 @@ def write_workflow_messages(
     try:
         payload = payload or WriteWorkflowMessagesRequest()
         return WorkflowSuggestionService(db).write_workflow_messages(
-            user, strategy_id, payload.step_id, payload.remarks
+            user, strategy_id, payload.step_id, payload.remarks, audience=payload.audience
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -1620,12 +1631,14 @@ def list_comms(
     user: RequirePayflowProduct,
     db: DbSession,
     client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
     account_id: int | None = Query(default=None),
     status_filter: str | None = Query(default=None, alias="status"),
     channel: str | None = Query(default=None),
     purpose: str | None = Query(default=None),
     workflow: str | None = Query(default=None),
     search: str | None = Query(default=None),
+    recipient_email: str | None = Query(default=None),
     date_from: datetime | None = Query(default=None),
     date_to: datetime | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1635,17 +1648,72 @@ def list_comms(
         return PayflowCommunicationService(db).list_communications(
             user,
             client_id=client_id,
+            portfolio_id=portfolio_id,
             account_id=account_id,
             status=status_filter,
             channel=channel,
             purpose=purpose,
             workflow=workflow,
             search=search,
+            recipient_email=recipient_email,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             offset=offset,
         )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post("/comms/export")
+def export_comms(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    client_id: int | None = Query(default=None),
+    portfolio_id: int | None = Query(default=None),
+    account_id: int | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    channel: str | None = Query(default=None),
+    purpose: str | None = Query(default=None),
+    workflow: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    recipient_email: str | None = Query(default=None),
+    date_from: datetime | None = Query(default=None),
+    date_to: datetime | None = Query(default=None),
+    format: str = Query(default="json", description="json | html"),
+    limit: int = Query(default=5000, ge=1, le=10000),
+):
+    """Generate Email Communication History for the current filters (preview JSON or printable HTML)."""
+    try:
+        from app.modules.payflow.services.communication_export_service import (
+            CommunicationExportService,
+        )
+
+        filters = {
+            "client_id": client_id,
+            "portfolio_id": portfolio_id,
+            "account_id": account_id,
+            "status": status_filter,
+            "channel": channel,
+            "purpose": purpose,
+            "workflow": workflow,
+            "search": search,
+            "recipient_email": recipient_email,
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": limit,
+        }
+        report = CommunicationExportService(db).build_report(user, filters=filters)
+        if (format or "json").strip().lower() == "html":
+            html = CommunicationExportService(db).render_html(report)
+            return Response(
+                content=html,
+                media_type="text/html; charset=utf-8",
+                headers={
+                    "Content-Disposition": 'attachment; filename="email-communication-history.html"'
+                },
+            )
+        return report
     except AppError as exc:
         raise _map_error(exc) from exc
 

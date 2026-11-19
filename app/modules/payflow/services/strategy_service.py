@@ -404,6 +404,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         cfg["translations"] = translations
     # The AI's plan for the text, and the same message written for each audience (see _clean_versions).
     raw_brief, raw_versions = cfg.pop("brief", None), cfg.pop("versions", None)
+    raw_review_status = cfg.pop("review_status", None)
     if kind == "Communication":
         brief = _clean_brief(raw_brief)
         if brief:
@@ -411,6 +412,11 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         if isinstance(raw_versions, dict):
             # Sent: these are the step's versions ({} = every version removed on purpose) - see _carry_versions.
             cfg["versions"] = _clean_versions(raw_versions)
+        from app.modules.payflow.services.message_variant_review import normalize_review_status
+
+        status = normalize_review_status(raw_review_status)
+        if status:
+            cfg["review_status"] = status
 
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
@@ -471,10 +477,13 @@ def _clean_brief(raw: Any) -> dict[str, str]:
 
 
 def _clean_versions(raw: Any) -> dict[str, dict[str, Any]]:
-    """{"age_65_plus": {"label", "subject", "body", "sms_body", "tone", "brief", "translations"}, ...}: the step's
-    message written for each audience (workflow_suggestion/audiences.py). Versions without text are dropped."""
+    """{"age_65_plus": {"label", "subject", "body", "sms_body", "tone", "brief", "translations",
+    "review_status", "segment"}, ...}: the step's message written for each audience
+    (workflow_suggestion/audiences.py). Versions without text are dropped."""
     if not isinstance(raw, dict):
         return {}
+    from app.modules.payflow.services.message_variant_review import normalize_review_status
+
     cleaned: dict[str, dict[str, Any]] = {}
     for key, version in raw.items():
         if not isinstance(version, dict) or not str(key or "").strip():
@@ -484,9 +493,31 @@ def _clean_versions(raw: Any) -> dict[str, dict[str, Any]]:
         if not (text.get("body") or text.get("sms_body")):
             continue
         brief, translations = _clean_brief(version.get("brief")), _clean_translations(version.get("translations"))
-        cleaned[str(key).strip()] = {**text, **({"brief": brief} if brief else {}),
-                                     **({"translations": translations} if translations else {})}
+        entry = {**text, **({"brief": brief} if brief else {}),
+                 **({"translations": translations} if translations else {})}
+        status = normalize_review_status(version.get("review_status"))
+        if status:
+            entry["review_status"] = status
+        segment = version.get("segment")
+        if isinstance(segment, dict) and segment:
+            entry["segment"] = {
+                k: v for k, v in segment.items() if v is not None and v != ""
+            }
+        content_origin = str(version.get("content_origin") or "").strip()
+        if content_origin:
+            entry["content_origin"] = content_origin
+        cleaned[str(key).strip()] = entry
     return cleaned
+
+
+def _sends_as(step: dict) -> tuple[str, str]:
+    """(channel, purpose) a message step is sent with - channel "" when the worker picks it ("Email + SMS").
+    The channel is read the way the worker reads it (workflow_contact_runtime.is_contact_step)."""
+    cfg = _cfg(step)
+    raw = cfg.get("channel") if cfg.get("channel") is not None else step.get("channel")
+    channel = str(raw or "").strip()
+    purpose = str(cfg.get("purpose") or step.get("purpose") or "").strip()
+    return ("" if channel == CONTACT_CHANNEL else channel), purpose
 
 
 def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
@@ -497,8 +528,16 @@ def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
     - `versions` sent → they are the step's versions: a version left out was removed on purpose ({} = all of them).
       A version whose own text was edited loses its outdated other-language versions (the update route writes them
       again); an unchanged one keeps its stored ones - and its label and brief - when they were not sent back.
+    - Editing a reviewed text resets its review_status to Modified (FR-05 / FR-06).
     - The main text's brief stays unless a new one is sent.
+    - The step's channel or purpose changed → its texts were written for the old one (an SMS-only step would send
+      a version's email body): every version not sent with new text is removed, and so is the main text's brief.
     """
+    from app.modules.payflow.services.message_variant_review import (
+        REVIEW_MODIFIED,
+        normalize_review_status,
+    )
+
     stored = {step.get("id"): step for step in before}
     result = []
     for step in after:
@@ -509,21 +548,43 @@ def _carry_versions(before: list[dict], after: list[dict]) -> list[dict]:
         if old is not None:
             old_cfg = _cfg(old)
             old_versions = old_cfg.get("versions") or {}
+            outdated = _sends_as(step) != _sends_as(old)
+            main_edited = _message_text(old) != _message_text(step)
+            if main_edited and (
+                normalize_review_status(old_cfg.get("review_status"))
+                or normalize_review_status(cfg.get("review_status"))
+            ):
+                cfg["review_status"] = REVIEW_MODIFIED
+            elif old_cfg.get("review_status") and not cfg.get("review_status"):
+                cfg["review_status"] = old_cfg["review_status"]
             if "versions" not in cfg:
-                if old_versions:
+                if old_versions and not outdated:
                     cfg["versions"] = copy.deepcopy(old_versions)
             else:
-                for key, version in (cfg.get("versions") or {}).items():
+                for key, version in list((cfg.get("versions") or {}).items()):
                     was = old_versions.get(key) or {}
                     edited = any((version.get(k) or "") != (was.get(k) or "") for k in MESSAGE_TEXT_KEYS)
+                    if outdated and not edited:
+                        cfg["versions"].pop(key)
+                        continue
                     if edited and version.get("translations") == was.get("translations"):
                         version.pop("translations", None)
                     elif not edited and was.get("translations") and not version.get("translations"):
                         version["translations"] = copy.deepcopy(was["translations"])
-                    for name in ("label", "brief"):
+                    for name in ("label", "brief", "segment", "content_origin"):
                         if was.get(name) and not version.get(name):
                             version[name] = copy.deepcopy(was[name])
-            if old_cfg.get("brief") and not cfg.get("brief"):
+                    if edited and (
+                        normalize_review_status(was.get("review_status"))
+                        or normalize_review_status(version.get("review_status"))
+                    ):
+                        version["review_status"] = REVIEW_MODIFIED
+                    elif was.get("review_status") and not version.get("review_status"):
+                        version["review_status"] = was["review_status"]
+            if outdated:
+                if cfg.get("brief") == old_cfg.get("brief"):
+                    cfg.pop("brief", None)  # sent back as it was: the plan of the old message
+            elif old_cfg.get("brief") and not cfg.get("brief"):
                 cfg["brief"] = copy.deepcopy(old_cfg["brief"])
         if "versions" in cfg and not cfg["versions"]:
             cfg.pop("versions")  # sent empty: every version removed
@@ -719,6 +780,31 @@ def _message_text(step: dict[str, Any]) -> tuple[str, str, str]:
     return cfg.get("subject") or "", cfg.get("body") or "", cfg.get("sms_body") or ""
 
 
+def _diff_versions(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Audit lines for audience-variant add / edit / remove on one Communication step."""
+    if old.get("kind") != "Communication" and new.get("kind") != "Communication":
+        return []
+    title = new.get("title") or old.get("title") or new.get("id") or old.get("id") or "message"
+    before = (_cfg(old).get("versions") or {}) if isinstance(_cfg(old).get("versions"), dict) else {}
+    after = (_cfg(new).get("versions") or {}) if isinstance(_cfg(new).get("versions"), dict) else {}
+    lines: list[str] = []
+    for key in sorted(set(before) | set(after)):
+        was, now = before.get(key), after.get(key)
+        label = (
+            (now or was or {}).get("label")
+            or key
+        )
+        if was and not now:
+            lines.append(f"{title}: removed variant '{label}' ({key})")
+        elif now and not was:
+            lines.append(f"{title}: added variant '{label}' ({key})")
+        elif was and now:
+            edited = any((now.get(k) or "") != (was.get(k) or "") for k in MESSAGE_TEXT_KEYS)
+            if edited:
+                lines.append(f"{title}: edited variant '{label}' ({key})")
+    return lines
+
+
 def _diff_steps(before: list[dict], after: list[dict]) -> list[str]:
     before_by_id = {s.get("id"): s for s in before if s.get("id")}
     after_by_id = {s.get("id"): s for s in after if s.get("id")}
@@ -751,6 +837,7 @@ def _diff_steps(before: list[dict], after: list[dict]) -> list[str]:
             changes.append(f"{new.get('title') or sid}: condition changed to {new_cond.strip()}")
         if _message_text(old) != _message_text(new):
             changes.append(f"{new.get('title') or sid}: message text edited")
+        changes.extend(_diff_versions(old, new))
         if bool(old.get("disabled")) != bool(new.get("disabled")):
             changes.append(
                 f"{new.get('title') or sid}: "
@@ -998,6 +1085,7 @@ class PayflowStrategyService:
             "stats": stats,
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
+            "segmentation_snapshot": row.segmentation_snapshot,
             "revision_of_id": row.revision_of_id,
             # The newest version regenerated from this one (it is then Rejected).
             "replaced_by_id": (
@@ -1193,6 +1281,7 @@ class PayflowStrategyService:
             entry_node_id=entry_node_id,
             ai_context=ai_context,
             ai_proposal_snapshot=ai_snapshot,
+            segmentation_snapshot=payload.get("segmentation_snapshot"),
             revision_of_id=payload.get("revision_of_id"),  # set by Regenerate only
             versions=[],
             reviewed_by=None,

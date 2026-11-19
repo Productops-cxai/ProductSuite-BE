@@ -17,10 +17,14 @@ from app.modules.payflow.services.strategy_service import (
     _message_text,
     read_strategy_versions,
 )
+from app.modules.payflow.services.segmentation_config_service import default_segmentation_config
 from app.modules.payflow.services.workflow_suggestion.audiences import (
+    audience_keys,
     audience_label,
+    audience_profile,
     find_audiences,
     members_by_segment,
+    text_audiences,
 )
 from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
@@ -49,8 +53,15 @@ from app.modules.payflow.services.workflow_suggestion.llm import build_output_sc
 from app.modules.payflow.services.workflow_suggestion.message_brief import MAIN, plan_messages
 from app.modules.payflow.services.workflow_suggestion.message_writer import (
     apply_messages,
+    check_texts,
     translate_messages,
     write_messages,
+)
+from app.modules.payflow.services.workflow_suggestion.required_wording import (
+    LABEL as WORDING_LABEL,
+    required_wording,
+    required_wording_line,
+    workflow_wording,
 )
 from app.modules.payflow.services.workflow_suggestion.prompt import (
     MAX_REGENERATE_CLIENT_EXAMPLES,
@@ -168,13 +179,15 @@ class WorkflowSuggestionService:
         # segment's accounts), written before saving.
         writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
         members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
+        segmentation = default_segmentation_config()  # the fixed age groups - never per-client settings
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
             segment_id = segment["segment_id"]
-            found = find_audiences(members[segment_id])
+            found = find_audiences(members[segment_id], segmentation=segmentation)
             performance = _email_performance(self.db, client["id"], portfolio_id=scope.id, found=found)
             workflows[segment_id], messages_note[segment_id] = _with_messages(
-                {**writer_client, "email_performance": performance},
+                {**writer_client, "email_performance": performance,
+                 "required_wording": required_wording(self.db, client["id"], members[segment_id])},
                 workflows[segment_id],
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
@@ -200,6 +213,7 @@ class WorkflowSuggestionService:
                         + learned[segment_id]
                         + messages_note[segment_id],
                         commit=False,
+                        segmentation_snapshot=segmentation,
                     )
                 )
             self.db.commit()
@@ -280,7 +294,8 @@ class WorkflowSuggestionService:
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
         members = load_segment_members(self.db, original)
-        found = find_audiences(members)
+        segmentation = default_segmentation_config()  # the fixed age groups - never per-client settings
+        found = find_audiences(members, segmentation=segmentation)
         workflow, messages_note = _with_messages(
             {
                 **client,
@@ -290,6 +305,7 @@ class WorkflowSuggestionService:
                     self.db, original["client_id"], portfolio_id=original.get("portfolio_id"),
                     strategy_id=original["id"], found=found,
                 ),
+                "required_wording": required_wording(self.db, original["client_id"], members),
             },
             workflow,
             _stored_segment(original),
@@ -336,6 +352,7 @@ class WorkflowSuggestionService:
                     f"Proposed by PayFlow AI as the next version of #{original['id']} {original['name']} "
                     f"(v{original['version']}), rejected by {rejected_by} on {rejected_at}. Remarks: {remarks}"
                 ),
+                segmentation_snapshot=segmentation,
             )
             self._record_rejection(original["id"], new, remarks, rejected_by=rejected_by, rejected_at=rejected_at)
             self.db.commit()
@@ -373,9 +390,19 @@ class WorkflowSuggestionService:
         )
 
     def write_workflow_messages(
-        self, user: UserModel, strategy_id: int, step_id: str | None = None, remarks: str | None = None
+        self,
+        user: UserModel,
+        strategy_id: int,
+        step_id: str | None = None,
+        remarks: str | None = None,
+        *,
+        audience: str | None = None,
     ) -> dict[str, Any]:
-        """AI writes the email / SMS text of a workflow — every message, or only `step_id`."""
+        """AI writes the email / SMS text of a workflow — every message, or only `step_id`.
+
+        `audience` (with `step_id`): only that one text of the message - MAIN ("main") or one of its audience
+        versions ("age_65_plus") - and its translations. The message's other texts and the other steps stay as they are.
+        """
         workflow = self.strategies.get_strategy(user, strategy_id)
         _assert_not_rejected(workflow, "write the messages of the new version")
         if workflow["status"] not in WRITE_MESSAGES_STATUSES:
@@ -383,8 +410,9 @@ class WorkflowSuggestionService:
                 "Message text can only be written for Draft, AI Proposed or Under Review workflows"
             )
         self.strategies._assert_manage(user, workflow["client_id"])
+        one_text_step = _one_text_step(workflow, step_id, audience) if audience else None
         members = load_segment_members(self.db, workflow)
-        found = find_audiences(members)
+        found = find_audiences(members, segmentation=default_segmentation_config())  # the fixed age groups
         client = {
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
@@ -392,7 +420,10 @@ class WorkflowSuggestionService:
                 self.db, workflow["client_id"], portfolio_id=workflow.get("portfolio_id"),
                 strategy_id=workflow["id"], found=found,
             ),
+            "required_wording": required_wording(self.db, workflow["client_id"], members),
         }
+        if one_text_step is not None:
+            return self._write_one_text(user, workflow, client, members, found, one_text_step, audience, remarks)
         written, audiences_note = _write_for_audiences(
             client,
             workflow,
@@ -408,19 +439,93 @@ class WorkflowSuggestionService:
         if not step_id:  # every message rewritten: who they are written for is new too
             ai_context = [item for item in ai_context if item.get("label") != "Audiences"] + audiences_note
         ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
+        ai_context = _with_wording_line(ai_context, client)
         return self.strategies.save_ai_messages(user, strategy_id, steps, remarks=remarks, ai_context=ai_context)
 
+    def _write_one_text(
+        self,
+        user: UserModel,
+        workflow: dict[str, Any],
+        client: dict[str, Any],
+        members: list,
+        found: dict[str, Any],
+        step: dict[str, Any],
+        key: str,
+        remarks: str | None,
+    ) -> dict[str, Any]:
+        """Write messages for one text of one message (write_workflow_messages with `audience`): written, translated
+        into the workflow's other languages, put back next to the message's other texts, and noted in the history."""
+        step_id, versions = step["id"], (step.get("config") or {}).get("versions")
+        text = _write_one(client, workflow, _stored_segment(workflow), members, found, step, key, remarks)
+        languages = _other_languages(client, members)
+        if key == MAIN:
+            written, _ = _with_translations(client, workflow, {step_id: text}, languages)
+            translated = written[step_id].get("translations") or {}
+            failed = [f"main text in {language_name(code)}" for code in languages if code not in translated]
+            steps = apply_messages(workflow["steps"], {step_id: {**written[step_id], "versions": versions}})
+            what, fallback = "main text", "those customers get it untranslated"
+        else:
+            done, failed = _translate_versions(client, workflow, {(step_id, key): text}, languages)
+            steps = _with_version(workflow["steps"], step_id, key, done[(step_id, key)])
+            what, fallback = f"{text['label']} version", "those customers get the main text"
+        note = f"Message text written by AI for {user.full_name}: {what} of {step.get('title') or step_id}"
+        if remarks:
+            note += f" (remarks: {remarks})"
+        if failed:
+            note += f"; not translated: {', '.join(failed)} - {fallback}"
+        ai_context = _refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps)
+        ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
+        ai_context = _with_wording_line(ai_context, client)
+        return self.strategies.save_ai_messages(user, workflow["id"], steps, note=note, ai_context=ai_context)
+
+    def workflow_audiences(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
+        """Who gets each of the workflow's texts - the main text and each audience version - from today's accounts:
+        the context the AI writes them for (audiences.text_audiences). No AI call; nothing is saved."""
+        workflow = self.strategies.get_strategy(user, strategy_id)
+        members = load_segment_members(self.db, workflow)
+        return {
+            "workflow_id": workflow["id"],
+            "accounts": len(members),
+            "situation": (workflow.get("segment") or {}).get("situation"),
+            # Counted with the settings the workflow was written with (the fixed age groups when none were saved).
+            "texts": text_audiences(
+                members, workflow.get("steps") or [], segmentation=workflow.get("segmentation_snapshot")
+            ),
+        }
+
     def update_workflow(self, user: UserModel, strategy_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """The existing workflow update, with every edited text translated again (_update_and_translate).
+
+        Every text the save changed - a main text or an audience version - is also checked like the AI's own text
+        (message_writer.check_texts): the problems come back in "text_warnings". They never block the save.
+        """
+        row = self.db.get(PayflowStrategyModel, strategy_id)
+        before = {step.get("id"): step for step in copy.deepcopy((row.steps if row else None) or [])}
+        result = self._update_and_translate(user, strategy_id, payload, before)
+        return {**result, "text_warnings": self._text_warnings(before, result)}
+
+    def _text_warnings(self, before: dict[str, dict], workflow: dict[str, Any]) -> list[dict[str, str]]:
+        """Problems with the texts a save changed ([] when none changed or all are fine) - including a missing
+        wording the client's compliance rules require (the send check would block that message)."""
+        texts = _edited_texts(before, workflow.get("steps") or [])
+        if not texts:
+            return []
+        language = load_client_context(self.db, workflow["client_id"]).get("language") or "English"
+        return check_texts(workflow, _stored_segment(workflow), texts,
+                           english=str(language).strip().lower().startswith("english"),
+                           wording=workflow_wording(self.db, workflow))
+
+    def _update_and_translate(
+        self, user: UserModel, strategy_id: int, payload: dict[str, Any], before: dict[str, dict]
+    ) -> dict[str, Any]:
         """The existing workflow update, then every message whose main text it changed is translated again into
         the other languages of the workflow's segment (one AI call per language) - and so is every audience
-        version whose own text it changed.
+        version whose own text it changed. `before`: the stored steps by id.
 
         update_strategy drops an edited text's outdated other-language versions; the main text and each audience
         version are edited on their own, and nothing else is removed. A translation that fails never undoes the
         edit: those customers get the edited text in the main language, and the workflow's history says so.
         """
-        row = self.db.get(PayflowStrategyModel, strategy_id)
-        before = {step.get("id"): step for step in copy.deepcopy((row.steps if row else None) or [])}
         updated = self.strategies.update_strategy(user, strategy_id, payload)
 
         edited = {
@@ -435,9 +540,12 @@ class WorkflowSuggestionService:
         if not edited and not edited_versions:
             return updated
         client = load_client_context(self.db, updated["client_id"])
-        languages = _other_languages(client, load_segment_members(self.db, updated))
+        members = load_segment_members(self.db, updated)
+        languages = _other_languages(client, members)
         if not languages:
             return updated
+        # The translations keep the compliance rules' wording as written (the send check looks for it).
+        client["required_wording"] = required_wording(self.db, updated["client_id"], members)
 
         written = {
             step_id: {key: value for key, value in (step.get("config") or {}).items()
@@ -542,6 +650,7 @@ class WorkflowSuggestionService:
         revision_of_id: int | None = None,
         version: int = 1,
         history_note: str | None = None,
+        segmentation_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Existing create path: AI Generated → status/origin "AI Proposed" + AI snapshot.
         # portfolio_id=None → client-level workflow for parent accounts.
@@ -560,6 +669,7 @@ class WorkflowSuggestionService:
                 "source": PayflowStrategySource.AI_GENERATED.value,
                 "ai_context": ai_context,
                 "revision_of_id": revision_of_id,
+                "segmentation_snapshot": segmentation_snapshot,
             },
             commit=commit,
             version=version,
@@ -658,7 +768,8 @@ def _with_messages(
             written[step["id"]] = {key: value for key, value in (step.get("config") or {}).items()
                                    if key in ("subject", "body", "sms_body", "tone", "content_origin") and value}
     written, languages_note = _with_translations(client, workflow, written, languages or [])
-    notes = languages_note + audiences_note + (_performance_note(client) if to_write else [])
+    notes = (languages_note + audiences_note + required_wording_line(client.get("required_wording"))
+             + (_performance_note(client) if to_write else []))
     return {**workflow, "steps": apply_messages(workflow["steps"], written)}, notes
 
 
@@ -702,7 +813,15 @@ def _write_for_audiences(
             failed.append(audience)
             continue
         for step_id, text in texts.items():
-            version = {"label": audience["label"], **text, "brief": audience_plans[step_id]}
+            version = {
+                "label": audience["label"],
+                **text,
+                "brief": audience_plans[step_id],
+                "segment": {
+                    "dimension": audience.get("dimension") or "age",
+                    "criteria": audience.get("criteria") or {},
+                },
+            }
             written[step_id] = {**written[step_id],
                                 "versions": {**(written[step_id].get("versions") or {}), audience["key"]: version}}
         done.append(audience)
@@ -712,6 +831,102 @@ def _write_for_audiences(
 def _plans_for(plans: dict[str, dict[str, dict[str, str]]], audience: str) -> dict[str, dict[str, str]]:
     """{step_id: brief} of one audience, from plan_messages' {step_id: {audience: brief}}."""
     return {step_id: by_audience[audience] for step_id, by_audience in plans.items() if audience in by_audience}
+
+
+def _with_wording_line(ai_context: list[dict[str, str]], client: dict[str, Any]) -> list[dict[str, str]]:
+    """ai_context with the "Required wording" line of the wording the messages were just written with."""
+    kept = [item for item in ai_context if item.get("label") != WORDING_LABEL]
+    return kept + required_wording_line(client.get("required_wording"))
+
+
+def _one_text_step(workflow: dict[str, Any], step_id: str | None, key: str) -> dict[str, Any]:
+    """The message step whose `key` text (MAIN or one of its audience versions) is rewritten on its own -
+    ValidationAppError when there is no such text to rewrite."""
+    if not step_id:
+        raise ValidationAppError("Choose the message (step_id) whose text to rewrite")
+    step = next((s for s in workflow.get("steps") or [] if s.get("id") == step_id), None)
+    if step is None or step.get("kind") != "Communication":
+        raise ValidationAppError(f"Step {step_id} is not an email or SMS step of this workflow")
+    if key != MAIN and key not in ((step.get("config") or {}).get("versions") or {}):
+        raise ValidationAppError(
+            f"Message {step_id} has no {audience_label(key)} version - rewrite its main text or one of its versions"
+        )
+    return step
+
+
+def _write_one(
+    client: dict[str, Any],
+    workflow: dict[str, Any],
+    segment: dict[str, Any],
+    members: list,
+    found: dict[str, Any],
+    step: dict[str, Any],
+    key: str,
+    remarks: str | None,
+) -> dict[str, Any]:
+    """One text of one message, planned and written on its own: the main text (MAIN) or one audience's version
+    ({"label", "subject", "body", "sms_body", "tone", "brief"}). The AI is shown that text as the message's
+    current text, so it improves it. Raises AppError when it cannot be written."""
+    step_id = step["id"]
+    if key == MAIN:
+        audience = {"key": MAIN, "label": "Main text", **(found.get("main") or {})}
+        found, current = {**found, "audiences": []}, workflow
+    else:
+        version = step["config"]["versions"][key]
+        audience = _audience_for(found, members, key, version.get("label"))
+        found, current = {**found, "audiences": [audience]}, _with_step_text(workflow, step_id, version)
+    plans = _plans_for(plan_messages(client, current, segment, found, step_ids=[step_id], only=key), key)
+    if key != MAIN and not plans:
+        raise ServiceUnavailableError(f"AI could not plan the {audience['label']} version - please try again")
+    written = write_messages(client, current, segment, step_ids=[step_id], remarks=remarks, plans=plans,
+                             audience=audience if plans else None)
+    text = {name: value for name, value in written[step_id].items() if value}
+    if key == MAIN:
+        return {**text, **({"brief": plans[step_id]} if plans else {})}
+    return {
+        "label": audience["label"],
+        **text,
+        "brief": plans[step_id],
+        "segment": {
+            "dimension": audience.get("dimension") or (
+                "country" if key.startswith("country_") else "region" if key.startswith("region_") else "age"
+            ),
+            "criteria": audience.get("criteria") or {},
+        },
+    }
+
+
+def _audience_for(found: dict[str, Any], members: list, key: str, label: str | None = None) -> dict[str, Any]:
+    """Audience `key` as find_audiences lists it; built from the members of that age group when it is no longer
+    big enough to be listed (it was when its version was written), or is one of the older wider groups."""
+    listed = next((audience for audience in found.get("audiences") or [] if audience["key"] == key), None)
+    if listed:
+        return listed
+    accounts = [account for account in members if key in audience_keys(account)]
+    return {"key": key, "label": label or audience_label(key), "accounts": len(accounts),
+            "profile": audience_profile(accounts)}
+
+
+def _with_step_text(workflow: dict[str, Any], step_id: str, text: dict[str, Any]) -> dict[str, Any]:
+    """The workflow with `text` (an audience version) as the step's current text - the text the AI improves."""
+    own = {key: text.get(key) for key in ("subject", "body", "sms_body")}
+    steps = [
+        {**step, "config": {**(step.get("config") or {}), **own}} if step.get("id") == step_id else step
+        for step in workflow.get("steps") or []
+    ]
+    return {**workflow, "steps": steps}
+
+
+def _with_version(steps: list[dict], step_id: str, key: str, version: dict[str, Any]) -> list[dict[str, Any]]:
+    """Copy of the steps with `version` as the step's `key` audience version - its other texts unchanged."""
+    result = []
+    for step in steps:
+        if step.get("id") == step_id:
+            config = dict(step.get("config") or {})
+            config["versions"] = {**(config.get("versions") or {}), key: version}
+            step = {**step, "config": config}
+        result.append(step)
+    return result
 
 
 def _audiences_line(
@@ -850,6 +1065,28 @@ def _translate_versions(
                 version = result[(step_id, key)]
                 version["translations"] = {**(version.get("translations") or {}), code: translated[step_id]}
     return result, failed
+
+
+def _edited_texts(before: dict[str, dict], steps: list[dict]) -> list[tuple[dict, str, dict]]:
+    """[(step, MAIN or an audience key, text)] for every main text and audience version a save changed or added
+    (a cleared one is not listed: the step's template is sent)."""
+    names = ("subject", "body", "sms_body")
+    edited = []
+    for step in steps:
+        if step.get("kind") != "Communication":
+            continue
+        old = before.get(step.get("id")) or {}
+        cfg = step.get("config") or {}
+        if any(_message_text(step)) and _message_text(step) != _message_text(old):
+            edited.append((step, MAIN, cfg))
+        old_versions = (old.get("config") or {}).get("versions") or {}
+        for key, version in (cfg.get("versions") or {}).items():
+            was = old_versions.get(key) or {}
+            if any(version.get(name) for name in names) and any(
+                (version.get(name) or "") != (was.get(name) or "") for name in names
+            ):
+                edited.append((step, key, version))
+    return edited
 
 
 def _edited_versions(before: dict[str, dict], steps: list[dict]) -> dict[tuple[str, str], dict]:

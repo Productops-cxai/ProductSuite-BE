@@ -17,6 +17,7 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowCommunicationEventModel,
     PayflowCommunicationModel,
+    PayflowPortfolioModel,
     PayflowStrategyModel,
     UserModel,
 )
@@ -445,12 +446,25 @@ class PayflowCommunicationService:
                     provider_error = ev.get("detail")
                     break
 
+        portfolio_id = getattr(row, "portfolio_id", None)
+        if portfolio_id is None and account is not None:
+            portfolio_id = getattr(account, "portfolio_id", None)
+        portfolio_name = None
+        account_portfolio = getattr(account, "portfolio", None) if account is not None else None
+        if account_portfolio is not None and getattr(account_portfolio, "id", None) == portfolio_id:
+            portfolio_name = getattr(account_portfolio, "name", None)
+        elif portfolio_id is not None:
+            portfolio = self.db.get(PayflowPortfolioModel, int(portfolio_id))
+            portfolio_name = portfolio.name if portfolio else None
+
         return {
             "id": row.id,
             "code": row.code,
             "client_id": row.client_id,
             "client_code": client.code if client else None,
             "client_name": client.name if client else None,
+            "portfolio_id": portfolio_id,
+            "portfolio_name": portfolio_name,
             "account_id": row.account_id,
             "customer_name": account.customer_name if account else None,
             "account_reference": account.account_reference if account else None,
@@ -556,17 +570,26 @@ class PayflowCommunicationService:
         user: UserModel,
         *,
         client_id: int | None = None,
+        portfolio_id: int | None = None,
         account_id: int | None = None,
         status: str | None = None,
         channel: str | None = None,
         purpose: str | None = None,
         workflow: str | None = None,
         search: str | None = None,
+        recipient_email: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        include_expired: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
+        from app.modules.payflow.services.communication_export_service import (
+            apply_portfolio_filter,
+            assert_portfolio_scope,
+            within_retention,
+        )
+
         allowed = self._visible_client_ids(user)
         q = self.db.query(PayflowCommunicationModel).options(
             joinedload(PayflowCommunicationModel.client),
@@ -579,6 +602,9 @@ class PayflowCommunicationService:
         if client_id is not None:
             self._assert_view(user, client_id)
             q = q.filter(PayflowCommunicationModel.client_id == client_id)
+        if portfolio_id is not None:
+            assert_portfolio_scope(self.db, portfolio_id=int(portfolio_id), client_id=client_id)
+            q = apply_portfolio_filter(q, int(portfolio_id))
         if account_id is not None:
             q = q.filter(PayflowCommunicationModel.account_id == account_id)
         if status:
@@ -587,12 +613,26 @@ class PayflowCommunicationService:
             q = q.filter(PayflowCommunicationModel.channel == channel)
         if purpose:
             q = q.filter(PayflowCommunicationModel.purpose == purpose)
-        # Apply workflow after facet options are built so the Workflow dropdown
-        # still lists every workflow available under the other filters.
+        if recipient_email:
+            term = recipient_email.strip().lower()
+            q = q.filter(PayflowCommunicationModel.recipient.ilike(f"%{term}%"))
+        # Date filtering uses sent timestamp (fallback created_at) — FR-01.
         if date_from is not None:
-            q = q.filter(PayflowCommunicationModel.created_at >= date_from)
+            q = q.filter(
+                (PayflowCommunicationModel.sent_at >= date_from)
+                | (
+                    (PayflowCommunicationModel.sent_at.is_(None))
+                    & (PayflowCommunicationModel.created_at >= date_from)
+                )
+            )
         if date_to is not None:
-            q = q.filter(PayflowCommunicationModel.created_at <= date_to)
+            q = q.filter(
+                (PayflowCommunicationModel.sent_at <= date_to)
+                | (
+                    (PayflowCommunicationModel.sent_at.is_(None))
+                    & (PayflowCommunicationModel.created_at <= date_to)
+                )
+            )
 
         rows = q.order_by(PayflowCommunicationModel.id.desc()).all()
         if not self.access.is_operations_admin(user):
@@ -609,9 +649,12 @@ class PayflowCommunicationService:
                     [
                         r.code or "",
                         str(r.id),
+                        r.recipient or "",
+                        r.subject or "",
                         (r.account.customer_name if r.account else ""),
                         (r.account.account_reference if r.account else ""),
                         (r.account.case_reference if r.account else ""),
+                        (r.client.name if r.client else ""),
                         r.purpose or "",
                         r.channel or "",
                         r.workflow_name or "",
@@ -619,6 +662,10 @@ class PayflowCommunicationService:
                     ]
                 ).lower()
             ]
+
+        # Retention: hide expired from operational listing (rows remain in DB) — FR-05 / AC10.
+        if not include_expired:
+            rows = [r for r in rows if within_retention(r)]
 
         workflows = sorted({r.workflow_name for r in rows if r.workflow_name})
         if workflow:
@@ -686,6 +733,8 @@ class PayflowCommunicationService:
         }
 
     def get_communication(self, user: UserModel, communication_id: int) -> dict[str, Any]:
+        from app.modules.payflow.services.communication_export_service import within_retention
+
         row = (
             self.db.query(PayflowCommunicationModel)
             .options(
@@ -698,6 +747,9 @@ class PayflowCommunicationService:
         if not row:
             raise NotFoundError("Communication not found")
         self._assert_view(user, row.client_id)
+        # Expired rows stay in DB but are hidden from operational detail views (FR-05).
+        if not within_retention(row):
+            raise NotFoundError("Communication not found")
         return self._serialize(row, user=user)
 
     def evaluate_send_eligibility(
