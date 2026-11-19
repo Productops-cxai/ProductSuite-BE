@@ -1041,6 +1041,42 @@ class PayflowStrategyItem(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class PayflowTextWarning(BaseModel):
+    """A problem with a message text a person wrote - the checks the AI's own text passes. Never blocks the save."""
+
+    step_id: str
+    text: str  # which of the step's texts: "main" or an audience version, e.g. "age_65_plus"
+    channel: str  # the part with the problem: "Email" or "SMS"
+    problem: str
+
+
+class PayflowStrategyUpdateItem(PayflowStrategyItem):
+    """POST /workflows/{id}/update: the saved workflow, and problems with the texts this save changed."""
+
+    text_warnings: List[PayflowTextWarning] = Field(default_factory=list)
+
+
+class WorkflowTextAudience(BaseModel):
+    """Who gets one of a workflow's texts, from today's accounts - totals only, never one person."""
+
+    key: str  # "main" or an audience version, e.g. "age_65_plus"
+    label: str  # "Main text", "Age 65 and over"
+    accounts: int
+    # Shares in % of the accounts and averages: age, regions, countries, languages, avg_balance, balance_bands,
+    # partly_paid_pct, avg_days_past_due, with_email_pct, with_mobile_pct, contact_history
+    # (workflow_suggestion/audiences.py: audience_profile + reach_profile)
+    profile: dict = Field(default_factory=dict)
+
+
+class WorkflowAudiencesResponse(BaseModel):
+    """GET /workflows/{id}/audiences: the context of the main text and of each audience version."""
+
+    workflow_id: int
+    accounts: int  # the workflow's eligible accounts today
+    situation: Optional[str] = None  # the segment's situation (e.g. "Payment Plan"); None for an ordinary segment
+    texts: List[WorkflowTextAudience] = Field(default_factory=list)
+
+
 class StrategiesSummary(BaseModel):
     total: int = 0
     ai_proposed: int = 0
@@ -1732,8 +1768,14 @@ class SuggestWorkflowsResponse(BaseModel):
 class WriteWorkflowMessagesRequest(BaseModel):
     step_id: Optional[str] = Field(default=None, max_length=64, description="Rewrite only this message step")
     remarks: Optional[str] = Field(default=None, max_length=2000, description="What the reviewer wants changed")
+    audience: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description='With step_id: rewrite only this text of the message - "main" (its main text) or one of its '
+        'audience versions (e.g. "age_65_plus"); its other texts stay as they are',
+    )
 
-    @field_validator("step_id", "remarks")
+    @field_validator("step_id", "remarks", "audience")
     @classmethod
     def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
         cleaned = (value or "").strip()

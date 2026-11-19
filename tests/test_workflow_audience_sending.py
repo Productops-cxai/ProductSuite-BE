@@ -98,6 +98,20 @@ def test_fixed_channel_steps_use_the_version_too(db_session):
     assert calls[0]["subject"] == "Your account ACC-991" and sent_text(calls[0]) == "age_65_plus"
 
 
+def test_a_workflow_saved_with_the_older_wider_groups_keeps_sending_them(db_session):
+    young = _account(date_of_birth=date(date.today().year - 22, 1, 1))  # 22: 18 – 24, inside the older 18 – 34
+    older = step(versions=False)
+    older["config"]["versions"] = {"age_18_34": {**SENIOR_TEXT, "label": "Age 18 – 34"}}
+    calls, _, _ = _send(db_session, older, account=young)
+    assert sent_text(calls[0]) == "age_18_34" and calls[0]["subject"] == "Your account ACC-991"
+
+    # A step with the customer's own group too: that one comes first.
+    older["config"]["versions"]["age_18_24"] = {**SENIOR_TEXT, "subject": "Hello {{first_name}}",
+                                                "label": "Age 18 – 24"}
+    calls, _, _ = _send(db_session, older, account=young)
+    assert sent_text(calls[0]) == "age_18_24" and calls[0]["subject"] == "Hello Ali"
+
+
 def test_a_step_without_text_of_its_own_sends_its_template(db_session):
     template_step = {"id": "s2", "kind": "Communication",
                      "config": {"channel": "Email", "purpose": "Payment Reminder", "template_id": "em-reminder"}}

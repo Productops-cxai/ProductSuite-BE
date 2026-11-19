@@ -293,11 +293,11 @@ def test_versions_sent_back_without_translations_keep_them(client, admin_token, 
 
 def test_a_reviewer_can_remove_one_version_or_all_of_them(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811,E501
     add_seniors(db_session, portfolio)
-    add_seniors(db_session, portfolio, count=25, start=600, born=date(2000, 1, 1))  # 18 - 34 too
+    add_seniors(db_session, portfolio, count=25, start=600, born=date(2000, 1, 1))  # 25 - 34 too
     saved = write_with(db_session, admin, ai_workflow["id"])
     first, second = [step for step in json.loads(json.dumps(saved["steps"])) if step["kind"] == "Communication"][:2]
-    assert set(first["config"]["versions"]) == {"age_65_plus", "age_18_34"}
-    first["config"]["versions"].pop("age_18_34")  # left out: removed on purpose
+    assert set(first["config"]["versions"]) == {"age_65_plus", "age_25_34"}
+    first["config"]["versions"].pop("age_25_34")  # left out: removed on purpose
     second["config"]["versions"] = {}  # every version removed
     steps = [first if s["id"] == first["id"] else second if s["id"] == second["id"] else s for s in saved["steps"]]
     response = _post_update(client, admin_token, saved["id"], steps)

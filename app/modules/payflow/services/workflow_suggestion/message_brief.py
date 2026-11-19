@@ -115,17 +115,19 @@ def plan_messages(
     found: dict[str, Any],
     *,
     step_ids: list[str] | None = None,
+    only: str | None = None,
 ) -> dict[str, dict[str, dict[str, str]]]:
     """{step_id: {audience: brief}} for the workflow's messages (default all; `step_ids`: only these).
 
     `client`: load_client_context + "payment_options". `segment`: {"label", "segment", "stats"}.
-    `found`: audiences.find_audiences(...). Briefs that stay invalid are left out; {} when the AI fails.
+    `found`: audiences.find_audiences(...). `only`: plan just this audience's text (MAIN, or an audience in
+    `found`), default the main text and every audience. Briefs that stay invalid are left out; {} when the AI fails.
     """
     steps = {step["id"]: step for step in workflow.get("steps") or [] if step.get("id")}
     stats = segment.get("stats") or {}
     tones = message_tones(workflow, segment.get("segment") or {}, stats.get("avg_days_past_due"))
     messages = [step_id for step_id in tones if step_ids is None or step_id in step_ids]
-    audiences = [MAIN, *(audience["key"] for audience in found.get("audiences") or [])]
+    audiences = [only] if only else [MAIN, *(audience["key"] for audience in found.get("audiences") or [])]
     pending = [(step_id, audience) for step_id in messages for audience in audiences]
     options = list(client.get("payment_options") or [])
     situation = (segment.get("segment") or {}).get("situation")
@@ -341,8 +343,8 @@ gets the same text, filled with their own details. Reply with JSON only, matchin
 
 ## Fit the audience: the style - never the facts or the firmness
 Choose the approach from the audience's numbers (age, region, country, languages, balance, days late):
-- 18 - 34: short and direct, made for a phone; a lighter, modern voice is fine.
-- 35 - 64: clear and practical; get to the point and show the options.
+- 18 - 24 and 25 - 34: short and direct, made for a phone; a lighter, modern voice is fine.
+- 35 - 44, 45 - 54 and 55 - 64: clear and practical; get to the point and show the options.
 - 65 and over: respectful, a little more formal, warm and reassuring; one step at a time, and say that the
   payment page shows every option; never rushed.
 - Mixed or unknown ages: plain and clear for everyone.

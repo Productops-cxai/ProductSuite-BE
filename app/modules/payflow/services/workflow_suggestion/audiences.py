@@ -21,19 +21,29 @@ from app.modules.payflow.services.workflow_suggestion.segmenter import (
     _band,
     _in_range,
     _years_since,
+    contact_state_of,
     filter_eligible,
     match_account_to_segment,
 )
 
 # Audience key (stored with each version) → (age band, [low, high) years from date_of_birth).
 AUDIENCES: dict[str, tuple[str, tuple[int, int | None]]] = {
-    "age_18_34": ("18 – 34", (18, 35)),
-    "age_35_64": ("35 – 64", (35, 65)),
+    "age_18_24": ("18 – 24", (18, 25)),
+    "age_25_34": ("25 – 34", (25, 35)),
+    "age_35_44": ("35 – 44", (35, 45)),
+    "age_45_54": ("45 – 54", (45, 55)),
+    "age_55_64": ("55 – 64", (55, 65)),
     "age_65_plus": ("65 and over", (65, None)),
 }
+# The wider groups of versions written before the six above (until 2026-11): never written now, but a saved
+# workflow's versions for them are still sent to their customers (audience_keys).
+OLDER_AUDIENCES: dict[str, tuple[str, tuple[int, int | None]]] = {
+    "age_18_34": ("18 – 34", (18, 35)),
+    "age_35_64": ("35 – 64", (35, 65)),
+}
 MAIN_KEY = "main"  # the step's own text, for everyone without a version of their own
-MIN_AUDIENCE_SIZE = 20  # fewer accounts → no own version (they get the main text)
-MAX_VERSIONS = 3  # per message, besides the main text
+MIN_AUDIENCE_SIZE = 12  # fewer accounts → no own version (they get the main text)
+MAX_VERSIONS = 6  # per message, besides the main text
 UNKNOWN = "Unknown"
 
 PROVINCES = {
@@ -50,7 +60,7 @@ def audience_label(key: str | None) -> str | None:
         return None
     if key == MAIN_KEY:
         return "Main text"
-    band = AUDIENCES.get(key)
+    band = AUDIENCES.get(key) or OLDER_AUDIENCES.get(key)
     return f"Age {band[0]}" if band else key
 
 
@@ -58,6 +68,14 @@ def audience_of(account, today: date | None = None) -> str | None:
     """The account's audience key from its date of birth; None without one (or under 18)."""
     age = _years_since(getattr(account, "date_of_birth", None), today or date.today())
     return next((key for key, (_, years) in AUDIENCES.items() if _in_range(age, years)), None)
+
+
+def audience_keys(account, today: date | None = None) -> list[str]:
+    """Every version key the account belongs to, its own group first: e.g. ["age_25_34", "age_18_34"] - the
+    older wider group catches versions saved before the six groups. [] without a date of birth (or under 18)."""
+    age = _years_since(getattr(account, "date_of_birth", None), today or date.today())
+    return [key for groups in (AUDIENCES, OLDER_AUDIENCES) for key, (_, years) in groups.items()
+            if _in_range(age, years)]
 
 
 def find_audiences(members: list, today: date | None = None) -> dict[str, Any]:
@@ -119,6 +137,50 @@ def audience_profile(accounts: list, today: date | None = None) -> dict[str, Any
         "balance_bands": _shares(accounts, lambda a: _band(config.BALANCE_RANGES, a.outstanding_balance) or UNKNOWN),
         "partly_paid_pct": round(100 * sum(1 for a in accounts if (a.recovered_balance or 0) > 0) / len(accounts)),
         "avg_days_past_due": round(sum(days) / len(days)) if days else None,
+    }
+
+
+CONTACT_HISTORY = {
+    "never_contacted": "Never contacted",
+    "contacted_no_payment": "Contacted, no payment yet",
+    "partly_paid": "Paid part",
+}
+
+
+def text_audiences(members: list, steps: list[dict], today: date | None = None) -> list[dict[str, Any]]:
+    """Who gets each of a workflow's texts today: the main text and every audience version its messages have.
+
+    `members`: the workflow's eligible accounts. A customer gets their age group's version when the messages have
+    one (as the worker picks it), else the main text. [{"key", "label", "accounts", "profile"}] - the main text
+    first, then the versions; each profile is audience_profile plus reach_profile. Totals only, never one person.
+    """
+    today = today or date.today()
+    keys = {key for step in steps if step.get("kind") == "Communication"
+            for key in ((step.get("config") or {}).get("versions") or {})}
+    groups: dict[str, list] = {MAIN_KEY: [], **{key: [] for key in (*AUDIENCES, *OLDER_AUDIENCES) if key in keys}}
+    for account in members:
+        key = next((key for key in audience_keys(account, today) if key in groups), MAIN_KEY)
+        groups[key].append(account)
+    return [
+        {
+            "key": key,
+            "label": audience_label(key),
+            "accounts": len(accounts),
+            "profile": {**audience_profile(accounts, today), **reach_profile(accounts)},
+        }
+        for key, accounts in groups.items()
+    ]
+
+
+def reach_profile(accounts: list) -> dict[str, Any]:
+    """How `accounts` can be reached and what happened before, in % of the accounts ({} without accounts)."""
+    if not accounts:
+        return {}
+    total = len(accounts)
+    return {
+        "with_email_pct": round(100 * sum(1 for a in accounts if str(a.email or "").strip()) / total),
+        "with_mobile_pct": round(100 * sum(1 for a in accounts if str(a.phone_mobile or "").strip()) / total),
+        "contact_history": _shares(accounts, lambda a: CONTACT_HISTORY[contact_state_of(a)]),
     }
 
 

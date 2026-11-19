@@ -37,14 +37,14 @@ PRIVATE = dict(customer_name="Jane Doe", email="jane.doe@example.com", phone_mob
 
 
 def accounts():
-    """40 aged 65+, 30 aged 18 – 34, 25 without a date of birth - all in Ontario, Canada."""
+    """40 aged 65+, 30 aged 25 – 34, 25 without a date of birth - all in Ontario, Canada."""
     common = dict(province_state="ON", country_code="CA", outstanding_balance=2400.0, **PRIVATE)
     return ([make_account(date_of_birth=born(70), **common) for _ in range(40)]
             + [make_account(date_of_birth=born(25), **common) for _ in range(30)]
             + [make_account(**common) for _ in range(25)])
 
 
-FOUND = find_audiences(accounts(), TODAY)  # versions: age_65_plus, age_18_34; main: the 25 without an age
+FOUND = find_audiences(accounts(), TODAY)  # versions: age_65_plus, age_25_34; main: the 25 without an age
 
 
 def good(step_id, audience, tone, **changes):
@@ -102,8 +102,8 @@ def test_every_message_is_planned_for_every_audience_in_one_call():
     plans = plan(call)
     assert len(prompts) == 1
     assert {step_id: sorted(by_audience) for step_id, by_audience in plans.items()} == {
-        "s2": sorted([MAIN, "age_65_plus", "age_18_34"]),
-        "s4": sorted([MAIN, "age_65_plus", "age_18_34"]),
+        "s2": sorted([MAIN, "age_65_plus", "age_25_34"]),
+        "s4": sorted([MAIN, "age_65_plus", "age_25_34"]),
     }
     assert plans["s2"]["age_65_plus"]["tone"] == "Firm" and plans["s4"][MAIN]["tone"] == "Final notice"
     assert set(plans["s2"][MAIN]) == {"approach", "tone", "length", "subject_style", "lead_option",
@@ -115,7 +115,7 @@ def test_the_prompt_has_totals_the_rules_and_never_one_person():
     plan(call)
     system, user = " ".join(prompts[0][0]["content"].split()), prompts[0][1]["content"]
     assert "age_65_plus (Age 65 and over): 40 accounts." in user
-    assert "age_18_34 (Age 18 – 34): 30 accounts." in user
+    assert "age_25_34 (Age 25 – 34): 30 accounts." in user
     assert f"{MAIN} (the main text): 25 accounts" in user
     assert '"regions": {"Ontario": 100}' in user and "- Canada: amounts are in Canadian dollars" in user
     assert "the customer can pay in full, pay part now, set up a payment plan" in user
@@ -137,7 +137,7 @@ def test_bad_briefs_go_back_to_the_ai_with_the_problems():
             return {"tone": "Friendly"}  # two steps softer than Firm
         if (step_id, audience) == ("s4", "age_65_plus"):
             return {"tone": "Clear"}  # Final notice is fixed
-        if (step_id, audience) == ("s2", "age_18_34"):
+        if (step_id, audience) == ("s2", "age_25_34"):
             return {"lead_option": "pay next year"}
         if (step_id, audience) == ("s4", MAIN):
             return None  # left out
@@ -150,11 +150,11 @@ def test_bad_briefs_go_back_to_the_ai_with_the_problems():
     assert "Your previous briefs for these had problems" in retry
     assert "s2 (main): tone must be Firm or Clear" in retry
     assert "s4 (age_65_plus): tone must be Final notice" in retry
-    assert "s2 (age_18_34): lead_option must be one the payment page offers" in retry
+    assert "s2 (age_25_34): lead_option must be one the payment page offers" in retry
     assert "s4 (main): no brief was written" in retry
     # Only the four failing briefs were asked again.
     assert retry.split("Write one brief for each message and audience: ")[1].split("\n")[0] == (
-        "s2 → main, age_18_34; s4 → main, age_65_plus"
+        "s2 → main, age_25_34; s4 → main, age_65_plus"
     )
     assert all(len(by_audience) == 3 for by_audience in plans.values())
 
