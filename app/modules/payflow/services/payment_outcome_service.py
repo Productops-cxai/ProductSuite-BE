@@ -354,8 +354,48 @@ class PayflowPaymentOutcomeService:
         self.db.flush()
         if first_txn is not None:
             first_txn.payment_plan_id = plan.id
-        account.collection_status = "Payment Plan"
+        # Do not overwrite Resolved when the first instalment already cleared the balance.
+        if _money(account.outstanding_balance or 0) > 0:
+            account.collection_status = "Payment Plan"
         return plan
+
+    def complete_open_plans_for_settled_account(
+        self, account: PayflowAccountModel
+    ) -> None:
+        """When balance is cleared, close open plans and waive unpaid instalments."""
+        if _money(account.outstanding_balance or 0) > 0:
+            return
+        plans = (
+            self.db.query(PayflowPaymentPlanModel)
+            .filter(
+                PayflowPaymentPlanModel.account_id == account.id,
+                PayflowPaymentPlanModel.status.in_(
+                    [
+                        PayflowPaymentPlanStatus.ACTIVE.value,
+                        PayflowPaymentPlanStatus.OVERDUE.value,
+                    ]
+                ),
+            )
+            .all()
+        )
+        now = _utcnow()
+        for plan in plans:
+            plan.status = PayflowPaymentPlanStatus.COMPLETED.value
+            plan.completed_at = now
+            plan.next_due_date = None
+            plan.auto_charge_enabled = False
+            for inst in plan.installments or []:
+                if inst.status != PayflowPaymentInstallmentStatus.PAID.value:
+                    inst.status = PayflowPaymentInstallmentStatus.WAIVED.value
+            events = list(plan.events or [])
+            events.append(
+                {
+                    "at": now.isoformat(),
+                    "label": "Plan Completed",
+                    "detail": "Account balance settled — remaining instalments waived",
+                }
+            )
+            plan.events = events[-60:]
 
     def record_auto_charge_failure(
         self,

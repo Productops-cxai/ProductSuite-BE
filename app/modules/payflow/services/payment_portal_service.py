@@ -632,6 +632,12 @@ class PayflowPaymentPortalService:
         except (TypeError, ValueError):
             return None
 
+    def _align_plan_start_date(self, start: date, today: date) -> date:
+        """FE sends the payer's local calendar day; UTC today can lag or lead by one day."""
+        if start in {today + timedelta(days=1), today - timedelta(days=1)}:
+            return today
+        return start
+
     def quote_plan(
         self,
         token: str,
@@ -664,7 +670,7 @@ class PayflowPaymentPortalService:
         if balance <= 0:
             raise ValidationAppError("This account has no outstanding balance")
         today = _utcnow().date()
-        start = self._parse_iso_date(start_date) or today
+        start = self._align_plan_start_date(self._parse_iso_date(start_date) or today, today)
         if start < today:
             raise ValidationAppError("Start date cannot be in the past")
         currency = (account.currency_code or (client.currency_code if client else None)) or "USD"
@@ -749,7 +755,7 @@ class PayflowPaymentPortalService:
         elif option["type"] == PayflowPaymentOptionType.PAYMENT_PLAN.value and (
             option.get("custom_plan") or option_id == CUSTOM_PLAN_OPTION_ID
         ):
-            start = self._parse_iso_date(start_date) or today
+            start = self._align_plan_start_date(self._parse_iso_date(start_date) or today, today)
             if start < today:
                 raise ValidationAppError("Start date cannot be in the past")
             try:
@@ -1646,6 +1652,7 @@ class PayflowPaymentPortalService:
         account = self.db.get(PayflowAccountModel, attempt.account_id)
         amount = _money(attempt.amount)
         prev = _money(account.outstanding_balance) if account else 0.0
+        previous_status = account.collection_status if account else None
         new_bal = prev
 
         # Setup-only (future start): save PM + create plan schedule; no balance cut.
@@ -1680,10 +1687,10 @@ class PayflowPaymentPortalService:
                         WorkflowExecutionService,
                     )
 
+                    # Setup saves the method only — do not stamp last_payment_* as money received.
                     WorkflowExecutionService(self.db).on_payment_event(
                         attempt.account_id,
                         {
-                            "amount": 0,
                             "completed": False,
                             "case_settled": False,
                             "payment_plan": True,
@@ -1691,7 +1698,6 @@ class PayflowPaymentPortalService:
                             "status": "plan_setup",
                             "source": "stripe" if attempt.provider == "stripe" else "mock",
                             "attempt_id": attempt.public_id,
-                            "payment_date": _utcnow().date().isoformat(),
                         },
                         commit=False,
                     )
@@ -1817,6 +1823,25 @@ class PayflowPaymentPortalService:
             )
         except Exception:  # noqa: BLE001
             logger.exception("workflow payment event failed")
+
+        # Settled case: cancel this account's open runs/jobs so Scheduled steps disappear.
+        if account and new_bal <= 0:
+            try:
+                from app.modules.payflow.services.workflow_execution_service import (
+                    WorkflowExecutionService,
+                )
+
+                outcome.complete_open_plans_for_settled_account(account)
+                if (account.collection_status or "") != "Resolved":
+                    account.collection_status = "Resolved"
+                WorkflowExecutionService(self.db).on_case_status_changed(
+                    attempt.account_id,
+                    previous=previous_status,
+                    new="Resolved",
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("workflow settle cancel failed")
 
         if commit:
             self.db.commit()
