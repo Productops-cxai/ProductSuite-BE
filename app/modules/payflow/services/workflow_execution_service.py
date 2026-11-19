@@ -1906,6 +1906,23 @@ class WorkflowExecutionService:
             closed += 1
         return closed
 
+    def _cancel_open_step_runs_for_run(self, run_id: int, *, reason: str) -> int:
+        """Cancel waiting/scheduled step rows so Resolved timelines do not keep showing Scheduled."""
+        rows = (
+            self.db.query(PayflowWorkflowStepRunModel)
+            .filter(
+                PayflowWorkflowStepRunModel.run_id == run_id,
+                PayflowWorkflowStepRunModel.status.in_(["waiting", "scheduled", "running"]),
+            )
+            .all()
+        )
+        now = _utcnow()
+        for row in rows:
+            row.status = "cancelled"
+            row.finished_at = now
+            row.error = (reason or "")[:500] or None
+        return len(rows)
+
     def _delivery_report_due_at(
         self, account: PayflowAccountModel, cfg: dict, step: dict
     ) -> datetime | None:
@@ -3308,7 +3325,8 @@ class WorkflowExecutionService:
             .first()
         )
         current_def = steps_by_id.get(run.current_step_id or "") or {}
-        next_step_id = pending_job.step_id if pending_job else None
+        show_pending = bool(pending_job) and run.status not in _TERMINAL
+        next_step_id = pending_job.step_id if show_pending else None
         next_def = steps_by_id.get(next_step_id or "") or {}
         activity: list[dict[str, Any]] = []
         for s in step_rows:
@@ -3329,7 +3347,8 @@ class WorkflowExecutionService:
                     "error": s.error,
                 }
             )
-        if pending_job:
+        # Terminal runs must not surface a future Scheduled row (e.g. after settle cancel).
+        if show_pending:
             activity.append(
                 {
                     "at": pending_job.scheduled_at,
@@ -3375,8 +3394,8 @@ class WorkflowExecutionService:
             if run.current_step_id
             else None,
             "next_step_id": next_step_id,
-            "next_step_title": next_def.get("title"),
-            "next_scheduled_at": pending_job.scheduled_at if pending_job else None,
+            "next_step_title": next_def.get("title") if show_pending else None,
+            "next_scheduled_at": pending_job.scheduled_at if show_pending else None,
             "human_review_id": run.human_review_id,
             "started_at": run.started_at,
             "completed_at": run.completed_at,
@@ -3600,6 +3619,7 @@ class WorkflowExecutionService:
                 run.completed_at = _utcnow()
                 run.last_error = block
                 cancel_pending_jobs_for_run(self.db, run.id)
+                self._cancel_open_step_runs_for_run(run.id, reason=block)
                 self.log_event(
                     event_type="run_cancelled",
                     message=block,
