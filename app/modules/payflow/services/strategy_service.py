@@ -1086,7 +1086,6 @@ class PayflowStrategyService:
             "ai_context": list(row.ai_context or []),
             "ai_proposal_snapshot": row.ai_proposal_snapshot,
             "segmentation_snapshot": row.segmentation_snapshot,
-            "variant_reviews": self.variant_review_summary(steps),
             "revision_of_id": row.revision_of_id,
             # The newest version regenerated from this one (it is then Rejected).
             "replaced_by_id": (
@@ -1585,85 +1584,6 @@ class PayflowStrategyService:
         self._notify_awaiting(row, user)
         return self._serialize(self._get_row(row.id))
 
-    def variant_review_summary(self, steps: list[dict] | None) -> dict[str, Any]:
-        from app.modules.payflow.services.message_variant_review import review_summary
-
-        return review_summary(steps)
-
-    def review_variant(
-        self,
-        user: UserModel,
-        strategy_id: int,
-        *,
-        step_id: str,
-        audience: str = "main",
-        review_status: str = "Reviewed",
-        note: str | None = None,
-    ) -> dict[str, Any]:
-        """Mark one communication text as Reviewed (or reset). Independent per variant (FR-06)."""
-        from app.modules.payflow.services.message_variant_review import (
-            REVIEW_MODIFIED,
-            REVIEW_PENDING,
-            REVIEW_REVIEWED,
-            normalize_review_status,
-        )
-
-        row = self._get_row(strategy_id)
-        self._assert_manage(user, row.client_id)
-        self._assert_open(row)
-        if row.status not in {
-            PayflowStrategyStatus.DRAFT.value,
-            PayflowStrategyStatus.AI_PROPOSED.value,
-            PayflowStrategyStatus.UNDER_REVIEW.value,
-        }:
-            raise ValidationAppError(
-                "Variant review is only available for Draft, AI Proposed or Under Review workflows"
-            )
-        status = normalize_review_status(review_status) or REVIEW_REVIEWED
-        if status not in {REVIEW_PENDING, REVIEW_REVIEWED, REVIEW_MODIFIED}:
-            raise ValidationAppError(
-                f"review_status must be one of: {REVIEW_PENDING}, {REVIEW_REVIEWED}, {REVIEW_MODIFIED}"
-            )
-        key = (audience or "main").strip() or "main"
-        steps = copy.deepcopy(list(row.steps or []))
-        step = next((s for s in steps if s.get("id") == step_id), None)
-        if not step or step.get("kind") != "Communication":
-            raise ValidationAppError(f"Step {step_id} is not a Communication step of this workflow")
-        cfg = _cfg(step)
-        if key == "main":
-            if not any(str(cfg.get(part) or "").strip() for part in MESSAGE_TEXT_KEYS):
-                raise ValidationAppError(f"Message {step_id} has no Main / Default text to review")
-            cfg["review_status"] = status
-            label = "Main / Default"
-        else:
-            versions = cfg.get("versions") if isinstance(cfg.get("versions"), dict) else {}
-            version = versions.get(key)
-            if not isinstance(version, dict):
-                raise ValidationAppError(f"Message {step_id} has no variant '{key}' to review")
-            version["review_status"] = status
-            versions[key] = version
-            cfg["versions"] = versions
-            label = version.get("label") or key
-        step["config"] = cfg
-        row.steps = copy.deepcopy(steps)
-        history_note = f"Variant review by {user.full_name}: {step.get('title') or step_id} / {label} → {status}"
-        if note:
-            history_note += f" ({_clean_note(note)})"
-        self._prepend_version(
-            row,
-            {
-                "version": int(row.version or 1),
-                "date": _stamp(),
-                "note": history_note,
-                "changes": [f"{step.get('title') or step_id}: {label} marked {status}"],
-                "status": row.status,
-                "origin": row.origin,
-            },
-        )
-        self.db.commit()
-        self.db.refresh(row)
-        return self._serialize(self._get_row(row.id))
-
     def approve(self, user: UserModel, strategy_id: int, *, note: str | None = None) -> dict[str, Any]:
         row = self._get_row(strategy_id)
         self._assert_manage(user, row.client_id)
@@ -1677,45 +1597,6 @@ class PayflowStrategyService:
                 "Only AI Proposed or Under Review workflows can be approved "
                 "(approval does not activate — use Activate when ready)"
             )
-
-        from app.modules.payflow.services.message_variant_review import (
-            active_texts,
-            approval_blockers,
-            normalize_review_status,
-        )
-        from app.modules.payflow.services.workflow_suggestion.message_writer import check_texts
-
-        steps_now = list(row.steps or [])
-        blockers = approval_blockers(steps_now)
-        if blockers:
-            raise ValidationAppError(
-                "All active communication variants must be Reviewed before approval. Pending: "
-                + "; ".join(blockers[:8])
-                + ("…" if len(blockers) > 8 else "")
-            )
-
-        # Compliance gate only for workflows that use per-variant review (stamped texts).
-        # Legacy workflows without review_status keep the previous approve behaviour (AC18).
-        stamped = [
-            (step, key, {k: text.get(k) for k in (*MESSAGE_TEXT_KEYS, "tone")})
-            for step, key, text in active_texts(steps_now)
-            if normalize_review_status(text.get("review_status")) is not None
-        ]
-        if stamped:
-            warnings = check_texts(
-                {"steps": steps_now},
-                {"segment": row.segment or {}, "stats": {}},
-                stamped,
-            )
-            if warnings:
-                sample = "; ".join(
-                    f"{w.get('step_id')}/{w.get('text')}: {w.get('problem')}" for w in warnings[:5]
-                )
-                raise ValidationAppError(
-                    "Cannot approve: one or more communication variants fail compliance checks. "
-                    + sample
-                    + ("…" if len(warnings) > 5 else "")
-                )
 
         # Keep Human Modified if already modified; do not revert to AI Proposed
         human_modified = _is_human_modified(row, list(row.steps or []))

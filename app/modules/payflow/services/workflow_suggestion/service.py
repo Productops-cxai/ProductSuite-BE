@@ -17,8 +17,7 @@ from app.modules.payflow.services.strategy_service import (
     _message_text,
     read_strategy_versions,
 )
-from app.modules.payflow.services.message_variant_review import stamp_pending
-from app.modules.payflow.services.segmentation_config_service import get_client_segmentation
+from app.modules.payflow.services.segmentation_config_service import default_segmentation_config
 from app.modules.payflow.services.workflow_suggestion.audiences import (
     audience_keys,
     audience_label,
@@ -57,6 +56,12 @@ from app.modules.payflow.services.workflow_suggestion.message_writer import (
     check_texts,
     translate_messages,
     write_messages,
+)
+from app.modules.payflow.services.workflow_suggestion.required_wording import (
+    LABEL as WORDING_LABEL,
+    required_wording,
+    required_wording_line,
+    workflow_wording,
 )
 from app.modules.payflow.services.workflow_suggestion.prompt import (
     MAX_REGENERATE_CLIENT_EXAMPLES,
@@ -174,14 +179,15 @@ class WorkflowSuggestionService:
         # segment's accounts), written before saving.
         writer_client = {**client, "payment_options": load_payment_options(self.db, client["id"])}
         members = members_by_segment(accounts, segments)  # each segment's own accounts → its audiences
-        segmentation = get_client_segmentation(self.db, client["id"])
+        segmentation = default_segmentation_config()  # the fixed age groups - never per-client settings
         messages_note: dict[str, list[dict[str, str]]] = {}  # segment_id → "Messages" / "Languages" lines
         for segment in segments:
             segment_id = segment["segment_id"]
             found = find_audiences(members[segment_id], segmentation=segmentation)
             performance = _email_performance(self.db, client["id"], portfolio_id=scope.id, found=found)
             workflows[segment_id], messages_note[segment_id] = _with_messages(
-                {**writer_client, "email_performance": performance},
+                {**writer_client, "email_performance": performance,
+                 "required_wording": required_wording(self.db, client["id"], members[segment_id])},
                 workflows[segment_id],
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
@@ -288,7 +294,7 @@ class WorkflowSuggestionService:
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
         members = load_segment_members(self.db, original)
-        segmentation = get_client_segmentation(self.db, original["client_id"])
+        segmentation = default_segmentation_config()  # the fixed age groups - never per-client settings
         found = find_audiences(members, segmentation=segmentation)
         workflow, messages_note = _with_messages(
             {
@@ -299,6 +305,7 @@ class WorkflowSuggestionService:
                     self.db, original["client_id"], portfolio_id=original.get("portfolio_id"),
                     strategy_id=original["id"], found=found,
                 ),
+                "required_wording": required_wording(self.db, original["client_id"], members),
             },
             workflow,
             _stored_segment(original),
@@ -405,11 +412,7 @@ class WorkflowSuggestionService:
         self.strategies._assert_manage(user, workflow["client_id"])
         one_text_step = _one_text_step(workflow, step_id, audience) if audience else None
         members = load_segment_members(self.db, workflow)
-        segmentation = (
-            workflow.get("segmentation_snapshot")
-            or get_client_segmentation(self.db, workflow["client_id"])
-        )
-        found = find_audiences(members, segmentation=segmentation)
+        found = find_audiences(members, segmentation=default_segmentation_config())  # the fixed age groups
         client = {
             **load_client_context(self.db, workflow["client_id"]),
             "payment_options": load_payment_options(self.db, workflow["client_id"]),
@@ -417,6 +420,7 @@ class WorkflowSuggestionService:
                 self.db, workflow["client_id"], portfolio_id=workflow.get("portfolio_id"),
                 strategy_id=workflow["id"], found=found,
             ),
+            "required_wording": required_wording(self.db, workflow["client_id"], members),
         }
         if one_text_step is not None:
             return self._write_one_text(user, workflow, client, members, found, one_text_step, audience, remarks)
@@ -435,6 +439,7 @@ class WorkflowSuggestionService:
         if not step_id:  # every message rewritten: who they are written for is new too
             ai_context = [item for item in ai_context if item.get("label") != "Audiences"] + audiences_note
         ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
+        ai_context = _with_wording_line(ai_context, client)
         return self.strategies.save_ai_messages(user, strategy_id, steps, remarks=remarks, ai_context=ai_context)
 
     def _write_one_text(
@@ -470,6 +475,7 @@ class WorkflowSuggestionService:
             note += f"; not translated: {', '.join(failed)} - {fallback}"
         ai_context = _refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps)
         ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
+        ai_context = _with_wording_line(ai_context, client)
         return self.strategies.save_ai_messages(user, workflow["id"], steps, note=note, ai_context=ai_context)
 
     def workflow_audiences(self, user: UserModel, strategy_id: int) -> dict[str, Any]:
@@ -477,18 +483,14 @@ class WorkflowSuggestionService:
         the context the AI writes them for (audiences.text_audiences). No AI call; nothing is saved."""
         workflow = self.strategies.get_strategy(user, strategy_id)
         members = load_segment_members(self.db, workflow)
-        segmentation = (
-            workflow.get("segmentation_snapshot")
-            or get_client_segmentation(self.db, workflow["client_id"])
-        )
         return {
             "workflow_id": workflow["id"],
             "accounts": len(members),
             "situation": (workflow.get("segment") or {}).get("situation"),
+            # Counted with the settings the workflow was written with (the fixed age groups when none were saved).
             "texts": text_audiences(
-                members, workflow.get("steps") or [], segmentation=segmentation
+                members, workflow.get("steps") or [], segmentation=workflow.get("segmentation_snapshot")
             ),
-            "variant_reviews": self.strategies.variant_review_summary(workflow.get("steps") or []),
         }
 
     def update_workflow(self, user: UserModel, strategy_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -503,13 +505,15 @@ class WorkflowSuggestionService:
         return {**result, "text_warnings": self._text_warnings(before, result)}
 
     def _text_warnings(self, before: dict[str, dict], workflow: dict[str, Any]) -> list[dict[str, str]]:
-        """Problems with the texts a save changed ([] when none changed or all are fine)."""
+        """Problems with the texts a save changed ([] when none changed or all are fine) - including a missing
+        wording the client's compliance rules require (the send check would block that message)."""
         texts = _edited_texts(before, workflow.get("steps") or [])
         if not texts:
             return []
         language = load_client_context(self.db, workflow["client_id"]).get("language") or "English"
         return check_texts(workflow, _stored_segment(workflow), texts,
-                           english=str(language).strip().lower().startswith("english"))
+                           english=str(language).strip().lower().startswith("english"),
+                           wording=workflow_wording(self.db, workflow))
 
     def _update_and_translate(
         self, user: UserModel, strategy_id: int, payload: dict[str, Any], before: dict[str, dict]
@@ -536,9 +540,12 @@ class WorkflowSuggestionService:
         if not edited and not edited_versions:
             return updated
         client = load_client_context(self.db, updated["client_id"])
-        languages = _other_languages(client, load_segment_members(self.db, updated))
+        members = load_segment_members(self.db, updated)
+        languages = _other_languages(client, members)
         if not languages:
             return updated
+        # The translations keep the compliance rules' wording as written (the send check looks for it).
+        client["required_wording"] = required_wording(self.db, updated["client_id"], members)
 
         written = {
             step_id: {key: value for key, value in (step.get("config") or {}).items()
@@ -761,7 +768,8 @@ def _with_messages(
             written[step["id"]] = {key: value for key, value in (step.get("config") or {}).items()
                                    if key in ("subject", "body", "sms_body", "tone", "content_origin") and value}
     written, languages_note = _with_translations(client, workflow, written, languages or [])
-    notes = languages_note + audiences_note + (_performance_note(client) if to_write else [])
+    notes = (languages_note + audiences_note + required_wording_line(client.get("required_wording"))
+             + (_performance_note(client) if to_write else []))
     return {**workflow, "steps": apply_messages(workflow["steps"], written)}, notes
 
 
@@ -790,10 +798,7 @@ def _write_for_audiences(
     )
     for step_id, brief in main_plans.items():
         if step_id in written:
-            written[step_id] = stamp_pending({**written[step_id], "brief": brief})
-    for step_id, text in list(written.items()):
-        if "review_status" not in text:
-            written[step_id] = stamp_pending(text)
+            written[step_id] = {**written[step_id], "brief": brief}
 
     done, failed = [], []
     for audience in found.get("audiences") or []:
@@ -808,7 +813,7 @@ def _write_for_audiences(
             failed.append(audience)
             continue
         for step_id, text in texts.items():
-            version = stamp_pending({
+            version = {
                 "label": audience["label"],
                 **text,
                 "brief": audience_plans[step_id],
@@ -816,7 +821,7 @@ def _write_for_audiences(
                     "dimension": audience.get("dimension") or "age",
                     "criteria": audience.get("criteria") or {},
                 },
-            })
+            }
             written[step_id] = {**written[step_id],
                                 "versions": {**(written[step_id].get("versions") or {}), audience["key"]: version}}
         done.append(audience)
@@ -826,6 +831,12 @@ def _write_for_audiences(
 def _plans_for(plans: dict[str, dict[str, dict[str, str]]], audience: str) -> dict[str, dict[str, str]]:
     """{step_id: brief} of one audience, from plan_messages' {step_id: {audience: brief}}."""
     return {step_id: by_audience[audience] for step_id, by_audience in plans.items() if audience in by_audience}
+
+
+def _with_wording_line(ai_context: list[dict[str, str]], client: dict[str, Any]) -> list[dict[str, str]]:
+    """ai_context with the "Required wording" line of the wording the messages were just written with."""
+    kept = [item for item in ai_context if item.get("label") != WORDING_LABEL]
+    return kept + required_wording_line(client.get("required_wording"))
 
 
 def _one_text_step(workflow: dict[str, Any], step_id: str | None, key: str) -> dict[str, Any]:
@@ -871,8 +882,8 @@ def _write_one(
                              audience=audience if plans else None)
     text = {name: value for name, value in written[step_id].items() if value}
     if key == MAIN:
-        return stamp_pending({**text, **({"brief": plans[step_id]} if plans else {})})
-    return stamp_pending({
+        return {**text, **({"brief": plans[step_id]} if plans else {})}
+    return {
         "label": audience["label"],
         **text,
         "brief": plans[step_id],
@@ -882,7 +893,7 @@ def _write_one(
             ),
             "criteria": audience.get("criteria") or {},
         },
-    })
+    }
 
 
 def _audience_for(found: dict[str, Any], members: list, key: str, label: str | None = None) -> dict[str, Any]:

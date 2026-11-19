@@ -55,6 +55,8 @@ def build_message_prompt(
     `remarks` (on a rewrite): what the reviewer asked for.
     `audience` ({"key", "label", "accounts", "profile"}): who these texts are for (audiences.py)."""
     parts = [_client_lines(client), _segment_lines(segment)]
+    if client.get("required_wording"):
+        parts.append(_wording_lines(client["required_wording"]))
     if audience:
         parts.append(_audience_lines(audience))
     parts.append(_workflow_lines(workflow))
@@ -181,6 +183,18 @@ def _client_lines(client: dict[str, Any]) -> str:
     )
 
 
+def _wording_lines(wording: dict[str, list[str]]) -> str:
+    """The wording the client's compliance rules require (required_wording.py)."""
+    lines = [
+        "Required wording - the client's compliance rules: a message without it is blocked when it is sent. Put it "
+        "in every message of that kind, word for word and exactly as written (one unchanged sentence - the "
+        "writing rules about numbers and words do not apply to it):"
+    ]
+    for channel, where in (("Email", "every email (in the body)"), ("SMS", "every SMS")):
+        lines += [f'- {where}: "{text}"' for text in wording.get(channel) or []]
+    return "\n".join(lines)
+
+
 def _segment_lines(segment: dict[str, Any]) -> str:
     stats = json.dumps(segment.get("stats") or {}, ensure_ascii=False)
     situation = (segment.get("segment") or {}).get("situation")
@@ -278,6 +292,13 @@ Reply with JSON only, matching the provided schema: one entry per step_id, with 
 - SMS: at most {MAX_SMS_CHARS} characters with the values filled in - when the translation runs longer, say the
   same thing in fewer words. Translate the opt-out sentence too, keeping the word STOP as it is (e.g. French:
   "Répondez STOP pour vous désabonner.")."""
+    required = list(dict.fromkeys(text for texts in (client.get("required_wording") or {}).values() for text in texts))
+    if required:
+        system += (
+            "\n- Required wording (the client's compliance rules - the send check looks for it exactly as written): "
+            "keep it word for word and untranslated wherever the original has it: "
+            + "; ".join(f'"{text}"' for text in required) + "."
+        )
     parts = [
         f"Client: {client['name']}",
         "Messages to translate (one per step_id):\n"

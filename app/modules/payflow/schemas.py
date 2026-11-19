@@ -1040,7 +1040,6 @@ class PayflowStrategyItem(BaseModel):
     ai_proposal_snapshot: Optional[dict] = None
     # Segmentation rules snapshotted when variants were generated (FR-10 / AC17).
     segmentation_snapshot: Optional[dict] = None
-    variant_reviews: Optional[dict] = None
     revision_of_id: Optional[int] = None  # Regenerate: the workflow this one was regenerated from
     replaced_by_id: Optional[int] = None  # Regenerate: the newest version made from this one (it is then Rejected)
     versions: List[StrategyVersionItem] = Field(default_factory=list)
@@ -1089,56 +1088,6 @@ class WorkflowAudiencesResponse(BaseModel):
     accounts: int  # the workflow's eligible accounts today
     situation: Optional[str] = None  # the segment's situation (e.g. "Payment Plan"); None for an ordinary segment
     texts: List[WorkflowTextAudience] = Field(default_factory=list)
-    variant_reviews: Optional[dict] = None
-
-
-class SegmentationAgeGroup(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    key: str = Field(min_length=2, max_length=64)
-    label: str = Field(min_length=1, max_length=64)
-    min_age: int = Field(ge=18, le=120)
-    max_age: Optional[int] = Field(default=None, ge=18, le=120)
-
-
-class SegmentationDimensionAge(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = True
-    groups: List[SegmentationAgeGroup] = Field(default_factory=list)
-
-
-class SegmentationDimensionValues(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    enabled: bool = False
-    # Empty = auto from portfolio data when enabled; otherwise only these labels/codes.
-    values: List[str] = Field(default_factory=list)
-
-
-class SegmentationConfigBody(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    min_audience_size: int = Field(default=12, ge=1, le=1000)
-    max_versions: int = Field(default=6, ge=1, le=20)
-    priority: List[str] = Field(default_factory=lambda: ["region", "country", "age"])
-    dimensions: dict = Field(default_factory=dict)
-
-
-class UpdateSegmentationConfigRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    config: Optional[SegmentationConfigBody] = None
-    note: Optional[str] = Field(default=None, max_length=2000)
-
-
-class ReviewVariantRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    step_id: str = Field(min_length=1, max_length=64)
-    audience: str = Field(default="main", max_length=64, description='"main" or a versions key')
-    review_status: str = Field(default="Reviewed", max_length=64)
-    note: Optional[str] = Field(default=None, max_length=2000)
 
 
 class StrategiesSummary(BaseModel):
