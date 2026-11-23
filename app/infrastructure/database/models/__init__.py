@@ -686,6 +686,8 @@ class PayflowStrategyModel(Base):
     origin: Mapped[str] = mapped_column(String(32), nullable=False, default="Human Created")
     # Nullable for additive schema_sync on existing DBs; app always sets on create.
     source: Mapped[str | None] = mapped_column(String(32), nullable=True, default="Human Created")
+    # Adaptive B3: event-driven next-best-action layer (default on). Off = fixed flowchart only.
+    adaptive: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     coverage: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -872,6 +874,44 @@ class PayflowCommunicationEventModel(Base):
     )
 
     communication = relationship("PayflowCommunicationModel", back_populates="event_rows")
+
+
+class PayflowEngagementEventModel(Base):
+    """Normalized customer engagement / payment signals for adaptive workflow reassessment (B1)."""
+
+    __tablename__ = "payflow_engagement_events"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_payflow_engagement_dedupe"),
+        Index("ix_payflow_engagement_account_occurred", "account_id", "occurred_at"),
+        Index("ix_payflow_engagement_run_processed", "run_id", "processed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    strategy_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_strategies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    communication_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("payflow_communications.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class PayflowPaymentLinkModel(Base):
@@ -1716,6 +1756,13 @@ class PayflowWorkflowRunModel(Base):
     # made since then: a part payment from before the workflow is not the customer acting on it.
     # Null on runs from before this column (they count every part payment, as before).
     recovered_at_start: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Adaptive B4: latest engagement label for Ops screens.
+    engagement_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Adaptive: preferred channel after switch_channel (Email / SMS).
+    preferred_channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Adaptive: {planned_step_id: follow_up_step_id} swaps awaiting send.
+    swaps: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_reassessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -1723,6 +1770,47 @@ class PayflowWorkflowRunModel(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class PayflowAdaptiveDecisionModel(Base):
+    """Audit trail for adaptive next-best-action decisions (B4/B5)."""
+
+    __tablename__ = "payflow_adaptive_decisions"
+    __table_args__ = (
+        Index("ix_payflow_adaptive_decisions_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id"), nullable=False, index=True
+    )
+    strategy_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_strategies.id"), nullable=False, index=True
+    )
+    trigger_event_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    decided_by: Mapped[str] = mapped_column(String(32), nullable=False, default="rules")
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    replace_step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    follow_up_step_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    needs_approval: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="executed", index=True)
+    decided_by_user: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    human_review_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 

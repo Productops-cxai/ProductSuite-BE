@@ -103,7 +103,13 @@ from app.modules.payflow.schemas import (
     SuggestWorkflowsResponse,
     RegenerateWorkflowRequest,
     WriteWorkflowMessagesRequest,
+    PayflowAdaptiveDecisionItem,
+    PayflowAdaptiveDecisionModifyRequest,
+    PayflowAdaptiveDecisionNoteRequest,
+    PayflowAdaptiveDecisionsListResponse,
+    PayflowAdaptiveRunSnapshot,
     PayflowWorkflowPaymentEventRequest,
+    PayflowWorkflowReassessResponse,
     PayflowWorkflowRunItem,
     PayflowWorkflowRunsResponse,
     PayflowWorkflowWorkerLogsResponse,
@@ -2368,6 +2374,197 @@ def get_workflow_run(run_id: int, user: RequirePayflowProduct, db: DbSession):
         ):
             raise ForbiddenError("Client access denied")
         return item
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/workflow-runs/{run_id}/adaptive", response_model=PayflowAdaptiveRunSnapshot)
+def get_workflow_run_adaptive(run_id: int, user: RequirePayflowProduct, db: DbSession):
+    """Engagement state, events, decisions, next scheduled step, swaps, channel."""
+    from app.infrastructure.database.models import PayflowWorkflowRunModel
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        access = AccessContextService(db)
+        if not access.can(user, "view_workflows"):
+            raise ForbiddenError("Permission required: view_workflows")
+        run = db.get(PayflowWorkflowRunModel, run_id)
+        if not run:
+            raise NotFoundError("Workflow run not found")
+        if not access.can(user, "view_workflows", int(run.client_id)):
+            raise ForbiddenError("Client access denied")
+        item = AdaptiveWorkflowService(db).get_run_adaptive(run_id)
+        if not item:
+            raise NotFoundError("Workflow run not found")
+        return item
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/workflow-runs/{run_id}/reassess",
+    response_model=PayflowWorkflowReassessResponse,
+)
+def reassess_workflow_run(run_id: int, user: PayflowManageWorkflows, db: DbSession):
+    """Manual 'Reassess plan' — records reassess_requested and queues the job."""
+    from app.core.exceptions import ValidationAppError
+    from app.infrastructure.database.models import PayflowWorkflowRunModel
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        access = AccessContextService(db)
+        run = db.get(PayflowWorkflowRunModel, run_id)
+        if not run:
+            raise NotFoundError("Workflow run not found")
+        if not access.can(user, "create_edit_workflows", int(run.client_id)):
+            raise ForbiddenError("Client access denied")
+        job = AdaptiveWorkflowService(db).queue_manual_reassess(run_id)
+        if not job:
+            raise ValidationAppError(
+                "Cannot reassess this run (terminal, missing, or workflow not adaptive)"
+            )
+        db.commit()
+        return {
+            "run_id": run_id,
+            "job_id": job.id,
+            "scheduled_at": job.scheduled_at,
+        }
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.get("/adaptive-decisions", response_model=PayflowAdaptiveDecisionsListResponse)
+def list_adaptive_decisions(
+    user: RequirePayflowProduct,
+    db: DbSession,
+    status_filter: str | None = Query(default=None, alias="status"),
+    client_id: int | None = Query(default=None),
+    run_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        access = AccessContextService(db)
+        allowed = _scoped_client_ids_for_view_workflows(access, user, client_id)
+        items = AdaptiveWorkflowService(db).list_decisions(
+            status=status_filter,
+            client_id=client_id,
+            run_id=run_id,
+            limit=limit,
+            allowed_client_ids=allowed,
+        )
+        return {"items": items}
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/adaptive-decisions/{decision_id}/approve",
+    response_model=PayflowAdaptiveDecisionItem,
+)
+def approve_adaptive_decision(
+    decision_id: int,
+    body: PayflowAdaptiveDecisionNoteRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    from app.infrastructure.database.models import (
+        PayflowAdaptiveDecisionModel,
+        PayflowWorkflowRunModel,
+    )
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        row = db.get(PayflowAdaptiveDecisionModel, decision_id)
+        if not row:
+            raise NotFoundError("Adaptive decision not found")
+        run = db.get(PayflowWorkflowRunModel, row.run_id)
+        if not run:
+            raise NotFoundError("Workflow run not found")
+        access = AccessContextService(db)
+        if not access.can(user, "create_edit_workflows", int(run.client_id)):
+            raise ForbiddenError("Client access denied")
+        return AdaptiveWorkflowService(db).approve_decision(
+            decision_id,
+            user=user,
+            note=body.note,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/adaptive-decisions/{decision_id}/modify",
+    response_model=PayflowAdaptiveDecisionItem,
+)
+def modify_adaptive_decision(
+    decision_id: int,
+    body: PayflowAdaptiveDecisionModifyRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    from app.infrastructure.database.models import (
+        PayflowAdaptiveDecisionModel,
+        PayflowWorkflowRunModel,
+    )
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        row = db.get(PayflowAdaptiveDecisionModel, decision_id)
+        if not row:
+            raise NotFoundError("Adaptive decision not found")
+        run = db.get(PayflowWorkflowRunModel, row.run_id)
+        if not run:
+            raise NotFoundError("Workflow run not found")
+        access = AccessContextService(db)
+        if not access.can(user, "create_edit_workflows", int(run.client_id)):
+            raise ForbiddenError("Client access denied")
+        return AdaptiveWorkflowService(db).modify_decision(
+            decision_id,
+            user=user,
+            note=body.note,
+            action=body.action,
+            replace_step_id=body.replace_step_id,
+            follow_up_step_id=body.follow_up_step_id,
+            at=body.at,
+            channel=body.channel,
+        )
+    except AppError as exc:
+        raise _map_error(exc) from exc
+
+
+@router.post(
+    "/adaptive-decisions/{decision_id}/reject",
+    response_model=PayflowAdaptiveDecisionItem,
+)
+def reject_adaptive_decision(
+    decision_id: int,
+    body: PayflowAdaptiveDecisionNoteRequest,
+    user: PayflowManageWorkflows,
+    db: DbSession,
+):
+    from app.infrastructure.database.models import (
+        PayflowAdaptiveDecisionModel,
+        PayflowWorkflowRunModel,
+    )
+    from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+    try:
+        row = db.get(PayflowAdaptiveDecisionModel, decision_id)
+        if not row:
+            raise NotFoundError("Adaptive decision not found")
+        run = db.get(PayflowWorkflowRunModel, row.run_id)
+        if not run:
+            raise NotFoundError("Workflow run not found")
+        access = AccessContextService(db)
+        if not access.can(user, "create_edit_workflows", int(run.client_id)):
+            raise ForbiddenError("Client access denied")
+        return AdaptiveWorkflowService(db).reject_decision(
+            decision_id,
+            user=user,
+            note=body.note,
+        )
     except AppError as exc:
         raise _map_error(exc) from exc
 

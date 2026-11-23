@@ -897,6 +897,31 @@ class PayflowPaymentPortalService:
                 else f"{option['type']} {charge_amount:.2f} {currency}"
             ),
         )
+        # Adaptive B1: customer started checkout (not plan auto-charge).
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                safe_record_engagement_event,
+            )
+
+            safe_record_engagement_event(
+                self.db,
+                account_id=account.id,
+                client_id=row.client_id,
+                event_type="payment_started",
+                source="portal",
+                dedupe_key=f"portal:payment_started:attempt:{public_id}",
+                communication_id=attempt.communication_id,
+                detail={
+                    "attempt_id": public_id,
+                    "option_type": option["type"],
+                    "amount": charge_amount,
+                    "currency": currency,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement payment_started failed attempt=%s", public_id
+            )
 
         fe = (settings.FRONTEND_URL or "").rstrip("/")
         success_url = (
@@ -1308,6 +1333,11 @@ class PayflowPaymentPortalService:
                     detail=f"Reconcile expired · {attempt.stripe_session_id or attempt.public_id[:12]}",
                     commit=False,
                 )
+                self._record_payment_abandoned(
+                    attempt,
+                    reason="expired",
+                    detail="Stripe checkout session expired",
+                )
                 self.db.commit()
                 return True
 
@@ -1365,6 +1395,38 @@ class PayflowPaymentPortalService:
                 event,
             )
 
+    def _record_payment_abandoned(
+        self,
+        attempt: PayflowPaymentAttemptModel,
+        *,
+        reason: str,
+        detail: str | None = None,
+    ) -> None:
+        """Adaptive B1: customer left checkout (not balance-driven cancel of sibling attempts)."""
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                safe_record_engagement_event,
+            )
+
+            safe_record_engagement_event(
+                self.db,
+                account_id=attempt.account_id,
+                client_id=attempt.client_id,
+                event_type="payment_abandoned",
+                source="portal",
+                dedupe_key=f"portal:payment_abandoned:attempt:{attempt.public_id}:{reason}",
+                communication_id=attempt.communication_id,
+                detail={
+                    "attempt_id": attempt.public_id,
+                    "reason": reason,
+                    "message": detail,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement payment_abandoned failed attempt=%s", attempt.public_id
+            )
+
     def cancel_attempt(self, token: str, attempt_public_id: str) -> dict[str, Any]:
         real_token, is_preview = self._strip_preview_token(token)
         if is_preview:
@@ -1402,6 +1464,11 @@ class PayflowPaymentPortalService:
                 f"Checkout cancelled · {row.stripe_session_id or row.public_id[:12]}"
             ),
             commit=False,
+        )
+        self._record_payment_abandoned(
+            row,
+            reason="cancelled",
+            detail="Customer returned without paying",
         )
         self.db.commit()
         self.db.refresh(row)
@@ -1449,6 +1516,11 @@ class PayflowPaymentPortalService:
                 event="cancelled",
                 detail=f"Mock checkout cancelled · {row.public_id[:12]}",
                 commit=False,
+            )
+            self._record_payment_abandoned(
+                row,
+                reason="cancelled",
+                detail="Mock cancel — customer returned without paying",
             )
             self.db.commit()
         else:

@@ -1040,7 +1040,12 @@ class WorkflowExecutionService:
         after_human_review: bool = False,
         after_comm_delay: bool = False,
     ) -> None:
-        run = self.db.get(PayflowWorkflowRunModel, run_id)
+        run = (
+            self.db.query(PayflowWorkflowRunModel)
+            .filter(PayflowWorkflowRunModel.id == run_id)
+            .with_for_update()
+            .first()
+        )
         if not run or run.status in _TERMINAL:
             return
         if run.status == PayflowWorkflowRunStatus.PAUSED_HUMAN_REVIEW.value:
@@ -1062,6 +1067,86 @@ class WorkflowExecutionService:
         account = self.db.get(PayflowAccountModel, run.account_id)
         if not strategy or not account:
             return
+
+        # Adaptive B5: a job tied to a superseded decision must not send.
+        if job_id:
+            job_row = self.db.get(PayflowWorkflowJobModel, job_id)
+            payload = (job_row.payload if job_row and isinstance(job_row.payload, dict) else {}) or {}
+            decision_id = payload.get("decision_id")
+            if decision_id:
+                from app.infrastructure.database.models import PayflowAdaptiveDecisionModel
+
+                dec = self.db.get(PayflowAdaptiveDecisionModel, int(decision_id))
+                if dec and dec.status == "superseded":
+                    self.log_event(
+                        event_type="step_skipped",
+                        message=f"Step {step_id} skipped — adaptive decision #{decision_id} superseded",
+                        run_id=run_id,
+                        step_id=step_id,
+                        job_id=job_id,
+                        account_id=account.id,
+                        strategy_id=strategy.id,
+                        level="warn",
+                    )
+                    self.db.commit()
+                    return
+
+        # Adaptive B5: reassess before every Communication send on adaptive runs.
+        if bool(getattr(strategy, "adaptive", True)):
+            peek_steps = {
+                s.get("id"): s
+                for s in self._run_steps(run, strategy)
+                if isinstance(s, dict) and s.get("id")
+            }
+            peek = peek_steps.get(step_id) or {}
+            if (
+                peek.get("kind") == "Communication"
+                and not str(_cfg(peek).get("follow_up_for") or "").strip()
+            ):
+                from app.modules.payflow.services.adaptive_workflow_service import (
+                    AdaptiveWorkflowService,
+                )
+
+                result = AdaptiveWorkflowService(self.db).reassess(
+                    run.id,
+                    job_id=job_id,
+                    trigger="message_due",
+                    due_step_id=step_id,
+                    commit=False,
+                )
+                self.db.refresh(run)
+                if run.status in _TERMINAL or run.status == PayflowWorkflowRunStatus.PAUSED_HUMAN_REVIEW.value:
+                    self.log_event(
+                        event_type="step_skipped",
+                        message=(
+                            f"Step {step_id} aborted after adaptive pre-send "
+                            f"({result.get('action') or result.get('reason')})"
+                        ),
+                        run_id=run_id,
+                        step_id=step_id,
+                        job_id=job_id,
+                        account_id=account.id,
+                        strategy_id=strategy.id,
+                        level="info",
+                    )
+                    self.db.commit()
+                    return
+                if result.get("abort_send"):
+                    self.log_event(
+                        event_type="step_skipped",
+                        message=(
+                            f"Step {step_id} deferred/cancelled by adaptive "
+                            f"{result.get('action') or 'decision'}"
+                        ),
+                        run_id=run_id,
+                        step_id=step_id,
+                        job_id=job_id,
+                        account_id=account.id,
+                        strategy_id=strategy.id,
+                        level="info",
+                    )
+                    self.db.commit()
+                    return
 
         # Scheduled post-Wait job: close the Wait row so the timeline no longer
         # shows "Waiting" after the wait window has elapsed.
@@ -1177,6 +1262,24 @@ class WorkflowExecutionService:
         step = steps.get(step_id)
         if not step:
             self._fail_run(run, f"Unknown step {step_id}", job_id=job_id)
+            return
+
+        # Adaptive follow-ups are off-flowchart; B5 swap sends them in place of a planned step.
+        if str(_cfg(step).get("follow_up_for") or "").strip():
+            self.log_event(
+                event_type="follow_up_skipped",
+                message=(
+                    f"Follow-up step {step_id} cannot run on the flowchart "
+                    "(adaptive swap only)"
+                ),
+                level="warn",
+                run_id=run.id,
+                account_id=account.id,
+                strategy_id=strategy.id,
+                job_id=job_id,
+                step_id=step_id,
+            )
+            self.db.commit()
             return
 
         kind = step.get("kind") or ""
@@ -1602,10 +1705,31 @@ class WorkflowExecutionService:
             return None
 
         if kind == "Communication":
+            # Adaptive B5: send an approved follow-up in this planned step's place (once).
+            planned_step = step
+            planned_cfg = cfg
+            planned_id = str(step.get("id") or "")
+            swaps = dict(run.swaps or {})
+            follow_id = swaps.pop(planned_id, None) if planned_id else None
+            send_step = step
+            if follow_id:
+                follow = steps.get(follow_id)
+                if follow and follow.get("kind") == "Communication":
+                    send_step = follow
+                    run.swaps = swaps or None
+                    step_run.result_json = {
+                        **(step_run.result_json or {}),
+                        "adaptive_swap_from": planned_id,
+                        "adaptive_follow_up": follow_id,
+                    }
+                else:
+                    follow_id = None
+            send_cfg = _cfg(send_step)
+
             deferred_until = None
             if not after_comm_delay:
                 deferred_until = self._communication_defer_until(
-                    cfg, step, strategy, account=account, run=run
+                    send_cfg, send_step, strategy, account=account, run=run
                 )
             # Outside the client's send window: hold the message until the window
             # opens instead of logging it as skipped and moving on without it.
@@ -1616,7 +1740,7 @@ class WorkflowExecutionService:
                 deferred_until = window_opens
             # Jurisdiction compliance rules, asked before the message is prepared.
             verdict, permitted_at = self._compliance_gate(
-                account, cfg, step, review_approved=after_human_review
+                account, send_cfg, send_step, review_approved=after_human_review
             )
             if verdict == "review":
                 from app.modules.payflow.services.review_service import (
@@ -1627,7 +1751,7 @@ class WorkflowExecutionService:
                     run,
                     account,
                     strategy,
-                    step,
+                    planned_step,
                     step_run,
                     rule_id=None,
                     reason=COMPLIANCE_REVIEW_REASON,
@@ -1638,18 +1762,31 @@ class WorkflowExecutionService:
             ):
                 deferred_until = permitted_at
             if deferred_until is not None:
+                # Keep the swap until the deferred send actually goes out.
+                if follow_id and planned_id:
+                    kept = dict(run.swaps or {})
+                    kept[planned_id] = follow_id
+                    run.swaps = kept
                 run.status = PayflowWorkflowRunStatus.WAITING.value
                 step_run.status = "scheduled"
                 step_run.result_json = {
                     "wait_until": deferred_until.isoformat(),
                     "deferred_send": True,
-                    "next": step.get("id"),
-                    "timezone": self._wait_timezone_name(cfg, step, strategy),
+                    "next": planned_id,
+                    "timezone": self._wait_timezone_name(send_cfg, send_step, strategy),
+                    **(
+                        {
+                            "adaptive_swap_from": planned_id,
+                            "adaptive_follow_up": follow_id,
+                        }
+                        if follow_id
+                        else {}
+                    ),
                 }
                 enqueue_execute_step(
                     self.db,
                     run_id=run.id,
-                    step_id=step.get("id") or "",
+                    step_id=planned_id,
                     account_id=account.id,
                     strategy_id=strategy.id,
                     scheduled_at=deferred_until,
@@ -1661,10 +1798,16 @@ class WorkflowExecutionService:
                 )
                 return None
             self._send_communication(
-                run, account, strategy, step, step_run, review_approved=after_human_review
+                run,
+                account,
+                strategy,
+                send_step,
+                step_run,
+                review_approved=after_human_review,
             )
             run.status = PayflowWorkflowRunStatus.ACTIVE.value
-            return step.get("next") or cfg.get("next")
+            # Continue the flowchart from the planned step's next (not the follow-up's).
+            return planned_step.get("next") or planned_cfg.get("next")
 
         if kind == "Condition":
             report_due = (
@@ -2415,7 +2558,9 @@ class WorkflowExecutionService:
         cfg, audience = audience_message_config(
             _cfg(step), account, segmentation=getattr(strategy, "segmentation_snapshot", None)
         )
-        channels = preferred_contact_channels(self.db, account)
+        channels = preferred_contact_channels(
+            self.db, account, preferred=getattr(run, "preferred_channel", None)
+        )
         attempts: list[dict[str, Any]] = []
         chosen: str | None = None
         final: dict[str, Any] = {}
@@ -3374,6 +3519,15 @@ class WorkflowExecutionService:
                 if (s.status or "").lower() in {"blocked", "held", "failed"}:
                     block_reason = s.error or (s.result_json or {}).get("reason")
                     break
+        adaptive_block = None
+        try:
+            from app.modules.payflow.services.adaptive_workflow_service import (
+                AdaptiveWorkflowService,
+            )
+
+            adaptive_block = AdaptiveWorkflowService(self.db).get_run_adaptive(run.id)
+        except Exception:  # noqa: BLE001
+            adaptive_block = None
         return {
             "id": run.id,
             "account_id": run.account_id,
@@ -3406,6 +3560,7 @@ class WorkflowExecutionService:
                 self._serialize_step_run(s, steps_by_id=steps_by_id) for s in step_rows
             ],
             "activity": activity,
+            "adaptive": adaptive_block,
         }
 
     def get_run(self, run_id: int) -> dict[str, Any] | None:
@@ -3482,6 +3637,12 @@ class WorkflowExecutionService:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("payment failure exception raise failed")
+            self._record_payment_engagement(
+                account,
+                event_type="payment_failed",
+                payload=payload,
+                status_raw=status_raw,
+            )
             return {"advanced": 0, "exception": "payment_processing_issue"}
         if status_raw in {"plan_missed", "auto_charge_paused"}:
             # A missed instalment is the opposite of a payment: let conditions and
@@ -3499,6 +3660,12 @@ class WorkflowExecutionService:
                     account_id=account_id,
                     strategy_id=run.strategy_id,
                 )
+            self._record_payment_engagement(
+                account,
+                event_type="plan_instalment_missed",
+                payload=payload,
+                status_raw=status_raw,
+            )
             if commit:
                 self.db.commit()
             return {"advanced": advanced, "plan_missed": True}
@@ -3551,9 +3718,70 @@ class WorkflowExecutionService:
             )
         except Exception:  # noqa: BLE001
             logger.exception("failed to attribute payment to communication")
+        # Adaptive B1 payment engagement (completed / partial / plan_created).
+        eng_type: str | None = None
+        if status_raw in {"plan_setup"}:
+            eng_type = "plan_created"
+        elif payload.get("completed"):
+            eng_type = (
+                "payment_completed"
+                if payload.get("case_settled")
+                else "payment_partial"
+            )
+        if eng_type:
+            self._record_payment_engagement(
+                account,
+                event_type=eng_type,
+                payload=payload,
+                status_raw=status_raw,
+            )
         if commit:
             self.db.commit()
         return {"advanced": advanced}
+
+    def _record_payment_engagement(
+        self,
+        account: PayflowAccountModel,
+        *,
+        event_type: str,
+        payload: dict[str, Any],
+        status_raw: str,
+    ) -> None:
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                safe_record_engagement_event,
+            )
+
+            payment_id = payload.get("payment_id") or payload.get("attempt_id") or ""
+            amount = payload.get("amount")
+            when = _utcnow()
+            dedupe = (
+                f"stripe:{event_type}:account:{account.id}:"
+                f"{payment_id or when.strftime('%Y%m%d%H%M%S')}"
+            )
+            detail: dict[str, Any] = {"status": status_raw or None}
+            if amount is not None:
+                detail["amount"] = amount
+            if payload.get("case_settled") is not None:
+                detail["case_settled"] = bool(payload.get("case_settled"))
+            if payment_id:
+                detail["payment_id"] = str(payment_id)
+            source = "plan" if event_type.startswith("plan_") else "stripe"
+            safe_record_engagement_event(
+                self.db,
+                account_id=account.id,
+                client_id=account.client_id,
+                event_type=event_type,
+                source=source,
+                dedupe_key=dedupe,
+                occurred_at=when,
+                communication_id=payload.get("communication_id"),
+                detail=detail,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement %s failed account_id=%s", event_type, account.id
+            )
 
     def on_communication_event(
         self,

@@ -50,8 +50,13 @@ def is_contact_step(cfg: dict[str, Any], step: dict[str, Any] | None = None) -> 
 def preferred_contact_channels(
     db: Session,
     account: PayflowAccountModel,
+    *,
+    preferred: str | None = None,
 ) -> list[str]:
-    """Eligible channels first (Email preferred); if none eligible, still try both for audit."""
+    """Eligible channels first (Email preferred); if none eligible, still try both for audit.
+
+    ``preferred`` (adaptive ``run.preferred_channel``) is tried first when present.
+    """
     from app.modules.payflow.services.communication_service import (
         PayflowCommunicationService,
     )
@@ -64,9 +69,12 @@ def preferred_contact_channels(
         ordered.append("Email")
     if sms_ok:
         ordered.append("SMS")
-    if ordered:
-        return ordered
-    return ["Email", "SMS"]
+    if not ordered:
+        ordered = ["Email", "SMS"]
+    pref = (preferred or "").strip()
+    if pref in {"Email", "SMS"}:
+        ordered = [pref] + [c for c in ordered if c != pref]
+    return ordered
 
 
 def template_for(purpose: str | None, channel: str) -> dict[str, Any] | None:

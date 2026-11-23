@@ -45,6 +45,16 @@ STRATEGY_STEP_KINDS = [
 # Keep the string in sync with workflow_suggestion.config.CONTACT_CHANNEL (cannot import —
 # config.py imports this module).
 CONTACT_CHANNEL = "Email + SMS"
+# Adaptive B3: Communication steps that hold approved follow-up copy (not on the flowchart).
+FOLLOW_UP_FOR_VALUES = frozenset(
+    {
+        "email_not_opened",
+        "opened_not_clicked",
+        "clicked_not_paid",
+        "payment_partial",
+        "no_activity",
+    }
+)
 CHANNELS = ["Email", "SMS"]
 MESSAGE_PURPOSES = [
     "Payment Reminder",
@@ -302,6 +312,18 @@ def _cfg(step: dict[str, Any]) -> dict[str, Any]:
     return dict(cfg) if isinstance(cfg, dict) else {}
 
 
+def follow_up_for(step: dict[str, Any] | None) -> str | None:
+    """Situation label on an adaptive follow-up Communication step, else None."""
+    if not isinstance(step, dict):
+        return None
+    raw = str(_cfg(step).get("follow_up_for") or "").strip()
+    return raw if raw in FOLLOW_UP_FOR_VALUES else None
+
+
+def is_follow_up_step(step: dict[str, Any] | None) -> bool:
+    return follow_up_for(step) is not None
+
+
 def _timing_label(step: dict[str, Any]) -> str | None:
     if step.get("timing"):
         return str(step["timing"])
@@ -405,6 +427,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     # The AI's plan for the text, and the same message written for each audience (see _clean_versions).
     raw_brief, raw_versions = cfg.pop("brief", None), cfg.pop("versions", None)
     raw_review_status = cfg.pop("review_status", None)
+    raw_follow_up_for = cfg.pop("follow_up_for", None)
     if kind == "Communication":
         brief = _clean_brief(raw_brief)
         if brief:
@@ -417,6 +440,14 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         status = normalize_review_status(raw_review_status)
         if status:
             cfg["review_status"] = status
+        follow_for = str(raw_follow_up_for or "").strip()
+        if follow_for:
+            if follow_for not in FOLLOW_UP_FOR_VALUES:
+                raise ValidationAppError(
+                    f"Step '{title}' follow_up_for must be one of: "
+                    f"{', '.join(sorted(FOLLOW_UP_FOR_VALUES))}"
+                )
+            cfg["follow_up_for"] = follow_for
 
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
@@ -426,6 +457,8 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
             cfg["review_reason"] = normalize_review_reason(note)
 
     origin = (raw.get("origin") or default_origin or PayflowStrategyOrigin.HUMAN_CREATED.value).strip()
+    # Follow-up steps sit off the flowchart: no next/yes/no (adaptive swap only).
+    is_follow_up = bool(cfg.get("follow_up_for"))
     step: dict[str, Any] = {
         "id": step_id,
         "kind": kind,
@@ -433,9 +466,9 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
         "origin": origin,
         "disabled": bool(raw.get("disabled") or False),
         "config": cfg,
-        "next": raw.get("next"),
-        "yes": raw.get("yes"),
-        "no": raw.get("no"),
+        "next": None if is_follow_up else raw.get("next"),
+        "yes": None if is_follow_up else raw.get("yes"),
+        "no": None if is_follow_up else raw.get("no"),
         "channel": channel_val,
         "purpose": cfg.get("purpose") or raw.get("purpose"),
         "detail": raw.get("detail"),
@@ -619,6 +652,16 @@ def _carry_translations(before: list[dict], after: list[dict]) -> list[dict]:
     return result
 
 
+def _assert_entry_not_follow_up(steps: list[dict[str, Any]], entry_node_id: str | None) -> None:
+    if not entry_node_id:
+        return
+    for step in steps:
+        if step.get("id") == entry_node_id and is_follow_up_step(step):
+            raise ValidationAppError(
+                f"entry_node_id '{entry_node_id}' cannot be a follow-up step"
+            )
+
+
 def _normalize_steps(
     steps: list[Any], *, default_origin: str | None = None
 ) -> list[dict[str, Any]]:
@@ -635,12 +678,34 @@ def _normalize_steps(
         seen.add(step["id"])
         normalized.append(step)
     ids = {s["id"] for s in normalized}
+    follow_up_ids = {s["id"] for s in normalized if is_follow_up_step(s)}
+    seen_follow_ups: dict[str, str] = {}
     for step in normalized:
+        situation = follow_up_for(step)
+        if situation:
+            if step.get("kind") != "Communication":
+                raise ValidationAppError(
+                    f"Step '{step['id']}' follow_up_for is only allowed on Communication steps"
+                )
+            prior = seen_follow_ups.get(situation)
+            if prior:
+                raise ValidationAppError(
+                    f"Only one follow-up step is allowed for '{situation}' "
+                    f"(already set on '{prior}')"
+                )
+            seen_follow_ups[situation] = step["id"]
         for link in ("next", "yes", "no"):
             target = step.get(link)
-            if target and target not in ids:
+            if not target:
+                continue
+            if target not in ids:
                 raise ValidationAppError(
                     f"Step '{step['id']}' {link} points to unknown step '{target}'"
+                )
+            if target in follow_up_ids:
+                raise ValidationAppError(
+                    f"Step '{step['id']}' {link} cannot point to follow-up step '{target}' "
+                    "(follow-ups are reached only via adaptive swap)"
                 )
     return normalized
 
@@ -653,21 +718,23 @@ def _step_stats(steps: list[dict]) -> dict[str, int]:
         ch = _comm_channel(step)
         return step.get("kind") == "Communication" and (not ch or ch == CONTACT_CHANNEL)
 
+    def _planned_comm(step: dict) -> bool:
+        return step.get("kind") == "Communication" and not is_follow_up_step(step)
+
     return {
         "steps": len(steps),
         "branches": sum(1 for s in steps if s.get("kind") == "Condition"),
         "emails": sum(
             1
             for s in steps
-            if s.get("kind") == "Communication"
-            and (_is_contact(s) or _comm_channel(s) == "Email")
+            if _planned_comm(s) and (_is_contact(s) or _comm_channel(s) == "Email")
         ),
         "sms": sum(
             1
             for s in steps
-            if s.get("kind") == "Communication"
-            and (_is_contact(s) or _comm_channel(s) == "SMS")
+            if _planned_comm(s) and (_is_contact(s) or _comm_channel(s) == "SMS")
         ),
+        "follow_ups": sum(1 for s in steps if is_follow_up_step(s)),
         "payment_actions": sum(1 for s in steps if s.get("kind") == "Payment Action"),
         "case_actions": sum(1 for s in steps if s.get("kind") == "Case Action"),
     }
@@ -1075,6 +1142,7 @@ class PayflowStrategyService:
             "status": row.status,
             "origin": row.origin,
             "source": _row_source(row),
+            "adaptive": bool(getattr(row, "adaptive", True)),
             "version": row.version,
             "summary": row.summary,
             "coverage": row.coverage,
@@ -1248,10 +1316,12 @@ class PayflowStrategyService:
         entry_node_id = payload.get("entry_node_id") or (
             steps[0]["id"] if steps and steps[0].get("kind") == "Trigger" else steps[0]["id"]
         )
+        _assert_entry_not_follow_up(steps, entry_node_id)
         coverage = _coverage_value(payload)
         segment = payload.get("segment") or {}
         summary = (payload.get("summary") or "").strip() or None
         ai_context = payload.get("ai_context") or []
+        adaptive = True if payload.get("adaptive") is None else bool(payload.get("adaptive"))
 
         ai_snapshot = None
         if ai_generated:
@@ -1273,6 +1343,7 @@ class PayflowStrategyService:
             status=status,
             origin=origin,
             source=source,
+            adaptive=adaptive,
             version=version,
             summary=summary,
             coverage=coverage,
@@ -1345,6 +1416,30 @@ class PayflowStrategyService:
         self._assert_manage(user, row.client_id)
         self._assert_open(row)
 
+        # Adaptive-only toggle: any status except Rejected, no re-review.
+        payload_keys = set(payload.keys())
+        if payload_keys <= {"adaptive", "note"} and "adaptive" in payload:
+            desired = bool(payload["adaptive"])
+            previous = bool(getattr(row, "adaptive", True))
+            if desired != previous:
+                row.adaptive = desired
+                self._prepend_version(
+                    row,
+                    {
+                        "version": int(row.version or 1),
+                        "date": _stamp(),
+                        "note": (
+                            f"Adaptive turned {'on' if desired else 'off'} by {user.full_name}"
+                        ),
+                        "changes": [],
+                        "status": row.status,
+                        "origin": row.origin,
+                    },
+                )
+                self.db.commit()
+                self.db.refresh(row)
+            return self._serialize(self._get_row(row.id))
+
         before_steps = copy.deepcopy(list(row.steps or []))
         was_ai_proposed = row.status == PayflowStrategyStatus.AI_PROPOSED.value
         was_approved_or_active = row.status in {
@@ -1352,7 +1447,29 @@ class PayflowStrategyService:
             PayflowStrategyStatus.ACTIVE.value,
         }
 
-        if was_approved_or_active:
+        adaptive_note: str | None = None
+        if "adaptive" in payload:
+            desired = bool(payload["adaptive"])
+            previous = bool(getattr(row, "adaptive", True))
+            if desired != previous:
+                row.adaptive = desired
+                adaptive_note = (
+                    f"Adaptive turned {'on' if desired else 'off'} by {user.full_name}"
+                )
+
+        substantive = any(
+            key in payload
+            for key in (
+                "name",
+                "summary",
+                "segment",
+                "steps",
+                "entry_node_id",
+                "coverage",
+                "cases_covered",
+            )
+        )
+        if was_approved_or_active and substantive:
             self._archive_current(
                 row,
                 note=f"Archived approved/active configuration before edit by {user.full_name}",
@@ -1399,6 +1516,9 @@ class PayflowStrategyService:
                 row.steps = new_steps
             if not row.entry_node_id and row.steps:
                 row.entry_node_id = row.steps[0].get("id")
+            _assert_entry_not_follow_up(list(row.steps or []), row.entry_node_id)
+        elif "entry_node_id" in payload:
+            _assert_entry_not_follow_up(list(row.steps or []), row.entry_node_id)
 
         changes = _diff_steps(before_steps, list(row.steps or []))
 
@@ -1445,9 +1565,21 @@ class PayflowStrategyService:
             if note:
                 entry["reviewer_note"] = note
             self._prepend_version(row, entry)
+        if adaptive_note:
+            self._prepend_version(
+                row,
+                {
+                    "version": int(row.version or 1),
+                    "date": _stamp(),
+                    "note": adaptive_note,
+                    "changes": [],
+                    "status": row.status,
+                    "origin": row.origin,
+                },
+            )
 
-        # Editing never activates
-        if row.status == PayflowStrategyStatus.ACTIVE.value:
+        # Editing never activates (adaptive-only toggle is handled above and does not land here).
+        if substantive and row.status == PayflowStrategyStatus.ACTIVE.value:
             row.status = PayflowStrategyStatus.UNDER_REVIEW.value
 
         self.db.commit()

@@ -311,12 +311,34 @@ class PayflowEmailPreferenceService:
             account.email_consent = False
             logger.info("email unsubscribed account_id=%s source=%s", account.id, resolved_source)
         # Always record an event so staff have a trail (including one-click).
-        self._record_event(
+        pref_event = self._record_event(
             account,
             reasons=cleaned or (["prefer_no_email"] if resolved_source == "one_click" else []),
             comment=text,
             source=resolved_source,
         )
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                safe_record_engagement_event,
+            )
+
+            safe_record_engagement_event(
+                self.db,
+                account_id=account.id,
+                client_id=account.client_id,
+                event_type="email_unsubscribed",
+                source="unsubscribe",
+                dedupe_key=f"unsubscribe:email:account:{account.id}:pref:{pref_event.id}",
+                channel="Email",
+                detail={
+                    "preference_source": resolved_source,
+                    "reasons": cleaned or None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement email_unsubscribed failed account_id=%s", account.id
+            )
         if commit:
             self.db.commit()
         else:
@@ -360,12 +382,35 @@ class PayflowEmailPreferenceService:
         account.email_consent = email_consent
         if email_consent is False and previous is not False:
             cleaned = self._normalize_reasons(reasons)
-            self._record_event(
+            pref_event = self._record_event(
                 account,
                 reasons=cleaned,
                 comment=comment,
                 source="staff",
             )
+            try:
+                from app.modules.payflow.services.engagement_service import (
+                    safe_record_engagement_event,
+                )
+
+                safe_record_engagement_event(
+                    self.db,
+                    account_id=account.id,
+                    client_id=account.client_id,
+                    event_type="email_unsubscribed",
+                    source="unsubscribe",
+                    dedupe_key=f"unsubscribe:email:account:{account.id}:pref:{pref_event.id}",
+                    channel="Email",
+                    detail={
+                        "preference_source": "staff",
+                        "reasons": cleaned or None,
+                        "by_user_id": user.id,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "engagement email_unsubscribed failed account_id=%s", account.id
+                )
         if commit:
             self.db.commit()
         else:

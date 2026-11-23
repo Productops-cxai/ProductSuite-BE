@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     AI_SUGGEST_JOB_STALE_MINUTES: int = 30
     # Customer portal base (token appended). Empty → {FRONTEND_URL}/pay
     WORKFLOW_PAYMENT_LINK_BASE: str = ""
+    # Adaptive workflow timer events (B2) — silence / non-conversion signals.
+    ADAPTIVE_NOT_OPENED_HOURS: int = 48
+    ADAPTIVE_OPENED_NOT_CLICKED_HOURS: int = 48
+    ADAPTIVE_CLICKED_NOT_PAID_HOURS: int = 24
+    ADAPTIVE_NO_ACTIVITY_DAYS: int = 7
     # Opaque payment-link token TTL (hours). Default 14 days.
     PAYMENT_LINK_TTL_HOURS: int = 336
     # Email subject performance: a payment is credited to the last payment-link click within

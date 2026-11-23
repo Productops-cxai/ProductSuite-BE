@@ -64,6 +64,14 @@ def process_job(job_id: int, worker_id: str | None = None) -> None:
             )
         elif job_type == PayflowWorkflowJobType.GAP_FILL.value:
             svc.gap_fill_active_strategies(job_id=job.id)
+        elif job_type == PayflowWorkflowJobType.REASSESS_RUN.value:
+            if not job.run_id:
+                raise ValueError("reassess_run missing run_id")
+            from app.modules.payflow.services.adaptive_workflow_service import (
+                AdaptiveWorkflowService,
+            )
+
+            AdaptiveWorkflowService(db).reassess(job.run_id, job_id=job.id)
         else:
             raise ValueError(f"Unknown job_type={job_type}")
         mark_job_done(db, job_id)

@@ -196,6 +196,35 @@ class PayflowNotificationService:
             actor_user_id=actor_user_id,
         )
 
+    def notify_adaptive_decision_awaiting(
+        self,
+        *,
+        decision_id: int,
+        run_id: int,
+        account_id: int,
+        client_id: int,
+        action: str,
+        reason: str | None = None,
+        actor_user_id: UUID | None = None,
+        send_mail: bool = False,
+    ) -> list[PayflowNotificationModel]:
+        """Adaptive NBA decision waiting for Ops (not the Human Review queue)."""
+        users = self.recipients_for_client(client_id)
+        body = (reason or "An adaptive workflow recommendation needs approval.").strip()
+        return self.notify(
+            users=users,
+            notification_type=PayflowNotificationType.ADAPTIVE_DECISION_AWAITING.value,
+            title=f"Adaptive decision · {action}",
+            body=body[:500],
+            link=f"/payflow/cases/{account_id}",
+            client_id=client_id,
+            entity_type="adaptive_decision",
+            entity_id=str(decision_id),
+            send_mail=send_mail,
+            email_type="adaptive_decision_awaiting",
+            actor_user_id=actor_user_id,
+        )
+
     def notify_comm_awaiting_governance(
         self,
         *,
