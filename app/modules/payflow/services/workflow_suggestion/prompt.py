@@ -19,6 +19,7 @@ from app.modules.payflow.services.strategy_service import (
     REFERENCE_EVENTS,
     TIME_DIRECTIONS,
     TIME_UNITS,
+    is_follow_up_step,
 )
 from app.modules.payflow.services.workflow_suggestion.config import (
     CHANNEL_EVENTS,
@@ -143,7 +144,8 @@ def build_revision(
         "name": workflow.get("name"),
         "summary": workflow.get("summary"),
         "entry_node_id": workflow.get("entry_node_id"),
-        "steps": [compact_step(step) for step in workflow.get("steps") or []],
+        # The flowchart only: the adaptive follow-ups are added back by code (adaptive_follow_ups.py).
+        "steps": [compact_step(step) for step in workflow.get("steps") or [] if not is_follow_up_step(step)],
     }
     remarks_text = (remarks or "").strip()[:MAX_REMARKS_CHARS]
     parts = [

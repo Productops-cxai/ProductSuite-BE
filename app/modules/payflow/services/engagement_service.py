@@ -150,7 +150,9 @@ def record_engagement_event(
         source=str(source).strip() or "unknown",
         detail=detail,
         dedupe_key=key,
-        processed_at=None,
+        # Delivered never wakes the run, so it is saved as already read: otherwise it would stay
+        # "new" until the next send, and nearly every send would call decide_next_action.
+        processed_at=_utcnow() if event_type in _NO_WAKE_EVENT_TYPES else None,
     )
     # SAVEPOINT so a duplicate-key race does not roll back the caller's transaction.
     try:

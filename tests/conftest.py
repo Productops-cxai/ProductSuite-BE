@@ -42,14 +42,17 @@ def message_ai_off():
     """
     from app.core.exceptions import ServiceUnavailableError
     from app.modules.payflow.services import case_reassessment_service
-    from app.modules.payflow.services.workflow_suggestion import message_brief, message_writer
+    from app.modules.payflow.services.workflow_suggestion import message_brief, message_writer, next_action_ai
 
     off = ServiceUnavailableError("AI is off in tests")
     # Case reassessment asks the AI too; off, it uses its fixed rules (tests patch it to try the AI).
     # The message briefs (plan per audience) too; off, messages are written without them.
+    # Adaptive workflows' next action too; off, the rules' answer stands.
     with patch.object(message_writer, "call_llm", side_effect=off), patch.object(
         case_reassessment_service, "call_llm", side_effect=off
-    ), patch.object(message_brief, "call_llm", side_effect=off):
+    ), patch.object(message_brief, "call_llm", side_effect=off), patch.object(
+        next_action_ai, "call_llm", side_effect=off
+    ):
         yield
 
 

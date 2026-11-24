@@ -123,6 +123,7 @@ Keep UI logic thin. Call these contracts exactly. Do **not** invent PATCH/PUT. D
 - `email_not_opened`
 - `opened_not_clicked`
 - `clicked_not_paid`
+- `payment_failed` (added by the AI team: the customer's payment did not go through)
 - `payment_partial`
 - `no_activity`
 

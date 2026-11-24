@@ -12,7 +12,7 @@ from app.modules.payflow.services.workflow_suggestion import service as suggesti
 from app.modules.payflow.services.workflow_suggestion.message_validator import check_message, check_translation
 from app.modules.payflow.services.workflow_suggestion.message_writer import write_messages
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
-from tests.test_workflow_message_api import fake_message_ai, messages
+from tests.test_workflow_message_api import fake_message_ai, flowchart_messages, messages
 from tests.test_workflow_message_brief import _message_lines, good
 from tests.test_workflow_message_translation import fake_writer
 from tests.test_workflow_message_validator import EMAIL, SMS, brief
@@ -148,7 +148,7 @@ def test_write_messages_saves_the_main_text_and_an_audience_version(db_session, 
 
     assert len(plans) == 1  # one plan for every message and audience
     assert len(prompts) == 2 and SENIORS in prompts[1] and "the main text - 29 accounts" in prompts[0]
-    for step_id, config in messages(saved).items():
+    for step_id, config in flowchart_messages(saved).items():
         assert config["body"] and config["brief"]["approach"] == "Approach for main", step_id
         version = config["versions"]["age_65_plus"]
         assert version["label"] == "Age 65 and over" and version["body"] and version["tone"]
@@ -192,7 +192,8 @@ def test_audience_versions_are_translated_too(db_session, admin, portfolio, ai_w
     saved = write_with(db_session, admin, ai_workflow["id"], writer)
     assert len(translations) == 2  # French: one call for the main text, one for the 65+ version
     for config in messages(saved).values():
-        assert config["translations"]["FR"]["body"].startswith("FR - ")
+        assert config["translations"]["FR"]["body"].startswith("FR - ")  # the follow-ups too
+    for config in flowchart_messages(saved).values():
         assert config["versions"]["age_65_plus"]["translations"]["FR"]["body"].startswith("FR - ")
 
 
@@ -208,7 +209,7 @@ def test_suggest_and_regenerate_write_audience_versions(db_session, admin, portf
         suggested = service.suggest_workflows(admin, portfolio["client_id"], portfolio["portfolio_id"])["workflows"][0]
         regenerated = service.regenerate_workflow(admin, suggested["id"], REMARKS)
     for workflow_ in (suggested, regenerated):
-        assert all("age_65_plus" in config["versions"] for config in messages(workflow_).values())
+        assert all("age_65_plus" in config["versions"] for config in flowchart_messages(workflow_).values())
         assert context(workflow_)["Audiences"].startswith("Own version for Age 65 and over (25 accounts)")
 
 
@@ -221,14 +222,14 @@ def _post_update(client, token, workflow_id, steps):
 
 
 def _texts(workflow_):
-    """Each message's main body, brief and versions - empty fields left out (the API lists every field)."""
+    """Each flowchart message's main body, brief and versions - empty fields left out (the API lists every field)."""
     def clean(value):
         if isinstance(value, dict):
             return {key: clean(item) for key, item in value.items() if item not in (None, {}, [])}
         return value
 
     return {step_id: clean({key: config.get(key) for key in ("body", "brief", "versions")})
-            for step_id, config in messages(workflow_).items()}
+            for step_id, config in flowchart_messages(workflow_).items()}
 
 
 def test_a_client_that_does_not_send_versions_keeps_them(client, admin_token, db_session, admin, portfolio, ai_workflow):  # noqa: F811
@@ -286,7 +287,7 @@ def test_versions_sent_back_without_translations_keep_them(client, admin_token, 
             version.pop("brief", None)
     response = _post_update(client, admin_token, saved["id"], steps)
     assert response.status_code == 200, response.json()
-    for config in messages(response.json()).values():
+    for config in flowchart_messages(response.json()).values():
         version = config["versions"]["age_65_plus"]
         assert version["translations"]["FR"]["body"].startswith("FR - ") and version["brief"]["approach"]
 

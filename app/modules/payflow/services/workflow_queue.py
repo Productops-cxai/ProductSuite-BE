@@ -150,25 +150,44 @@ def enqueue_reassess_run(
     payload: dict[str, Any] | None = None,
     commit: bool = False,
 ) -> PayflowWorkflowJobModel | None:
-    """Queue adaptive reassessment. At most one pending reassess_run per run (B4)."""
+    """Queue adaptive reassessment. At most one pending reassess_run per run (B4).
+
+    When one is already waiting, it is kept, and moved up to ``scheduled_at`` if it was due later:
+    a recheck set days ahead must not hold back an urgent event (a payment, an unsubscribe).
+    Returns the waiting job or the new one.
+    """
+    when = scheduled_at or _utcnow()
     waiting = (
-        db.query(PayflowWorkflowJobModel.id)
+        db.query(PayflowWorkflowJobModel)
         .filter(
             PayflowWorkflowJobModel.run_id == run_id,
             PayflowWorkflowJobModel.job_type == PayflowWorkflowJobType.REASSESS_RUN.value,
             PayflowWorkflowJobModel.status == PayflowWorkflowJobStatus.PENDING.value,
         )
+        .order_by(PayflowWorkflowJobModel.scheduled_at.asc())
         .first()
     )
     if waiting:
-        return None
+        due = waiting.scheduled_at
+        if due is not None and due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        if due is None or when < due:
+            waiting.scheduled_at = when
+            waiting.payload = {**(waiting.payload or {}), **(payload or {})}
+            db.flush()
+            if db.get_bind().dialect.name == "postgresql":
+                channel = settings.WORKFLOW_JOB_NOTIFY_CHANNEL or "workflow_jobs"
+                db.execute(text(f"NOTIFY {channel}, :payload"), {"payload": str(waiting.id)})
+        if commit:
+            db.commit()
+        return waiting
     return enqueue_job(
         db,
         job_type=PayflowWorkflowJobType.REASSESS_RUN.value,
         run_id=run_id,
         account_id=account_id,
         strategy_id=strategy_id,
-        scheduled_at=scheduled_at,
+        scheduled_at=when,
         payload=payload,
         priority=45,
         commit=commit,

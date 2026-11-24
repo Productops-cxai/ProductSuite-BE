@@ -918,7 +918,7 @@ class StrategyNodeConfig(BaseModel):
     # Review status of the Main / Default text (same values as StrategyMessageVersion.review_status).
     review_status: Optional[str] = Field(default=None, max_length=64)
     # Adaptive B3: orphan Communication used as a situation-specific follow-up (swap target).
-    # email_not_opened | opened_not_clicked | clicked_not_paid | payment_partial | no_activity
+    # email_not_opened | opened_not_clicked | clicked_not_paid | payment_failed | payment_partial | no_activity
     follow_up_for: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("subject", "body", "sms_body", "tone")

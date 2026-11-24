@@ -51,6 +51,7 @@ FOLLOW_UP_FOR_VALUES = frozenset(
         "email_not_opened",
         "opened_not_clicked",
         "clicked_not_paid",
+        "payment_failed",  # the customer's payment did not go through: a "try again" message (AI team)
         "payment_partial",
         "no_activity",
     }
