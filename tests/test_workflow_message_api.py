@@ -53,6 +53,11 @@ def messages(workflow):
     return {step["id"]: step["config"] for step in workflow["steps"] if step["kind"] == "Communication"}
 
 
+def flowchart_messages(workflow):
+    """The flowchart's messages: the adaptive follow-ups (config.follow_up_for) get no audience versions or plan."""
+    return {step_id: config for step_id, config in messages(workflow).items() if not config.get("follow_up_for")}
+
+
 def test_writes_every_message_and_keeps_it_an_ai_proposal(client, admin_token, ai_workflow):  # noqa: F811
     response, prompts = write(client, admin_token, ai_workflow["id"])  # no body at all
     body = response.json()

@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.exceptions import ServiceUnavailableError, ValidationAppError
-from app.modules.payflow.services.strategy_service import _timing_label
+from app.modules.payflow.services.strategy_service import _timing_label, is_follow_up_step
+from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import follow_up_tones
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 from app.modules.payflow.services.workflow_suggestion.languages import language_name
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema, call_llm
@@ -53,8 +54,7 @@ def write_messages(
     `audience`: who the texts are for ({"key", "label", "accounts", "profile"}, audiences.py).
     """
     steps = {step["id"]: step for step in workflow.get("steps") or [] if step.get("id")}
-    stats = segment.get("stats") or {}
-    tones = message_tones(workflow, segment.get("segment") or {}, stats.get("avg_days_past_due"))
+    tones = _tones(workflow, segment)
     unknown = [step_id for step_id in step_ids or [] if step_id not in tones]
     if unknown:
         raise ValidationAppError(f"Step {unknown[0]} is not an email or SMS step of this workflow")
@@ -90,8 +90,18 @@ def write_messages(
             return written
         pending = [item["step_id"] for item in feedback]
 
+    # Only adaptive follow-ups still fail: the flowchart's messages are kept; those follow-ups stay without
+    # text (never sent until written) rather than failing the whole workflow.
+    if written and all(is_follow_up_step(steps[item["step_id"]]) for item in feedback):
+        return written
     problems = [error for item in feedback for error in item["errors"]]
     raise ServiceUnavailableError("AI could not write valid messages: " + "; ".join(problems[:10]))
+
+
+def _tones(workflow: dict[str, Any], segment: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """The code's tone (and path) of every message: the flowchart's messages and the adaptive follow-ups."""
+    situation, avg = segment.get("segment") or {}, (segment.get("stats") or {}).get("avg_days_past_due")
+    return {**message_tones(workflow, situation, avg), **follow_up_tones(workflow, situation, avg)}
 
 
 def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -198,6 +208,7 @@ def _brief(
         "promise_ok": cfg.get("purpose") == "Promise-to-Pay Reminder"
         or situation == PayflowCollectionStatus.PROMISE_TO_PAY.value,
         "english": english,  # some checks look for English words
+        "follow_up": bool(cfg.get("follow_up_for")),  # adaptive follow-up: never says what we saw them do
     }
     if plan:
         low, high = LENGTHS.get(plan.get("length"), EMAIL_WORDS)
@@ -264,8 +275,7 @@ def check_texts(
     `wording`: what the client's compliance rules require in each email / SMS (required_wording.py).
     Returns [{"step_id", "text", "channel", "problem"}] - [] when every text is fine.
     """
-    stats = segment.get("stats") or {}
-    tones = message_tones(workflow, segment.get("segment") or {}, stats.get("avg_days_past_due"))
+    tones = _tones(workflow, segment)
     warnings: list[dict[str, str]] = []
     for step, key, text in texts:
         code = tones.get(step["id"]) or {"tone": CLEAR, "path": None, "why": None}

@@ -161,6 +161,16 @@ first line. The audience totals are averages for many customers - never type the
   Never mention the other channel (no "we also sent you an email").
 - If a message shows its current text, improve that text (and apply the reviewer remarks) instead of starting over.
 
+## Follow-ups (path_so_far starts with "Follow-up")
+A follow-up is not on the timeline: PayFlow sends it in place of the next planned reminder, only to a customer in
+the situation its path_so_far describes, so it can come after any of the earlier messages. Write it for that
+situation: short and helpful, one clear ask with {{{{payment_link}}}}, and do not refer to a particular earlier
+message. Never say or hint that you can see what the customer opened, clicked or started (no "we saw you opened
+our email", no "you visited your payment page"); write it so it reads naturally either way, e.g. "If something
+stopped you from paying, ..." After a part payment, thank them for it and ask for the rest
+({{{{outstanding_balance}}}}). A failed payment is the exception: the customer saw it fail, so say plainly that their
+payment did not go through and invite them to try again or choose another way to pay.
+
 ## Style examples (illustrative only, do not copy)
 {examples}"""
 

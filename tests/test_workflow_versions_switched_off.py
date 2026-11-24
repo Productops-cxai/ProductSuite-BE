@@ -13,7 +13,7 @@ from app.infrastructure.database.models import PayflowSegmentationConfigModel, P
 from app.modules.payflow.services.segmentation_config_service import default_segmentation_config
 from app.modules.payflow.services.strategy_service import PayflowStrategyService
 from tests.test_workflow_audience_messages import _post_update, add_seniors, write_with
-from tests.test_workflow_message_api import get, messages
+from tests.test_workflow_message_api import flowchart_messages, get, messages
 from tests.test_workflow_regenerate import admin, ai_workflow  # noqa: F401 (fixtures)
 from tests.test_workflow_suggestion_api import portfolio  # noqa: F401 (fixture)
 
@@ -27,6 +27,7 @@ def test_ai_texts_carry_no_review_status(db_session, admin, portfolio, ai_workfl
     saved = write_with(db_session, admin, ai_workflow["id"])
     for config in messages(saved).values():
         assert "review_status" not in config
+    for config in flowchart_messages(saved).values():  # the adaptive follow-ups have no versions
         assert all("review_status" not in version for version in config["versions"].values())
         assert config["versions"]["age_65_plus"]["segment"]["dimension"] == "age"  # which group it is for
     assert "variant_reviews" not in saved
@@ -58,7 +59,7 @@ def test_the_ai_ignores_a_clients_saved_segmentation_settings(db_session, admin,
     db_session.commit()
 
     saved = write_with(db_session, admin, ai_workflow["id"])
-    for config in messages(saved).values():
+    for config in flowchart_messages(saved).values():
         assert set(config["versions"]) == {"age_65_plus"}  # no "Region: Ontario" / "Country: Canada" versions
 
 

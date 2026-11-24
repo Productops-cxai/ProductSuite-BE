@@ -280,6 +280,7 @@ class AdaptiveWorkflowService:
             new_events=unread,
             trigger=resolved_trigger,
             job=job,
+            due_step_id=due_step_id,
         )
 
         decision = self._safety_decision(run, account, unread)
@@ -799,8 +800,9 @@ class AdaptiveWorkflowService:
         """Always-automatic rules. Returns a decision or None to continue to NBA."""
         bal = float(account.outstanding_balance or 0)
         paid_event = any(e.event_type == "payment_completed" for e in events)
-        status = payment_status(self.db, account, run=run)
-        if paid_event or bal <= 0.005 or status == "Paid In Full":
+        # Only a real payment / nothing owed. Not payment_status(): it also says "Paid In Full" for a
+        # case closed with money owed, and the engine already ends those runs as Cancelled.
+        if paid_event or bal <= 0.005:
             if run.status not in _TERMINAL:
                 return {
                     "action": "stop",
@@ -830,7 +832,9 @@ class AdaptiveWorkflowService:
                 "confidence": 100,
                 "needs_approval": False,
             }
-        if email_dead and sms_possible:
+        # Switch once. email_consent False stays set, so without this every reassessment would
+        # switch again, never reach decide_next_action, and supersede (drop) its follow-up swaps.
+        if email_dead and sms_possible and run.preferred_channel != "SMS":
             return {
                 "action": "switch_channel",
                 "channel": "SMS",
@@ -839,7 +843,7 @@ class AdaptiveWorkflowService:
                 "confidence": 100,
                 "needs_approval": False,
             }
-        if sms_opted and email_ok and not email_dead:
+        if sms_opted and email_ok and not email_dead and run.preferred_channel != "Email":
             # SMS dead but email still possible.
             if any(e.event_type in {"sms_opted_out", "sms_failed"} for e in events):
                 return {
@@ -957,6 +961,10 @@ class AdaptiveWorkflowService:
             swaps = dict(run.swaps or {})
             swaps[replace_id] = follow_id
             run.swaps = swaps
+            # Optional channel: e.g. "email not opened" → the follow-up (and later messages) go by SMS first.
+            channel = (decision.get("channel") or "").strip()
+            if channel in {"Email", "SMS"} and self._channel_allowed_for_account(account, channel):
+                run.preferred_channel = channel
             at = self._parse_at(decision.get("at"))
             abort = False
             if at is not None:
@@ -1347,6 +1355,7 @@ class AdaptiveWorkflowService:
         new_events: list[PayflowEngagementEventModel],
         trigger: str,
         job: PayflowWorkflowJobModel | None,
+        due_step_id: str | None = None,
     ) -> dict[str, Any]:
         client = self.db.get(PayflowClientModel, run.client_id)
         follow_ups = {
@@ -1365,7 +1374,16 @@ class AdaptiveWorkflowService:
             .first()
         )
         next_planned = None
-        if pending:
+        if due_step_id:
+            # Before a send (message_due) the step being sent is the next one; its job is running, not pending.
+            step = next((s for s in steps if s.get("id") == due_step_id), None)
+            next_planned = {
+                "step_id": due_step_id,
+                "kind": (step or {}).get("kind"),
+                "at": _utcnow().isoformat(),
+                "due_now": True,
+            }
+        elif pending:
             step = next((s for s in steps if s.get("id") == pending.step_id), None)
             next_planned = {
                 "step_id": pending.step_id,

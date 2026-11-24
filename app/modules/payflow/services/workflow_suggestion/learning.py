@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.infrastructure.database.models import PayflowStrategyModel
-from app.modules.payflow.services.strategy_service import read_strategy_versions
+from app.modules.payflow.services.strategy_service import is_follow_up_step, read_strategy_versions
 from app.modules.payflow.services.workflow_suggestion.prompt import compact_step
 from app.modules.payflow.services.workflow_suggestion.segmenter import CONTACT_STATES
 from app.modules.payflow.services.workflow_suggestion.validator import (
@@ -100,12 +100,17 @@ def learned_from(examples: list[dict], lessons: list[str]) -> list[dict[str, str
 # --------------------------------------------------------------------------- helpers
 
 
+def _flowchart(row: PayflowStrategyModel) -> list[dict[str, Any]]:
+    """The workflow's steps without its adaptive follow-ups (off the flowchart; added back by code)."""
+    return [step for step in row.steps or [] if isinstance(step, dict) and not is_follow_up_step(step)]
+
+
 def _valid_today(row: PayflowStrategyModel, limits: dict[str, Any]) -> bool:
     """Old-format workflows, ones using e.g. a channel the client turned off, branching on email / SMS
     delivery, that keep sending reminders after the customer paid or set up a plan, that can mark a
     customer who did not pay in full as "Paid In Full", that time a wait after a message from a past date,
     or that check an untrustworthy Customer Response, are not shown."""
-    workflow = {"segment_id": f"#{row.id}", "entry_node_id": row.entry_node_id, "steps": list(row.steps or [])}
+    workflow = {"segment_id": f"#{row.id}", "entry_node_id": row.entry_node_id, "steps": _flowchart(row)}
     if not workflow["steps"] or validate_flowchart(workflow):
         return False
     errors = validate_catalog_values(workflow, limits) + validate_step_config(workflow) + validate_limits(workflow, limits)
@@ -128,7 +133,7 @@ def _candidate(db: Session, row: PayflowStrategyModel) -> dict[str, Any]:
         "name": row.name,
         "summary": row.summary,
         "entry_node_id": row.entry_node_id,
-        "steps": [compact_step(step) for step in row.steps or []],
+        "steps": [compact_step(step) for step in _flowchart(row)],
     }
     if notes:
         example["reviewer_notes"] = notes
@@ -164,7 +169,7 @@ def _lessons(db: Session, rows: list[PayflowStrategyModel]) -> list[dict]:
         label = _segment_label(segment)
         history = read_strategy_versions(db, row)
         lines = [
-            _lesson(entry, label, row.steps or [])
+            _lesson(entry, label, _flowchart(row))
             for entry in history
             if isinstance(entry, dict)
         ]
