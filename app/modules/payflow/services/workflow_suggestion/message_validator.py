@@ -91,6 +91,17 @@ _GROUP_WORDS = re.compile(
     r"millennials?|gen ?z|retirees?|pensioners?|at your age|your age)\b",
     re.IGNORECASE,
 )
+# An adaptive follow-up must not tell the customer we saw what they opened, clicked or started (English text):
+# "We noticed you haven't opened", "You opened our last email", "It looks like you started the payment".
+_TRACKING = re.compile(
+    r"\b(?:we (?:noticed|saw|see|can see|have seen)|it (?:looks|seems) like|"
+    r"(?:you|you[’']ve|you have|you had)\s+(?:\w+\s+)?(?:opened|viewed|clicked|visited|started|began|begun)|"
+    r"(?:haven[’']t|have not|hasn[’']t|has not|didn[’']t|did not|not yet)\s+(?:\w+\s+)?"
+    r"(?:opened?|viewed?|read|clicked?|visited?)|"
+    r"(?:started|began|begun)\s+(?:(?:the|your|to|a)\s+)?pay\w*|"
+    r"(?:was not|wasn[’']t)\s+(?:finished|completed))\b",
+    re.IGNORECASE,
+)
 
 
 def _without(text: str, wording: list[str]) -> str:
@@ -108,8 +119,9 @@ def render_sample(text: str) -> str:
 def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: list[str]) -> list[str]:
     """Problems with one written message — [] when it can be saved.
 
-    `brief`: step_id, channel, tone, promise_ok (promise variables allowed), english (text is English), and
-    required_wording ({"Email": [...], "SMS": [...]}: what the client's compliance rules require, word for word).
+    `brief`: step_id, channel, tone, promise_ok (promise variables allowed), english (text is English), follow_up
+    (an adaptive follow-up: never says what we saw the customer do), and required_wording ({"Email": [...],
+    "SMS": [...]}: what the client's compliance rules require, word for word).
     `other_bodies`: the workflow's other message bodies (no copy-paste between messages).
     """
     where = brief["step_id"]
@@ -163,6 +175,10 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
         errors.append(f"{where}: a Final notice must say the account will then be passed to our team for review")
     if _EMOJI.search(text):
         errors.append(f"{where}: has an emoji or a symbol - use words only")
+    tracked = brief.get("follow_up") and brief.get("english", True) and _TRACKING.search(text)
+    if tracked:
+        errors.append(f"{where}: '{tracked.group(0)}' tells the customer we saw what they opened, clicked or started - "
+                      "a follow-up must read naturally either way (e.g. \"If something stopped you from paying, ...\")")
     group = brief.get("english", True) and _GROUP_WORDS.search(text)
     if group:
         errors.append(f"{where}: '{group.group(0)}' is about the customer's age or group - write for them, never "

@@ -26,6 +26,11 @@ from app.modules.payflow.services.workflow_suggestion.audiences import (
     members_by_segment,
     text_audiences,
 )
+from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import (
+    LABEL as FOLLOW_UPS_LABEL,
+    add_follow_ups,
+    follow_up_line,
+)
 from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
     load_client_context,
@@ -106,6 +111,7 @@ _REWRITTEN_CONTEXT = {
     "Languages",  # the languages the messages were written in
     "Reviewer text kept",  # Regenerate: messages whose reviewer-written text was improved, not replaced
     "Audiences",  # who the messages were written for (main text and audience versions)
+    FOLLOW_UPS_LABEL,  # which adaptive follow-ups have text
 }
 
 
@@ -188,7 +194,7 @@ class WorkflowSuggestionService:
             workflows[segment_id], messages_note[segment_id] = _with_messages(
                 {**writer_client, "email_performance": performance,
                  "required_wording": required_wording(self.db, client["id"], members[segment_id])},
-                workflows[segment_id],
+                add_follow_ups(workflows[segment_id]),  # adaptive follow-ups, written with the other messages
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
                 found=found,
@@ -290,6 +296,8 @@ class WorkflowSuggestionService:
             ],
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
+        # Adaptive follow-ups (same ids as the original's, so a reviewer's follow-up text is kept below too).
+        workflow = add_follow_ups(workflow)
         # Messages a reviewer wrote or edited on the original keep that text as written (and are translated);
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
@@ -762,15 +770,16 @@ def _with_messages(
             )
     except AppError as exc:
         note = f"Not written, so the templates will be sent. Use Write messages to try again. ({exc.message})"
-        return workflow, [{"label": "Messages", "value": note}]
+        return workflow, [{"label": "Messages", "value": note}] + follow_up_line(workflow.get("steps"))
     for step in messages:
         if step["id"] in keep:
             written[step["id"]] = {key: value for key, value in (step.get("config") or {}).items()
                                    if key in ("subject", "body", "sms_body", "tone", "content_origin") and value}
     written, languages_note = _with_translations(client, workflow, written, languages or [])
+    steps = apply_messages(workflow["steps"], written)
     notes = (languages_note + audiences_note + required_wording_line(client.get("required_wording"))
-             + (_performance_note(client) if to_write else []))
-    return {**workflow, "steps": apply_messages(workflow["steps"], written)}, notes
+             + (_performance_note(client) if to_write else []) + follow_up_line(steps))
+    return {**workflow, "steps": steps}, notes
 
 
 def _write_for_audiences(
@@ -1156,9 +1165,9 @@ def _refreshed_context(
         for step in steps
         if step.get("kind") == "Communication"
     )
-    stale = {"Languages"} | ({"Messages"} if all_written else set())
+    stale = {"Languages", FOLLOW_UPS_LABEL} | ({"Messages"} if all_written else set())
     kept = [item for item in ai_context or [] if isinstance(item, dict) and item.get("label") not in stale]
-    return kept + languages_line_for_steps(client_language, languages, steps)
+    return kept + languages_line_for_steps(client_language, languages, steps) + follow_up_line(steps)
 
 
 def _names(codes: list[str]) -> str:

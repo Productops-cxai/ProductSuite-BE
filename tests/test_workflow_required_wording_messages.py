@@ -111,7 +111,8 @@ def test_the_ai_writes_the_wording_into_every_message_and_its_translations(db_se
     assert f'- every SMS: "{DEBT_COLLECTOR}"' in prompts[0]
     assert translations and DEBT_COLLECTOR in translations[0][0]["content"]  # the translator is told to keep it
     for config in messages(saved).values():
-        for text in (config, config["versions"]["age_65_plus"]):
+        # The adaptive follow-ups too (they have no audience versions).
+        for text in (config,) if config.get("follow_up_for") else (config, config["versions"]["age_65_plus"]):
             assert DEBT_COLLECTOR in text["body"] and DEBT_COLLECTOR in text["sms_body"]
             assert DEBT_COLLECTOR in text["translations"]["FR"]["body"]  # kept as written
     line = next(item["value"] for item in saved["ai_context"] if item["label"] == "Required wording")

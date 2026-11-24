@@ -1327,6 +1327,32 @@ class PayflowCommunicationService:
             detail=detail,
             occurred_at=now,
         )
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                safe_record_engagement_event,
+            )
+
+            safe_record_engagement_event(
+                self.db,
+                account_id=row.account_id,
+                client_id=row.client_id,
+                event_type="payment_page_opened",
+                source="portal",
+                dedupe_key=(
+                    f"portal:payment_page_opened:comm:{row.id}:"
+                    f"{now.strftime('%Y%m%d%H%M%S')}"
+                ),
+                occurred_at=now,
+                communication_id=row.id,
+                channel=row.channel,
+                detail={"label": detail} if detail else None,
+                run_id=row.run_id,
+                strategy_id=row.strategy_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement payment_page_opened failed communication_id=%s", row.id
+            )
 
     def update_status(
         self,
@@ -1535,6 +1561,71 @@ class PayflowCommunicationService:
             row.restriction_reason = "Provider deferred delivery"
             row.next_eligible_at = _utcnow() + timedelta(hours=4)
 
+        # Adaptive B1: normalize provider engagement into payflow_engagement_events.
+        try:
+            from app.modules.payflow.services.engagement_service import (
+                map_provider_event_type,
+                safe_record_engagement_event,
+            )
+
+            mapped = map_provider_event_type(
+                provider_event_type=et,
+                channel=row.channel,
+                is_payment_link_click=bool(
+                    et in {"click", "clicked"} and (is_payment_click or row.payment_link)
+                ),
+            )
+            if mapped and row.account_id:
+                machine_open = False
+                if isinstance(payload, dict) and payload.get("sg_machine_open") in (
+                    True,
+                    "true",
+                    "True",
+                    1,
+                ):
+                    machine_open = True
+                provider_name = (row.provider or "").strip().lower()
+                if provider_name in {"twilio", "sms"}:
+                    source = "twilio"
+                elif provider_name in {"sendgrid", "email"}:
+                    source = "sendgrid"
+                else:
+                    source = "twilio" if (row.channel or "").lower() == "sms" else "sendgrid"
+                if provider_event_id:
+                    dedupe = f"{source}:{provider_event_id}"
+                else:
+                    dedupe = (
+                        f"{source}:{mapped}:comm:{row.id}:"
+                        f"{when.strftime('%Y%m%d%H%M%S')}"
+                    )
+                detail: dict[str, Any] = {}
+                if machine_open:
+                    detail["machine_open"] = True
+                if url:
+                    detail["url"] = url[:1024]
+                if fail_detail:
+                    detail["provider_error"] = fail_detail
+                if et:
+                    detail["provider_event"] = et
+                safe_record_engagement_event(
+                    self.db,
+                    account_id=row.account_id,
+                    client_id=row.client_id,
+                    event_type=mapped,
+                    source=source,
+                    dedupe_key=dedupe,
+                    occurred_at=when,
+                    communication_id=row.id,
+                    channel=row.channel,
+                    detail=detail or None,
+                    run_id=row.run_id,
+                    strategy_id=row.strategy_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "engagement event record failed for communication_id=%s", row.id
+            )
+
         if commit:
             self.db.commit()
         else:
@@ -1686,6 +1777,7 @@ class PayflowCommunicationService:
             .all()
         )
         updated = 0
+        newly_opted: list[PayflowAccountModel] = []
         for account in candidates:
             for raw in (account.phone_mobile, account.phone_work):
                 other = normalize_e164(raw)
@@ -1694,7 +1786,32 @@ class PayflowCommunicationService:
                     if not account.sms_opt_out:
                         account.sms_opt_out = True
                         updated += 1
+                        newly_opted.append(account)
                     break
+        if newly_opted:
+            try:
+                from app.modules.payflow.services.engagement_service import (
+                    safe_record_engagement_event,
+                )
+
+                now = _utcnow()
+                for account in newly_opted:
+                    safe_record_engagement_event(
+                        self.db,
+                        account_id=account.id,
+                        client_id=account.client_id,
+                        event_type="sms_opted_out",
+                        source="twilio",
+                        dedupe_key=(
+                            f"twilio:sms_opted_out:account:{account.id}:"
+                            f"{now.strftime('%Y%m%d%H%M%S')}"
+                        ),
+                        occurred_at=now,
+                        channel="SMS",
+                        detail={"from_phone_digits": digits[-4:] if digits else None},
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("engagement sms_opted_out failed")
         if commit:
             self.db.commit()
         else:

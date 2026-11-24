@@ -917,6 +917,9 @@ class StrategyNodeConfig(BaseModel):
     versions: Optional[dict[str, StrategyMessageVersion]] = None
     # Review status of the Main / Default text (same values as StrategyMessageVersion.review_status).
     review_status: Optional[str] = Field(default=None, max_length=64)
+    # Adaptive B3: orphan Communication used as a situation-specific follow-up (swap target).
+    # email_not_opened | opened_not_clicked | clicked_not_paid | payment_failed | payment_partial | no_activity
+    follow_up_for: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
@@ -976,6 +979,7 @@ class StrategyStats(BaseModel):
     branches: int = 0
     emails: int = 0
     sms: int = 0
+    follow_ups: int = 0
     payment_actions: int = 0
     case_actions: int = 0
 
@@ -1028,6 +1032,7 @@ class PayflowStrategyItem(BaseModel):
     status: str
     origin: str
     source: str = "Human Created"
+    adaptive: bool = True
     version: int = 1
     summary: Optional[str] = None
     coverage: Optional[str] = None
@@ -1124,6 +1129,8 @@ class CreatePayflowStrategyRequest(BaseModel):
     entry_node_id: Optional[str] = None
     status: Optional[str] = None
     source: Optional[str] = None
+    # Adaptive B3: default on unless the client explicitly turns it off.
+    adaptive: Optional[bool] = True
     ai_context: Optional[List[StrategyContextItem]] = None
 
 
@@ -1135,6 +1142,8 @@ class UpdatePayflowStrategyRequest(BaseModel):
     segment: Optional[dict] = None
     steps: Optional[List[StrategyStepItem]] = None
     entry_node_id: Optional[str] = None
+    # Adaptive toggle does not force re-review (any status except Rejected).
+    adaptive: Optional[bool] = None
     note: Optional[str] = Field(default=None, max_length=2000, description="Optional: why this edit was made")
 
 
@@ -1901,10 +1910,93 @@ class PayflowWorkflowRunItem(BaseModel):
     deactivate_policy: Optional[str] = None
     step_runs: List[PayflowWorkflowStepRunItem] = Field(default_factory=list)
     activity: List[PayflowWorkflowActivityItem] = Field(default_factory=list)
+    adaptive: Optional[dict[str, Any]] = None
 
 
 class PayflowWorkflowRunsResponse(BaseModel):
     items: List[PayflowWorkflowRunItem] = Field(default_factory=list)
+
+
+class PayflowAdaptiveEngagementEventItem(BaseModel):
+    id: int
+    type: str
+    at: Optional[datetime] = None
+    channel: Optional[str] = None
+    source: Optional[str] = None
+    step_id: Optional[str] = None
+    detail: Optional[dict[str, Any]] = None
+    processed_at: Optional[datetime] = None
+
+
+class PayflowAdaptiveDecisionItem(BaseModel):
+    id: int
+    run_id: int
+    account_id: int
+    strategy_id: int
+    client_id: Optional[int] = None
+    trigger_event_ids: List[int] = Field(default_factory=list)
+    decided_by: str
+    action: str
+    replace_step_id: Optional[str] = None
+    follow_up_step_id: Optional[str] = None
+    at: Optional[datetime] = None
+    channel: Optional[str] = None
+    reason: Optional[str] = None
+    confidence: Optional[int] = None
+    needs_approval: bool = False
+    status: str
+    decided_by_user: Optional[str] = None
+    decision_note: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    human_review_id: Optional[int] = None
+    executed_at: Optional[datetime] = None
+    outcome: Optional[dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+
+
+class PayflowAdaptiveDecisionsListResponse(BaseModel):
+    items: List[PayflowAdaptiveDecisionItem] = Field(default_factory=list)
+
+
+class PayflowAdaptiveNextScheduled(BaseModel):
+    step_id: Optional[str] = None
+    kind: Optional[str] = None
+    title: Optional[str] = None
+    at: Optional[datetime] = None
+
+
+class PayflowAdaptiveRunSnapshot(BaseModel):
+    run_id: int
+    account_id: int
+    client_id: Optional[int] = None
+    strategy_id: int
+    adaptive: bool = True
+    engagement_state: Optional[str] = None
+    preferred_channel: Optional[str] = None
+    swaps: dict[str, Any] = Field(default_factory=dict)
+    last_reassessed_at: Optional[datetime] = None
+    next_scheduled: Optional[PayflowAdaptiveNextScheduled] = None
+    events: List[PayflowAdaptiveEngagementEventItem] = Field(default_factory=list)
+    decisions: List[PayflowAdaptiveDecisionItem] = Field(default_factory=list)
+
+
+class PayflowAdaptiveDecisionNoteRequest(BaseModel):
+    note: Optional[str] = None
+
+
+class PayflowAdaptiveDecisionModifyRequest(BaseModel):
+    note: Optional[str] = None
+    action: Optional[str] = None
+    replace_step_id: Optional[str] = None
+    follow_up_step_id: Optional[str] = None
+    at: Optional[str] = None
+    channel: Optional[str] = None
+
+
+class PayflowWorkflowReassessResponse(BaseModel):
+    run_id: int
+    job_id: Optional[int] = None
+    scheduled_at: Optional[datetime] = None
 
 
 class PayflowWorkflowPaymentEventRequest(BaseModel):

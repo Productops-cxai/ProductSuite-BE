@@ -271,6 +271,7 @@ class PayflowCommPurpose(str, Enum):
 class PayflowNotificationType(str, Enum):
     HUMAN_REVIEW_AWAITING = "human_review_awaiting"
     WORKFLOW_AWAITING_APPROVAL = "workflow_awaiting_approval"
+    ADAPTIVE_DECISION_AWAITING = "adaptive_decision_awaiting"
     COMM_AWAITING_GOVERNANCE = "comm_awaiting_governance"
     COMM_SENT = "comm_sent"
     INTEGRATION_CONNECTION_FAILED = "integration_connection_failed"
@@ -313,6 +314,7 @@ class PayflowWorkflowJobType(str, Enum):
     EXECUTE_STEP = "execute_step"
     RESUME_RUN = "resume_run"
     GAP_FILL = "gap_fill"
+    REASSESS_RUN = "reassess_run"
 
 
 class PayflowOnboardingStepStatus(str, Enum):

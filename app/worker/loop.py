@@ -143,6 +143,29 @@ def run_maintenance(state: dict) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("hold release sweep failed")
 
+    # Adaptive B2: silence / non-conversion timers for open adaptive runs.
+    try:
+        from app.modules.payflow.services.engagement_service import (
+            emit_adaptive_timer_events,
+        )
+
+        db = SessionLocal()
+        try:
+            result = emit_adaptive_timer_events(db)
+            db.commit()
+            fired = (
+                int(result.get("email_not_opened") or 0)
+                + int(result.get("opened_not_clicked") or 0)
+                + int(result.get("clicked_not_paid") or 0)
+                + int(result.get("no_activity") or 0)
+            )
+            if fired:
+                logger.info("adaptive timer sweep %s", result)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("adaptive timer sweep failed")
+
     # Human reviews held until a date: release the ones that are due.
     try:
         from app.modules.payflow.services.review_service import PayflowReviewService

@@ -65,7 +65,11 @@ def reminder_stage(steps: list[dict[str, Any]] | None, step: dict[str, Any], pur
     messages = [
         s.get("id")
         for s in steps or []
-        if isinstance(s, dict) and s.get("kind") == "Communication" and not s.get("disabled")
+        if isinstance(s, dict)
+        and s.get("kind") == "Communication"
+        and not s.get("disabled")
+        # Adaptive follow-ups are off-flowchart and must not shift reminder stages.
+        and not str((s.get("config") or {}).get("follow_up_for") or "").strip()
     ]
     if step.get("id") not in messages or messages.index(step.get("id")) == 0:
         return "First reminder"
