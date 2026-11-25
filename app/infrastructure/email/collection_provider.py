@@ -290,6 +290,7 @@ def _send_via_sendgrid(
     from_name: str,
     custom_args: dict[str, str] | None,
     list_unsubscribe_url: str | None = None,
+    api_key: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
     personalization: dict[str, Any] = {"to": [{"email": to_email}]}
     if custom_args:
@@ -314,12 +315,15 @@ def _send_via_sendgrid(
             "List-Unsubscribe": f"<{list_unsubscribe_url}>",
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
         }
+    key = (api_key or settings.SENDGRID_API_KEY or "").strip()
+    if not key:
+        return False, "sendgrid_api_key_missing", None
     try:
         with httpx.Client(timeout=20.0) as client:
             resp = client.post(
                 "https://api.sendgrid.com/v3/mail/send",
                 headers={
-                    "Authorization": f"Bearer {settings.SENDGRID_API_KEY.strip()}",
+                    "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
                 },
                 json=payload,
@@ -384,6 +388,7 @@ def send_collection_email(
     balance: float | int | None = None,
     unsubscribe_url: str | None = None,
     list_unsubscribe_url: str | None = None,
+    api_key: str | None = None,
     commit: bool = True,
 ) -> EmailLogModel:
     """Send collection email via SendGrid (if configured) else SMTP else log-only.
@@ -396,9 +401,13 @@ def send_collection_email(
     ``unsubscribe_url`` is the customer page (footer link).
     ``list_unsubscribe_url`` is the one-click HTTPS endpoint for List-Unsubscribe.
     Activation / password-reset callers leave both unset.
+
+    ``api_key`` — optional per-client SendGrid key; when set, SendGrid is used even if
+    platform SENDGRID_* is empty.
     """
     resolved_from, resolved_name = _resolve_from(from_email=from_email, from_name=from_name)
-    provider = active_collection_provider()
+    client_key = (api_key or "").strip() or None
+    provider = "sendgrid" if client_key else active_collection_provider()
     status = "logged"
     err: str | None = None
     provider_id: str | None = None
@@ -434,6 +443,7 @@ def send_collection_email(
             from_name=resolved_name,
             custom_args=custom_args,
             list_unsubscribe_url=list_unsubscribe_url,
+            api_key=client_key,
         )
         status = "sent" if ok else "failed"
     elif provider == "smtp":

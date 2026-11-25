@@ -91,11 +91,12 @@ class Settings(BaseSettings):
     # Set 0 to send all segments in one call (paid tier).
     GROQ_SEGMENTS_PER_CALL: int = 3
 
-    # Collection email — SendGrid (empty key = log-only).
+    # Collection email — platform SendGrid (system / Third Party / fallback only).
+    # Per-client collection From uses payflow_client_email_providers + sender identities.
     SENDGRID_API_KEY: str = ""
     SENDGRID_FROM_EMAIL: str = ""
     SENDGRID_FROM_NAME: str = "PayFlow"
-    # Signed Event Webhook verification key from SendGrid.
+    # Signed Event Webhook verification key from SendGrid (platform account).
     # Empty = accept events without signature check (local/dev only).
     SENDGRID_WEBHOOK_VERIFICATION_KEY: str = ""
 

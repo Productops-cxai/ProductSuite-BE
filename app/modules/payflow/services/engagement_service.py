@@ -57,6 +57,7 @@ _CUSTOMER_ACTIVITY_EVENT_TYPES = frozenset(
         "plan_created",
         "plan_instalment_missed",
         "email_unsubscribed",
+        "email_from_failover",
         "sms_opted_out",
         "email_bounced",
         "sms_failed",

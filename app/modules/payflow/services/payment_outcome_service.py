@@ -159,6 +159,17 @@ class PayflowPaymentOutcomeService:
                 self.db.flush()
         except Exception:  # noqa: BLE001 - the payment is recorded either way
             logger.exception("failed to attribute payment txn=%s", txn.public_id)
+        # Successful payment clears From-failover override so future mail can use primary again.
+        try:
+            from app.modules.payflow.services.sender_identity_service import (
+                PayflowSenderIdentityService,
+            )
+
+            PayflowSenderIdentityService(self.db).clear_override_for_account(account.id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to clear sender override after payment account_id=%s", account.id
+            )
         return txn
 
     def _plan_quote_from_attempt(self, attempt: PayflowPaymentAttemptModel) -> dict[str, Any]:
