@@ -480,6 +480,15 @@ class PayflowClientService:
         if self._sync_catalog_mappings(client):
             self.db.commit()
             client = self._get_or_404(client_id)
+        try:
+            from app.modules.payflow.services.sender_identity_service import (
+                PayflowSenderIdentityService,
+            )
+
+            if PayflowSenderIdentityService(self.db).backfill_from_client_email_from(client_id):
+                client = self._get_or_404(client_id)
+        except Exception:  # noqa: BLE001
+            pass
         return self._detail(client)
 
     # ------------------------------------------------------------------
@@ -909,6 +918,15 @@ class PayflowClientService:
 
     def activate_client(self, client_id: int, user: UserModel | None = None) -> tuple[dict, list[int]]:
         client = self._get_or_404(client_id)
+        try:
+            from app.modules.payflow.services.sender_identity_service import (
+                PayflowSenderIdentityService,
+            )
+
+            PayflowSenderIdentityService(self.db).backfill_from_client_email_from(client_id)
+            client = self._get_or_404(client_id)
+        except Exception:  # noqa: BLE001
+            pass
         blockers = self._activation_blockers(client)
         if blockers:
             raise ValidationAppError("; ".join(blockers))
@@ -3431,8 +3449,31 @@ class PayflowClientService:
             issues.append("Sender name is required (set in Branding & Channels)")
         is_first = client.client_type == PayflowClientType.FIRST_PARTY.value
         if is_first:
-            if client.channel_email and not (client.email_from or "").strip():
-                issues.append("Email from address is required when Email is enabled")
+            if client.channel_email:
+                has_legacy_from = bool((client.email_from or "").strip())
+                has_verified_primary = False
+                uses_identities = False
+                try:
+                    from app.modules.payflow.services.sender_identity_service import (
+                        PayflowSenderIdentityService,
+                    )
+
+                    sender_svc = PayflowSenderIdentityService(self.db)
+                    has_verified_primary = sender_svc.has_verified_primary(client.id)
+                    uses_identities = sender_svc.client_uses_sender_identities(client.id)
+                except Exception:  # noqa: BLE001
+                    has_verified_primary = False
+                    uses_identities = False
+                if uses_identities and not has_verified_primary:
+                    issues.append(
+                        "Connect SendGrid and verify a primary From email (DNS) "
+                        "when Email is enabled"
+                    )
+                elif not has_legacy_from and not has_verified_primary:
+                    issues.append(
+                        "Email from address is required when Email is enabled "
+                        "(connect SendGrid and add a verified From, or set email_from)"
+                    )
             if client.channel_sms and not (client.sms_sender_id or "").strip():
                 issues.append("SMS sender ID is required when SMS is enabled")
         return issues

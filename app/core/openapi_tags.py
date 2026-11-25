@@ -55,6 +55,10 @@ OPENAPI_TAGS: list[dict[str, str]] = [
         "description": "Clients, logos, activation, portfolios, client bulk import",
     },
     {
+        "name": "PayFlow · Client Email",
+        "description": "Per-client SendGrid provider, From identities, DNS verification",
+    },
+    {
         "name": "PayFlow · Accounts",
         "description": "Debtor / case accounts",
     },
@@ -134,6 +138,12 @@ def tag_for_path(path: str) -> str | None:
 
 def _payflow_tag(path: str) -> str:
     # More specific prefixes first
+    if (
+        "/email-provider" in path
+        or "/sender-identities" in path
+        or "/sender-domains" in path
+    ):
+        return "PayFlow · Client Email"
     if path.startswith("/payflow/clients"):
         return "PayFlow · Clients & portfolios"
     if path.startswith("/payflow/accounts"):

@@ -21,6 +21,7 @@ from app.modules.identity.routes import router as identity_router
 from app.modules.payflow.compliance_routes import router as compliance_router
 from app.modules.payflow.email_subject_routes import router as email_subject_router
 from app.modules.payflow.routes import router as payflow_router
+from app.modules.payflow.sender_routes import router as sender_router
 from app.modules.payflow.sendgrid_webhook import router as sendgrid_webhook_router
 from app.modules.payflow.stripe_webhook import router as stripe_webhook_router
 from app.modules.payflow.twilio_webhook import router as twilio_webhook_router
@@ -149,6 +150,7 @@ app.mount("/uploads", PublicUploads(directory=str(uploads_dir)), name="uploads")
 app.include_router(identity_router)
 app.include_router(platform_router)
 app.include_router(payflow_router)
+app.include_router(sender_router)
 app.include_router(compliance_router)
 app.include_router(email_subject_router)
 app.include_router(sendgrid_webhook_router)

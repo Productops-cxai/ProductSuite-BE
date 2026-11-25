@@ -2004,3 +2004,78 @@ class PayflowWorkflowPaymentEventRequest(BaseModel):
     payment_date: Optional[str] = None
     is_ptp: Optional[bool] = None
     note: Optional[str] = None
+
+
+# --- Client SendGrid provider + sender identities ---
+
+
+class PayflowEmailProviderUpsertRequest(BaseModel):
+    api_key: Optional[str] = None
+    webhook_verification_key: Optional[str] = None
+    label: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class PayflowEmailProviderStatusResponse(BaseModel):
+    configured: bool = False
+    provider: Optional[str] = None
+    is_active: bool = False
+    label: Optional[str] = None
+    has_api_key: bool = False
+    has_webhook_verification_key: bool = False
+    last_checked_at: Optional[str] = None
+    last_error: Optional[str] = None
+    ok: Optional[bool] = None
+    error: Optional[str] = None
+    deleted: Optional[bool] = None
+
+
+class PayflowSenderIdentityCreateRequest(BaseModel):
+    email: str
+    display_name: Optional[str] = None
+    is_primary: Optional[bool] = None
+    failover_order: Optional[int] = None
+
+
+class PayflowSenderIdentityUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    failover_order: Optional[int] = None
+
+
+class PayflowSenderIdentityToggleRequest(BaseModel):
+    is_enabled: bool
+
+
+class PayflowSenderIdentityResponse(BaseModel):
+    id: int
+    client_id: int
+    email_provider_id: Optional[int] = None
+    email: str
+    display_name: Optional[str] = None
+    domain: str
+    is_enabled: bool = True
+    is_primary: bool = False
+    verification_status: str = "pending"
+    sendgrid_domain_id: Optional[str] = None
+    dns_records: List[Any] = Field(default_factory=list)
+    last_verified_at: Optional[str] = None
+    failover_order: int = 100
+    last_error: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PayflowSenderIdentityListResponse(BaseModel):
+    items: List[PayflowSenderIdentityResponse] = Field(default_factory=list)
+
+
+class PayflowSenderDomainItem(BaseModel):
+    domain: str
+    verification_status: str = "pending"
+    sendgrid_domain_id: Optional[str] = None
+    dns_records: List[Any] = Field(default_factory=list)
+    emails: List[str] = Field(default_factory=list)
+
+
+class PayflowSenderDomainListResponse(BaseModel):
+    items: List[PayflowSenderDomainItem] = Field(default_factory=list)

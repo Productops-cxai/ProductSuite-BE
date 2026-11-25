@@ -63,12 +63,35 @@ def _is_third_party_client(client: PayflowClientModel | None) -> bool:
 
 def _resolve_collection_from(
     client: PayflowClientModel | None,
-) -> tuple[str | None, str | None]:
-    """Wire From for collection email.
+    *,
+    account: PayflowAccountModel | None = None,
+    db: Session | None = None,
+) -> tuple[str | None, str | None, int | None, str | None, str]:
+    """Wire From + optional client SendGrid API key for collection email.
 
-    - Third Party → PayFlow operator (SENDGRID_FROM_EMAIL / operator brand)
-    - First Party → client email_from + sender/brand name
+    Returns ``(from_email, from_name, sender_identity_id, api_key, source)``.
+
+    - Third Party → platform SendGrid
+    - First Party → verified sender identity (override → primary → failover) when configured
+    - ``source=unresolved`` means First Party SendGrid/identities exist but none are sendable
     """
+    if db is not None:
+        from app.modules.payflow.services.sender_identity_service import (
+            PayflowSenderIdentityService,
+        )
+
+        resolved = PayflowSenderIdentityService(db).resolve_for_account(
+            client=client, account=account
+        )
+        return (
+            resolved.from_email,
+            resolved.from_name,
+            resolved.identity_id,
+            resolved.api_key,
+            resolved.source,
+        )
+
+    # Legacy fallback when no session is available.
     if _is_third_party_client(client):
         from_email = (settings.SENDGRID_FROM_EMAIL or "").strip() or None
         from_name = (
@@ -76,9 +99,15 @@ def _resolve_collection_from(
             or (settings.SENDGRID_FROM_NAME or "").strip()
             or "PayFlow Collections"
         )
-        return from_email, from_name
+        return (
+            from_email,
+            from_name,
+            None,
+            (settings.SENDGRID_API_KEY or "").strip() or None,
+            "platform",
+        )
     if not client:
-        return None, None
+        return None, None, None, None, "unresolved"
     from_email = (client.email_from or "").strip() or None
     from_name = (
         (client.sender_name or "").strip()
@@ -86,7 +115,13 @@ def _resolve_collection_from(
         or (client.name or "").strip()
         or None
     )
-    return from_email, from_name
+    return (
+        from_email,
+        from_name,
+        None,
+        (settings.SENDGRID_API_KEY or "").strip() or None,
+        "legacy_email_from",
+    )
 
 
 def _utcnow() -> datetime:
@@ -1035,7 +1070,66 @@ class PayflowCommunicationService:
         client = account.client
         if client is None and account.client_id:
             client = self.db.get(PayflowClientModel, account.client_id)
-        brand_from, brand_name = _resolve_collection_from(client)
+        brand_from, brand_name, sender_identity_id, sender_api_key, sender_source = (
+            _resolve_collection_from(client, account=account, db=self.db)
+        )
+        if channel_norm != "SMS" and (
+            sender_source == "unresolved"
+            or (sender_source == "identity" and (not brand_from or not sender_api_key))
+        ):
+            reason = (
+                "No verified client From address / SendGrid API key available for send. "
+                "Connect SendGrid, add DNS, and verify a primary From email."
+            )
+            blocked = self.record_blocked_communication(
+                account=account,
+                strategy=strategy,
+                channel=channel_norm,
+                purpose=purpose_norm,
+                subject=subject,
+                body=body,
+                payment_link=bool(payment_link),
+                restriction_reason=reason,
+                eligibility_status="Blocked",
+                client_id=client_id,
+            )
+            try:
+                from app.modules.payflow.services.operational_exception_service import (
+                    PayflowOperationalExceptionService,
+                )
+                from app.shared.enums import PayflowOperationalExceptionType
+
+                PayflowOperationalExceptionService(self.db).raise_exception(
+                    exception_type=PayflowOperationalExceptionType.COMMUNICATION_FAILURE.value,
+                    reason=reason,
+                    client_id=client_id or account.client_id,
+                    account_id=account.id,
+                    source_entity_type="communication",
+                    source_entity_id=blocked.id,
+                    severity="High",
+                    retriable=True,
+                    diagnostic_ref=blocked.code,
+                    link=f"/payflow/comms/{blocked.id}",
+                    notify=True,
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to raise sender unresolved exception")
+            self.db.commit()
+            return {
+                "skipped": "sender_unresolved",
+                "channel": channel_norm,
+                "status": "blocked",
+                "communication_id": blocked.id,
+                "code": blocked.code,
+                "restriction_reason": reason,
+                "eligibility_status": "Blocked",
+            }
+
+        # Prefer client SendGrid when a key was resolved.
+        if channel_norm != "SMS" and sender_api_key:
+            email_provider = "sendgrid"
+            engagement_tracking = "available"
         comm = PayflowCommunicationModel(
             code=code,
             client_id=client_id or account.client_id,
@@ -1064,6 +1158,9 @@ class PayflowCommunicationService:
                 if channel_norm == "SMS"
                 else email_provider
             ),
+            from_email=brand_from if channel_norm != "SMS" else None,
+            from_name=brand_name if channel_norm != "SMS" else None,
+            sender_identity_id=sender_identity_id if channel_norm != "SMS" else None,
         )
         self.db.add(comm)
         self.db.flush()
@@ -1186,6 +1283,7 @@ class PayflowCommunicationService:
                 balance=float(account.outstanding_balance or 0),
                 unsubscribe_url=unsub_page,
                 list_unsubscribe_url=unsub_one_click,
+                api_key=sender_api_key,
                 commit=False,
             )
             send_status = log.status
@@ -1427,6 +1525,16 @@ class PayflowCommunicationService:
         et = (event_type or "").lower().strip()
         payment_base = (settings.WORKFLOW_PAYMENT_LINK_BASE or "").rstrip("/")
         is_payment_click = bool(url and payment_base and payment_base in url)
+        from_failover_applied = False
+
+        # Always attach the communication's From so spam/unsub/failover can be audited.
+        if row.from_email or row.sender_identity_id:
+            base_payload = dict(payload) if isinstance(payload, dict) else {}
+            if row.from_email and "from_email" not in base_payload:
+                base_payload["from_email"] = row.from_email
+            if row.sender_identity_id is not None and "sender_identity_id" not in base_payload:
+                base_payload["sender_identity_id"] = row.sender_identity_id
+            payload = base_payload or payload
 
         # Email provider (SendGrid) link click ≠ Stripe payment webhooks.
         # PayFlow app Click = record_portal_visit. Stripe = checkout/PI/refund only.
@@ -1540,11 +1648,72 @@ class PayflowCommunicationService:
             self._advance_status(row, PayflowCommStatus.SUPPRESSED.value)
             row.eligibility_status = "Blocked"
             row.restriction_reason = f"Provider event: {et}"
-            # Account-level block so future email eligibility fails.
             if row.account_id:
                 account = self.db.get(PayflowAccountModel, row.account_id)
                 if account is not None:
-                    account.email_consent = False
+                    from app.modules.payflow.services.sender_identity_service import (
+                        PayflowSenderIdentityService,
+                    )
+
+                    sender_svc = PayflowSenderIdentityService(self.db)
+                    paid = sender_svc.account_has_successful_payment(account.id)
+                    # No payment + SendGrid spam/unsub → From failover (keep email_consent).
+                    # Paid accounts keep today's global stop.
+                    if not paid and et in {
+                        "spamreport",
+                        "spam",
+                        "unsubscribe",
+                        "group_unsubscribe",
+                    }:
+                        failover = sender_svc.apply_from_failover(
+                            account=account,
+                            blocked_identity_id=row.sender_identity_id,
+                            reason=et,
+                        )
+                        if failover.get("failover"):
+                            from_failover_applied = True
+                            row.restriction_reason = (
+                                f"From failover after {et} → {failover.get('active_email')}"
+                            )
+                            # Do not set email_consent=False — next send uses override From.
+                            try:
+                                from app.modules.payflow.services.engagement_service import (
+                                    safe_record_engagement_event,
+                                )
+
+                                safe_record_engagement_event(
+                                    self.db,
+                                    account_id=account.id,
+                                    client_id=row.client_id,
+                                    event_type="email_from_failover",
+                                    source="sendgrid",
+                                    communication_id=row.id,
+                                    run_id=row.run_id,
+                                    dedupe_key=(
+                                        f"sendgrid:failover:{row.id}:{et}:"
+                                        f"{failover.get('active_identity_id')}"
+                                    ),
+                                    detail={
+                                        "provider_event": et,
+                                        "blocked_identity_id": failover.get(
+                                            "blocked_identity_id"
+                                        ),
+                                        "active_identity_id": failover.get(
+                                            "active_identity_id"
+                                        ),
+                                        "active_email": failover.get("active_email"),
+                                    },
+                                )
+                            except Exception:  # noqa: BLE001
+                                logger.exception("email_from_failover engagement failed")
+                        else:
+                            # No alternate From — fall back to global unsub.
+                            account.email_consent = False
+                            row.restriction_reason = (
+                                f"Provider event: {et} (no alternate From)"
+                            )
+                    else:
+                        account.email_consent = False
         elif et in {"group_resubscribe", "resubscribe"}:
             # SendGrid / ESP resubscribe — restore email consent only (do not change SMS).
             self._append_json_event(row, "Email Resubscribed", f"Provider event: {et}")
@@ -1575,6 +1744,9 @@ class PayflowCommunicationService:
                     et in {"click", "clicked"} and (is_payment_click or row.payment_link)
                 ),
             )
+            # Failover already recorded email_from_failover — do not also mark unsubscribed.
+            if from_failover_applied and mapped == "email_unsubscribed":
+                mapped = None
             if mapped and row.account_id:
                 machine_open = False
                 if isinstance(payload, dict) and payload.get("sg_machine_open") in (

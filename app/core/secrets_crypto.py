@@ -66,6 +66,40 @@ def decrypt_value(value: str, *, master_key: str | None = None) -> str:
         ) from exc
 
 
+def _fernet_from_explicit_key(key: str) -> Fernet:
+    raw = (key or "").strip()
+    if not raw:
+        raise SecretsCryptoError("Encryption key is empty")
+    try:
+        return Fernet(_pad_urlsafe_b64(raw))
+    except Exception as exc:  # noqa: BLE001
+        raise SecretsCryptoError(f"Invalid encryption key: {exc}") from exc
+
+
+def encrypt_value(plain: str, *, key: str | None = None) -> str:
+    """Encrypt a plaintext secret. Returns ``enc:<token>`` (never log the result's payload).
+
+    Uses ``ENV_MASTER_KEY`` unless an explicit Fernet ``key`` is passed.
+    """
+    if plain is None:
+        raise SecretsCryptoError("Cannot encrypt empty secret")
+    text = str(plain)
+    f = _fernet_from_explicit_key(key) if key else _fernet_from_env()
+    token = f.encrypt(text.encode("utf-8")).decode("ascii")
+    return f"{ENC_PREFIX}{token}"
+
+
+def decrypt_with_key(value: str, *, key: str | None = None) -> str:
+    """Decrypt a value that may be ``enc:…`` or already plain (DB-stored secrets)."""
+    if value is None:
+        return value
+    if not isinstance(value, str) or not value.startswith(ENC_PREFIX):
+        return value
+    if key and key.strip():
+        return decrypt_value(value, master_key=key.strip())
+    return decrypt_value(value)
+
+
 def decrypt_settings_values(data: dict) -> dict:
     """Walk settings field dict and decrypt any ``enc:`` string values."""
     out = {}

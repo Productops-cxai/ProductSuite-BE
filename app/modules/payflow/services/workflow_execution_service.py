@@ -2822,7 +2822,9 @@ class WorkflowExecutionService:
                 or "PayFlow Collections"
             )
         else:
-            _, rendered_name = _resolve_collection_from(client)
+            _, rendered_name, _, _, _ = _resolve_collection_from(
+                client, account=account, db=self.db
+            )
             brand_name = rendered_name or (settings.SENDGRID_FROM_NAME or "PayFlow")
         mapping = {
             "first_name": first or "Customer",

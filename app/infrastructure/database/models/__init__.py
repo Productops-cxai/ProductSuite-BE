@@ -363,6 +363,128 @@ class PayflowClientModel(Base):
         back_populates="client",
         cascade="all, delete-orphan",
     )
+    email_provider = relationship(
+        "PayflowClientEmailProviderModel",
+        back_populates="client",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+    sender_identities = relationship(
+        "PayflowClientSenderIdentityModel",
+        back_populates="client",
+        cascade="all, delete-orphan",
+    )
+
+
+class PayflowClientEmailProviderModel(Base):
+    """Per-client SendGrid account credentials (one row per client in v1)."""
+
+    __tablename__ = "payflow_client_email_providers"
+    __table_args__ = (
+        UniqueConstraint("client_id", name="uq_payflow_client_email_provider_client"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="sendgrid")
+    api_key_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    webhook_verification_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="email_provider")
+    sender_identities = relationship(
+        "PayflowClientSenderIdentityModel",
+        back_populates="email_provider",
+    )
+
+
+class PayflowClientSenderIdentityModel(Base):
+    """From-address identity under a client's SendGrid account."""
+
+    __tablename__ = "payflow_client_sender_identities"
+    __table_args__ = (
+        UniqueConstraint("client_id", "email", name="uq_payflow_client_sender_identity_email"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    email_provider_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("payflow_client_email_providers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verification_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending"
+    )
+    sendgrid_domain_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    dns_records: Mapped[list | dict | None] = mapped_column(JSON, nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failover_order: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    client = relationship("PayflowClientModel", back_populates="sender_identities")
+    email_provider = relationship(
+        "PayflowClientEmailProviderModel", back_populates="sender_identities"
+    )
+
+
+class PayflowAccountSenderOverrideModel(Base):
+    """Per-account From failover after spam/unsub without payment."""
+
+    __tablename__ = "payflow_account_sender_overrides"
+    __table_args__ = (
+        UniqueConstraint("account_id", name="uq_payflow_account_sender_override_account"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    client_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("payflow_clients.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    blocked_identity_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("payflow_client_sender_identities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    active_identity_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("payflow_client_sender_identities.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payment_gate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class PayflowPortfolioModel(Base):
@@ -834,6 +956,15 @@ class PayflowCommunicationModel(Base):
     # Opens the provider flagged as automatic (a mail app pre-loading the email, not a person).
     # They stay in opens_count (existing behaviour); subject performance leaves them out.
     machine_opens_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Actual From used on the wire (client multi-sender / failover).
+    from_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    from_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sender_identity_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("payflow_client_sender_identities.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

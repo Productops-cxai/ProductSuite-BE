@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -11,33 +12,30 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.infrastructure.database.models import PayflowCommunicationModel
 from app.infrastructure.database.session import SessionLocal
 from app.modules.payflow.services.communication_service import PayflowCommunicationService
+from app.modules.payflow.services.email_provider_service import PayflowEmailProviderService
 
 logger = logging.getLogger("app.comms.sendgrid_webhook")
 
 router = APIRouter(tags=["Webhooks · SendGrid"])
 
 
-def _verify_signature(raw_body: bytes, signature: str | None, timestamp: str | None) -> bool:
-    """Verify SendGrid signed Event Webhook when verification key is configured.
-
-    Empty SENDGRID_WEBHOOK_VERIFICATION_KEY → accept (local/dev). Set the key from
-    SendGrid Event Webhook settings for production.
-    """
-    key = (settings.SENDGRID_WEBHOOK_VERIFICATION_KEY or "").strip()
-    if not key:
-        # Unsigned events can flip consent and fake bounces: never in production.
-        return (settings.APP_ENV or "").strip().lower() != "production"
-    if not signature or not timestamp:
+def _verify_with_key(
+    raw_body: bytes,
+    signature: str | None,
+    timestamp: str | None,
+    key: str,
+) -> bool:
+    if not key or not signature or not timestamp:
         return False
     try:
+        from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.serialization import load_pem_public_key
-        from cryptography.exceptions import InvalidSignature
 
-        # SendGrid provides a public key; accept PEM or raw base64 DER.
         pem = key
         if "BEGIN PUBLIC KEY" not in key:
             der = base64.b64decode(key)
@@ -61,6 +59,31 @@ def _verify_signature(raw_body: bytes, signature: str | None, timestamp: str | N
         return False
 
 
+def _verify_signature(
+    raw_body: bytes,
+    signature: str | None,
+    timestamp: str | None,
+    *,
+    verification_keys: list[str] | None = None,
+) -> bool:
+    """Verify against client key(s) and/or platform key.
+
+    Empty keys in non-production → accept (local/dev).
+    """
+    keys = [k.strip() for k in (verification_keys or []) if (k or "").strip()]
+    platform = (settings.SENDGRID_WEBHOOK_VERIFICATION_KEY or "").strip()
+    if platform and platform not in keys:
+        keys.append(platform)
+
+    if not keys:
+        return (settings.APP_ENV or "").strip().lower() != "production"
+
+    for key in keys:
+        if _verify_with_key(raw_body, signature, timestamp, key):
+            return True
+    return False
+
+
 def _parse_event_time(ev: dict[str, Any]) -> datetime | None:
     ts = ev.get("timestamp")
     if ts is None:
@@ -72,11 +95,42 @@ def _parse_event_time(ev: dict[str, Any]) -> datetime | None:
 
 
 def _custom_arg(ev: dict[str, Any], key: str) -> str | None:
-    # SendGrid may nest custom args at top level or under unique_args / custom_args.
     for bag in (ev, ev.get("unique_args") or {}, ev.get("custom_args") or {}):
         if isinstance(bag, dict) and bag.get(key) is not None:
             return str(bag.get(key))
     return None
+
+
+def _resolve_client_webhook_keys(db: Session, events: list[Any]) -> list[str]:
+    """Collect per-client webhook verification keys from communication custom args."""
+    client_ids: set[int] = set()
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        cid_raw = _custom_arg(ev, "communication_id")
+        code = _custom_arg(ev, "communication_code")
+        row: PayflowCommunicationModel | None = None
+        if cid_raw:
+            try:
+                row = db.get(PayflowCommunicationModel, int(cid_raw))
+            except ValueError:
+                row = None
+        if row is None and code:
+            row = (
+                db.query(PayflowCommunicationModel)
+                .filter(PayflowCommunicationModel.code == code)
+                .first()
+            )
+        if row and row.client_id:
+            client_ids.add(int(row.client_id))
+
+    keys: list[str] = []
+    svc = PayflowEmailProviderService(db)
+    for client_id in client_ids:
+        key = svc.decrypt_webhook_key(client_id)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
 
 
 @router.post("/webhooks/sendgrid")
@@ -86,15 +140,9 @@ async def sendgrid_event_webhook(
     x_twilio_email_event_webhook_timestamp: str | None = Header(default=None),
 ):
     raw = await request.body()
-    if not _verify_signature(
-        raw,
-        x_twilio_email_event_webhook_signature,
-        x_twilio_email_event_webhook_timestamp,
-    ):
-        raise HTTPException(status_code=401, detail="Invalid SendGrid webhook signature")
 
     try:
-        events = await request.json()
+        events = json.loads(raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
 
@@ -106,6 +154,15 @@ async def sendgrid_event_webhook(
     duplicates = 0
     unmatched = 0
     try:
+        client_keys = _resolve_client_webhook_keys(db, events)
+        if not _verify_signature(
+            raw,
+            x_twilio_email_event_webhook_signature,
+            x_twilio_email_event_webhook_timestamp,
+            verification_keys=client_keys,
+        ):
+            raise HTTPException(status_code=401, detail="Invalid SendGrid webhook signature")
+
         svc = PayflowCommunicationService(db)
         for ev in events:
             if not isinstance(ev, dict):
@@ -123,7 +180,6 @@ async def sendgrid_event_webhook(
                 ev.get("sg_message_id") or ev.get("smtp-id") or ev.get("sg_message_id")
             )
             if isinstance(provider_message_id, str) and "." in provider_message_id:
-                # SendGrid often appends .filter; keep prefix for match flexibility.
                 provider_message_id = provider_message_id.split(".", 1)[0]
             provider_event_id = None
             if ev.get("sg_event_id"):
@@ -153,6 +209,9 @@ async def sendgrid_event_webhook(
             else:
                 unmatched += 1
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception:  # noqa: BLE001
         db.rollback()
         logger.exception("SendGrid webhook processing failed")
