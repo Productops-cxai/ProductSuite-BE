@@ -3,8 +3,9 @@
 Token is HMAC over account_id (JWT_SECRET). Used in collection email footers and
 List-Unsubscribe one-click. Does not affect SMS opt-out or payment links.
 
-Reasons + comment are recorded when the client has the Allow Unsubscribe Option
-governance rule in force; one-click and legacy POSTs without a body still work.
+Unsubscribe footer + reason options are default off; both require Allow Unsubscribe
+Option Active and selected for the client. One-click and POSTs without a body
+still work when a link was issued.
 """
 
 from __future__ import annotations
@@ -26,11 +27,9 @@ from app.infrastructure.database.models import (
     PayflowAccountModel,
     PayflowClientModel,
     PayflowEmailUnsubscribeEventModel,
-    PayflowRuleModel,
     UserModel,
 )
 from app.modules.payflow.services.access_context_service import AccessContextService
-from app.shared.enums import PayflowRuleStatus
 
 logger = logging.getLogger("app.comms.email_pref")
 
@@ -182,20 +181,10 @@ class PayflowEmailPreferenceService:
     def should_include_email_unsubscribe(self, account: PayflowAccountModel) -> bool:
         """Whether collection emails should carry unsubscribe links.
 
-        Legacy-safe: while the seeded Allow Unsubscribe Option rule is not Active
-        yet, keep the previous always-on footer. Once that rule is Active, only
-        clients who selected it get the option.
+        Default off. Only when Allow Unsubscribe Option is Active and selected
+        for this account's client (AI & Governance) — same gate as reason options.
         """
-        if self.client_has_unsubscribe_option(account):
-            return True
-        seed = (
-            self.db.query(PayflowRuleModel)
-            .filter(PayflowRuleModel.code == ALLOW_UNSUBSCRIBE_RULE_CODE)
-            .first()
-        )
-        if seed is None or seed.status != PayflowRuleStatus.ACTIVE.value:
-            return True
-        return False
+        return self.client_has_unsubscribe_option(account)
 
     def _latest_event(self, account_id: int) -> PayflowEmailUnsubscribeEventModel | None:
         return (
