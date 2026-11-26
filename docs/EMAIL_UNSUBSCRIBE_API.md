@@ -9,8 +9,8 @@ This doc covers **backend only**. FE should implement the customer preference pa
 ## Product behaviour (short)
 
 1. Governance rule **Allow Unsubscribe Option** (`code: allow-unsubscribe-option`, action `Include Unsubscribe Option`).
-2. While that system rule is **not Active**, collection emails keep the **legacy always-on** unsubscribe footer (unchanged).
-3. Once the rule is **Active**, only clients that **selected** it under governance get unsubscribe links on collection emails.
+2. **Default off:** collection emails do **not** include an unsubscribe footer.
+3. Only when the system rule is **Active** and the client has **selected** it under AI & Governance do collection emails get the unsubscribe link (and List-Unsubscribe header).
 4. When that rule applies to the account’s client, the public preference page **shows** reason options + optional comment. Reasons are **never required** — customer can confirm unsubscribe with zero reasons.
 5. Selecting any of `already_paid` | `wrong_person` | `dispute` | `attorney` sets `review_required: true` on the event for Ops visibility. Opt-out is **immediate** (no delay); Human Review queue is **not** used.
 6. Unsubscribes are stored and listed for staff; `email_consent = false` still blocks further email (existing behaviour).
@@ -231,7 +231,7 @@ Suggested FE route: `/payflow/email-unsubscribes` (permission: `view_communicati
 
 ## What BE already does (no FE work)
 
-- Attaches / omits unsubscribe footer + List-Unsubscribe on **collection** send based on the rule (legacy always-on until rule is Active).
+- Attaches / omits unsubscribe footer + List-Unsubscribe on **collection** send only when the client has Allow Unsubscribe Option applied (default omitted).
 - One-click List-Unsubscribe hits the same public unsubscribe URL (form POST).
 - Sets `account.email_consent = false` and records `payflow_email_unsubscribe_events` (with `review_required` when applicable).
 - Compliance category label **Unsubscribe Option** (was Consent & Opt-Out).
