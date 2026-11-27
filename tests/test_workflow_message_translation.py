@@ -114,8 +114,9 @@ def test_suggest_writes_every_message_in_the_segments_other_language(db_session,
     _make_french(db_session, portfolio["portfolio_id"])
     workflow, translations = _suggest(db_session, admin, portfolio)
 
-    assert len(translations) == 1  # one AI call for French, for all the workflow's messages
-    assert "into French" in translations[0][0]["content"]
+    # French: one AI call for the flowchart's messages, one for the adaptive follow-ups.
+    assert len(translations) == 2
+    assert all("into French" in call[0]["content"] for call in translations)
     for config in _messages(workflow):
         french = config["translations"]["FR"]
         assert french["body"] == _french(config["body"]) and french["sms_body"] == _french(config["sms_body"])
@@ -166,7 +167,7 @@ def test_regenerate_writes_the_other_languages_too(db_session, admin, portfolio,
     with patch.object(suggestion_service, "call_llm", side_effect=design), \
             patch.object(message_writer, "call_llm", side_effect=writer):
         new = WorkflowSuggestionService(db_session).regenerate_workflow(admin, ai_workflow["id"], REMARKS)
-    assert len(translations) == 1
+    assert len(translations) == 2  # the flowchart's messages, then the follow-ups
     assert all(config["translations"]["FR"]["body"] == _french(config["body"]) for config in _messages(new))
     assert _context(new)["Languages"] == "English (main), French"
 

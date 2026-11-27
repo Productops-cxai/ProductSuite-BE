@@ -107,6 +107,7 @@ from app.modules.payflow.schemas import (
     PayflowAdaptiveDecisionModifyRequest,
     PayflowAdaptiveDecisionNoteRequest,
     PayflowAdaptiveDecisionsListResponse,
+    PayflowAdaptiveFollowUpTypesResponse,
     PayflowAdaptiveRunSnapshot,
     PayflowWorkflowPaymentEventRequest,
     PayflowWorkflowReassessResponse,
@@ -1621,7 +1622,8 @@ def write_workflow_messages(
     try:
         payload = payload or WriteWorkflowMessagesRequest()
         return WorkflowSuggestionService(db).write_workflow_messages(
-            user, strategy_id, payload.step_id, payload.remarks, audience=payload.audience
+            user, strategy_id, payload.step_id, payload.remarks, audience=payload.audience,
+            follow_ups_only=payload.follow_ups_only,
         )
     except AppError as exc:
         raise _map_error(exc) from exc
@@ -2431,6 +2433,14 @@ def reassess_workflow_run(run_id: int, user: PayflowManageWorkflows, db: DbSessi
         }
     except AppError as exc:
         raise _map_error(exc) from exc
+
+
+@router.get("/adaptive/follow-up-types", response_model=PayflowAdaptiveFollowUpTypesResponse)
+def list_adaptive_follow_up_types(user: RequirePayflowProduct):
+    """The follow-up types, their texts (first time, repeat) and waiting times - read-only, from the settings."""
+    from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import follow_up_types
+
+    return {"items": follow_up_types()}
 
 
 @router.get("/adaptive-decisions", response_model=PayflowAdaptiveDecisionsListResponse)

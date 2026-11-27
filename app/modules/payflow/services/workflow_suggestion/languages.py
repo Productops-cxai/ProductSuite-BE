@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from app.modules.payflow.services.strategy_service import is_follow_up_step
+
 # Names the AI is told, by account language code (ISO 639-1). Any other code still works: the AI is
 # then given the code itself.
 LANGUAGE_NAMES = {
@@ -57,8 +59,11 @@ def accounts_languages(accounts: list, fits) -> list[str]:
     return [code for code, _ in counts.most_common()]
 
 
-def languages_line(client_language: Any, written: list[str], failed: list[str]) -> list[dict[str, str]]:
-    """The "Languages" ai_context line for reviewers ([] when the messages have only the main language)."""
+def languages_line(
+    client_language: Any, written: list[str], failed: list[str], follow_ups_missing: list[str] | None = None
+) -> list[dict[str, str]]:
+    """The "Languages" ai_context line for reviewers ([] when the messages have only the main language).
+    `follow_ups_missing`: written languages the adaptive follow-ups have no version in."""
     if not written and not failed:
         return []
     main = language_name(language_code(client_language) or "EN")
@@ -66,19 +71,30 @@ def languages_line(client_language: Any, written: list[str], failed: list[str]) 
     if failed:
         names = ", ".join(language_name(code) for code in failed)
         value += f"; not written: {names} - these customers get {main} (use Write messages to try again)"
+    if follow_ups_missing:
+        names = ", ".join(language_name(code) for code in follow_ups_missing)
+        value += f"; follow-ups not written in {names} - these customers get the planned messages instead"
     return [{"label": "Languages", "value": value}]
 
 
 def languages_line_for_steps(client_language: Any, languages: list[str], steps: list[dict]) -> list[dict[str, str]]:
-    """The "Languages" line read from the steps themselves: a language counts as written when every message
-    with text has a version in it (after a rewrite or an edit only some may have)."""
-    configs = [
-        step.get("config") or {}
+    """The "Languages" line read from the steps themselves: a language counts as written when every message of
+    the flowchart with text has a version in it (after a rewrite or an edit only some may have); the adaptive
+    follow-ups are told apart (a language they lack only means no follow-up in it)."""
+    messages = [
+        step
         for step in steps
         if step.get("kind") == "Communication"
         and any((step.get("config") or {}).get(key) for key in ("subject", "body", "sms_body"))
     ]
-    if not configs:
+    follow_ups = [step for step in messages if is_follow_up_step(step)]
+    flowchart = [step for step in messages if not is_follow_up_step(step)] or follow_ups
+    if not flowchart:
         return []
-    done = [code for code in languages if all(code in (cfg.get("translations") or {}) for cfg in configs)]
-    return languages_line(client_language, done, [code for code in languages if code not in done])
+
+    def everywhere(code: str, group: list[dict]) -> bool:
+        return all(code in ((step.get("config") or {}).get("translations") or {}) for step in group)
+
+    done = [code for code in languages if everywhere(code, flowchart)]
+    missing = [code for code in done if not everywhere(code, follow_ups)]
+    return languages_line(client_language, done, [code for code in languages if code not in done], missing)

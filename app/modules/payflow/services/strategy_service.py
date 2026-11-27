@@ -54,8 +54,11 @@ FOLLOW_UP_FOR_VALUES = frozenset(
         "payment_failed",  # the customer's payment did not go through: a "try again" message (AI team)
         "payment_partial",
         "no_activity",
+        "plan_setup_not_finished",  # began setting up a payment plan, did not finish (AI team)
     }
 )
+# config.follow_up_level: 1 = the first-time text, 2 = the repeat text (the same situation again), ...
+MAX_FOLLOW_UP_LEVEL = 9
 CHANNELS = ["Email", "SMS"]
 MESSAGE_PURPOSES = [
     "Payment Reminder",
@@ -325,6 +328,14 @@ def is_follow_up_step(step: dict[str, Any] | None) -> bool:
     return follow_up_for(step) is not None
 
 
+def follow_up_level(step: dict[str, Any] | None) -> int:
+    """Which text of its situation a follow-up step is: 1 the first time (also when not set), 2 the repeat, ..."""
+    try:
+        return max(1, int(_cfg(step or {}).get("follow_up_level") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _timing_label(step: dict[str, Any]) -> str | None:
     if step.get("timing"):
         return str(step["timing"])
@@ -346,6 +357,20 @@ def _timing_label(step: dict[str, Any]) -> str | None:
         unit_label = unit[:-1]
     # Explicit event-based timing (never "Day 3")
     return f"{int(amount_num) if amount_num == int(amount_num) else amount_num} {unit_label} {direction} {reference}"
+
+
+def _follow_up_level_value(raw: Any, title: str) -> int:
+    if raw in (None, ""):
+        return 1
+    try:
+        level = int(str(raw).strip())  # "2.5" and True are refused, not rounded
+    except ValueError:
+        level = 0
+    if not 1 <= level <= MAX_FOLLOW_UP_LEVEL:
+        raise ValidationAppError(
+            f"Step '{title}' follow_up_level must be a whole number from 1 to {MAX_FOLLOW_UP_LEVEL}"
+        )
+    return level
 
 
 def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -> dict[str, Any]:
@@ -429,6 +454,7 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
     raw_brief, raw_versions = cfg.pop("brief", None), cfg.pop("versions", None)
     raw_review_status = cfg.pop("review_status", None)
     raw_follow_up_for = cfg.pop("follow_up_for", None)
+    raw_follow_up_level = cfg.pop("follow_up_level", None)
     if kind == "Communication":
         brief = _clean_brief(raw_brief)
         if brief:
@@ -449,6 +475,9 @@ def _normalize_step(raw: dict[str, Any], *, default_origin: str | None = None) -
                     f"{', '.join(sorted(FOLLOW_UP_FOR_VALUES))}"
                 )
             cfg["follow_up_for"] = follow_for
+            level = _follow_up_level_value(raw_follow_up_level, title)
+            if level > 1:  # the first-time text keeps no level, as before
+                cfg["follow_up_level"] = level
 
     if kind == "Human Review" and not (cfg.get("review_reason") or "").strip():
         note = (cfg.get("note") or raw.get("detail") or "").strip()
@@ -680,7 +709,7 @@ def _normalize_steps(
         normalized.append(step)
     ids = {s["id"] for s in normalized}
     follow_up_ids = {s["id"] for s in normalized if is_follow_up_step(s)}
-    seen_follow_ups: dict[str, str] = {}
+    seen_follow_ups: dict[tuple[str, int], str] = {}
     for step in normalized:
         situation = follow_up_for(step)
         if situation:
@@ -688,13 +717,15 @@ def _normalize_steps(
                 raise ValidationAppError(
                     f"Step '{step['id']}' follow_up_for is only allowed on Communication steps"
                 )
-            prior = seen_follow_ups.get(situation)
+            # One step per situation and level (the first-time text, the repeat, ...).
+            level = follow_up_level(step)
+            prior = seen_follow_ups.get((situation, level))
             if prior:
+                text = f"'{situation}'" if level == 1 else f"'{situation}' level {level}"
                 raise ValidationAppError(
-                    f"Only one follow-up step is allowed for '{situation}' "
-                    f"(already set on '{prior}')"
+                    f"Only one follow-up step is allowed for {text} (already set on '{prior}')"
                 )
-            seen_follow_ups[situation] = step["id"]
+            seen_follow_ups[(situation, level)] = step["id"]
         for link in ("next", "yes", "no"):
             target = step.get(link)
             if not target:

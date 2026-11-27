@@ -17,6 +17,7 @@ from app.infrastructure.database.models import (
 )
 from app.modules.payflow.services.payment_portal_service import PayflowPaymentPortalService
 from app.modules.payflow.services.workflow_suggestion.languages import accounts_languages
+from app.modules.payflow.services.workflow_suggestion.message_validator import FULL_OPTION, PART_OPTION, PLAN_OPTION
 from app.modules.payflow.services.workflow_suggestion.segmenter import account_fits_segment, filter_eligible
 from app.shared.enums import PayflowPortfolioStatus, PayflowRuleStatus, PayflowRuleType
 
@@ -55,9 +56,9 @@ def load_payment_options(db: Session, client_id: int) -> list[str]:
     client = db.get(PayflowClientModel, client_id)
     settings = PayflowPaymentPortalService(db)._client_settings(client)
     options = {
-        "allow_pay_in_full": "pay in full",
-        "allow_partial": "pay part now",
-        "allow_payment_plan": "set up a payment plan",
+        "allow_pay_in_full": FULL_OPTION,
+        "allow_partial": PART_OPTION,
+        "allow_payment_plan": PLAN_OPTION,
     }
     return [label for key, label in options.items() if settings.get(key)]
 

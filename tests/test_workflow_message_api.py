@@ -54,7 +54,7 @@ def messages(workflow):
 
 
 def flowchart_messages(workflow):
-    """The flowchart's messages: the adaptive follow-ups (config.follow_up_for) get no audience versions or plan."""
+    """The flowchart's messages, without the adaptive follow-ups (config.follow_up_for)."""
     return {step_id: config for step_id, config in messages(workflow).items() if not config.get("follow_up_for")}
 
 
@@ -62,7 +62,7 @@ def test_writes_every_message_and_keeps_it_an_ai_proposal(client, admin_token, a
     response, prompts = write(client, admin_token, ai_workflow["id"])  # no body at all
     body = response.json()
     assert response.status_code == 200, body
-    assert len(prompts) == 1
+    assert len(prompts) == 2  # the flowchart's messages, then the adaptive follow-ups
     assert all(cfg.get("body") and cfg.get("tone") for cfg in messages(body).values())
 
     assert body["status"] == "AI Proposed"  # still the AI's proposal: no review started
@@ -177,5 +177,7 @@ def test_hand_made_workflow_gets_messages_too(client, admin_token, db_session, a
     body = response.json()
     assert response.status_code == 200, body
     assert "Segment: Custom segment" in prompts[0]
-    assert [cfg["tone"] for cfg in messages(body).values()] == ["Firm", "Final notice"]
+    assert [cfg["tone"] for cfg in flowchart_messages(body).values()] == ["Firm", "Final notice"]
+    follow_ups = {step_id: cfg for step_id, cfg in messages(body).items() if cfg.get("follow_up_for")}
+    assert len(follow_ups) == 14 and all(cfg["body"] for cfg in follow_ups.values())  # added and written too
     assert body["origin"] == "Human Created"
