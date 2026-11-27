@@ -1,9 +1,11 @@
-"""Adaptive workflows, AI side, segment 3: AI workflows come with their adaptive follow-ups.
+"""Adaptive workflows, AI side: AI workflows come with their adaptive follow-ups.
 
-Suggest and Regenerate add one message step per situation (not opened, opened but not paid, payment not finished,
-part paid, no response), off the flowchart. Their text is written with the workflow's other messages (main text
-and translations, no audience versions), in a tone the code decides, and reviewed with the workflow. The design
-AI never sees them; learning reads the flowchart only. A follow-up without text is never used.
+Suggest and Regenerate add message steps for each situation (not opened, opened but not paid, payment not
+finished, payment failed, part paid, no response, plan setup not finished), off the flowchart: a first-time text
+and a repeat text (config.follow_up_level 2). Their text is written after the workflow's other messages, in calls
+of their own (main text, audience versions, translations), in a tone the code decides, and reviewed with the
+workflow. The design AI never sees them; learning reads the flowchart only. A follow-up without text is never
+used. "Plan setup not finished" only for clients that offer payment plans, never to customers already on one.
 """
 
 import json
@@ -15,7 +17,8 @@ from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import
 from app.modules.payflow.services.workflow_suggestion.context import load_client_context, load_rules
 from app.modules.payflow.services.workflow_suggestion.learning import _candidate, _valid_today
 from app.modules.payflow.services.workflow_suggestion.message_prompt import build_message_system_prompt
-from app.modules.payflow.services.workflow_suggestion.message_validator import check_message
+from app.modules.payflow.services.workflow_suggestion.message_validator import PLAN_OPTION, check_message
+from app.shared.enums import PayflowCollectionStatus
 from app.modules.payflow.services.workflow_suggestion.next_action import decide_next_action
 from app.modules.payflow.services.workflow_suggestion.rules import design_limits
 from app.modules.payflow.services.workflow_suggestion.service import WorkflowSuggestionService
@@ -27,8 +30,10 @@ from tests.test_workflow_regenerate import REMARKS, admin, context  # noqa: F401
 from tests.test_workflow_suggestion_api import fake_llm, portfolio  # noqa: F401 (fixture)
 
 SITUATIONS = ["email_not_opened", "opened_not_clicked", "clicked_not_paid", "payment_failed", "payment_partial",
-              "no_activity"]
-FOLLOW_UP_IDS = [f"fu_{situation}" for situation in SITUATIONS]
+              "no_activity", "plan_setup_not_finished"]
+# Each situation's first-time text, then its repeat. The test clients offer payment plans (the portal default).
+FOLLOW_UP_IDS = [f"fu_{situation}{suffix}" for situation in SITUATIONS for suffix in ("", "_repeat")]
+WITHOUT_PLAN_SETUP = FOLLOW_UP_IDS[:-2]
 
 
 def _suggest(db_session, admin, portfolio, writer=None):  # noqa: F811
@@ -59,29 +64,43 @@ def test_suggest_adds_a_follow_up_for_each_situation_off_the_flowchart(db_sessio
     assert list(follow_ups) == FOLLOW_UP_IDS
     for step_id, step in follow_ups.items():
         config = step["config"]
+        repeat = step_id.endswith("_repeat")
         assert step["kind"] == "Communication" and not any(step.get(link) for link in ("next", "yes", "no"))
-        assert config["follow_up_for"] == step_id.removeprefix("fu_") and config["purpose"] == "Payment Reminder"
+        assert config["follow_up_for"] == step_id.removeprefix("fu_").removesuffix("_repeat")
+        assert config.get("follow_up_level") == (2 if repeat else None) and step["title"].endswith("(repeat)") == repeat
+        assert config["purpose"] == "Payment Reminder"
         assert config["body"] and config["sms_body"] and config["subject"] and config["tone"]  # email and SMS
-        assert "versions" not in config and "brief" not in config  # no audience versions for follow-ups
+        assert "versions" not in config and "brief" not in config  # the planner is off here: no plan, no versions
         assert "channel" not in config  # the worker picks email or SMS
-    assert workflow["stats"]["follow_ups"] == 6
+    assert workflow["stats"]["follow_ups"] == 14
     assert workflow["stats"]["emails"] == len(flowchart_messages(workflow))  # they are not counted as reminders
     line = context(workflow)["Adaptive follow-ups"]
     assert line.startswith("Sent in place of the next planned reminder, only to customers in that situation.")
-    assert "Written: Follow-up: email not opened, Follow-up: opened, not paid" in line and "Not written" not in line
+    assert "Written: Follow-up: email not opened, Follow-up: email not opened (repeat), Follow-up: opened" in line
+    assert "Not written" not in line
 
 
 def test_the_writer_is_told_what_each_follow_up_is_for(db_session, admin, portfolio):  # noqa: F811
     writer, prompts = fake_message_ai()
     _suggest(db_session, admin, portfolio, writer)
-    asked = _asked(prompts[0])
+    # The flowchart's messages first; the follow-ups in a call of their own, with those messages as context.
+    assert not any(step_id.startswith("fu_") for step_id in _asked(prompts[0]))
+    follow_up_prompt = next(prompt for prompt in prompts if "fu_no_activity" in _asked(prompt))
+    asked = _asked(follow_up_prompt)
+    assert list(asked) == FOLLOW_UP_IDS
+    assert "Other messages in this workflow (already written - do not repeat their wording)" in follow_up_prompt
     for step_id in FOLLOW_UP_IDS:
         assert asked[step_id]["path_so_far"].startswith("Follow-up, not on the timeline: sent in place of the next")
     assert "opened the last email but did not go to the payment page" in asked["fu_opened_not_clicked"]["path_so_far"]
     assert "the payment did not go through (they saw it fail)" in asked["fu_payment_failed"]["path_so_far"]
-    assert asked["fu_payment_partial"]["tone"] == "Supportive"
+    assert "it happened again after the first follow-up" in asked["fu_opened_not_clicked_repeat"]["path_so_far"]
+    assert "payment plan is not set up yet" in asked["fu_plan_setup_not_finished"]["path_so_far"]
+    assert asked["fu_payment_partial"]["tone"] == asked["fu_plan_setup_not_finished"]["tone"] == "Supportive"
     assert asked["fu_no_activity"]["tone"] in ("Friendly", "Clear")  # never firmer than Clear
-    assert "Never say or hint that you can see what the customer opened" in build_message_system_prompt()
+    assert asked["fu_no_activity_repeat"]["tone"] in ("Friendly", "Clear")
+    system = build_message_system_prompt()
+    assert "Never say or hint that you can see what the customer opened" in system
+    assert 'A repeat follow-up (its title ends "(repeat)")' in system
 
 
 def test_a_follow_up_the_writer_cannot_get_right_is_left_unwritten_not_the_workflow(db_session, admin, portfolio):  # noqa: F811,E501
@@ -94,7 +113,7 @@ def test_a_follow_up_the_writer_cannot_get_right_is_left_unwritten_not_the_workf
     assert all(config["body"] for config in flowchart_messages(workflow).values())  # the flowchart's messages
     follow_ups = _follow_ups(workflow)
     assert not follow_ups["fu_no_activity"]["config"].get("body")
-    assert all(follow_ups[step_id]["config"]["body"] for step_id in FOLLOW_UP_IDS[:-1])  # all but "no response"
+    assert all(follow_ups[step_id]["config"]["body"] for step_id in FOLLOW_UP_IDS if step_id != "fu_no_activity")
     assert "Messages" not in context(workflow)
     assert context(workflow)["Adaptive follow-ups"].endswith(
         "Not written yet, so never sent until written (Write messages): Follow-up: no response."
@@ -196,9 +215,21 @@ def _message(step_id, purpose, **links):
 def test_only_a_workflow_with_an_ordinary_reminder_gets_follow_ups():
     plan_only = {"steps": [_message("s1", "Payment Plan Reminder", next="s2"),
                            _message("s2", "Promise-to-Pay Reminder")]}
-    assert add_follow_ups(plan_only) == plan_only
+    assert add_follow_ups(plan_only, payment_options=[PLAN_OPTION]) == plan_only
     reminders = {"steps": [_message("s1", "Payment Plan Reminder", next="s2"), _message("s2", "Firm Reminder")]}
-    assert [s["id"] for s in add_follow_ups(reminders)["steps"]] == ["s1", "s2", *FOLLOW_UP_IDS]
+    assert [s["id"] for s in add_follow_ups(reminders)["steps"]] == ["s1", "s2", *WITHOUT_PLAN_SETUP]
+
+
+def test_plan_setup_follow_ups_only_where_plans_are_offered_and_never_to_plan_customers():
+    reminders = {"steps": [_message("s1", "Payment Reminder")]}
+
+    def plan_setup(**kwargs):
+        return [s["id"] for s in add_follow_ups(reminders, **kwargs)["steps"] if "plan_setup" in s["id"]]
+
+    assert plan_setup(payment_options=[PLAN_OPTION]) == FOLLOW_UP_IDS[-2:]  # its first-time text and its repeat
+    assert plan_setup(payment_options=["pay in full", "pay part now"]) == []
+    assert plan_setup() == []  # the client's options not known: left out
+    assert plan_setup(payment_options=[PLAN_OPTION], situation=PayflowCollectionStatus.PAYMENT_PLAN.value) == []
 
 
 def test_follow_ups_already_there_are_kept_and_ids_never_clash():
@@ -209,10 +240,12 @@ def test_follow_ups_already_there_are_kept_and_ids_never_clash():
                                                              "body": "kept"}},
     ]}
     steps = add_follow_ups(workflow)["steps"]
-    follow_ups = {step["config"]["follow_up_for"]: step["id"] for step in steps if step["config"].get("follow_up_for")}
-    assert follow_ups["email_not_opened"] == "mine" and steps[2]["config"]["body"] == "kept"
-    assert follow_ups["no_activity"] == "fu_no_activity_2"
-    assert len(follow_ups) == 6 and add_follow_ups({"steps": steps})["steps"] == steps  # adding again changes nothing
+    follow_ups = {(step["config"]["follow_up_for"], step["config"].get("follow_up_level", 1)): step["id"]
+                  for step in steps if step["config"].get("follow_up_for")}
+    assert follow_ups[("email_not_opened", 1)] == "mine" and steps[2]["config"]["body"] == "kept"
+    assert follow_ups[("email_not_opened", 2)] == "fu_email_not_opened_repeat"  # the missing repeat is added
+    assert follow_ups[("no_activity", 1)] == "fu_no_activity_2"
+    assert len(follow_ups) == 12 and add_follow_ups({"steps": steps})["steps"] == steps  # adding again changes nothing
 
 
 # --------------------------------------------------------------------------- helpers

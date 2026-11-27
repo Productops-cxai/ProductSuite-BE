@@ -170,6 +170,10 @@ our email", no "you visited your payment page"); write it so it reads naturally 
 stopped you from paying, ..." After a part payment, thank them for it and ask for the rest
 ({{{{outstanding_balance}}}}). A failed payment is the exception: the customer saw it fail, so say plainly that their
 payment did not go through and invite them to try again or choose another way to pay.
+A repeat follow-up (its title ends "(repeat)") is sent when the same situation happens again after the first one
+was sent: never repeat the first one's wording or approach - take the new angle its path_so_far gives. A payment
+plan not set up yet: invite them to finish setting it up, without saying we saw them begin. Only offer the ways to
+pay the payment page has (listed above).
 
 ## Style examples (illustrative only, do not copy)
 {examples}"""

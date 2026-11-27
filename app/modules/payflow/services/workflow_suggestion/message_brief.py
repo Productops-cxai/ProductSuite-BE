@@ -26,14 +26,19 @@ from app.modules.payflow.services.workflow_suggestion.audiences import audience_
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 from app.modules.payflow.services.workflow_suggestion.llm import _enum, _object, call_llm
 from app.modules.payflow.services.workflow_suggestion.message_prompt import SITUATION_NOTES, _workflow_lines
+from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import workflow_tones
 from app.modules.payflow.services.workflow_suggestion.message_tone import (
     FINAL_NOTICE,
     LADDER,
     NEUTRAL,
     SUPPORTIVE,
-    message_tones,
 )
-from app.modules.payflow.services.workflow_suggestion.message_validator import _TYPED_MONEY
+from app.modules.payflow.services.workflow_suggestion.message_validator import (
+    _TYPED_MONEY,
+    FULL_OPTION,
+    PART_OPTION,
+    PLAN_OPTION,
+)
 from app.shared.enums import PayflowCollectionStatus
 
 logger = logging.getLogger("app.payflow.message_brief")
@@ -43,8 +48,6 @@ MAX_FIX_ATTEMPTS = 2  # after the first answer, invalid briefs are sent back thi
 # Email length per brief, in words (within message_validator.EMAIL_WORDS). The SMS version is always short.
 LENGTHS = {"short": (40, 80), "medium": (80, 130), "long": (130, 180)}
 NO_LEAD = "none"
-# context.load_payment_options labels.
-FULL_OPTION, PART_OPTION, PLAN_OPTION = "pay in full", "pay part now", "set up a payment plan"
 SMALLER_STEPS = (PLAN_OPTION, PART_OPTION)
 # An audience mostly owing this much or more → lead with a smaller step (a plan, part now), not paying in full.
 LARGE_BALANCE_FROM = 1500
@@ -124,8 +127,7 @@ def plan_messages(
     `found`), default the main text and every audience. Briefs that stay invalid are left out; {} when the AI fails.
     """
     steps = {step["id"]: step for step in workflow.get("steps") or [] if step.get("id")}
-    stats = segment.get("stats") or {}
-    tones = message_tones(workflow, segment.get("segment") or {}, stats.get("avg_days_past_due"))
+    tones = workflow_tones(workflow, segment)  # the flowchart's messages and the adaptive follow-ups
     messages = [step_id for step_id in tones if step_ids is None or step_id in step_ids]
     audiences = [only] if only else [MAIN, *(audience["key"] for audience in found.get("audiences") or [])]
     pending = [(step_id, audience) for step_id in messages for audience in audiences]
@@ -338,6 +340,12 @@ gets the same text, filled with their own details. Reply with JSON only, matchin
   follows those): say "their balance".
 - Each message on a path takes a new angle instead of repeating the one before (for example: easy online
   payment -> the plan option -> what happens next). The path_so_far shows what came before.
+- A follow-up (path_so_far starts with "Follow-up") is not on the path: it is sent in place of the next reminder,
+  only to a customer in the situation its path_so_far describes. Plan it for that situation - short, one easy
+  step - so it reads naturally either way: never plan wording that says or hints that we saw what the customer
+  opened, clicked or started (no "the payment you started"; "if something stopped you from paying" is fine). A
+  repeat (title ends "(repeat)") is for the same situation again: plan a different angle from its first-time
+  follow-up (another way to pay, an offer of help).
 - Promise to Pay: remind them of their own promise. Already on a payment plan: help them keep up - never offer a
   new plan. Partly paid: thank them first.
 

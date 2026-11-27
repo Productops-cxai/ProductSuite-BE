@@ -45,7 +45,7 @@ def context(workflow):
 
 def test_suggest_writes_every_workflows_messages(db_session, admin, portfolio):  # noqa: F811
     workflows, prompts = suggest(db_session, admin, portfolio)
-    assert len(prompts) == len(workflows)  # one writer call per workflow
+    assert len(prompts) == 2 * len(workflows)  # per workflow: its flowchart's messages, then its follow-ups
     for workflow in workflows:
         assert messages(workflow) and all(cfg.get("body") and cfg.get("tone") for cfg in messages(workflow).values())
         assert "Messages" not in context(workflow)
@@ -75,7 +75,7 @@ def test_suggest_still_saves_when_messages_cannot_be_written(db_session, admin, 
 def test_regenerate_writes_messages_for_the_new_version(db_session, admin, ai_workflow):  # noqa: F811
     assert "Messages" in context(ai_workflow)  # made while the message AI was off
     new, prompts = regenerate(db_session, admin, ai_workflow["id"])
-    assert len(prompts) == 1
+    assert len(prompts) == 2  # the flowchart's messages, then the follow-ups
     assert all(cfg.get("body") and cfg.get("tone") for cfg in messages(new).values())
     assert "Messages" not in context(new)  # the old note is not copied over
     assert f"Segment: {context(ai_workflow)['Segment']}" in prompts[0]

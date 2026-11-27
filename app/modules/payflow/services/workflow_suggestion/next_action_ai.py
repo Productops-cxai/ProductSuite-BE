@@ -27,6 +27,7 @@ RECHECK_HOURS = (1, 336)  # look again: 1 hour to 14 days from now
 # Never move a message sooner than this after the last one sent.
 GAP_AFTER_LAST_MESSAGE = timedelta(hours=24)
 HISTORY_LIMIT = 30
+REASON_LIMIT = 200  # characters of an earlier decision's reason
 NOT_SHOWN = frozenset({"email_delivered", "sms_delivered"})
 
 SCHEMA = {
@@ -50,7 +51,8 @@ the client approved. You may only adjust it with one action:
 - "keep_plan": nothing to change. Choose it whenever you are not sure.
 - "use_follow_up": send one of follow_ups_available (follow_up_step_id) in place of one of next_message_choices
   (replace_step_id). It goes out at that message's planned time, so the customer gets no extra message. Only
-  when what the follow-up is "for" fits what the customer did.
+  when what the follow-up is "for" fits what the customer did. A "repeat" level is that situation's second
+  text, for when it happened again after the first one was sent.
 - "move_next": move the next planned step to in_hours from now ({MOVE_HOURS[0]}-{MOVE_HOURS[1]}). Later when the
   customer needs time; sooner only when they are clearly engaging, and never sooner than
   {int(GAP_AFTER_LAST_MESSAGE.total_seconds() // 3600)} hours after the last message sent.
@@ -61,6 +63,8 @@ the client approved. You may only adjust it with one action:
   does not fit, anything unusual.
 Never write new messages and never contact the customer more often than the plan does.
 Opens marked machine_open are the mail app, not the customer.
+earlier_decisions say what was decided before and why: build on them, and never suggest again a change that
+Operations rejected (status "rejected").
 reason: one or two plain sentences for Operations with the facts that decided it.
 confidence: 0-100, how sure you are; below 60 when the facts are thin or point both ways.
 Answer with JSON only."""
@@ -231,11 +235,16 @@ def _facts(
         "workflow_started_days_ago": _days(now, run.get("started_at")),
         "earlier_decisions": [
             {"action": d.get("action"), "status": d.get("status"), "by": d.get("decided_by"),
-             "days_ago": _days(now, d.get("at"))}
+             "days_ago": _days(now, d.get("at")), "why": _short(d.get("reason"))}
             for d in context.get("decisions") or []
             if isinstance(d, dict)
         ],
     }
+
+
+def _short(reason: Any) -> str | None:
+    text = " ".join(str(reason or "").split())
+    return text[:REASON_LIMIT] or None
 
 
 def _last_sent(context: dict[str, Any]) -> datetime | None:

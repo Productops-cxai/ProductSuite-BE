@@ -21,12 +21,14 @@ from app.infrastructure.database.models import PayflowCommunicationModel, Payflo
 
 logger = logging.getLogger("app.comms")
 
+FOLLOW_UP_STAGE = "Follow-up"
 REMINDER_STAGES = [
     "First reminder",
     "Second reminder",
     "Final reminder",
     "Payment plan",
     "Promise to pay",
+    FOLLOW_UP_STAGE,
 ]
 # A message purpose that is its own stage, whatever the step's place in the workflow.
 STAGE_BY_PURPOSE = {
@@ -53,12 +55,14 @@ def subject_key(subject: str | None) -> str | None:
 
 
 def reminder_stage(steps: list[dict[str, Any]] | None, step: dict[str, Any], purpose: str | None) -> str:
-    """The step's reminder stage: the one set on it, else from its purpose, else from its place
-    among the workflow's message steps (first, a later one, the last of three or more)."""
+    """The step's reminder stage: the one set on it, else "Follow-up" for an adaptive follow-up, else from its
+    purpose, else from its place among the workflow's message steps (first, a later one, the last of three or more)."""
     cfg = step.get("config") or {}
     explicit = str(cfg.get("reminder_stage") or cfg.get("reminderStage") or "").strip()
     if explicit in REMINDER_STAGES:
         return explicit
+    if str(cfg.get("follow_up_for") or "").strip():
+        return FOLLOW_UP_STAGE  # sent in place of a reminder, so its results are kept apart from the reminders'
     by_purpose = STAGE_BY_PURPOSE.get(str(purpose or cfg.get("purpose") or "").strip())
     if by_purpose:
         return by_purpose

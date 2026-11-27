@@ -919,7 +919,10 @@ class StrategyNodeConfig(BaseModel):
     review_status: Optional[str] = Field(default=None, max_length=64)
     # Adaptive B3: orphan Communication used as a situation-specific follow-up (swap target).
     # email_not_opened | opened_not_clicked | clicked_not_paid | payment_failed | payment_partial | no_activity
+    # | plan_setup_not_finished
     follow_up_for: Optional[str] = Field(default=None, max_length=64)
+    # Which text of that situation: 1 (or unset) the first time, 2 the repeat when it happens again, ...
+    follow_up_level: Optional[int] = Field(default=None, ge=1, le=9)
 
     @field_validator("subject", "body", "sms_body", "tone")
     @classmethod
@@ -1798,6 +1801,11 @@ class WriteWorkflowMessagesRequest(BaseModel):
         description='With step_id: rewrite only this text of the message - "main" (its main text) or one of its '
         'audience versions (e.g. "age_65_plus"); its other texts stay as they are',
     )
+    follow_ups_only: bool = Field(
+        default=False,
+        description="Add the workflow's adaptive follow-ups (when missing) and write the ones without text - the "
+        "workflow's other messages are not touched. Not with step_id or audience.",
+    )
 
     @field_validator("step_id", "remarks", "audience")
     @classmethod
@@ -1928,6 +1936,83 @@ class PayflowAdaptiveEngagementEventItem(BaseModel):
     processed_at: Optional[datetime] = None
 
 
+class PayflowAdaptiveFollowUpLevel(BaseModel):
+    level: int  # 1 the first-time text, 2 the repeat (config.follow_up_level)
+    name: str  # "First time", "Repeat"
+    step_title: str  # the title its step gets on a workflow, e.g. "Follow-up: part paid (repeat)"
+
+
+class PayflowAdaptiveFollowUpType(BaseModel):
+    """One situation the adaptive layer answers with a follow-up (GET /payflow/adaptive/follow-up-types)."""
+
+    follow_up_for: str  # config.follow_up_for of its steps
+    label: str  # name on screen, e.g. "Payment Not Finished"
+    trigger: str  # when it is used, with the waiting time from the settings
+    waiting_hours: int
+    needs_payment_plans: bool = False  # only on workflows of clients that offer payment plans
+    levels: List[PayflowAdaptiveFollowUpLevel] = Field(default_factory=list)
+
+
+class PayflowAdaptiveFollowUpTypesResponse(BaseModel):
+    items: List[PayflowAdaptiveFollowUpType] = Field(default_factory=list)
+
+
+class PayflowAdaptiveMessagePreview(BaseModel):
+    """The text a follow-up decision sends this customer: their audience version, in their language when the
+    follow-up is written in it. Variables ({{first_name}}, ...) are filled at send time."""
+
+    step_id: str
+    title: Optional[str] = None
+    level: int = 1  # 1 the first-time text, 2 the repeat
+    version: Optional[str] = None  # "main", an audience key ("age_65_plus"), None when a template is sent
+    version_label: Optional[str] = None  # "Main text", "Age 65 and over"
+    language: Optional[str] = None  # account language code of the text, None = the main language
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    sms_body: Optional[str] = None
+
+
+class PayflowAdaptiveSentMessage(BaseModel):
+    """A message the run sent: which text went out and, for a follow-up, the planned message it replaced."""
+
+    communication_id: int
+    step_id: Optional[str] = None
+    title: Optional[str] = None
+    channel: Optional[str] = None
+    status: Optional[str] = None
+    sent_at: Optional[datetime] = None
+    version: Optional[str] = None
+    version_label: Optional[str] = None
+    follow_up: bool = False
+    follow_up_level: Optional[int] = None
+    replaced_step_id: Optional[str] = None
+    replaced_title: Optional[str] = None
+
+
+class PayflowAdaptiveLinedUp(BaseModel):
+    """A follow-up waiting to go out in a planned message's place (at that message's time)."""
+
+    replace_step_id: str
+    replace_title: Optional[str] = None
+    follow_up_step_id: str
+    follow_up_title: Optional[str] = None
+    follow_up_level: int = 1
+
+
+class PayflowAdaptiveFollowUpUsage(BaseModel):
+    """One follow-up of the run's workflow and where it stands for this customer."""
+
+    step_id: str
+    follow_up_for: Optional[str] = None
+    level: int = 1  # 1 first time, 2 repeat
+    title: Optional[str] = None
+    state: str  # "sent" | "lined_up" | "available" | "not_written"
+    sent_at: Optional[datetime] = None
+    replaced_step_id: Optional[str] = None  # sent / lined up in place of this planned message
+    replaced_title: Optional[str] = None
+    last_failed: bool = False  # a send failed or was blocked: it did not count, so it is still available
+
+
 class PayflowAdaptiveDecisionItem(BaseModel):
     id: int
     run_id: int
@@ -1952,6 +2037,11 @@ class PayflowAdaptiveDecisionItem(BaseModel):
     executed_at: Optional[datetime] = None
     outcome: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
+    # In the run snapshot only: the titles of replace_step_id / follow_up_step_id, and on follow-up decisions
+    # the text this customer would get.
+    replace_title: Optional[str] = None
+    follow_up_title: Optional[str] = None
+    preview: Optional[PayflowAdaptiveMessagePreview] = None
 
 
 class PayflowAdaptiveDecisionsListResponse(BaseModel):
@@ -1965,6 +2055,14 @@ class PayflowAdaptiveNextScheduled(BaseModel):
     at: Optional[datetime] = None
 
 
+class PayflowAdaptiveNextMessage(BaseModel):
+    """The next planned message: the next step, or the message it leads to past waits and checks."""
+
+    step_id: str
+    title: Optional[str] = None
+    not_before: Optional[datetime] = None  # the next step's time: the message goes then, or after a wait / check
+
+
 class PayflowAdaptiveRunSnapshot(BaseModel):
     run_id: int
     account_id: int
@@ -1976,8 +2074,12 @@ class PayflowAdaptiveRunSnapshot(BaseModel):
     swaps: dict[str, Any] = Field(default_factory=dict)
     last_reassessed_at: Optional[datetime] = None
     next_scheduled: Optional[PayflowAdaptiveNextScheduled] = None
+    next_message: Optional[PayflowAdaptiveNextMessage] = None
     events: List[PayflowAdaptiveEngagementEventItem] = Field(default_factory=list)
     decisions: List[PayflowAdaptiveDecisionItem] = Field(default_factory=list)
+    messages: List[PayflowAdaptiveSentMessage] = Field(default_factory=list)  # latest first
+    lined_up: List[PayflowAdaptiveLinedUp] = Field(default_factory=list)
+    follow_ups: List[PayflowAdaptiveFollowUpUsage] = Field(default_factory=list)  # the usage table
 
 
 class PayflowAdaptiveDecisionNoteRequest(BaseModel):

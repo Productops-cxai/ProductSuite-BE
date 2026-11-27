@@ -153,18 +153,28 @@ def run_maintenance(state: dict) -> None:
         try:
             result = emit_adaptive_timer_events(db)
             db.commit()
-            fired = (
-                int(result.get("email_not_opened") or 0)
-                + int(result.get("opened_not_clicked") or 0)
-                + int(result.get("clicked_not_paid") or 0)
-                + int(result.get("no_activity") or 0)
-            )
+            fired = sum(int(count or 0) for kind, count in result.items() if kind != "runs")
             if fired:
                 logger.info("adaptive timer sweep %s", result)
         finally:
             db.close()
     except Exception:  # noqa: BLE001
         logger.exception("adaptive timer sweep failed")
+
+    # Adaptive B6: decisions waiting for approval that no longer apply are closed as expired.
+    try:
+        from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
+
+        db = SessionLocal()
+        try:
+            expired = AdaptiveWorkflowService(db).expire_waiting_decisions()
+            db.commit()
+            if expired:
+                logger.info("adaptive decisions expired: %s", expired)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("adaptive decision expiry sweep failed")
 
     # Human reviews held until a date: release the ones that are due.
     try:

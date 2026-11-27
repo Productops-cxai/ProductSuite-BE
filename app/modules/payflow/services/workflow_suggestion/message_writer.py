@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.exceptions import ServiceUnavailableError, ValidationAppError
+from app.core.exceptions import AppError, ServiceUnavailableError, ValidationAppError
 from app.modules.payflow.services.strategy_service import _timing_label, is_follow_up_step
-from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import follow_up_tones
+from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import workflow_tones
 from app.modules.payflow.services.workflow_suggestion.config import CONTACT_CHANNEL
 from app.modules.payflow.services.workflow_suggestion.languages import language_name
 from app.modules.payflow.services.workflow_suggestion.llm import build_message_schema, call_llm
@@ -21,7 +21,7 @@ from app.modules.payflow.services.workflow_suggestion.message_prompt import (
     build_translation_prompt,
 )
 from app.modules.payflow.services.workflow_suggestion.message_brief import LENGTHS, no_subject_style
-from app.modules.payflow.services.workflow_suggestion.message_tone import CLEAR, message_tones
+from app.modules.payflow.services.workflow_suggestion.message_tone import CLEAR
 from app.modules.payflow.services.workflow_suggestion.message_validator import (
     EMAIL_WORDS,
     MAX_SUBJECT_CHARS,
@@ -52,9 +52,13 @@ def write_messages(
     `plans`: {step_id: brief} - the AI's plan per message for this audience (message_brief.py); a message
     with a plan is written in the plan's tone (already checked: the code's tone or one step softer).
     `audience`: who the texts are for ({"key", "label", "accounts", "profile"}, audiences.py).
+
+    The adaptive follow-ups are written after the flowchart's messages, in a call of their own: those messages
+    are the context the follow-ups must not repeat, and a follow-up the AI cannot get right stays without text
+    (never sent until written) instead of failing the workflow.
     """
     steps = {step["id"]: step for step in workflow.get("steps") or [] if step.get("id")}
-    tones = _tones(workflow, segment)
+    tones = workflow_tones(workflow, segment)
     unknown = [step_id for step_id in step_ids or [] if step_id not in tones]
     if unknown:
         raise ValidationAppError(f"Step {unknown[0]} is not an email or SMS step of this workflow")
@@ -62,14 +66,53 @@ def write_messages(
     if not pending:
         raise ValidationAppError("This workflow has no email or SMS steps")
 
+    def write(batch: list[str], written: dict[str, dict[str, Any]]) -> tuple[dict, list[dict[str, Any]]]:
+        return _write_batch(client, workflow, segment, steps, tones, batch, written,
+                            remarks=remarks, plans=plans, audience=audience)
+
+    flowchart = [step_id for step_id in pending if not is_follow_up_step(steps[step_id])]
+    follow_ups = [step_id for step_id in pending if is_follow_up_step(steps[step_id])]
+    written: dict[str, dict[str, Any]] = {}
+    if flowchart:
+        written, failed = write(flowchart, written)
+        if failed:
+            raise _not_written(failed)
+    if follow_ups:
+        try:
+            written, failed = write(follow_ups, written)
+        except AppError:
+            if not written:
+                raise
+            failed = []  # the AI could not be asked: the follow-ups wait for Write messages
+        if failed and not written:  # only follow-ups were asked for, and none could be written
+            raise _not_written(failed)
+    return written
+
+
+def _write_batch(
+    client: dict[str, Any],
+    workflow: dict[str, Any],
+    segment: dict[str, Any],
+    steps: dict[str, dict[str, Any]],
+    tones: dict[str, dict[str, str]],
+    pending: list[str],
+    written: dict[str, dict[str, Any]],
+    *,
+    remarks: str | None,
+    plans: dict[str, dict[str, str]] | None,
+    audience: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """One AI call for the `pending` messages (failing ones sent back up to MAX_FIX_ATTEMPTS times), the
+    `written` ones as context. Returns (written + the ones written now, the feedback of the ones that still fail)."""
     english = (client.get("language") or "English").strip().lower().startswith("english")
     wording = client.get("required_wording") or {}  # the compliance rules' wording - checked in every message
-    written: dict[str, dict[str, Any]] = {}
+    options = client.get("payment_options")  # only these ways to pay may be offered
+    written = dict(written)
     feedback: list[dict[str, Any]] = []
     for _ in range(1 + MAX_FIX_ATTEMPTS):
         briefs = [
             {**_brief(steps[step_id], tones[step_id], segment, english, (plans or {}).get(step_id)),
-             "required_wording": wording}
+             "required_wording": wording, "payment_options": options}
             for step_id in pending
         ]
         others = _other_messages(steps, tones, written, skip=pending)
@@ -87,21 +130,14 @@ def write_messages(
                 written[brief["step_id"]] = {**message, "tone": brief["tone"]}
                 bodies += [text for text in (message["body"], message.get("sms_body")) if text]
         if not feedback:
-            return written
+            break
         pending = [item["step_id"] for item in feedback]
+    return written, feedback
 
-    # Only adaptive follow-ups still fail: the flowchart's messages are kept; those follow-ups stay without
-    # text (never sent until written) rather than failing the whole workflow.
-    if written and all(is_follow_up_step(steps[item["step_id"]]) for item in feedback):
-        return written
+
+def _not_written(feedback: list[dict[str, Any]]) -> ServiceUnavailableError:
     problems = [error for item in feedback for error in item["errors"]]
-    raise ServiceUnavailableError("AI could not write valid messages: " + "; ".join(problems[:10]))
-
-
-def _tones(workflow: dict[str, Any], segment: dict[str, Any]) -> dict[str, dict[str, str]]:
-    """The code's tone (and path) of every message: the flowchart's messages and the adaptive follow-ups."""
-    situation, avg = segment.get("segment") or {}, (segment.get("stats") or {}).get("avg_days_past_due")
-    return {**message_tones(workflow, situation, avg), **follow_up_tones(workflow, situation, avg)}
+    return ServiceUnavailableError("AI could not write valid messages: " + "; ".join(problems[:10]))
 
 
 def apply_messages(steps: list[dict[str, Any]], written: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -209,6 +245,9 @@ def _brief(
         or situation == PayflowCollectionStatus.PROMISE_TO_PAY.value,
         "english": english,  # some checks look for English words
         "follow_up": bool(cfg.get("follow_up_for")),  # adaptive follow-up: never says what we saw them do
+        # Already on a payment plan: the message may speak of that plan, even where new plans are not offered.
+        "plan_customer": cfg.get("purpose") == "Payment Plan Reminder"
+        or situation == PayflowCollectionStatus.PAYMENT_PLAN.value,
     }
     if plan:
         low, high = LENGTHS.get(plan.get("length"), EMAIL_WORDS)
@@ -275,7 +314,7 @@ def check_texts(
     `wording`: what the client's compliance rules require in each email / SMS (required_wording.py).
     Returns [{"step_id", "text", "channel", "problem"}] - [] when every text is fine.
     """
-    tones = _tones(workflow, segment)
+    tones = workflow_tones(workflow, segment)
     warnings: list[dict[str, str]] = []
     for step, key, text in texts:
         code = tones.get(step["id"]) or {"tone": CLEAR, "path": None, "why": None}

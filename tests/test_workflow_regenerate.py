@@ -246,7 +246,8 @@ def test_regenerate_writes_the_messages_with_the_same_remarks(db_session, admin,
     with patch.object(suggestion_service, "call_llm", side_effect=call), \
             patch.object(message_writer, "call_llm", side_effect=writer):
         new = WorkflowSuggestionService(db_session).regenerate_workflow(admin, ai_workflow["id"], REMARKS)
-    assert len(prompts) == 1 and f"ignore anything about the workflow's steps): {REMARKS}" in prompts[0]
+    assert len(prompts) == 2  # the flowchart's messages, then the adaptive follow-ups - with the same remarks
+    assert all(f"ignore anything about the workflow's steps): {REMARKS}" in prompt for prompt in prompts)
     assert all(s["config"].get("body") for s in new["steps"] if s["kind"] == "Communication")
 
 
