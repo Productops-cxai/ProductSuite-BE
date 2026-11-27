@@ -15,6 +15,7 @@ from app.modules.payflow.services.email_tracking import ORIGIN_HUMAN
 from app.modules.payflow.services.strategy_service import (
     PayflowStrategyService,
     _message_text,
+    is_follow_up_step,
     read_strategy_versions,
 )
 from app.modules.payflow.services.segmentation_config_service import default_segmentation_config
@@ -30,6 +31,7 @@ from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import
     LABEL as FOLLOW_UPS_LABEL,
     add_follow_ups,
     follow_up_line,
+    has_text,
 )
 from app.modules.payflow.services.workflow_suggestion.config import CHANNEL_FIELDS, REASONING_LABELS
 from app.modules.payflow.services.workflow_suggestion.context import (
@@ -191,10 +193,16 @@ class WorkflowSuggestionService:
             segment_id = segment["segment_id"]
             found = find_audiences(members[segment_id], segmentation=segmentation)
             performance = _email_performance(self.db, client["id"], portfolio_id=scope.id, found=found)
+            # Adaptive follow-ups, written after the other messages.
+            with_follow_ups = add_follow_ups(
+                workflows[segment_id],
+                payment_options=writer_client["payment_options"],
+                situation=(segment.get("segment") or {}).get("situation"),
+            )
             workflows[segment_id], messages_note[segment_id] = _with_messages(
                 {**writer_client, "email_performance": performance,
                  "required_wording": required_wording(self.db, client["id"], members[segment_id])},
-                add_follow_ups(workflows[segment_id]),  # adaptive follow-ups, written with the other messages
+                with_follow_ups,
                 segment,
                 languages=extra_languages(client.get("language"), segment_stats_languages(segment["stats"])),
                 found=found,
@@ -297,7 +305,10 @@ class WorkflowSuggestionService:
             lessons=lessons[:MAX_REGENERATE_LESSONS],
         )["A"]
         # Adaptive follow-ups (same ids as the original's, so a reviewer's follow-up text is kept below too).
-        workflow = add_follow_ups(workflow)
+        payment_options = load_payment_options(self.db, original["client_id"])
+        workflow = add_follow_ups(
+            workflow, payment_options=payment_options, situation=(original.get("segment") or {}).get("situation")
+        )
         # Messages a reviewer wrote or edited on the original keep that text as written (and are translated);
         # the others get fresh email / SMS text, following the same remarks.
         workflow, carried = _seed_reviewer_text(workflow, original)
@@ -307,7 +318,7 @@ class WorkflowSuggestionService:
         workflow, messages_note = _with_messages(
             {
                 **client,
-                "payment_options": load_payment_options(self.db, original["client_id"]),
+                "payment_options": payment_options,
                 # The original's own results first: the new version replaces it.
                 "email_performance": _email_performance(
                     self.db, original["client_id"], portfolio_id=original.get("portfolio_id"),
@@ -405,12 +416,20 @@ class WorkflowSuggestionService:
         remarks: str | None = None,
         *,
         audience: str | None = None,
+        follow_ups_only: bool = False,
     ) -> dict[str, Any]:
         """AI writes the email / SMS text of a workflow — every message, or only `step_id`.
 
         `audience` (with `step_id`): only that one text of the message - MAIN ("main") or one of its audience
         versions ("age_65_plus") - and its translations. The message's other texts and the other steps stay as they are.
+        Every message, or `follow_ups_only`: the workflow's adaptive follow-ups are added first when it has none yet
+        (a workflow built by hand). `follow_ups_only` then writes only the follow-ups without text - a person's own
+        texts in the workflow are never touched.
         """
+        if follow_ups_only and (step_id or audience):
+            raise ValidationAppError(
+                "follow_ups_only writes the follow-ups without text - leave out step_id and audience"
+            )
         workflow = self.strategies.get_strategy(user, strategy_id)
         _assert_not_rejected(workflow, "write the messages of the new version")
         if workflow["status"] not in WRITE_MESSAGES_STATUSES:
@@ -432,19 +451,33 @@ class WorkflowSuggestionService:
         }
         if one_text_step is not None:
             return self._write_one_text(user, workflow, client, members, found, one_text_step, audience, remarks)
+        step_ids = [step_id] if step_id else None
+        if not step_id:
+            workflow = add_follow_ups(
+                workflow,
+                payment_options=client["payment_options"],
+                situation=(workflow.get("segment") or {}).get("situation"),
+            )
+        if follow_ups_only:
+            step_ids = [step["id"] for step in workflow["steps"] if is_follow_up_step(step) and not has_text(step)]
+            if not step_ids:
+                raise ValidationAppError(
+                    "No follow-up to write: they are all written, or this workflow has no reminder or payment-link "
+                    "message for a follow-up to replace"
+                )
         written, audiences_note = _write_for_audiences(
             client,
             workflow,
             _stored_segment(workflow),
             found,
-            step_ids=[step_id] if step_id else None,
+            step_ids=step_ids,
             remarks=remarks,
         )
         languages = _other_languages(client, members)
         written, _ = _with_translations(client, workflow, written, languages)
         steps = apply_messages(workflow["steps"], written)
         ai_context = _refreshed_context(workflow.get("ai_context"), client.get("language"), languages, steps)
-        if not step_id:  # every message rewritten: who they are written for is new too
+        if step_ids is None:  # every message rewritten: who they are written for is new too
             ai_context = [item for item in ai_context if item.get("label") != "Audiences"] + audiences_note
         ai_context = [item for item in ai_context if item.get("label") != PERFORMANCE_LABEL] + _performance_note(client)
         ai_context = _with_wording_line(ai_context, client)
@@ -793,12 +826,23 @@ def _write_for_audiences(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
     """{step_id: main text + its "brief" + its audience "versions"}, and the "Audiences" ai_context line.
 
-    AI call 1 (plan_messages) plans every message for the main text and for each audience in `found`; call 2
-    (write_messages) writes the main text, then each audience's version, from those plans. Raises AppError when
-    the main text cannot be written. An audience version that fails is left out - those customers get the main
-    text. Without plans (the AI could not plan) the main text is written as before, with no versions.
+    AI call 1 (plan_messages) plans every message of the flowchart for the main text and for each audience in
+    `found`; then the adaptive follow-ups are planned, one call per text (main, then each audience) so a call
+    stays small whatever the number of audiences, and a failure leaves only the follow-ups without a plan (or a
+    version). write_messages then writes the main text, then each audience's version, from those plans. Raises
+    AppError when the main text cannot be written. An audience version that fails is left out - those customers
+    get the main text. Without plans (the AI could not plan) the main text is written as before, with no versions.
     """
-    plans = plan_messages(client, workflow, segment, found, step_ids=step_ids)
+    steps = {step.get("id"): step for step in workflow.get("steps") or []}
+    asked = [step_id for step_id, step in steps.items()
+             if step.get("kind") == "Communication" and (step_ids is None or step_id in step_ids)]
+    flowchart = [step_id for step_id in asked if not is_follow_up_step(steps[step_id])]
+    follow_ups = [step_id for step_id in asked if is_follow_up_step(steps[step_id])]
+    plans = plan_messages(client, workflow, segment, found, step_ids=flowchart) if flowchart else {}
+    for key in [MAIN, *(audience["key"] for audience in found.get("audiences") or [])] if follow_ups else []:
+        for step_id, by_audience in plan_messages(client, workflow, segment, found, step_ids=follow_ups,
+                                                  only=key).items():
+            plans.setdefault(step_id, {}).update(by_audience)
     main_plans = _plans_for(plans, MAIN)
     main = {"key": MAIN, "label": "Main text", **(found.get("main") or {})}
     written = write_messages(
@@ -1022,21 +1066,37 @@ def _with_translations(
 
     One AI call per language for the main text, and one per language for each audience's versions. A
     language that cannot be translated is left out - its customers get the main text - and never blocks a save.
+    The adaptive follow-ups are translated in a call of their own: when they fail, the language still counts for
+    the other messages, and its customers get the planned messages instead of a follow-up (next_action.py).
     """
+    steps = {step.get("id"): step for step in workflow.get("steps") or []}
+    follow_ups = {step_id: m for step_id, m in written.items() if is_follow_up_step(steps.get(step_id))}
+    flowchart = {step_id: m for step_id, m in written.items() if step_id not in follow_ups}
+    groups = [group for group in (flowchart, follow_ups) if group]
     done: list[str] = []
     failed: list[str] = []
+    follow_ups_missing: list[str] = []
     for code in languages if written else []:
         try:
-            versions = translate_messages(client, workflow, written, code)
+            versions = translate_messages(client, workflow, groups[0], code)
         except AppError:
             failed.append(code)
             continue
+        if len(groups) > 1:
+            try:
+                versions.update(translate_messages(client, workflow, groups[1], code))
+            except AppError:
+                follow_ups_missing.append(code)
         written = {
-            step_id: {**message, "translations": {**(message.get("translations") or {}), code: versions[step_id]}}
+            step_id: (
+                {**message, "translations": {**(message.get("translations") or {}), code: versions[step_id]}}
+                if step_id in versions
+                else message
+            )
             for step_id, message in written.items()
         }
         done.append(code)
-    note = languages_line(client.get("language"), done, failed)
+    note = languages_line(client.get("language"), done, failed, follow_ups_missing)
 
     audience_versions = {
         (step_id, key): version
@@ -1058,21 +1118,27 @@ def _translate_versions(
 ) -> tuple[dict[tuple[str, str], dict], list[str]]:
     """{(step_id, audience): version with its other-language versions}, and what could not be translated
     ("Age 65 and over in French"). One AI call per audience and language: a customer gets all of their
-    audience's messages in the same language, or the main text."""
+    audience's messages in the same language, or the main text. The audience's follow-up versions are
+    translated in a call of their own ("Age 65 and over follow-ups in French" when it fails)."""
+    steps = {step.get("id"): step for step in workflow.get("steps") or []}
     result = {pair: dict(version) for pair, version in versions.items()}
     failed: list[str] = []
     for key in dict.fromkeys(audience for _, audience in versions):
         texts = {step_id: version for (step_id, audience), version in result.items() if audience == key}
         label = next(iter(texts.values())).get("label") or key
+        follow_ups = {step_id: text for step_id, text in texts.items() if is_follow_up_step(steps.get(step_id))}
+        flowchart = {step_id: text for step_id, text in texts.items() if step_id not in follow_ups}
+        groups = [(group, name) for group, name in ((flowchart, label), (follow_ups, f"{label} follow-ups")) if group]
         for code in languages:
-            try:
-                translated = translate_messages(client, workflow, texts, code)
-            except AppError:
-                failed.append(f"{label} in {language_name(code)}")
-                continue
-            for step_id in texts:
-                version = result[(step_id, key)]
-                version["translations"] = {**(version.get("translations") or {}), code: translated[step_id]}
+            for group, name in groups:
+                try:
+                    translated = translate_messages(client, workflow, group, code)
+                except AppError:
+                    failed.append(f"{name} in {language_name(code)}")
+                    continue
+                for step_id in group:
+                    version = result[(step_id, key)]
+                    version["translations"] = {**(version.get("translations") or {}), code: translated[step_id]}
     return result, failed
 
 

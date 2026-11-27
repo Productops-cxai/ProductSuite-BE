@@ -146,9 +146,12 @@ def test_write_messages_saves_the_main_text_and_an_audience_version(db_session, 
     planner, plans = fake_planner()
     saved = write_with(db_session, admin, ai_workflow["id"], writer, planner)
 
-    assert len(plans) == 1  # one plan for every message and audience
-    assert len(prompts) == 2 and SENIORS in prompts[1] and "the main text - 29 accounts" in prompts[0]
-    for step_id, config in flowchart_messages(saved).items():
+    # Planned: the flowchart's messages for every audience, then the follow-ups one text at a time (main, 65+).
+    assert len(plans) == 3
+    # Written: the main text (the flowchart's messages, then the follow-ups), then the 65+ version (the same two).
+    assert len(prompts) == 4 and all(SENIORS in prompt for prompt in prompts[2:])
+    assert all("the main text - 29 accounts" in prompt for prompt in prompts[:2])
+    for step_id, config in messages(saved).items():  # the follow-ups get the 65+ version too
         assert config["body"] and config["brief"]["approach"] == "Approach for main", step_id
         version = config["versions"]["age_65_plus"]
         assert version["label"] == "Age 65 and over" and version["body"] and version["tone"]
@@ -165,7 +168,8 @@ def test_no_plans_means_one_text_for_everyone_as_before(db_session, admin, portf
     writer, prompts = fake_message_ai()
     with patch.object(message_writer, "call_llm", side_effect=writer):  # the planner stays off (conftest)
         saved = WorkflowSuggestionService(db_session).write_workflow_messages(admin, ai_workflow["id"])
-    assert len(prompts) == 1 and "These texts are for" not in prompts[0]
+    assert len(prompts) == 2  # the flowchart's messages, then the follow-ups
+    assert not any("These texts are for" in prompt for prompt in prompts)
     assert all(config["body"] and "versions" not in config and "brief" not in config
                for config in messages(saved).values())
     assert context(saved)["Audiences"].startswith("One text for everyone - the AI could not plan")
@@ -190,10 +194,10 @@ def test_audience_versions_are_translated_too(db_session, admin, portfolio, ai_w
     add_seniors(db_session, portfolio, language="FR")
     writer, translations = fake_writer()
     saved = write_with(db_session, admin, ai_workflow["id"], writer)
-    assert len(translations) == 2  # French: one call for the main text, one for the 65+ version
-    for config in messages(saved).values():
-        assert config["translations"]["FR"]["body"].startswith("FR - ")  # the follow-ups too
-    for config in flowchart_messages(saved).values():
+    # French: the main text, then the 65+ version - each the flowchart's messages, then the follow-ups.
+    assert len(translations) == 4
+    for config in messages(saved).values():  # the follow-ups too
+        assert config["translations"]["FR"]["body"].startswith("FR - ")
         assert config["versions"]["age_65_plus"]["translations"]["FR"]["body"].startswith("FR - ")
 
 

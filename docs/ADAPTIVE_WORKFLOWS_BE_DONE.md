@@ -1,7 +1,8 @@
 # Adaptive AI Workflows — BE done (handover)
 
-**Status:** BE foundation complete (B1–B6 + safety locks 77–82).  
-**Not in this BE delivery:** real AI NBA brain, FE screens.  
+**Status:** BE foundation complete (B1–B6 + safety locks 77–82). **AI part done** (rules + AI next-best-action, follow-up
+writing, first-time / repeat follow-ups): see **§6** for everything the AI team added or changed on top of this doc.  
+**FE:** build from **`docs/ADAPTIVE_WORKFLOWS_FE.md`** (screens, calls, labels).  
 **Out of scope (by design):** inbound customer reply handling.
 
 Updates use **POST** (not PATCH/PUT), same as the rest of PayFlow.
@@ -126,12 +127,15 @@ Keep UI logic thin. Call these contracts exactly. Do **not** invent PATCH/PUT. D
 - `payment_failed` (added by the AI team: the customer's payment did not go through)
 - `payment_partial`
 - `no_activity`
+- `plan_setup_not_finished` (added by the AI team: a payment plan setup not finished)
+
+Optional `config.follow_up_level` (AI team): `2` = the situation's repeat text; missing = 1 (first time).
 
 Rules FE must respect when saving:
 
 - Step must be `kind: Communication`
 - Follow-up steps are **orphans** (not on the main `next` path)
-- One follow-up situation per workflow (BE validates)
+- One follow-up step per situation **and level** (BE validates)
 - Stats may include `follow_ups` count
 
 #### Case workflow execution
@@ -347,7 +351,55 @@ Body:
 | Layer | Status |
 |---|---|
 | **BE** (events → reassess → apply/approve → APIs → safety) | Complete |
-| **AI** (`decide_next_action` real brain + content) | Gap — §3 |
-| **FE** (editor + monitoring + approval UI) | Not started — use §4 |
+| **AI** (`decide_next_action` real brain + content) | Done — §6 |
+| **FE** (editor + monitoring + approval UI) | Not started — use `ADAPTIVE_WORKFLOWS_FE.md` |
 
 When AI + FE land on top of this contract, story ACs can close end-to-end.
+
+---
+
+## 6. AI team update (27 Nov 2026)
+
+### 6.1 What the AI side does now
+
+| Area | Where | What |
+|---|---|---|
+| Next-best-action rules | `workflow_suggestion/next_action.py` | A situation → its approved follow-up in place of the next planned reminder (first time, then the repeat text); payment started → next step waits a day; failed / part payment → no contact for 2 h / 24 h; a late open or click → the lined-up follow-up is dropped (`drop_follow_up`); plan set up → payment follow-ups dropped |
+| AI for unclear cases | `workflow_suggestion/next_action_ai.py` | Only when the rules cannot settle it (every follow-up text for the situation used, unclear next message, Reassess plan). Never at send time; at most `ADAPTIVE_AI_CALLS_PER_WEEK` per run. No PII or message text sent to the AI |
+| Follow-ups on workflows | `workflow_suggestion/adaptive_follow_ups.py` | One registry: 7 situations × first time / repeat. Suggest, Regenerate and Write messages add them; `follow_ups_only` writes only them. Written after the flowchart's messages in calls of their own (texts, age versions, translations) |
+| Writing checks | `workflow_suggestion/message_validator.py` | Follow-ups never say we saw what the customer opened / clicked / started; no message offers a way to pay the client's payment page does not have |
+
+### 6.2 New / changed settings (`app/core/config.py`)
+
+| Setting | Default | Was |
+|---|---|---|
+| `ADAPTIVE_NO_ACTIVITY_HOURS` | 72 | `ADAPTIVE_NO_ACTIVITY_DAYS` = 7 (removed) |
+| `ADAPTIVE_PLAN_SETUP_HOURS` | 24 | new: plan setup not finished |
+| `ADAPTIVE_AI_CALLS_PER_WEEK` | 3 | was a constant in code |
+| `ADAPTIVE_PAYMENT_FAILED_WAIT_HOURS` | 2 | new |
+| `ADAPTIVE_PART_PAID_WAIT_HOURS` | 24 | new |
+
+### 6.3 API additions (all backward compatible)
+
+| Call | Addition |
+|---|---|
+| `GET /payflow/adaptive/follow-up-types` | **New.** The 7 types: label, trigger text, waiting hours (from settings), levels |
+| `POST /payflow/workflows/{id}/content` | `{"follow_ups_only": true}`: add missing follow-ups, write only those without text |
+| `GET /payflow/workflow-runs/{id}/adaptive` (and `execution.adaptive`) | `next_message` (the next planned message, past waits and checks), `messages` (sent, with version and what a follow-up replaced), `lined_up`, `follow_ups` (usage per follow-up text), and on decisions `replace_title`, `follow_up_title`, `preview` (the text this customer would get) |
+| Decision `action` | `drop_follow_up` (rules only) |
+| Decision `status` | `superseded` also when a newer waiting decision replaces an older one; `failed` when an approved / changed decision could not be carried out |
+| Notifications | `adaptive_decision_awaiting` is marked read when the decision stops waiting |
+| Subject Performance | Reminder stage `Follow-up` for follow-up sends |
+
+### 6.4 BE fixes made by the AI team (with tests)
+
+| File | Fix |
+|---|---|
+| `adaptive_workflow_service.py` | A message moved by a decision was dropped when a newer decision replaced it (job cancelled / skipped at send) - it now keeps its new time. A newer waiting decision replaces the older; waiting decisions that no longer apply expire (worker sweep); a sent follow-up stays `executed` (not `superseded`); notifications cleared when a decision stops waiting; dates without a time zone compared safely |
+| `engagement_service.py` | `no_activity` fired once per run only (its dedupe key ignored later messages) - now once per silence after each message; new plan-setup timer |
+| `workflow_execution_service.py` | The step run kept the swap only until the send overwrote `result_json` - the `adaptive_*` keys are kept |
+| `email_tracking.py` | Follow-ups recorded as reminder stage `Follow-up` (were "First reminder") |
+| `strategy_service.py` / `schemas.py` | `plan_setup_not_finished`, `follow_up_level`, one step per situation and level |
+| `worker/loop.py` | Expiry sweep for waiting decisions; timer log counts every timer |
+
+Tests: `tests/test_adaptive_*.py` (including `test_adaptive_end_to_end.py`, a customer's journey through `process_job`).

@@ -2,6 +2,8 @@
 
 Ticket: **AI adaptive, event-driven communication workflows** · From the AI team · 23 Nov 2026
 
+> **This is the plan written before the build.** What was built, and the current settings and APIs: `docs/ADAPTIVE_WORKFLOWS_BE_DONE.md` (§6 for the AI team's part) and, for the frontend, `docs/ADAPTIVE_WORKFLOWS_FE.md`.
+
 This file is the backend part of the ticket. Build it first; the AI team then plugs in the AI part (section 6).
 
 ---

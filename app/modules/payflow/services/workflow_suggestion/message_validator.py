@@ -10,6 +10,9 @@ from typing import Any
 
 from app.modules.payflow.services.workflow_suggestion.message_tone import FINAL_NOTICE, FIRM, NEUTRAL
 
+# What a client's payment page can offer (context.load_payment_options gives the client's own list).
+FULL_OPTION, PART_OPTION, PLAN_OPTION = "pay in full", "pay part now", "set up a payment plan"
+
 # The variables the worker fills per account (workflow_execution_service._render).
 VARIABLES = {
     "first_name",
@@ -102,6 +105,34 @@ _TRACKING = re.compile(
     r"(?:was not|wasn[’']t)\s+(?:finished|completed))\b",
     re.IGNORECASE,
 )
+# Offering a way to pay (English text): only the ones the client's payment page offers. "Thank you for your part
+# payment" thanks the customer for what they did - it offers nothing.
+_OFFERS = {
+    PLAN_OPTION: re.compile(
+        r"\b(?:(?:re)?payment|instal+ment)\s+plans?\b|\binstal+ments?\b|\bset(?:ting)?\s+up\s+(?:a|your)\s+plan\b"
+        r"|\bpay\w*\s+(?:\w+\s+)?over\s+time\b",
+        re.I,
+    ),
+    PART_OPTION: re.compile(
+        r"\b(?:pay|paying|make|making)\s+(?:a\s+)?(?:part|portion|partial\s+payment)\b"
+        r"|\bsmaller\s+(?:amounts?|payments?)\b",
+        re.I,
+    ),
+}
+
+
+def _unavailable_offer(text: str, brief: dict[str, Any]) -> str | None:
+    """The words offering a way to pay the client's payment page does not have, else None."""
+    options = brief.get("payment_options")
+    if not options or not brief.get("english", True):
+        return None
+    for option, pattern in _OFFERS.items():
+        if option == PLAN_OPTION and brief.get("plan_customer"):
+            continue  # a customer already on a plan: the message is about that plan
+        found = option not in options and pattern.search(text)
+        if found:
+            return found.group(0)
+    return None
 
 
 def _without(text: str, wording: list[str]) -> str:
@@ -120,8 +151,10 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
     """Problems with one written message — [] when it can be saved.
 
     `brief`: step_id, channel, tone, promise_ok (promise variables allowed), english (text is English), follow_up
-    (an adaptive follow-up: never says what we saw the customer do), and required_wording ({"Email": [...],
-    "SMS": [...]}: what the client's compliance rules require, word for word).
+    (an adaptive follow-up: never says what we saw the customer do), required_wording ({"Email": [...],
+    "SMS": [...]}: what the client's compliance rules require, word for word), payment_options (the ways to pay
+    the client's payment page offers; None: not known, not checked) and plan_customer (already on a payment plan:
+    the message may speak of it).
     `other_bodies`: the workflow's other message bodies (no copy-paste between messages).
     """
     where = brief["step_id"]
@@ -179,6 +212,10 @@ def check_message(message: dict[str, Any], brief: dict[str, Any], other_bodies: 
     if tracked:
         errors.append(f"{where}: '{tracked.group(0)}' tells the customer we saw what they opened, clicked or started - "
                       "a follow-up must read naturally either way (e.g. \"If something stopped you from paying, ...\")")
+    offer = _unavailable_offer(text, brief)
+    if offer:
+        errors.append(f"{where}: '{offer}' offers a way to pay this client's payment page does not have - offer only: "
+                      f"{', '.join(brief['payment_options'])}")
     group = brief.get("english", True) and _GROUP_WORDS.search(text)
     if group:
         errors.append(f"{where}: '{group.group(0)}' is about the customer's age or group - write for them, never "

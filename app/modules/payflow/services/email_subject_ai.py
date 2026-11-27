@@ -1568,6 +1568,7 @@ class PayflowEmailSubjectAiService:
         """What the message writer's own checks say about this email text, in the step's tone
         ([] when it is fine - or when the checks cannot be run, which never blocks a decision)."""
         from app.modules.payflow.services.strategy_service import PayflowStrategyService
+        from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import workflow_tones
         from app.modules.payflow.services.workflow_suggestion.context import load_client_context
         from app.modules.payflow.services.workflow_suggestion.message_validator import check_message
         from app.modules.payflow.services.workflow_suggestion.required_wording import workflow_wording
@@ -1576,9 +1577,7 @@ class PayflowEmailSubjectAiService:
         try:
             workflow = PayflowStrategyService(self.db)._serialize(strategy)
             segment = _stored_segment(workflow)
-            tones = message_writer.message_tones(
-                workflow, segment.get("segment") or {}, (segment.get("stats") or {}).get("avg_days_past_due")
-            )
+            tones = workflow_tones(workflow, segment)  # the flowchart's messages and the adaptive follow-ups
             # A step the workflow's path does not reach has no decided tone: the general checks
             # (threats, typed amounts / numbers, variables) still apply, as for a Clear message.
             tone = tones.get(step.get("id")) or {"tone": "Clear", "why": "", "path": ""}

@@ -5,6 +5,8 @@
 2. A case closed with money owed was stopped as "paid in full" (Completed) instead of ending as Cancelled.
 3. A waiting reassessment due later (a recheck days ahead, or the 5-minute batch) held back urgent events.
 4. "Delivered" events stayed unread, so nearly every send called decide_next_action and saved a decision.
+5. A message moved by a decision was dropped when a newer decision replaced that one (its job was cancelled,
+   or skipped at send time), and the customer's workflow stopped there.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -21,7 +23,7 @@ from app.infrastructure.database.models import (
 from app.modules.payflow.services import adaptive_workflow_service
 from app.modules.payflow.services.adaptive_workflow_service import AdaptiveWorkflowService
 from app.modules.payflow.services.engagement_service import record_engagement_event
-from app.modules.payflow.services.workflow_queue import enqueue_reassess_run
+from app.modules.payflow.services.workflow_queue import enqueue_execute_step, enqueue_reassess_run
 
 STEPS = [
     {"id": "s1", "kind": "Communication", "title": "Email 1",
@@ -233,3 +235,77 @@ def test_a_delivered_event_does_not_make_the_send_check_call_next_action(db_sess
     assert result["abort_send"] is False
     assert calls == []
     assert _decisions(db_session, run) == []
+
+
+# --------------------------------------------------------------------------- 5. a moved message is kept
+
+
+def _decision(action, **fields):
+    return {"action": action, "decided_by": "rules", "reason": f"test {action}", **fields}
+
+
+def test_a_moved_message_keeps_its_new_time_when_a_newer_decision_replaces_the_move(db_session):
+    run = _run(db_session)
+    now = datetime.now(timezone.utc)
+    job = enqueue_execute_step(db_session, run_id=run.id, step_id="s2", scheduled_at=now + timedelta(hours=1))
+    db_session.commit()
+    service = AdaptiveWorkflowService(db_session)
+
+    moved_to = now + timedelta(days=1)
+    with _next_action([], _decision("move_next", at=moved_to.isoformat())):  # e.g. the customer started paying
+        service.reassess(run.id, trigger="event")
+    with _next_action([], _decision("use_follow_up", replace_step_id="s2", follow_up_step_id="f1")):
+        service.reassess(run.id, trigger="event")  # e.g. then left the payment page
+
+    db_session.refresh(job)
+    db_session.refresh(run)
+    assert job.status == "pending"
+    assert abs(_aware(job.scheduled_at) - moved_to) < timedelta(seconds=1)
+    assert "decision_id" not in (job.payload or {})
+    assert run.swaps == {"s2": "f1"}  # the follow-up goes out in its place, at the moved time
+    assert [(d.action, d.status) for d in _decisions(db_session, run)] == [
+        ("move_next", "superseded"),
+        ("use_follow_up", "executed"),
+    ]
+
+
+def test_a_message_moved_by_a_replaced_decision_is_still_sent(db_session):
+    run = _run(db_session)
+    replaced = PayflowAdaptiveDecisionModel(
+        run_id=run.id, account_id=run.account_id, strategy_id=run.strategy_id, action="move_next",
+        decided_by="rules", status="superseded",
+    )
+    db_session.add(replaced)
+    db_session.flush()
+    job = enqueue_execute_step(db_session, run_id=run.id, step_id="s2", payload={"decision_id": replaced.id})
+    db_session.commit()
+
+    with _next_action([]):
+        result = AdaptiveWorkflowService(db_session).reassess(
+            run.id, job_id=job.id, trigger="message_due", due_step_id="s2"
+        )
+
+    assert result["abort_send"] is False
+
+
+def test_a_recheck_of_a_replaced_decision_is_still_cancelled(db_session):
+    run = _run(db_session)
+    old = PayflowAdaptiveDecisionModel(
+        run_id=run.id, account_id=run.account_id, strategy_id=run.strategy_id, action="move_next",
+        decided_by="rules", status="executed",
+    )
+    db_session.add(old)
+    db_session.flush()
+    recheck = enqueue_reassess_run(
+        db_session, run_id=run.id, scheduled_at=datetime.now(timezone.utc) + timedelta(days=2),
+        payload={"trigger": "event", "decision_id": old.id},
+    )
+    db_session.commit()
+
+    with _next_action([], _decision("use_follow_up", replace_step_id="s2", follow_up_step_id="f1")):
+        AdaptiveWorkflowService(db_session).reassess(run.id, trigger="event")
+
+    db_session.refresh(recheck)
+    db_session.refresh(old)
+    assert old.status == "superseded"
+    assert recheck.status == "cancelled"

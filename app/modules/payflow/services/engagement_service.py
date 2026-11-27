@@ -22,7 +22,12 @@ from app.infrastructure.database.models import (
     PayflowStrategyModel,
     PayflowWorkflowRunModel,
 )
-from app.shared.enums import PayflowCommChannel, PayflowCommStatus, PayflowWorkflowRunStatus
+from app.shared.enums import (
+    PayflowCommChannel,
+    PayflowCommStatus,
+    PayflowPaymentOptionType,
+    PayflowWorkflowRunStatus,
+)
 
 logger = logging.getLogger("app.payflow.engagement")
 
@@ -247,7 +252,7 @@ def emit_adaptive_timer_events(db: Session) -> dict[str, int]:
     B2 — create silence / non-conversion timer events for open adaptive runs.
 
     Safe to call repeatedly: ``dedupe_key`` ensures each timer fires once per
-    message (or once per no_activity window per run).
+    message (no_activity: once per silence window after the run's last message).
     """
     counts = {
         "runs": 0,
@@ -255,6 +260,7 @@ def emit_adaptive_timer_events(db: Session) -> dict[str, int]:
         "opened_not_clicked": 0,
         "clicked_not_paid": 0,
         "no_activity": 0,
+        "plan_setup_not_finished": 0,
     }
     now = _utcnow()
     not_opened_after = timedelta(hours=max(1, int(settings.ADAPTIVE_NOT_OPENED_HOURS or 48)))
@@ -264,8 +270,8 @@ def emit_adaptive_timer_events(db: Session) -> dict[str, int]:
     clicked_not_paid_after = timedelta(
         hours=max(1, int(settings.ADAPTIVE_CLICKED_NOT_PAID_HOURS or 24))
     )
-    no_activity_days = max(1, int(settings.ADAPTIVE_NO_ACTIVITY_DAYS or 7))
-    no_activity_after = timedelta(days=no_activity_days)
+    no_activity_after = timedelta(hours=max(1, int(settings.ADAPTIVE_NO_ACTIVITY_HOURS or 72)))
+    plan_setup_after = timedelta(hours=max(1, int(settings.ADAPTIVE_PLAN_SETUP_HOURS or 24)))
 
     runs = _open_adaptive_runs(db)
     counts["runs"] = len(runs)
@@ -320,9 +326,10 @@ def emit_adaptive_timer_events(db: Session) -> dict[str, int]:
             run_comms,
             now=now,
             threshold=no_activity_after,
-            window_days=no_activity_days,
         ):
             counts["no_activity"] += 1
+        if _emit_plan_setup_not_finished(db, run, now=now, threshold=plan_setup_after):
+            counts["plan_setup_not_finished"] += 1
 
     return counts
 
@@ -515,6 +522,55 @@ def _emit_clicked_not_paid(
     return row is not None
 
 
+def _emit_plan_setup_not_finished(
+    db: Session,
+    run: PayflowWorkflowRunModel,
+    *,
+    now: datetime,
+    threshold: timedelta,
+) -> bool:
+    """The customer's latest checkout was setting up a payment plan, and `threshold` later (24 h by default)
+    there is still no plan and no payment. Once per checkout."""
+    started = (
+        db.query(PayflowEngagementEventModel)
+        .filter(
+            PayflowEngagementEventModel.run_id == run.id,
+            PayflowEngagementEventModel.event_type == "payment_started",
+        )
+        .order_by(PayflowEngagementEventModel.occurred_at.desc(), PayflowEngagementEventModel.id.desc())
+        .first()
+    )
+    if started is None or (started.detail or {}).get("option_type") != PayflowPaymentOptionType.PAYMENT_PLAN.value:
+        return False
+    started_at = _aware(started.occurred_at)
+    if started_at is None or now - started_at < threshold:
+        return False
+    finished = (
+        db.query(PayflowEngagementEventModel.id)
+        .filter(
+            PayflowEngagementEventModel.run_id == run.id,
+            PayflowEngagementEventModel.event_type.in_(["plan_created", "payment_completed", "payment_partial"]),
+            PayflowEngagementEventModel.occurred_at >= started.occurred_at,
+        )
+        .first()
+    )
+    if finished:
+        return False
+    row = record_engagement_event(
+        db,
+        account_id=run.account_id,
+        client_id=run.client_id,
+        event_type="plan_setup_not_finished",
+        source="timer",
+        dedupe_key=f"timer:plan_setup_not_finished:start:{started.id}",
+        occurred_at=now,
+        run_id=run.id,
+        strategy_id=run.strategy_id,
+        detail={"started_at": started_at.isoformat(), "attempt_id": (started.detail or {}).get("attempt_id")},
+    )
+    return row is not None
+
+
 def _emit_no_activity(
     db: Session,
     run: PayflowWorkflowRunModel,
@@ -522,8 +578,8 @@ def _emit_no_activity(
     *,
     now: datetime,
     threshold: timedelta,
-    window_days: int,
 ) -> bool:
+    """One event per `threshold` of silence after the last message sent (every 72 h by default)."""
     last_message_at: datetime | None = None
     for comm in run_comms:
         sent_at = _comm_sent_at(comm)
@@ -548,24 +604,25 @@ def _emit_no_activity(
     if customer_after:
         return False
 
-    elapsed = now - last_message_at
-    window = int(elapsed.total_seconds() // (window_days * 86400))
+    window = int((now - last_message_at) // threshold)
     if window < 1:
         return False
+    # Counted from the last message: a silence after a later message is a new one, not a repeat of this.
+    since = int(last_message_at.timestamp())
     row = record_engagement_event(
         db,
         account_id=run.account_id,
         client_id=run.client_id,
         event_type="no_activity",
         source="timer",
-        dedupe_key=f"timer:no_activity:run:{run.id}:w{window}",
+        dedupe_key=f"timer:no_activity:run:{run.id}:since:{since}:w{window}",
         occurred_at=now,
         run_id=run.id,
         strategy_id=run.strategy_id,
         detail={
             "last_message_at": last_message_at.isoformat(),
             "window": window,
-            "window_days": window_days,
+            "window_hours": int(threshold.total_seconds() // 3600),
         },
     )
     return row is not None

@@ -2780,7 +2780,9 @@ class WorkflowExecutionService:
         persist_result: bool = True,
     ) -> None:
         if persist_result:
-            step_run.result_json = result
+            # The adaptive swap stays on the step run: which follow-up went out in this planned step's place.
+            swap = {key: value for key, value in (step_run.result_json or {}).items() if key.startswith("adaptive_")}
+            step_run.result_json = {**swap, **result}
         if result.get("skipped") and not result.get("chosen_channel"):
             event = "sms_skipped" if channel == "SMS" else "email_skipped"
             self.log_event(

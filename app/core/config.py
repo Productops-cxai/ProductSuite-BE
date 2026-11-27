@@ -128,7 +128,13 @@ class Settings(BaseSettings):
     ADAPTIVE_NOT_OPENED_HOURS: int = 48
     ADAPTIVE_OPENED_NOT_CLICKED_HOURS: int = 48
     ADAPTIVE_CLICKED_NOT_PAID_HOURS: int = 24
-    ADAPTIVE_NO_ACTIVITY_DAYS: int = 7
+    ADAPTIVE_NO_ACTIVITY_HOURS: int = 72
+    ADAPTIVE_PLAN_SETUP_HOURS: int = 24  # began setting up a payment plan, not finished after this long
+    # Adaptive next-best-action: the AI is asked at most this often per run ("Reassess plan" not counted).
+    ADAPTIVE_AI_CALLS_PER_WEEK: int = 3
+    # No contact this soon after a failed / part payment: time to try again, or to pay the rest.
+    ADAPTIVE_PAYMENT_FAILED_WAIT_HOURS: int = 2
+    ADAPTIVE_PART_PAID_WAIT_HOURS: int = 24
     # Opaque payment-link token TTL (hours). Default 14 days.
     PAYMENT_LINK_TTL_HOURS: int = 336
     # Email subject performance: a payment is credited to the last payment-link click within

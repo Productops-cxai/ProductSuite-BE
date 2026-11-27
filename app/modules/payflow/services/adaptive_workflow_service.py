@@ -20,23 +20,32 @@ from app.infrastructure.database.models import (
     PayflowClientModel,
     PayflowCommunicationModel,
     PayflowEngagementEventModel,
+    PayflowNotificationModel,
     PayflowStrategyModel,
     PayflowWorkflowJobModel,
     PayflowWorkflowRunModel,
+    PayflowWorkflowStepRunModel,
     UserModel,
 )
 from app.modules.payflow.services.strategy_service import (
-    FOLLOW_UP_FOR_VALUES,
     follow_up_for,
+    follow_up_level,
     is_follow_up_step,
 )
 from app.modules.payflow.services.workflow_condition_runtime import payment_status
+from app.modules.payflow.services.workflow_contact_runtime import audience_message_config, localized_message_config
 from app.modules.payflow.services.workflow_execution_service import WorkflowExecutionService
 from app.modules.payflow.services.workflow_queue import (
     cancel_pending_jobs_for_run,
     enqueue_reassess_run,
 )
-from app.modules.payflow.services.workflow_suggestion.next_action import decide_next_action
+from app.modules.payflow.services.workflow_suggestion.adaptive_follow_ups import has_text
+from app.modules.payflow.services.workflow_suggestion.audiences import audience_label
+from app.modules.payflow.services.workflow_suggestion.next_action import (
+    NOT_SENT,
+    decide_next_action,
+    messages_after,
+)
 from app.shared.enums import PayflowWorkflowJobStatus, PayflowWorkflowJobType, PayflowWorkflowRunStatus
 
 logger = logging.getLogger("app.payflow.adaptive")
@@ -68,6 +77,7 @@ _ALLOWED_ACTIONS = frozenset(
     {
         "keep_plan",
         "use_follow_up",
+        "drop_follow_up",  # rules only: the customer answered a lined-up follow-up's situation
         "move_next",
         "switch_channel",
         "recheck_at",
@@ -77,6 +87,7 @@ _ALLOWED_ACTIONS = frozenset(
     }
 )
 
+_APPLIED_DECISION_STATUSES = frozenset({"executed", "approved", "modified"})
 # Decisions that change the live plan (supersede earlier unfinished ones).
 _PLAN_CHANGING_ACTIONS = frozenset(
     {
@@ -118,6 +129,11 @@ _ENGAGEMENT_STATE_BY_EVENT = {
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """A stored time with its zone (a database without time zones returns it without one)."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def _cfg(step: dict[str, Any]) -> dict[str, Any]:
@@ -343,7 +359,9 @@ class AdaptiveWorkflowService:
             row.status = "failed"
             row.outcome = {"error": decision.get("reason")}
         elif self._requires_human_approval(decision, client):
-            # B6 approval flow; run continues on the normal plan meanwhile.
+            # B6 approval flow; run continues on the normal plan meanwhile. Only the latest waits, so
+            # Operations act on what is true now.
+            self._supersede_waiting(run, except_id=row.id)
             row.status = "awaiting_approval"
             row.needs_approval = True
             needs_notify = True
@@ -420,6 +438,7 @@ class AdaptiveWorkflowService:
             .first()
         )
         next_scheduled = None
+        next_message = None
         if pending and run.status not in _TERMINAL:
             step_def = steps_by_id.get(pending.step_id or "") or {}
             next_scheduled = {
@@ -428,6 +447,14 @@ class AdaptiveWorkflowService:
                 "title": step_def.get("title"),
                 "at": pending.scheduled_at,
             }
+            # The message that job leads to (past waits and checks) - None when none, or a check could go either way.
+            ahead = messages_after(steps_by_id, pending.step_id)
+            if len(ahead) == 1:
+                next_message = {
+                    "step_id": ahead[0].get("id"),
+                    "title": ahead[0].get("title"),
+                    "not_before": pending.scheduled_at,
+                }
 
         events = (
             self.db.query(PayflowEngagementEventModel)
@@ -443,6 +470,17 @@ class AdaptiveWorkflowService:
             .limit(50)
             .all()
         )
+        account = self.db.get(PayflowAccountModel, run.account_id)
+        messages = self._sent_messages(run, steps_by_id)
+        decision_items = []
+        for decision in decisions:
+            item = self._serialize_decision(decision, client_id=run.client_id)
+            item["replace_title"] = (steps_by_id.get(decision.replace_step_id or "") or {}).get("title")
+            item["follow_up_title"] = (steps_by_id.get(decision.follow_up_step_id or "") or {}).get("title")
+            follow = steps_by_id.get(decision.follow_up_step_id or "") if decision.action == "use_follow_up" else None
+            if follow and account:
+                item["preview"] = self._message_preview(follow, account, strategy)
+            decision_items.append(item)
         return {
             "run_id": run.id,
             "account_id": run.account_id,
@@ -454,9 +492,120 @@ class AdaptiveWorkflowService:
             "swaps": dict(run.swaps or {}),
             "last_reassessed_at": run.last_reassessed_at,
             "next_scheduled": next_scheduled,
+            "next_message": next_message,
             "events": [self._serialize_event(e) for e in events],
-            "decisions": [self._serialize_decision(d, client_id=run.client_id) for d in decisions],
+            "decisions": decision_items,
+            "messages": messages,
+            "lined_up": [
+                {
+                    "replace_step_id": planned_id,
+                    "replace_title": (steps_by_id.get(planned_id) or {}).get("title"),
+                    "follow_up_step_id": follow_id,
+                    "follow_up_title": (steps_by_id.get(follow_id) or {}).get("title"),
+                    "follow_up_level": follow_up_level(steps_by_id.get(follow_id)),
+                }
+                for planned_id, follow_id in (run.swaps or {}).items()
+            ],
+            "follow_ups": self._follow_up_usage(run, steps_by_id, messages),
         }
+
+    def _follow_up_usage(
+        self, run: PayflowWorkflowRunModel, steps_by_id: dict[str, dict], messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Every follow-up of the run's workflow and where it stands for this customer: "sent" (when, in place
+        of which message), "lined_up" (waiting to go in a planned message's place), "available" or "not_written".
+        A message that failed or was blocked does not count as sent (last_failed says so)."""
+        lined_up = {follow_id: planned_id for planned_id, follow_id in (run.swaps or {}).items()}
+        sent: dict[str, dict[str, Any]] = {}
+        failed: set[str] = set()
+        for message in messages:  # latest first
+            if not message["follow_up"]:
+                continue
+            if message["status"] in NOT_SENT:
+                failed.add(message["step_id"])
+            else:
+                sent.setdefault(message["step_id"], message)
+        usage = []
+        for step_id, step in steps_by_id.items():
+            if not is_follow_up_step(step):
+                continue
+            message = sent.get(step_id)
+            if message:
+                state, replaced_id = "sent", message["replaced_step_id"]
+            elif step_id in lined_up:
+                state, replaced_id = "lined_up", lined_up[step_id]
+            else:
+                state, replaced_id = ("available" if has_text(step) else "not_written"), None
+            usage.append({
+                "step_id": step_id,
+                "follow_up_for": follow_up_for(step),
+                "level": follow_up_level(step),
+                "title": step.get("title"),
+                "state": state,
+                "sent_at": message["sent_at"] if message else None,
+                "replaced_step_id": replaced_id,
+                "replaced_title": (steps_by_id.get(replaced_id or "") or {}).get("title"),
+                "last_failed": step_id in failed and not message,
+            })
+        return usage
+
+    def _message_preview(
+        self, step: dict[str, Any], account: PayflowAccountModel, strategy: PayflowStrategyModel | None
+    ) -> dict[str, Any]:
+        """What `step` sends this customer, picked as the worker picks it: their audience version, in their
+        language when it is written in it. Variables are filled at send time."""
+        cfg, version = audience_message_config(
+            dict(step.get("config") or {}), account, segmentation=getattr(strategy, "segmentation_snapshot", None)
+        )
+        language = str(account.language or "").strip().upper()
+        written_in = language if language and language in (cfg.get("translations") or {}) else None
+        text = localized_message_config(cfg, written_in)
+        return {
+            "step_id": step.get("id"),
+            "title": step.get("title"),
+            "level": follow_up_level(step),
+            "version": version,
+            "version_label": audience_label(version),
+            "language": written_in,
+            **{part: text.get(part) for part in ("subject", "body", "sms_body")},
+        }
+
+    def _sent_messages(self, run: PayflowWorkflowRunModel, steps_by_id: dict[str, dict]) -> list[dict[str, Any]]:
+        """The run's messages, latest first: which text went out and, for a follow-up, the planned message it
+        was sent in place of (from the worker's step runs)."""
+        replaced: dict[str, str] = {}
+        step_runs = self.db.query(PayflowWorkflowStepRunModel).filter(PayflowWorkflowStepRunModel.run_id == run.id)
+        for step_run in step_runs:
+            result = step_run.result_json if isinstance(step_run.result_json, dict) else {}
+            if result.get("adaptive_follow_up"):
+                replaced[result["adaptive_follow_up"]] = result.get("adaptive_swap_from")
+        messages = (
+            self.db.query(PayflowCommunicationModel)
+            .filter(PayflowCommunicationModel.run_id == run.id)
+            .order_by(PayflowCommunicationModel.id.desc())
+            .limit(100)
+            .all()
+        )
+        items = []
+        for message in messages:
+            step = steps_by_id.get(message.step_id or "") or {}
+            follow_up = is_follow_up_step(step)
+            replaced_id = replaced.get(message.step_id or "") if follow_up else None
+            items.append({
+                "communication_id": message.id,
+                "step_id": message.step_id,
+                "title": step.get("title"),
+                "channel": message.channel,
+                "status": message.status,
+                "sent_at": message.sent_at,
+                "version": message.message_audience,
+                "version_label": audience_label(message.message_audience),
+                "follow_up": follow_up,
+                "follow_up_level": follow_up_level(step) if follow_up else None,
+                "replaced_step_id": replaced_id,
+                "replaced_title": (steps_by_id.get(replaced_id or "") or {}).get("title"),
+            })
+        return items
 
     def list_decisions(
         self,
@@ -502,6 +651,7 @@ class AdaptiveWorkflowService:
             raise ConflictError(f"Decision is {row.status}, not awaiting_approval")
 
         self._stamp_reviewer(row, user=user, note=note)
+        self._close_notifications([row.id])
         applies, why = self._decision_still_applies(run, row)
         if not applies:
             row.status = "expired"
@@ -515,7 +665,8 @@ class AdaptiveWorkflowService:
         if decision.get("action") in _PLAN_CHANGING_ACTIONS:
             self._supersede_prior_decisions(run, except_id=row.id)
         outcome = self._apply_decision(run, account, strategy, steps, decision, row)
-        row.status = "approved"
+        # It could not be carried out (e.g. SMS for a customer without a mobile number): the history says so.
+        row.status = "failed" if outcome.get("status") == "failed" else "approved"
         row.outcome = outcome
         row.executed_at = _utcnow()
         if outcome.get("human_review_id"):
@@ -577,6 +728,7 @@ class AdaptiveWorkflowService:
         row.reason = decision.get("reason")
         row.decided_by = "operations"
         self._stamp_reviewer(row, user=user, note=note)
+        self._close_notifications([row.id])
 
         applies, why = self._decision_still_applies(run, row)
         if not applies:
@@ -590,7 +742,7 @@ class AdaptiveWorkflowService:
         if decision.get("action") in _PLAN_CHANGING_ACTIONS:
             self._supersede_prior_decisions(run, except_id=row.id)
         outcome = self._apply_decision(run, account, strategy, steps, decision, row)
-        row.status = "modified"
+        row.status = "failed" if outcome.get("status") == "failed" else "modified"
         row.outcome = {
             "ai_decision": ai_snapshot,
             "reviewer": decision,
@@ -624,6 +776,7 @@ class AdaptiveWorkflowService:
             raise ConflictError(f"Decision is {row.status}, not awaiting_approval")
 
         self._stamp_reviewer(row, user=user, note=note)
+        self._close_notifications([row.id])
         row.status = "rejected"
         row.outcome = {"rejected": True}
         row.executed_at = _utcnow()
@@ -876,6 +1029,9 @@ class AdaptiveWorkflowService:
         if action == "keep_plan":
             return {"status": "executed", "applied": "keep_plan", "abort_send": False}
 
+        if action == "drop_follow_up":
+            return self._drop_follow_up(run, decision)
+
         if action == "switch_channel":
             channel = (decision.get("channel") or "").strip()
             if channel not in {"Email", "SMS"}:
@@ -963,6 +1119,7 @@ class AdaptiveWorkflowService:
             run.swaps = swaps
             # Optional channel: e.g. "email not opened" → the follow-up (and later messages) go by SMS first.
             channel = (decision.get("channel") or "").strip()
+            previous_channel = run.preferred_channel
             if channel in {"Email", "SMS"} and self._channel_allowed_for_account(account, channel):
                 run.preferred_channel = channel
             at = self._parse_at(decision.get("at"))
@@ -989,6 +1146,8 @@ class AdaptiveWorkflowService:
                 "applied": "use_follow_up",
                 "replace_step_id": replace_id,
                 "follow_up_step_id": follow_id,
+                # What drop_follow_up restores when the customer answers the situation before it is sent.
+                "previous_channel": previous_channel,
                 "abort_send": abort,
             }
 
@@ -1072,10 +1231,19 @@ class AdaptiveWorkflowService:
         )
         if except_id is not None:
             q = q.filter(PayflowAdaptiveDecisionModel.id != except_id)
-        priors = q.all()
+        swaps = dict(run.swaps or {})
+        # A follow-up already sent (no longer lined up) is done: it stays "executed" in the case history.
+        priors = [
+            prior for prior in q.all()
+            if not (
+                prior.action == "use_follow_up"
+                and prior.status in _APPLIED_DECISION_STATUSES
+                and swaps.get(prior.replace_step_id or "") != prior.follow_up_step_id
+            )
+        ]
         if not priors:
             return 0
-        swaps = dict(run.swaps or {})
+        self._close_notifications([prior.id for prior in priors if prior.status == "awaiting_approval"])
         for prior in priors:
             prior.status = "superseded"
             self._cancel_jobs_for_decision(run.id, prior.id)
@@ -1088,7 +1256,116 @@ class AdaptiveWorkflowService:
         run.swaps = swaps or None
         return len(priors)
 
+    def _supersede_waiting(self, run: PayflowWorkflowRunModel, *, except_id: int) -> int:
+        """An older decision of the run still waiting for approval is replaced by the newer one."""
+        waiting = (
+            self.db.query(PayflowAdaptiveDecisionModel)
+            .filter(
+                PayflowAdaptiveDecisionModel.run_id == run.id,
+                PayflowAdaptiveDecisionModel.status == "awaiting_approval",
+                PayflowAdaptiveDecisionModel.id != except_id,
+            )
+            .all()
+        )
+        for row in waiting:
+            row.status = "superseded"
+            row.outcome = {"superseded_by": except_id}
+        self._close_notifications([row.id for row in waiting])
+        return len(waiting)
+
+    def expire_waiting_decisions(self) -> int:
+        """Decisions waiting for approval that no longer apply - the case ended, the message they would replace
+        went out, nothing is left to move - are closed as "expired", with the reason. The worker calls this with
+        its timer sweep; the caller commits."""
+        waiting = (
+            self.db.query(PayflowAdaptiveDecisionModel)
+            .filter(PayflowAdaptiveDecisionModel.status == "awaiting_approval")
+            .all()
+        )
+        expired: list[int] = []
+        for row in waiting:
+            run = self.db.get(PayflowWorkflowRunModel, row.run_id)
+            applies, why = self._decision_still_applies(run, row) if run else (False, "run_missing")
+            if applies:
+                continue
+            row.status = "expired"
+            row.outcome = {"expired_reason": why}
+            row.executed_at = _utcnow()
+            expired.append(row.id)
+        self._close_notifications(expired)
+        return len(expired)
+
+    def _close_notifications(self, decision_ids: list[int]) -> None:
+        """These decisions no longer wait for approval: their "awaiting approval" notifications are marked read,
+        so the bell lists only decisions still waiting."""
+        if not decision_ids:
+            return
+        (
+            self.db.query(PayflowNotificationModel)
+            .filter(
+                PayflowNotificationModel.entity_type == "adaptive_decision",
+                PayflowNotificationModel.entity_id.in_([str(decision_id) for decision_id in decision_ids]),
+                PayflowNotificationModel.read_at.is_(None),
+            )
+            .update({PayflowNotificationModel.read_at: _utcnow()}, synchronize_session=False)
+        )
+
+    def _drop_follow_up(self, run: PayflowWorkflowRunModel, decision: dict[str, Any]) -> dict[str, Any]:
+        """The customer answered a lined-up follow-up's situation (e.g. opened the email): the planned message
+        goes instead, by the channel used before the follow-up changed it."""
+        replace_id = (decision.get("replace_step_id") or "").strip()
+        follow_id = (decision.get("follow_up_step_id") or "").strip()
+        swaps = dict(run.swaps or {})
+        if not replace_id or swaps.get(replace_id) != follow_id:
+            return {"status": "failed", "error": "that follow-up is not lined up", "abort_send": False}
+        swaps.pop(replace_id)
+        run.swaps = swaps or None
+
+        lined_up = (
+            self.db.query(PayflowAdaptiveDecisionModel)
+            .filter(
+                PayflowAdaptiveDecisionModel.run_id == run.id,
+                PayflowAdaptiveDecisionModel.action == "use_follow_up",
+                PayflowAdaptiveDecisionModel.replace_step_id == replace_id,
+                PayflowAdaptiveDecisionModel.follow_up_step_id == follow_id,
+                PayflowAdaptiveDecisionModel.status.in_(list(_APPLIED_DECISION_STATUSES)),
+            )
+            .order_by(PayflowAdaptiveDecisionModel.id.desc())
+            .first()
+        )
+        if lined_up is not None:
+            lined_up.status = "superseded"
+            self._cancel_jobs_for_decision(run.id, lined_up.id)
+            outcome = lined_up.outcome if isinstance(lined_up.outcome, dict) else {}
+            if lined_up.channel and run.preferred_channel == lined_up.channel and not self._channel_switched_after(
+                run.id, lined_up.id
+            ):
+                run.preferred_channel = outcome.get("previous_channel")
+        return {
+            "status": "executed",
+            "applied": "drop_follow_up",
+            "replace_step_id": replace_id,
+            "follow_up_step_id": follow_id,
+            "abort_send": False,
+        }
+
+    def _channel_switched_after(self, run_id: int, decision_id: int) -> bool:
+        """A channel switch carried out after `decision_id` (e.g. the email bounced): it stays."""
+        return (
+            self.db.query(PayflowAdaptiveDecisionModel.id)
+            .filter(
+                PayflowAdaptiveDecisionModel.run_id == run_id,
+                PayflowAdaptiveDecisionModel.id > decision_id,
+                PayflowAdaptiveDecisionModel.action == "switch_channel",
+                PayflowAdaptiveDecisionModel.status.in_([*_APPLIED_DECISION_STATUSES, "superseded"]),
+            )
+            .first()
+            is not None
+        )
+
     def _cancel_jobs_for_decision(self, run_id: int, decision_id: int) -> int:
+        """Cancel the replaced decision's "check again" jobs. A step it moved keeps its new time: cancelling
+        that job would drop the message and stop the customer's workflow there."""
         rows = (
             self.db.query(PayflowWorkflowJobModel)
             .filter(
@@ -1100,12 +1377,20 @@ class AdaptiveWorkflowService:
         cancelled = 0
         for job in rows:
             payload = job.payload if isinstance(job.payload, dict) else {}
-            if payload.get("decision_id") == decision_id:
+            if payload.get("decision_id") != decision_id:
+                continue
+            if job.job_type == PayflowWorkflowJobType.EXECUTE_STEP.value:
+                job.payload = {key: value for key, value in payload.items() if key != "decision_id"}
+            else:
                 job.status = PayflowWorkflowJobStatus.CANCELLED.value
                 cancelled += 1
         return cancelled
 
     def _job_decision_superseded(self, job: PayflowWorkflowJobModel) -> bool:
+        """A "check again" job whose decision was replaced is skipped. A step job always runs (see
+        _cancel_jobs_for_decision)."""
+        if job.job_type != PayflowWorkflowJobType.REASSESS_RUN.value:
+            return False
         payload = job.payload if isinstance(job.payload, dict) else {}
         decision_id = payload.get("decision_id")
         if not decision_id:
@@ -1114,8 +1399,6 @@ class AdaptiveWorkflowService:
         return bool(row and row.status == "superseded")
 
     def _step_already_sent(self, run_id: int, step_id: str) -> bool:
-        from app.infrastructure.database.models import PayflowWorkflowStepRunModel
-
         done = (
             self.db.query(PayflowWorkflowStepRunModel.id)
             .filter(
@@ -1154,7 +1437,7 @@ class AdaptiveWorkflowService:
         current_scheduled: datetime | None,
     ) -> bool:
         """Prevent Communication drops messages — never use move_next to send earlier under it."""
-        if current_scheduled is not None and at >= current_scheduled:
+        if current_scheduled is not None and at >= _as_utc(current_scheduled):
             return False
         from app.modules.payflow.services.rule_runtime_service import RuleRuntimeService
 
@@ -1200,19 +1483,22 @@ class AdaptiveWorkflowService:
         *,
         decision_id: int | None,
     ) -> None:
+        """Move `step_id`'s waiting job to `at`. When that step has no job yet (a check comes first), the run's
+        next step is held until `at` instead - only later, never sooner."""
+        pending_steps = self.db.query(PayflowWorkflowJobModel).filter(
+            PayflowWorkflowJobModel.run_id == run_id,
+            PayflowWorkflowJobModel.job_type == PayflowWorkflowJobType.EXECUTE_STEP.value,
+            PayflowWorkflowJobModel.status == PayflowWorkflowJobStatus.PENDING.value,
+        )
         pending = (
-            self.db.query(PayflowWorkflowJobModel)
-            .filter(
-                PayflowWorkflowJobModel.run_id == run_id,
-                PayflowWorkflowJobModel.step_id == step_id,
-                PayflowWorkflowJobModel.job_type == PayflowWorkflowJobType.EXECUTE_STEP.value,
-                PayflowWorkflowJobModel.status == PayflowWorkflowJobStatus.PENDING.value,
-            )
+            pending_steps.filter(PayflowWorkflowJobModel.step_id == step_id)
             .order_by(PayflowWorkflowJobModel.id.desc())
             .first()
         )
-        if not pending:
-            return
+        if pending is None:
+            pending = pending_steps.order_by(PayflowWorkflowJobModel.scheduled_at.asc()).first()
+            if pending is None or (pending.scheduled_at is not None and _as_utc(pending.scheduled_at) >= at):
+                return
         pending.scheduled_at = at
         payload = dict(pending.payload or {})
         if decision_id is not None:
@@ -1358,11 +1644,8 @@ class AdaptiveWorkflowService:
         due_step_id: str | None = None,
     ) -> dict[str, Any]:
         client = self.db.get(PayflowClientModel, run.client_id)
-        follow_ups = {
-            follow_up_for(s): s.get("id")
-            for s in steps
-            if is_follow_up_step(s) and follow_up_for(s) in FOLLOW_UP_FOR_VALUES
-        }
+        # Each situation's first-time follow-up (its repeat texts are in `steps`, with config.follow_up_level).
+        follow_ups = {follow_up_for(s): s.get("id") for s in steps if is_follow_up_step(s) and follow_up_level(s) == 1}
         pending = (
             self.db.query(PayflowWorkflowJobModel)
             .filter(
@@ -1504,6 +1787,8 @@ class AdaptiveWorkflowService:
                     "status": d.status,
                     "decided_by": d.decided_by,
                     "at": d.created_at.isoformat() if d.created_at else None,
+                    # Not Operations' own note: it may name the customer.
+                    "reason": d.reason if d.decided_by != "operations" else None,
                 }
                 for d in decisions
             ],
